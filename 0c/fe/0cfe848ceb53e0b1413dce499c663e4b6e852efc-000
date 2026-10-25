@@ -58,13 +58,36 @@ def main(params, prefix, out):
             if rn not in E_: continue
             for j in (nh_ - 1 - E_.index(rn), nh_ - 1 + E_.index(rn)):
                 if 0 <= j < R: G[:, j, 0] -= np.sign(G[:, j, 0]) * d
-    P = G.reshape(-1, 3); Q, N = [], []
-    idx = lambda i, j: i * R + (j % R)
+    # 25 October 2026: CROWN ; the top band (roof_centre -> roof_edge, roof and hood) was a straight ruled strip, a tent
+    # with a ridge in the front view ; crown_n columns are inserted, x linear and y = yc + (ye - yc) * u**crown_p, flat top
+    # that drops near its edges, as the sheet. Panels of the inserted strips follow their band.
+    cols = []
+    cn, cp = C.get("crown_n", 0), C.get("crown_p", 3.0)
+    def crown(ja, jb, ua, ub):   # ja centre column, jb edge column
+        out = []
+        for k in range(1, cn + 1):
+            u = k / (cn + 1); u = ua + (ub - ua) * u
+            out.append((ja, jb, u))
+        return out
+    for j in range(R):
+        cols.append((j, j, 0.0, j))
+        if cn and j == 0: cols += [(0, 1, u, 0) for (_, _, u) in crown(0, 1, 0, 1)]
+        if cn and j == R - 1: cols += [(0, R - 1, u, R - 1) for (_, _, u) in crown(0, R - 1, 0, 1)[::-1]]
+    G2 = np.zeros((len(t), len(cols), 3))
+    for k, (a, b, u, _) in enumerate(cols):
+        if a == b: G2[:, k] = G[:, a]
+        else:
+            G2[:, k, 0] = G[:, a, 0] + u * (G[:, b, 0] - G[:, a, 0]); G2[:, k, 2] = G[:, a, 2] + u * (G[:, b, 2] - G[:, a, 2])
+            G2[:, k, 1] = G[:, a, 1] + (G[:, b, 1] - G[:, a, 1]) * u ** cp
+    band = [c[3] for c in cols]; R2 = len(cols)
+    P = G2.reshape(-1, 3); Q, N = [], []
+    idx = lambda i, j: i * R2 + (j % R2)
     for i in range(len(t) - 1):
-        for j in range(R):
-            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(panels[seg[i] * R + j])
+        for j in range(R2):
+            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(panels[seg[i] * R + band[j]])
+    R_orig, R = R, R2
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
-    for i, flip, cap in ((0, True, panels[(S - 1) * R]), (len(t) - 1, False, panels[(S - 1) * R + h - 1])):
+    for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):
             q = (idx(i, j), idx(i, j + 1), idx(i, R - 2 - j), idx(i, R - 1 - j)); Q.append(q[::-1] if flip else q); N.append(cap)
     np.savez(out, P=P.astype(np.float32), Q=np.array(Q, np.int32)[:, ::-1], names=np.array(["CAR_body_" + n for n in N]), panel=np.array(N))
