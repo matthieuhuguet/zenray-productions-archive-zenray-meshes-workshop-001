@@ -1,0 +1,59 @@
+# 25 October 2026 : ZenRay Meshes, LINE SCORE : the silhouette IoU sees only the outline, the remaining gap is in the inner
+# lines (creases, joints, facet edges). Per view, the reference edges (Canny on the sheet panel, inside its mask) are
+# compared with the model edges (normal breaks of the render in the same panel camera as SheetScore) : precision, recall
+# and F1 within tol_px, plus an overlay board (green = matched reference line, red = reference line the model misses,
+# blue = model line the sheet does not have). FR : score des lignes intérieures, la cible que l'IoU ne voit pas.
+# Usage: python LineScore.py <frame_dir> <views_dir> <mesh.obj> <board.png>
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+import Raster, SheetScore
+
+P = {"tol_px": 3, "grad_pct": 88, "normal_break": 0.25, "erode_px": 3}
+
+
+def ref_edges(img):
+    """gradient magnitude edges (OpenCV is not installed) : Gaussian smoothing, Sobel, keep the top grad_pct percentile."""
+    g = ndi.gaussian_filter(img.astype(float), 1.0); m = np.hypot(ndi.sobel(g, 0), ndi.sobel(g, 1))
+    return m > np.percentile(m, P["grad_pct"])
+
+
+def model_edges(N, M):
+    E = np.zeros(M.shape, bool)
+    for dy, dx in ((0, 1), (1, 0)):
+        a = N[: N.shape[0] - dy, : N.shape[1] - dx]; b = N[dy:, dx:]
+        d = 1 - (a * b).sum(-1); m = M[: M.shape[0] - dy, : M.shape[1] - dx] & M[dy:, dx:]
+        E[: E.shape[0] - dy, : E.shape[1] - dx] |= (d > P["normal_break"]) & m
+    return E
+
+
+def main(fdir, vdir, mesh_path, board):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    mesh = trimesh.load(mesh_path, force="mesh", process=False); r = Raster.Renderer(mesh.vertices, mesh.faces); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["N"] = out[2]; return out
+    r.render = rr; res, tiles = {}, []
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); N = cap["N"][: mref.shape[0], : mref.shape[1]]
+        inner = ndi.binary_erosion(mref, iterations=P["erode_px"]) & ndi.binary_erosion(M, iterations=P["erode_px"])
+        Er = ref_edges(ref) & inner; Em = model_edges(N, M) & inner
+        dm = ndi.distance_transform_edt(~Em); dr = ndi.distance_transform_edt(~Er)
+        rec = float((dm[Er] <= P["tol_px"]).mean()) if Er.any() else 0.0; pre = float((dr[Em] <= P["tol_px"]).mean()) if Em.any() else 0.0
+        f1 = 2 * pre * rec / max(pre + rec, 1e-9); res[v["name"]] = {"precision": round(pre, 3), "recall": round(rec, 3), "f1": round(f1, 3)}
+        ov = np.stack([ref // 2] * 3, -1).astype(np.uint8)
+        ov[Er & (dm <= P["tol_px"])] = (60, 200, 60); ov[Er & (dm > P["tol_px"])] = (220, 60, 60); ov[Em & (dr > P["tol_px"])] = (60, 120, 230)
+        tiles.append(ov)
+    r.release()
+    Wd = max(t.shape[1] for t in tiles); out = np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0)
+    Image.fromarray(out).save(board)
+    res["mean_f1"] = round(float(np.mean([v["f1"] for k, v in res.items() if isinstance(v, dict)])), 3)
+    print(json.dumps(res))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

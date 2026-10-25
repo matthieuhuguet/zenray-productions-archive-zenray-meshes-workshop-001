@@ -12,12 +12,25 @@ W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"; PY = "/Users/zenray/.venvs/ze
 BR = ["python3", "/Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py", "hom"]
 CP = os.path.join(W, "work/car/cage_comp.json"); NPY = os.path.join(W, "work/car/cage_subd_P.npy")
 P = {"learn_ends": 1,   # 25 October 2026: ends learn on their own (subdivision pulls the nose 3.9 cm and the tail 7.7 cm short)
-     "learn_width_roof_ends": 0, "learn_roof": 1,   # 25 October 2026: roof alone learns again (crown was 4.6 cm low at v13, width stays off)
+     "learn_width_roof_ends": 0, "learn_roof": 1, "roof_bias_m": 0.012,   # 25 October 2026: roof alone learns again (crown was 4.6 cm low at v13, width stays off)
        # 25 October 2026: measured widths/roof are NOT the IoU optimum (v18 0.964 vs 0.9727 without); only shoulders and skirts learn by default
      "iters": 4, "gain": 0.9, "sx_range": [0.85, 1.3], "dy_range": [-0.15, 0.25], "dz_range": [-0.3, 0.3]}
 
 
+LOFT = bool(os.environ.get("LOFT"))   # 25 October 2026: learn on the row loft surface (Python only, no Houdini)
+if LOFT: CP = os.path.join(W, "work/car/cage_comp_loft.json")
+
+
 def build_and_read():
+    if LOFT:
+        env = dict(os.environ, ZRM_NO_COMP="1")
+        subprocess.run([PY, "-I", os.path.join(W, "Scripts/archetypes/ArchetypeCar.py"), os.path.join(W, "work/car"), os.path.join(W, "work/car/arch_loft")], check=True, capture_output=True, text=True, env=env)
+        subprocess.run([PY, "-I", os.path.join(W, "Scripts/RowLoft.py"), os.path.join(W, "work/car/loft_params.json"), os.path.join(W, "work/car/arch_loft"), os.path.join(W, "work/car/loft_comp.npz")], check=True, capture_output=True, text=True)
+        return np.load(os.path.join(W, "work/car/loft_comp.npz"))["P"]
+    return build_and_read_subd()
+
+
+def build_and_read_subd():
     subprocess.run([PY, "-I", os.path.join(W, "Scripts/archetypes/ArchetypeCar.py"), os.path.join(W, "work/car"), os.path.join(W, "work/car/arch_v1")],
                    check=True, capture_output=True, text=True)
     code = ("import hou, numpy as np\ng=hou.node('/obj/ZRM_Car'); g.node('IN_cage').parm('reload').pressButton(); g.node('cage_creases').cook(force=True)\n"
@@ -32,7 +45,7 @@ def main(iters=P["iters"], gain=P["gain"]):
     if os.path.exists(CP): os.remove(CP)
     for it in range(int(iters) + 1):
         X = build_and_read()
-        st = np.array(json.load(open(os.path.join(W, "work/car/arch_v1_cage.json")))["stations"]); S = len(st)
+        st = np.array(json.load(open(os.path.join(W, "work/car/arch_loft_cage.json" if LOFT else "work/car/arch_v1_cage.json")))["stations"]); S = len(st)
         cp = json.load(open(CP)) if os.path.exists(CP) else {"sx": [1.0] * S, "dy": [0.0] * S, "dz_nose": 0.0, "dz_tail": 0.0}
         err_w, err_t = [], []
         for i, z in enumerate(st):
@@ -47,7 +60,7 @@ def main(iters=P["iters"], gain=P["gain"]):
                 tb = max(at(pr["ybot"], z), 0.0) if ovh else m["floor_y"]
                 cp.setdefault("dyb", [0.0] * S)
                 if it < iters: cp["dyb"][i] = float(np.clip(cp["dyb"][i] + gain * (tb - sel[:, 1].min()), -0.12, 0.12))
-            tw, tt = at(pr["hw"], z), at(pr["ytop"], z)
+            tw, tt = at(pr["hw"], z), at(pr["ytop"], z) + P["roof_bias_m"]   # 25 October 2026: profile reads 1 to 2 cm under the mask at the rear
             aw, atop = np.abs(sel[:, 0]).max(), sel[:, 1].max()
             err_w.append(tw - aw); err_t.append(tt - atop)
             if it < iters:

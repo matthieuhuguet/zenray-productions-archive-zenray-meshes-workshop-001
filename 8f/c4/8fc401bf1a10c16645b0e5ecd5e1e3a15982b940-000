@@ -19,7 +19,11 @@ def main(params, body, out):
     zc, zm, zt = C["cut_z"], C["mid_z"], C["tip_z"]
     # body section at cut_z : points of the body mesh within a thin slab, outer skin only (largest |x| per height bin)
     d = np.load(body, allow_pickle=True); P = d["P"]
-    sl = P[(np.abs(P[:, 2] - zc) < C["slab_m"]) & (P[:, 0] >= -1e-4)]
+    # 25 October 2026: an inclined cut (cut_tilt : z0 at y0, z1 at y1, linear in y, constant beyond) replaces the vertical
+    # plane when the end must reach further at the top than at the bottom (tail corners above the rear arch)
+    TL = C.get("cut_tilt")
+    zcut = (lambda y: np.interp(y, [TL["y0"], TL["y1"]], [TL["z0"], TL["z1"]])) if TL else (lambda y: np.full_like(np.asarray(y, float), zc))
+    sl = P[(np.abs(P[:, 2] - zcut(P[:, 1])) < C["slab_m"]) & (P[:, 0] >= -1e-4)]
     bins = np.round(sl[:, 1] / C["bin_m"]).astype(int); sec = {}
     for b in np.unique(bins):
         q = sl[bins == b]; sec[int(b)] = q[np.argmax(q[:, 0])]
@@ -32,14 +36,14 @@ def main(params, body, out):
     def at_cut(r):
         """the point of row r on the cut : centre rows on the axis (body top or bottom), side rows on the outline nearest
         to the cage row point."""
-        if r == "roof_centre": return np.array([0.0, top_y, zc])
-        if r == "floor_centre": return np.array([0.0, bot_y, zc])
+        if r == "roof_centre": return np.array([0.0, top_y, float(zcut(top_y))])
+        if r == "floor_centre": return np.array([0.0, bot_y, float(zcut(bot_y))])
         c = CV[k_st, nh - 1 + E.index(r)]; dd = np.hypot(secP[:, 0] - abs(c[0]), secP[:, 1] - c[1]); k = int(np.argmin(dd))
-        return np.array([secP[k, 0], secP[k, 1], zc])
+        return np.array([secP[k, 0], secP[k, 1], secP[k, 2]])
     def at_kp(r, z):
         if r in NR:
             kp = np.array(NR[r]); return np.array([np.interp(z, kp[:, 0], kp[:, 1]), np.interp(z, kp[:, 0], kp[:, 2]), z])
-        x, y = C["tip_points"][r]; t = (z - zc) / (zt - zc); a = at_cut(r)
+        x, y = C["tip_points"][r]; a = at_cut(r); t = (z - a[2]) / (zt - a[2]) if abs(zt - a[2]) > 1e-6 else 1.0
         return np.array([a[0] + t * (x - a[0]), a[1] + t * (y - a[1]), z])
     # 25 October 2026: the tip is not a vertical face ; each row ends on the side view front extreme at its own height
     # (measured profile z_front(y)), and the middle section sits at the same fraction between the cut and that tip.
@@ -49,7 +53,9 @@ def main(params, body, out):
         y0 = at_kp(r, zt)[1]
         lo_, hi_ = sorted((zc + (-0.1 if tail else 0.1), zt))
         zt_r = float(np.clip(np.interp(y0, ey[ok], ez[ok]), lo_, hi_)) if C.get("tip_from_profile", 1) else zt
-        S[2].append(at_kp(r, zt_r)); S[1].append(at_kp(r, zc + f_mid * (zt_r - zc)))
+        if C.get("tip_z_points"):   # 25 October 2026: explicit [y, z] tip depth (mean of the left and right side views) wins
+            tz = np.array(C["tip_z_points"]); o_ = np.argsort(tz[:, 0]); zt_r = float(np.clip(np.interp(y0, tz[o_, 0], tz[o_, 1]), lo_, hi_))
+        zc_r = at_cut(r)[2]; S[2].append(at_kp(r, zt_r)); S[1].append(at_kp(r, zc_r + f_mid * (zt_r - zc_r)))
     S = np.array(S)
     # 25 October 2026: clamp_to_cut ; no row passes the body width at the cut (times clamp_to_cut), the back view widths
     # (1.15 m) made a fish tail in plan ; the sides run straight from the haunch and the end keeps the back view drawing
@@ -76,7 +82,7 @@ def main(params, body, out):
     for j in range(len(tip) - 1):   # quad strips between the left and right tip polylines (a concave n-gon triangulated badly)
         if abs(tip[j, 0]) < 1e-6 and abs(tip[j + 1, 0]) < 1e-6: continue
         qq = [tip[j], tip[j + 1], mir[j + 1], mir[j]]; add(qq if tail else qq[::-1], pre + "fascia_C")
-    json.dump({"_date": "25 October 2026", "cut_z": zc}, open(out.replace(".npz", "_cut.json"), "w"))
+    json.dump({"_date": "25 October 2026", "cut_z": zc, "cut_tilt": TL}, open(out.replace(".npz", "_cut.json"), "w"))
     np.savez(out, P=np.array(allP, np.float32), Q=np.array(allQ, dtype=object), names=np.array(allN))
     print(json.dumps({"faces": len(allQ), "names": sorted(set(allN))}))
 

@@ -69,6 +69,29 @@ def main(params, fdir, meas, out, body=None):
         return float(loc[0, 0]) if len(loc) else None
     for name, part in T["parts"].items():
         view = part["view"]; front = view == "front"
+        if part.get("tube"):   # 25 October 2026: swept tube along a polyline read on the end view (splitter bar, grille uprights)
+            pts = []
+            for px, py in part["tube"]:
+                a, u, b, w = to_world(meta, view, np.array([float(px)]), np.array([float(py)]))
+                xv = float(u[0]) if a == "x" else float(w[0]); yv = float(w[0]) if b == "y" else float(u[0])
+                zv = surf_z(xv, yv, front) if ray is not None else None
+                if zv is None or abs(zv - face_z(yv, front)) > part.get("point_depth_tol", 0.25): zv = face_z(yv, front)
+                if part.get("plan_follow", 1):
+                    zp = z_plan(xv, front)
+                    if zp is not None: zv = min(zv, zp) if front else max(zv, zp)
+                pts.append((xv, yv, zv + (1 if front else -1) * part.get("protrude", 0.0)))
+            pts = np.array(pts); rr = part.get("radius", 0.015); ns = part.get("sides", 8); P_, Q_ = [], []
+            for i in range(len(pts)):
+                d_ = pts[min(i + 1, len(pts) - 1)] - pts[max(i - 1, 0)]; d_ /= np.linalg.norm(d_)
+                n_ = np.cross(d_, [0, 0, 1.0]); n_ = n_ if np.linalg.norm(n_) > 1e-3 else np.cross(d_, [0, 1.0, 0]); n_ /= np.linalg.norm(n_); b_ = np.cross(d_, n_)
+                for k in range(ns):
+                    t_ = 2 * np.pi * k / ns; P_.append(tuple(pts[i] + rr * (np.cos(t_) * n_ + np.sin(t_) * b_)))
+            for i in range(len(pts) - 1):
+                for k in range(ns):
+                    Q_.append((i * ns + k, i * ns + (k + 1) % ns, (i + 1) * ns + (k + 1) % ns, (i + 1) * ns + k))
+            b = sum(len(p) for p in allP); allP.append(P_)
+            for q in Q_: allQ.append(tuple(b + i for i in q)); allN.append(name)
+            continue
         if view == "right":   # 25 October 2026: side parts, drawn on the side view, conformal along x, mirrored to both sides
             a, u, b, w = to_world(meta, view, np.array(part["px"], float), np.array(part["py"], float))
             z0, z1 = sorted(u.tolist()); y0, y1 = sorted(w.tolist())
@@ -123,8 +146,9 @@ def main(params, fdir, meas, out, body=None):
                         Z[j, i] = zv + sgn * part.get("protrude", 0.0)
                 if part.get("flat", 0):   # 25 October 2026: one flat plane on the most forward point, ends swept back on the plan
                     Zf = np.full_like(Z, Z.max() if front else Z.min())
+                    if "flat_z" in part: Zf = np.full_like(Z, part["flat_z"] + (1 if front else -1) * part.get("protrude", 0.0))   # absolute plane depth
                     for i, xv in enumerate(gx):
-                        zp = z_plan(xv, front)
+                        zp = z_plan(xv, front) if part.get("plan_follow", 1) else None   # 25 October 2026: plan_follow 0 is respected here too
                         if zp is not None: Zf[:, i] = np.minimum(Zf[:, i], zp) if front else np.maximum(Zf[:, i], zp)
                     Z = Zf
                 P, Q = slab(gx, gy, Z, sgn, part.get("depth", 0.03))

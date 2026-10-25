@@ -38,14 +38,37 @@ for inst in W["instances"]:
 cyr = geo.node("loft_arch_cyl_rev") or geo.createNode("reverse", "loft_arch_cyl_rev"); cyr.setInput(0, cy)
 bo = geo.node("loft_arch_cut") or geo.createNode("boolean::2.0", "loft_arch_cut")
 lr = geo.node("loft_rev") or geo.createNode("reverse", "loft_rev"); lr.setInput(0, ld)   # Houdini winds outward faces the other way
-bo.setInput(0, lr); bo.setInput(1, cy)   # measured: loft reversed + cylinder as built keeps 3297 faces, other pairings 0 to 363
+# 25 October 2026: the winding that makes a valid solid changed between builds (3297 faces one day, 71 the next) ; every
+# pairing of (loft, reversed loft) x (cylinder, reversed cylinder) is cooked and the one keeping the most faces is kept
+best = None
+for a_ in (ld, lr):
+    for b_ in (cy, cyr):
+        bo.setInput(0, a_); bo.setInput(1, b_); n_ = len(bo.geometry().prims())
+        if best is None or n_ > best[0]: best = (n_, a_, b_)
+bo.setInput(0, best[1]); bo.setInput(1, best[2])
 for pn, v in (("booleanop", "subtract"), ("asurface", "solid"), ("bsurface", "solid")):
     if bo.parm(pn):
         try: bo.parm(pn).set(v)
         except Exception: pass
 sw = geo.node("body_method_switch") or geo.createNode("switch", "body_method_switch")
-sw.setInput(0, geo.node("cage_subd")); sw.setInput(1, bo); sw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
+sw.setInput(0, geo.node("cage_subd")); sw.setInput(1, lr); sw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
 geo.node("panel_split").setInput(0, sw)
+# 25 October 2026: the arches are cut AFTER the panels (gap, groove, thickness) : cut before, the groove ate the cut edges
+# (ragged arches). The finished panels are surfaces, so A is cut as a surface ; the switch keeps the subd body untouched.
+na = geo.node("panel_name"); bp = geo.node("arch_cut_panels") or geo.createNode("boolean::2.0", "arch_cut_panels")
+bp.setInput(0, na); bp.setInput(1, best[2])
+for pn, v in (("booleanop", "subtract"), ("asurface", "surface"), ("bsurface", "solid")):
+    if bp.parm(pn):
+        try: bp.parm(pn).set(v)
+        except Exception: pass
+bb = None   # 25 October 2026: same automatic winding choice for the panel cut (95 faces kept with the solid's cylinder)
+for b_ in (cy, cyr):
+    bp.setInput(1, b_); n_ = len(bp.geometry().prims())
+    if bb is None or n_ > bb[0]: bb = (n_, b_)
+bp.setInput(1, bb[1])
+asw = geo.node("arch_cut_switch") or geo.createNode("switch", "arch_cut_switch")
+asw.setInput(0, na); asw.setInput(1, bp); asw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
+for n_ in (bp, asw): n_.moveToGoodPosition()
 for n_ in (ld, lr, cy, cyr, bo, sw): n_.moveToGoodPosition()
 g = bo.geometry()
 result = {"loft_prims": len(ld.geometry().prims()), "cut_prims": len(g.prims()) if g else None, "errors": ld.errors() + cy.errors() + bo.errors(),
