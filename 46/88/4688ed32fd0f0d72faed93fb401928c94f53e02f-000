@@ -1,0 +1,39 @@
+# 25 October 2026 : colour coded component views (side, front, top, three quarter) from an npz exported by ExportNamed.py,
+# with a legend of component names. FR : vues des composants en couleurs, avec légende.
+# Usage: python ColorViews.py <named.npz> <out.png> [res=700]
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import Raster
+from ShadedViews import VIEWS as _V, REAR_VIEWS as _RV, P as SP
+VIEWS = dict(_V)
+if os.environ.get("ZRM_VIEWS") == "rear":   # 25 October 2026: back, rear three quarter, bottom, side
+    VIEWS = {"back": _RV["back"], "three_quarter_rear": _RV["three_quarter_rear"], "bottom": ((0, 0, -1), (1, 0, 0)), "side": _V["side"]}
+
+
+def main(npz, out, res="700"):
+    d = np.load(npz, allow_pickle=True); V, F, T, names = d["P"], d["F"], d["T"], list(d["names"])
+    res = int(res); c = (V.max(0) + V.min(0)) / 2; ext = np.linalg.norm(V.max(0) - V.min(0))
+    rng = np.random.default_rng(11); pal = rng.integers(70, 255, (len(names), 3)); r = Raster.Renderer(V, F); tiles = []
+    if os.environ.get("ZRM_MATERIALS"):   # 25 October 2026: material palette by component family (body, glass, tyre, rim, trim)
+        MAT = [("wheelwell", (30, 30, 32)), ("brake_disc", (120, 120, 124)), ("caliper", (150, 40, 40)), ("susp", (50, 50, 52)), ("bolt", (90, 90, 92)), ("tunnel", (60, 60, 62)), ("glass", (60, 72, 88)), ("tyre", (38, 38, 40)), ("rim", (190, 192, 196)), ("light", (150, 40, 40)), ("grille", (55, 55, 58)),
+               ("diffuser", (55, 55, 58)), ("vent", (45, 45, 48)), ("splitter", (60, 60, 62)), ("under", (70, 70, 72)), ("fascia_rear_panel", (70, 70, 74)), ("", (215, 215, 212))]
+        pal = np.array([next(c for k, c in MAT if k in str(n)) for n in names])
+    k = np.array(SP["key"]); k /= np.linalg.norm(k)
+    for name, (rx, uy) in VIEWS.items():
+        rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy)
+        M, _, N, fid = r.render(c, res / (ext * SP["pad"]), (rx.tolist(), uy.tolist(), np.cross(rx, uy).tolist()), res)
+        lum = np.clip(0.35 + 0.65 * np.clip((N * k).sum(-1), 0, 1), 0, 1)[..., None]
+        col = np.where(M[..., None], pal[np.clip(T[np.clip(fid, 0, len(T) - 1)], 0, len(names) - 1)] * lum, SP["bg"])
+        tiles.append(col.astype(np.uint8))
+    r.release()
+    img = Image.fromarray(np.concatenate([np.concatenate(tiles[:2], 1), np.concatenate(tiles[2:], 1)], 0))
+    leg = Image.new("RGB", (330, img.height), (245, 244, 240)); dr = ImageDraw.Draw(leg); f = ImageFont.truetype("/Users/zenray/Library/Fonts/InterVariable.ttf", 13)
+    for i, n in enumerate(names):
+        y = 10 + i * 18; dr.rectangle((10, y, 24, y + 12), fill=tuple(int(x) for x in pal[i])); dr.text((30, y - 1), str(n), font=f, fill=(40, 40, 40))
+    full = Image.new("RGB", (img.width + 330, img.height)); full.paste(img, (0, 0)); full.paste(leg, (img.width, 0)); full.save(out); print(out)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

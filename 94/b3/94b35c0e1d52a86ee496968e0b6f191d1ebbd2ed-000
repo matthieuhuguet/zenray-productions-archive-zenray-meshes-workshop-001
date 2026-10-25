@@ -1,0 +1,94 @@
+# 25 October 2026 : ZenRay Meshes, WHEEL component (clean quads) : tyre = revolved section (sidewall bulge, shoulder,
+# tread, grooves), rim = lip ring + barrel + spokes as thick quad ribbons (straight or split pairs, concave toward the
+# hub) + hub cap ; four instances placed at the measured axles. Parameters in work/car/wheel_params.json (HDA interface).
+# Output npz (points, quads, name per quad) read by a Python SOP in Houdini.
+# FR : roue en quads propres, pneu en révolution, jante à branches en rubans épais, quatre instances.
+# Usage: python WheelBuild.py <wheel_params.json> <out.npz>
+import sys, json, math
+import numpy as np
+
+
+class Mesh:
+    def __init__(self): self.P, self.Q, self.N = [], [], []
+    def grid(self, G, name, close_u=False, flip=False):
+        """G: (nu, nv, 3) point grid -> quads; close_u wraps the first axis."""
+        b = len(self.P); nu, nv = G.shape[:2]; self.P.extend(G.reshape(-1, 3).tolist())
+        for i in range(nu if close_u else nu - 1):
+            for j in range(nv - 1):
+                a, c = i * nv + j, ((i + 1) % nu) * nv + j
+                q = (b + a, b + c, b + c + 1, b + a + 1); self.Q.append(q[::-1] if flip else q); self.N.append(name)
+
+
+def revolve(profile, segs):
+    """profile: (n,2) of (axial x, radius) -> grid (segs, n, 3) around the x axis."""
+    t = np.linspace(0, 2 * np.pi, segs, endpoint=False)
+    return np.stack([np.stack([np.full(segs, x), r * np.cos(t), r * np.sin(t)], 1) for x, r in profile], 1)
+
+
+def tyre_profile(p):
+    R, w, rr = p["tyre_r"], p["tyre_w"], p["rim_r"]; sh = p["shoulder_r"]; bu = p["bulge"]
+    pts = []
+    for k in range(7):                                    # inner sidewall, from the bead up to the shoulder, bulging out
+        t = k / 6; r = rr + t * (R - sh - rr); pts.append((-w / 2 - bu * math.sin(math.pi * t), r))
+    for k in range(1, 5):
+        a = math.pi / 2 * k / 4; pts.append((-w / 2 + sh - sh * math.cos(a), R - sh + sh * math.sin(a)))
+    n_t = 2 + 2 * p["grooves"]; xs = np.linspace(-w / 2 + sh, w / 2 - sh, n_t + 1)[1:-1]
+    for i, x in enumerate(xs):                            # tread with grooves (alternate up and down points)
+        pts.append((x, R - (p["groove_depth"] if (p["grooves"] and i % 2 == 1) else 0.0)))
+    for k in range(0, 4):
+        a = math.pi / 2 * (1 - k / 4); pts.append((w / 2 - sh + sh * math.cos(a), R - sh + sh * math.sin(a)))
+    for k in range(0, 7):
+        t = 1 - k / 6; r = rr + t * (R - sh - rr); pts.append((w / 2 + bu * math.sin(math.pi * t), r))
+    return np.array(pts)
+
+
+def spoke_ribbon(p, a_center, off):
+    """one spoke: side curves at angle a_center +- half width (+ off for split pairs), from hub to lip ; concave in x."""
+    rh, rl = p["hub_r"], p["rim_r"] - p["lip_w"]; n = p["spoke_steps"]; hw = p["spoke_w"] / 2
+    r = np.linspace(rh, rl, n); xface = p["face_x"] - p["concave"] * (1 - (r - rh) / (rl - rh))   # sinks toward the hub
+    tw = math.radians(p["twist_deg"]) * (r - rh) / (rl - rh)
+    rows = []
+    t = (r - rh) / (rl - rh); conv = p.get("split_converge", 1.0); offr = off * (conv + (1 - conv) * t)   # split pair opens as a V toward the lip (25 October 2026)
+    for s in np.linspace(-1, 1, 3):
+        ang = a_center + tw + (offr + s * hw * (0.8 + 0.4 * t)) / r
+        rows.append(np.stack([xface, r * np.cos(ang), r * np.sin(ang)], 1))
+    top = np.stack(rows, 1)                              # (n, 3, 3)
+    bot = top.copy(); bot[..., 0] -= p["spoke_depth"]
+    return top, bot
+
+
+def build_wheel(p):
+    m = Mesh(); seg = p["segments"]
+    m.grid(revolve(tyre_profile(p), seg), "tyre", close_u=True)
+    rl = p["rim_r"]; lw = p["lip_w"]; fx = p["face_x"]
+    lip = [(fx - 0.01, rl), (fx, rl - 0.004), (fx, rl - lw), (fx - 0.015, rl - lw)]           # lip ring, face side
+    m.grid(revolve(np.array(lip), seg), "rim_lip", close_u=True)
+    barrel = [(fx - 0.015, rl - lw), (-p["tyre_w"] / 2 + 0.02, rl - lw), (-p["tyre_w"] / 2 + 0.02, rl)]
+    m.grid(revolve(np.array(barrel), seg), "rim_barrel", close_u=True, flip=True)
+    hub = [(fx - p["concave"] + 0.01, 0.0001), (fx - p["concave"] + 0.012, p["hub_r"] * 0.6), (fx - p["concave"], p["hub_r"]), (fx - p["concave"] - p["spoke_depth"], p["hub_r"])]
+    m.grid(revolve(np.array(hub), seg), "rim_hub", close_u=True)
+    offs = [-p["split_gap"] / 2 - p["spoke_w"] / 2, p["split_gap"] / 2 + p["spoke_w"] / 2] if p["split"] else [0.0]
+    for k in range(p["spokes"]):
+        a = 2 * math.pi * k / p["spokes"] + math.radians(p["phase_deg"])
+        for o in offs:
+            top, bot = spoke_ribbon(p, a, o)
+            m.grid(top, "rim_spoke"); m.grid(bot, "rim_spoke", flip=True)
+            m.grid(np.stack([top[:, 0], bot[:, 0]], 1), "rim_spoke", flip=True); m.grid(np.stack([top[:, -1], bot[:, -1]], 1), "rim_spoke")
+    return m
+
+
+def main(params, out):
+    p = json.load(open(params)); w = build_wheel(p)
+    P0 = np.array(w.P); allP, allQ, allN = [], [], []
+    for inst in p["instances"]:
+        s = 1 if inst["x"] > 0 else -1                   # mirror so the rim face looks outward
+        P = P0.copy(); P[:, 0] *= s; P += [inst["x"], inst["y"], inst["z"]]
+        b = sum(len(a) for a in allP); allP.append(P)
+        for q, n in zip(w.Q, w.N):
+            allQ.append(tuple(b + i for i in (q if s > 0 else q[::-1]))); allN.append("CAR_wheel_%s_%s" % (n, inst["tag"]))
+    np.savez(out, P=np.concatenate(allP).astype(np.float32), Q=np.array(allQ, np.int32), names=np.array(allN))
+    print(json.dumps({"points": int(sum(len(a) for a in allP)), "quads": len(allQ)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

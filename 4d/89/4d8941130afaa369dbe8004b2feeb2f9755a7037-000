@@ -1,0 +1,29 @@
+# 25 October 2026 : ZenRay Meshes, which COMPONENTS make the extra (blue) pixels of a view against the reference mask.
+# Renders the named npz in the panel camera of SheetScore, reads the face id under each extra pixel, counts by name.
+# FR : quelles pièces font les pixels en trop d'une vue ; la cible de la prochaine correction.
+# Usage: python ViewBlame.py <frame_dir> <car.npz> [views=all] [top=8]
+import sys, os, json, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import Raster, SheetScore
+
+
+def main(fdir, npz, views="all", top=8):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); d = np.load(npz, allow_pickle=True)
+    P, F, T, N = d["P"], d["F"], d["T"], d["names"]; r = Raster.Renderer(P, F); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["f"] = out[3]; return out
+    r.render = rr; res = {}
+    for v in meta["views"]:
+        if views != "all" and v["name"] not in views.split(","): continue
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); fid = cap["f"][: mref.shape[0], : mref.shape[1]]
+        ids = fid[M & ~mref].astype(int); ids = ids[(ids >= 0) & (ids < len(T))]
+        res[v["name"]] = {"extra_px": int((M & ~mref).sum()), "missing_px": int((mref & ~M).sum()),
+                          "by_part": collections.Counter(N[T[ids]].tolist()).most_common(int(top))}
+    r.release(); print(json.dumps(res, indent=1))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

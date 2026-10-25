@@ -17,12 +17,27 @@ from PIL import Image
 from scipy import ndimage as ndi
 
 PARAMS = {  # construction rules of the archetype (shared by every car)
+    # 25 October 2026: COMPONENT JOINTS (z, metres) read on the traced guide curves; they become exact stations, and each
+    # cage face is named after its panel (row band x station zone), so the subdivided body splits into real parts
+    "joints_z": {"cowl": 1.56, "roof_front": 0.44, "roof_rear": -0.88, "deck_front": -1.77, "door_front": 0.73, "door_rear": -0.53},
+    "nose_rows": "lines/nose_rows.json",
+    "design_curves": "lines/design_curves_side_world.json",   # 25 October 2026: traced guide curves drive the named rows
+    "plan_curves": "lines/design_curves_top_world.json",
+    "design_rows_x": {"belt_top": "plan_shoulder_upper", "glass_base": "plan_dlo_bottom", "roof_edge": "plan_dlo_top", "hood_edge": "plan_hood_edge"},
+    "joint_curves": {"door_rear": ["door_rear_joint", "pillar_b"], "door_front": "door_front_joint"},   # 25 October 2026
+    # 25 October 2026: rear door cut and B pillar, mean of the left view (read on the sheet) and the right view traces ;
+    # the two views differ by about 8 cm here
+    "joint_points": {"door_rear": [[-0.573, 1.26], [-0.625, 1.0], [-0.678, 0.89], [-0.455, 0.33]]},
+    "planar_panels": ["hood_C"], "planar_amount": 1.0,   # 25 October 2026: faceted front
+    "design_rows_ext": {"belt": "fender_top", "belt_top": "fender_top"},   # 25 October 2026: continuation past the traced end
+    "design_rows": {"belt_top": "shoulder_upper", "sill": "sill_bottom", "door_low": "sill_crease", "belt": "shoulder_lower", "glass_base": "dlo_bottom", "roof_edge": "dlo_top"},
+    "fair": 1, "fair_keep_ends_m": 0.15, "fair_knot_len_m": 0.35, "fair_knot_h_m": 0.12,   # 25 October 2026: guide curves are FAIRED (least squares cubic splines), never raw per station samples
     "split_rows": [],   # 25 October 2026: a midpoint row is inserted after each named row listed here (denser section, more fit freedom)
     "floor_lift": 0.0,   # 25 October 2026: offset of the floor centre (subdivision lowers it by a few mm)
-    "measure_frame": "frame_hull",   # generic rule 6 (25 October 2026): profiles are read on the symmetrised visual hull, the consistent target
+    "measure_frame": "frame",   # generic rule 6 (25 October 2026): profiles are read on the symmetrised visual hull, the consistent target
     "segments": 6,                    # roof line pieces: nose-hood, hood, windshield, roof, rear glass, tail
     "between": {"nose": 4, "hood_lead": 4, "cowl": 4, "roof_front": 5, "roof_rear": 4, "deck": 4},
-    "end_inset": 0.025, "end_face_scale": 0.94,
+    "end_inset": 0.025, "end_face_scale": 0.94, "tail_support_m": 0.0, "plan_clamp": 1.03,
     "arch_stations": [1.0, 0.75, 0.4, 0.0],   # fractions of the arch radius around each axle (each side)
     "arch_pad": 1.06, "sill_h": 0.07, "door_low_frac": 0.45, "belt_drop": 0.80,
     "glass_inset": 0.03, "roof_edge_drop": 0.035, "fender_gap": 0.03, "cabin_min": 0.10,
@@ -36,7 +51,7 @@ def load_overrides(wd):
         PARAMS.update({k: v for k, v in json.load(open(f)).items() if k in PARAMS})
 
 
-ROWS = ["floor_centre", "floor_edge", "fender_inner", "sill", "door_low", "belt", "glass_base", "roof_edge", "roof_centre"]
+ROWS = ["floor_centre", "floor_edge", "fender_inner", "sill", "door_low", "belt", "belt_top", "glass_base", "roof_edge", "roof_centre"]   # belt_top added 25 October 2026 (shoulder band)
 
 
 def axis_map(meta, v):
@@ -149,7 +164,28 @@ def measure(wd):
         k = np.where(S[:, j])[0]
         zfront.append(float(zs[k.min()]) if len(k) else np.nan); zback.append(float(zs[k.max()]) if len(k) else np.nan)
     prof_ext = {"ext_y": ys.tolist(), "z_front": zfront, "z_back": zback}
-    prof = {"z": zs.tolist(), "ytop": ytop.tolist(), "ybot": ybot.tolist(), "hw": ndi.gaussian_filter1d(hw, 1.0).tolist(),
+    if PARAMS["fair"]:
+        from scipy.interpolate import LSQUnivariateSpline
+        def fair(x, y, step, keep_ends=0.0):
+            x0, y0 = np.asarray(x), np.asarray(y)
+            o = np.argsort(x0); x, y = x0[o], y0[o]
+            t = np.arange(x[0] + step, x[-1] - step * 0.5, step)
+            f = LSQUnivariateSpline(x, y, t, k=3)(x)[np.argsort(o)]
+            if keep_ends > 0:   # 25 October 2026: the ends (vertical tail, flat nose) are discontinuities the spline must not smooth
+                d = np.minimum(x0 - x0.min(), x0.max() - x0); w = np.clip(d / keep_ends, 0, 1)
+                f = w * f + (1 - w) * y0
+            return f
+        ke = PARAMS["fair_keep_ends_m"]
+        ytop = fair(zs, ytop, PARAMS["fair_knot_len_m"], ke); ybot = fair(zs, ybot, PARAMS["fair_knot_len_m"], ke); hw = fair(zs, hw, PARAMS["fair_knot_len_m"], ke)
+    # nose plan outline traced on the top view (flat front, rounded corners) replaces the measured half width there
+    pt = os.path.join(wd, "lines", "design_curves_top_world.json")
+    if os.path.exists(pt):
+        cc = json.load(open(pt))["curves"].get("plan_outline_front")
+        if cc:
+            zc, xc = np.array(cc["z"]), np.array(cc["x"]); o = np.argsort(zc); zc, xc = zc[o], xc[o]
+            sel = zs >= zc[0]; hw = np.array(hw, float); hw[sel] = np.interp(zs[sel], zc, xc)
+        F = np.maximum(fair(ys, F, PARAMS["fair_knot_h_m"]), 0); Fb = np.maximum(fair(ys, Fb, PARAMS["fair_knot_h_m"]), 0)
+    prof = {"z": zs.tolist(), "ytop": ytop.tolist(), "ybot": ybot.tolist(), "hw": np.asarray(hw).tolist(),
             "F_y": ys.tolist(), "F": F.tolist(), "F_back": Fb.tolist(), **prof_ext}
     return {"_date": "25 October 2026", "dims_m": D.tolist(), "floor_y": floor, "floor_centre_y": floor_centre, "belt_y": y_belt, "keys": keys,
             "wheels": W, "profiles": prof}
@@ -157,6 +193,36 @@ def measure(wd):
 
 def build(m, out_prefix):
     P = PARAMS; pr = m["profiles"]; W = m["wheels"]
+    # GUIDE CURVES (25 October 2026): y(z) of each named row from the traced design curves, NaN outside their z range
+    dc_path = os.path.join(os.path.dirname(out_prefix), P["design_curves"]); DC = {}
+    if os.path.exists(dc_path):
+        for nm, c in json.load(open(dc_path))["curves"].items():
+            zz, yy = np.array(c["z"]), np.array(c["y"]); o = np.argsort(zz); DC[nm] = (zz[o], yy[o])
+    pc_path = os.path.join(os.path.dirname(out_prefix), P["plan_curves"]); PC = {}
+    if os.path.exists(pc_path):
+        for nm, c in json.load(open(pc_path))["curves"].items():
+            zz, xx = np.array(c["z"]), np.array(c["x"]); o = np.argsort(zz); PC[nm] = (zz[o], xx[o])
+    def dx(row, z):
+        nm = P["design_rows_x"].get(row)
+        if nm not in PC: return None
+        zz, xx = PC[nm]
+        return float(np.interp(z, zz, xx)) if zz[0] - 1e-6 <= z <= zz[-1] + 1e-6 else None
+    nr_path = os.path.join(os.path.dirname(out_prefix), P["nose_rows"]); NR = json.load(open(nr_path))["rows"] if os.path.exists(nr_path) else {}
+    def dy(row, z):
+        nm = P["design_rows"].get(row)
+        if nm not in DC: return None
+        zz, yy = DC[nm]
+        if zz[0] - 1e-6 <= z <= zz[-1] + 1e-6: return float(np.interp(z, zz, yy))
+        # 25 October 2026: a row whose traced curve stops (shoulder lines end at the A pillar, z 0.72) continues on an
+        # extension curve (fender top) shifted to meet it without a step ; before, the belt fell back to 1.06 m (S bump).
+        ext = P.get("design_rows_ext", {}).get(row)
+        if ext and ext in DC:
+            ze, ye = DC[ext]
+            if ze[0] - 1e-6 <= z <= ze[-1] + 1e-6:
+                zj = zz[-1] if z > zz[-1] else zz[0]; yj = float(np.interp(zj, zz, yy))
+                off = yj - float(np.interp(zj, ze, ye)) if ze[0] - 1e-6 <= zj <= ze[-1] + 1e-6 else 0.0
+                return float(np.interp(z, ze, ye)) + off
+        return None
     zs_p, ytop_p, hw_p = np.array(pr["z"]), np.array(pr["ytop"]), np.array(pr["hw"])
     Fy, Fv = np.array(pr["F_y"]), np.array(pr["F"])
     at = lambda arr, z: float(np.interp(-z, -zs_p, arr))            # profiles are sampled with z decreasing
@@ -182,6 +248,8 @@ def build(m, out_prefix):
         for f in P["arch_stations"]:
             for sgn in (-1, 1):
                 st.append(zc + sgn * f * r_arch)
+    st = np.array(sorted(set(np.round(st, 5)), reverse=True))
+    st = np.concatenate([st, list(P["joints_z"].values())])
     st = np.array(sorted(set(np.round(st, 5)), reverse=True))
     st = st[(st <= m["keys"]["nose"]) & (st >= m["keys"]["tail"])]
     x_in_f = W["track_half"] - W["tyre_w"] / 2 - P["fender_gap"]
@@ -215,19 +283,45 @@ def build(m, out_prefix):
             rows["fender_inner"] = (min(x_in, hw * 0.95), min(y_fi, yt - 0.06))
         wF = lambda y: min(hw, max(Fat(y, z), 0.05))
         y_s = min(max(y_sill, arch), yt - 0.05)
+        if dy("sill", z) is not None and arch < 0: y_s = dy("sill", z)
         rows["sill"] = (hw, y_s)
         y_dl = yb + P["door_low_frac"] * (yb_belt - yb)
         y_dl = min(max(y_dl, arch + 0.02 if arch > 0 else -1), yt - 0.04)
+        if dy("door_low", z) is not None and arch < 0: y_dl = max(dy("door_low", z), y_s + 0.01)
         rows["door_low"] = (hw, y_dl)
         y_b = max(yb_belt, rows["door_low"][1] + 0.01)
+        if dy("belt", z) is not None: y_b = max(min(dy("belt", z), yt - 0.03), rows["door_low"][1] + 0.01)
         rows["belt"] = (wF(y_b) * 0.985, y_b)
+        # belt_top: the upper line of the shoulder band (side y, plan x), between the belt and the glass (25 October 2026)
+        ybt = dy("belt_top", z); ybt = y_b + 0.012 if ybt is None else min(max(ybt, y_b + 0.004), yt - 0.02)
+        xbt = dx("belt_top", z); xbt = wF(ybt) * 0.96 if xbt is None else min(xbt, hw)
+        rows["belt_top"] = (xbt, ybt)
         if cabin:
-            rows["glass_base"] = (min(hw, Fat(yb_belt + 0.05, z)) - P["glass_inset"], yb_belt + 0.03)
-            rows["roof_edge"] = (min(hw, Fat(yt - P["roof_edge_drop"], z)) * 0.97, yt - P["roof_edge_drop"])
+            yg = yb_belt + 0.03; yr = yt - P["roof_edge_drop"]
+            if dy("glass_base", z) is not None: yg = max(dy("glass_base", z), y_b + 0.005)
+            if dy("roof_edge", z) is not None: yr = min(max(dy("roof_edge", z), yg + 0.02), yt - 0.005)
+            yg = max(yg, ybt + 0.004)
+            xg = dx("glass_base", z); xg = min(hw, Fat(yg, z)) - P["glass_inset"] if xg is None else min(xg, xbt)
+            xr = dx("roof_edge", z); xr = min(hw, Fat(yr, z)) * 0.97 if xr is None else min(xr, xg)
+            rows["glass_base"] = (xg, yg)
+            rows["roof_edge"] = (xr, yr)
         else:
-            rows["glass_base"] = (hw * 0.9, max(yt - 0.03, rows["belt"][1] + 0.005))
-            rows["roof_edge"] = (hw * 0.6, yt - 0.005)
+            yg = max(yt - 0.03, ybt + 0.005); xg = min(xbt * 0.97, hw * 0.9)
+            # front zone (25 October 2026): the fender top line (side view) is the upper edge of the cheeks, lower than the hood
+            if P.get("front_fender_line", 0) and z > P["joints_z"]["cowl"] - 0.4 and "fender_top" in DC:   # OFF: lowered the nose into a wedge, the grille sat on its top (25 October 2026)
+                zz_, yy_ = DC["fender_top"]
+                if zz_[0] <= z <= zz_[-1]:
+                    yft = float(np.interp(z, zz_, yy_)); xpu = dx("belt_top", z)
+                    yg = min(max(yft, ybt + 0.005), yt - 0.02); xg = min(xpu if xpu is not None else xg, hw * 0.98)
+            xh = dx("hood_edge", z)
+            rows["glass_base"] = (xg, yg)
+            rows["roof_edge"] = (min(xh, xg * 0.98) if xh is not None else xg * 0.7, yt - 0.005)
         rows["roof_centre"] = (0.0, yt)
+        # NOSE EDGES (25 October 2026): rows overridden by 3D keypoints (front view corners + side depth) inside their z range
+        for rn, kp in NR.items():
+            kp = np.array(kp)
+            if rn in rows and kp[0, 0] <= z <= kp[-1, 0]:
+                rows[rn] = (float(np.interp(z, kp[:, 0], kp[:, 1])), float(np.interp(z, kp[:, 0], kp[:, 2])))
         half = []
         for k_, r in enumerate(ROWS):
             half.append((rows[r][0], rows[r][1], z))
@@ -236,16 +330,34 @@ def build(m, out_prefix):
         ring = [(-x, y, z) for (x, y, z) in half[::-1]] + half[1:-1]
         rings.append(ring)
     V = np.array(rings)
+    # SLANTED JOINTS (25 October 2026): a joint station follows its traced side curve, z by height (the rear door cut is a
+    # diagonal on the sheet, 22 cm from belt to sill) ; points outside the curve's heights keep the end values.
+    for jn, cn in P.get("joint_curves", {}).items():
+        cl = cn if isinstance(cn, list) else [cn]   # several traced curves concatenated by height (door cut, then B pillar)
+        if jn in P.get("joint_points", {}):         # explicit [z, y] points (mean of the left and right views) win
+            jp = np.array(P["joint_points"][jn]); zz_, yy_ = jp[:, 0], jp[:, 1]
+        elif any(c_ not in DC for c_ in cl) or jn not in P["joints_z"]: continue
+        else:
+            zz_ = np.concatenate([DC[c_][0] for c_ in cl]); yy_ = np.concatenate([DC[c_][1] for c_ in cl])
+        o = np.argsort(yy_); k = int(np.argmin(np.abs(st - P["joints_z"][jn])))
+        if abs(st[k] - P["joints_z"][jn]) > 1e-3: continue
+        lo_, hi_ = st[min(k + 1, len(st) - 1)] + 0.02, st[max(k - 1, 0)] - 0.02
+        V[k, :, 2] = np.clip(np.interp(V[k, :, 1], np.array(yy_)[o], np.array(zz_)[o]), lo_, hi_)
     def end_face(ring, z_tip):
         # the end face keeps the inset section's widths (scaled) but takes the HEIGHTS of the profile at the tip
         f = ring.copy(); f[:, 0] *= P["end_face_scale"]
         y0, y1 = ring[:, 1].min(), ring[:, 1].max(); t = (ring[:, 1] - y0) / max(y1 - y0, 1e-6)
+        ey = np.array(pr["ext_y"]); ez = np.array(pr["z_front"] if z_tip > 0 else pr["z_back"]); ok = np.isfinite(ez)
+        inner = ring[0, 2]
         yt_tip = min(at(ytop_p, z_tip), y1); yb_tip = y0              # the end face never reaches below the body
+        # 25 October 2026: the roof height AT the tip (0.24 m on the tail, bumper bottom) squashed the tall vertical tail
+        # face ; the end face rises to the highest height where the side extreme still passes the last inner section.
+        if P.get("end_face_from_extreme", 1):
+            past = ok & ((ez > inner) if z_tip > 0 else (ez < inner))
+            if past.any(): yt_tip = min(max(yt_tip, float(ey[past].max())), y1)
         f[:, 1] = yb_tip + t * (yt_tip - yb_tip)
         # each end vertex sits at the side silhouette's extreme at ITS height (slanted noses and tails)
-        ey = np.array(pr["ext_y"]); ez = np.array(pr["z_front"] if z_tip > 0 else pr["z_back"]); ok = np.isfinite(ez)
         zz = np.interp(f[:, 1], ey[ok], ez[ok])
-        inner = ring[0, 2]
         f[:, 2] = np.where(z_tip > 0, np.clip(zz, inner + 0.01, z_tip), np.clip(zz, z_tip, inner - 0.01))
         # plan view rounding (25 October 2026): each end vertex takes the top view half width at ITS own z
         if P.get("end_plan_follow", 1):
@@ -254,6 +366,12 @@ def build(m, out_prefix):
         return f
     V = np.concatenate([end_face(V[0], m["keys"]["nose"])[None], V, end_face(V[-1], m["keys"]["tail"])[None]])
     st = np.concatenate([[m["keys"]["nose"]], st, [m["keys"]["tail"]]])
+    # TAIL SUPPORT LOOP (25 October 2026): the subdivision rounded the tall vertical tail face 10 to 19 cm short in the
+    # side view ; a copy of the tail end face moved tail_support_m inward holds the face flat to its full height.
+    ts = P.get("tail_support_m", 0.0)
+    if ts > 0:
+        sup = V[-1].copy(); sup[:, 2] += ts
+        V = np.concatenate([V[:-1], sup[None], V[-1:]]); st = np.concatenate([st[:-1], [st[-1] + ts], st[-1:]])
     S, R = V.shape[0], V.shape[1]
     # LIMIT SURFACE COMPENSATION (generic rule 5, 25 October 2026): Catmull-Clark shrinks the cage, so each station
     # carries a width factor, a roof offset and (end faces) a length offset learned by CageComp.py from the subdivided
@@ -274,6 +392,15 @@ def build(m, out_prefix):
             if "fy" in cp:   # shoulders and roof: width factor by height above the belt (end views)
                 above = V[:, :, 1] > m["belt_y"]
                 V[:, :, 0] = np.where(above, V[:, :, 0] * np.interp(V[:, :, 1], cp["fy_y"], cp["fy"]), V[:, :, 0])
+                # 25 October 2026: the end views see the widest section, so fy widened the nose and tail corners in plan
+                # too ; the widened points never pass the top view half width at their own z (times plan_clamp).
+    # PLAN CLAMP (25 October 2026): no cage point passes the top view half width at its own z (times plan_clamp) ;
+    # the traced shoulder curves kept their full width to the tail (37 cm over the plan at the rear corners, v17).
+    if P.get("plan_clamp", 0) > 0:
+        ze = P.get("plan_clamp_end_m", 0.04)   # the plan half width falls to 0 on the last pixel; read it a little inside
+        zq = np.clip(V[:, :, 2], m["keys"]["tail"] + ze, m["keys"]["nose"] - ze)
+        lim = np.array([[at(hw_p, zz_) for zz_ in row] for row in zq]) * P["plan_clamp"]
+        V[:, :, 0] = np.sign(V[:, :, 0]) * np.minimum(np.abs(V[:, :, 0]), np.maximum(lim, P.get("plan_clamp_min", 0.05)))
     if os.path.exists(cpath):   # SILHOUETTE FIT offsets (SilFit.py, 25 October 2026), applied last, same topology only
         cp = json.load(open(cpath))
         if "dv" in cp and len(cp["dv"]) == S * R:
@@ -313,7 +440,49 @@ def build(m, out_prefix):
             fo.write("v %.5f %.5f %.5f\n" % tuple(v))
         for f in faces:
             fo.write("f %d %d %d %d\n" % tuple(k + 1 for k in f[::-1]))
-    json.dump({"creases": creases, "soft_creases": soft, "stations": st.tolist(), "rows": ROWS, "ring": R}, open(out_prefix + "_cage.json", "w"))
+    # PANEL NAME of every face (25 October 2026): band between two named rows x zone between joint stations
+    J = P["joints_z"]; W_ = m["wheels"]; ra = W_["tyre_r"] * P["arch_pad"]
+    BAND = {"floor_centre": "under_floor", "floor_edge": "under_floor", "fender_inner": "rocker", "sill": "rocker", "door_low": "flank",
+            "belt": "shoulder", "belt_top": "shoulder", "glass_base": "glass_side", "roof_edge": "top"}
+    named = [r for r in EXP]
+    for k in range(len(named)):
+        if named[k] is None: named[k] = named[k - 1]
+    def zone_side(z):
+        return "fender_front" if z > J["door_front"] else ("door" if z > J["door_rear"] else "quarter")
+    def panel_of(i, j):
+        zc = 0.5 * (st[i] + st[min(i + 1, S - 1)])
+        if j >= nh - 1: k = j - (nh - 1); x_sign = "L"
+        else: k = nh - 2 - j; x_sign = "R"
+        band = BAND.get(named[min(k, nh - 2)], "flank")
+        if band == "under_floor": return "under_floor_C"
+        if band == "top":
+            nm = "hood" if zc > J["cowl"] else "glass_windshield" if zc > J["roof_front"] else "roof" if zc > J["roof_rear"] else "glass_rear" if zc > J["deck_front"] else "decklid"
+            return nm + "_C"
+        if band == "glass_side":
+            if J["roof_rear"] - 0.2 < zc < J["cowl"] - 0.35: return ("glass_door_" if zc > J["door_rear"] else "glass_quarter_") + x_sign
+            return ("fender_front_" if zc > 0 else "quarter_") + x_sign
+        if band == "rocker":
+            if zc > W_["front_z"] + ra: return "bumper_front_C"
+            if zc < W_["rear_z"] - ra: return "bumper_rear_C"
+            return "rocker_" + x_sign
+        return zone_side(zc) + "_" + x_sign if band == "flank" else "shoulder_" + zone_side(zc) + "_" + x_sign
+    panels = [panel_of(i, j) for i in range(S - 1) for j in range(R)]
+    panels += ["fascia_front_C"] * (h - 1) + ["fascia_rear_C"] * (h - 1)
+    # PLANAR PANELS (25 October 2026): the reference front is faceted (flat hood trapezoid, flat fascia) ; the cage points of
+    # each listed panel go a fraction planar_amount onto their least squares plane, so the subdivision cannot bulge them.
+    if P.get("planar_panels"):
+        Vf = V.reshape(-1, 3)
+        for pn in P["planar_panels"]:
+            ids = sorted({k for f, nm in zip(faces, panels) if nm == pn for k in f})
+            if len(ids) < 4: continue
+            X = Vf[ids]; c0 = X.mean(0); n = np.linalg.svd(X - c0)[2][-1]
+            Vf[ids] = X - P.get("planar_amount", 1.0) * ((X - c0) @ n)[:, None] * n
+        V = Vf.reshape(V.shape)
+        with open(out_prefix + "_cage.obj", "w") as fo:
+            fo.write("# ZenRay Meshes archetype car v1 cage, planar panels, 25 October 2026\n")
+            for v in V.reshape(-1, 3): fo.write("v %.5f %.5f %.5f\n" % tuple(v))
+            for f in faces: fo.write("f %d %d %d %d\n" % tuple(k + 1 for k in f[::-1]))
+    json.dump({"creases": creases, "soft_creases": soft, "stations": st.tolist(), "rows": ROWS, "exp_rows": EXP, "ring": R, "panels": panels}, open(out_prefix + "_cage.json", "w"))
     return {"stations": int(S), "ring": int(R), "quads": len(faces), "creases": len(creases)}
 
 

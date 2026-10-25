@@ -1,0 +1,157 @@
+# 25 October 2026 : ZenRay Meshes, front and rear TRIM components (grille frame and slats, splitter, rear light bar,
+# rear panel, diffuser and its fins, rear vents) as clean quad boxes. Each part is drawn in the end view's crop pixels
+# (x range, y range) in work/car/trim_params.json, mapped to the world through the frame, and placed in depth on the
+# end face measured by the side profile at its own height (z_front(y), z_back(y)) plus its own protrusion and depth.
+# FR : pièces de face avant et arrière, dessinées en pixels des vues d'extrémité, posées sur la face mesurée à leur hauteur.
+# 25 October 2026 v2 : with a body mesh (npz from ExportNamed.py), each part is a CONFORMAL slab : a grid of nx x ny points
+# whose depth comes from a ray cast on the body along z (front parts from +z, rear parts from -z), offset by protrude,
+# closed by its back grid (depth) and its four sides ; trims follow the real surface instead of sticking out at corners.
+# Usage: python TrimBuild.py <trim_params.json> <frame_dir> <measure.json> <out.npz> [body.npz]
+import sys, os, json
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from DesignCurves import to_world
+
+
+def box(x0, x1, y0, y1, z0, z1):
+    """8 corners -> 6 quads (outward)."""
+    P = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0), (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    Q = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+    return P, Q
+
+
+def slab(xs, ys, zgrid, depth_sign, depth):
+    """conformal slab: front grid zgrid (ny, nx), back grid offset by depth along z ; quads outward."""
+    ny, nx = zgrid.shape; P = []
+    for zz in (zgrid, zgrid - depth_sign * depth):
+        for j in range(ny):
+            for i in range(nx): P.append((xs[i], ys[j], zz[j, i]))
+    idx = lambda l, j, i: l * nx * ny + j * nx + i; Q = []
+    for j in range(ny - 1):
+        for i in range(nx - 1):
+            Q.append((idx(0, j, i), idx(0, j, i + 1), idx(0, j + 1, i + 1), idx(0, j + 1, i)))
+            Q.append((idx(1, j, i), idx(1, j + 1, i), idx(1, j + 1, i + 1), idx(1, j, i + 1)))
+    for i in range(nx - 1):
+        for j in (0, ny - 1):
+            q = (idx(0, j, i), idx(1, j, i), idx(1, j, i + 1), idx(0, j, i + 1)); Q.append(q if j == 0 else q[::-1])
+    for j in range(ny - 1):
+        for i in (0, nx - 1):
+            q = (idx(0, j, i), idx(0, j + 1, i), idx(1, j + 1, i), idx(1, j, i)); Q.append(q if i == 0 else q[::-1])
+    if depth_sign < 0: Q = [q[::-1] for q in Q]
+    return P, Q
+
+
+def main(params, fdir, meas, out, body=None):
+    T = json.load(open(params)); meta = json.load(open(os.path.join(fdir, "frame.json"))); M = json.load(open(meas))["profiles"]
+    ey = np.array(M["ext_y"]); zf = np.array(M["z_front"]); zb = np.array(M["z_back"])
+    okf, okb = np.isfinite(zf), np.isfinite(zb)
+    face_z = lambda y, front: float(np.interp(y, ey[okf], zf[okf]) if front else np.interp(y, ey[okb], zb[okb]))
+    allP, allQ, allN = [], [], []; cuts = []
+    # 25 October 2026: plan follow ; at plan half width |x| the end trims sit no farther out than the z where the measured
+    # top view half width still reaches |x| (the splitter ends sweep back to the wheels like the reference)
+    zs_m, hw_m = np.array(M["z"]), np.array(M["hw"])
+    def z_plan(x, front):
+        ok = hw_m * T.get("plan_scale", 1.04) >= abs(x)   # 25 October 2026: the body may pass the plan by plan_clamp (3 %)
+        if not ok.any(): return None
+        return float(zs_m[ok].max() if front else zs_m[ok].min())
+    ray = None
+    if body:
+        import trimesh
+        d = np.load(body, allow_pickle=True); bm = trimesh.Trimesh(d["P"], d["F"], process=False)
+        ray = trimesh.ray.ray_triangle.RayMeshIntersector(bm); zmax = float(d["P"][:, 2].max()) + 1; zmin = float(d["P"][:, 2].min()) - 1
+    def surf_z(x, y, front):
+        o = np.array([[x, y, zmax if front else zmin]]); dv = np.array([[0, 0, -1.0 if front else 1.0]])
+        loc, _, _ = ray.intersects_location(o, dv, multiple_hits=False)
+        return float(loc[0, 2]) if len(loc) else None
+    def surf_x(z, y):
+        o = np.array([[5.0, y, z]]); dv = np.array([[-1.0, 0, 0]])
+        loc, _, _ = ray.intersects_location(o, dv, multiple_hits=False)
+        return float(loc[0, 0]) if len(loc) else None
+    for name, part in T["parts"].items():
+        view = part["view"]; front = view == "front"
+        if view == "right":   # 25 October 2026: side parts, drawn on the side view, conformal along x, mirrored to both sides
+            a, u, b, w = to_world(meta, view, np.array(part["px"], float), np.array(part["py"], float))
+            z0, z1 = sorted(u.tolist()); y0, y1 = sorted(w.tolist())
+            nz = max(2, int((z1 - z0) / 0.04) + 2); ny = max(2, int((y1 - y0) / 0.04) + 2)
+            gz = np.linspace(z0, z1, nz); gy = np.linspace(y0, y1, ny); X = np.zeros((ny, nz))
+            for j, yv in enumerate(gy):
+                for i, zv in enumerate(gz):
+                    xv = surf_x(zv, yv) if ray is not None else None
+                    X[j, i] = (xv if xv is not None else part.get("x_default", 1.0)) + part.get("protrude", 0.0)
+            for sd, tag in ((1, "_L"), (-1, "_R")):
+                P = []; Q = []
+                for k, XX in enumerate((X, X - part.get("depth", 0.03))):
+                    for j in range(ny):
+                        for i in range(nz): P.append((sd * XX[j, i], gy[j], gz[i]))
+                idx = lambda l, j, i: l * nz * ny + j * nz + i
+                for j in range(ny - 1):
+                    for i in range(nz - 1):
+                        q0 = (idx(0, j, i), idx(0, j + 1, i), idx(0, j + 1, i + 1), idx(0, j, i + 1)); q1 = (idx(1, j, i), idx(1, j, i + 1), idx(1, j + 1, i + 1), idx(1, j + 1, i))
+                        Q += [q0 if sd > 0 else q0[::-1], q1 if sd > 0 else q1[::-1]]
+                b_ = sum(len(pp) for pp in allP); allP.append(P)
+                for q in Q: allQ.append(tuple(b_ + i for i in q)); allN.append(name + tag)
+            continue
+        xs, ys = [], []
+        for px, py in ((part["px"][0], part["py"][0]), (part["px"][1], part["py"][1])):
+            a, u, b, w = to_world(meta, view, np.array([px]), np.array([py]))
+            xs.append(float(u[0]) if a == "x" else float(w[0])); ys.append(float(w[0]) if b == "y" else float(u[0]))
+        x0, x1 = sorted(xs); y0, y1 = sorted(ys)
+        if part.get("cut"): cuts.append({"name": name, "x0": x0, "x1": x1, "y0": y0, "y1": y1, "front": front})   # opening in the body (25 October 2026)
+        if ray is not None and part.get("conform", 1):
+            reps = part.get("repeat", 1); sgn = 1 if front else -1
+            spans = [(x0, x1)] if reps == 1 else [((x0 + (k + 0.5) * (x1 - x0) / reps) - part.get("width", 0.02) / 2, (x0 + (k + 0.5) * (x1 - x0) / reps) + part.get("width", 0.02) / 2) for k in range(reps)]
+            for k, (bx0, bx1) in enumerate(spans):
+                nx = max(2, int((bx1 - bx0) / 0.05) + 2); ny = max(2, int((y1 - y0) / 0.05) + 2)
+                # 25 October 2026: a part never extends past the body in plan ; the x range is trimmed to the columns where
+                # the ray still hits the body at mid height (misses fell back to a flat depth and made square corners).
+                if part.get("trim_to_body", 1) and reps == 1:
+                    ym = 0.5 * (y0 + y1); xs_ = np.linspace(bx0, bx1, 64); hz_ = [surf_z(xv, ym, front) for xv in xs_]; fz_ = face_z(ym, front)
+                    hit = [h is not None and abs(h - fz_) < part.get("trim_depth_tol", 0.06) for h in hz_]   # the hit must be ON the end face
+                    if any(hit):
+                        ii = np.where(hit)[0]; bx0, bx1 = float(xs_[ii[0]]), float(xs_[ii[-1]])
+                        nx = max(2, int((bx1 - bx0) / 0.05) + 2)
+                gx = np.linspace(bx0, bx1, nx); gy = np.linspace(y0, y1, ny); Z = np.zeros((ny, nx)); okk = True
+                for j, yv in enumerate(gy):
+                    for i, xv in enumerate(gx):
+                        zv = surf_z(xv, yv, front)
+                        # 25 October 2026: under the body the ray flew to a part 1.5 m behind (grille slab 0.8 to 2.3 m deep) ;
+                        # a hit farther than point_depth_tol from the measured end face falls back to the end face
+                        if zv is None or abs(zv - face_z(yv, front)) > part.get("point_depth_tol", 0.25): zv = face_z(yv, front)
+                        if part.get("plan_follow", 1):
+                            zp = z_plan(xv, front)
+                            if zp is not None: zv = min(zv, zp) if front else max(zv, zp)
+                        Z[j, i] = zv + sgn * part.get("protrude", 0.0)
+                if part.get("flat", 0):   # 25 October 2026: one flat plane on the most forward point, ends swept back on the plan
+                    Zf = np.full_like(Z, Z.max() if front else Z.min())
+                    for i, xv in enumerate(gx):
+                        zp = z_plan(xv, front)
+                        if zp is not None: Zf[:, i] = np.minimum(Zf[:, i], zp) if front else np.maximum(Zf[:, i], zp)
+                    Z = Zf
+                P, Q = slab(gx, gy, Z, sgn, part.get("depth", 0.03))
+                b = sum(len(p) for p in allP); allP.append(P)
+                nm = name if reps == 1 else "%s_%02d" % (name, k + 1)
+                for q in Q: allQ.append(tuple(b + i for i in q)); allN.append(nm)
+            continue
+        zface = min(face_z(y0, front), face_z(y1, front)) if front else max(face_z(y0, front), face_z(y1, front))
+        if ray is not None and part.get("conform", 1) == 0:   # 25 October 2026: a flat part sits on the most forward body point behind it
+            hz = [surf_z(xv, yv, front) for xv in np.linspace(x0, x1, 24) for yv in np.linspace(y0, y1, 6)]
+            hz = [h for h in hz if h is not None and abs(h - face_z(0.5 * (y0 + y1), front)) < part.get("point_depth_tol", 0.25)]
+            if hz: zface = max(hz) if front else min(hz)
+        sgn = 1 if front else -1
+        z_out = zface + sgn * part.get("protrude", 0.0); z_in = z_out - sgn * part.get("depth", 0.03)
+        reps = part.get("repeat", 1)
+        for k in range(reps):
+            if reps > 1:                                   # evenly spaced copies across the x range (slats, fins)
+                w_ = part.get("width", 0.02); xc = x0 + (k + 0.5) * (x1 - x0) / reps; bx0, bx1 = xc - w_ / 2, xc + w_ / 2
+            else: bx0, bx1 = x0, x1
+            P, Q = box(bx0, bx1, y0, y1, min(z_in, z_out), max(z_in, z_out))
+            b = sum(len(p) for p in allP); allP.append(P)
+            nm = name if reps == 1 else "%s_%02d" % (name, k + 1)
+            for q in Q: allQ.append(tuple(b + i for i in q)); allN.append(nm)
+    json.dump({"_date": "25 October 2026", "cuts": cuts}, open(out.replace(".npz", "_cuts.json"), "w"), indent=1)
+    np.savez(out, P=np.array([p for ps in allP for p in ps], np.float32), Q=np.array(allQ, np.int32), names=np.array(allN))
+    print(json.dumps({"parts": len(set(allN)), "quads": len(allQ)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

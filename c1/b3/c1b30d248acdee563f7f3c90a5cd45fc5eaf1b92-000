@@ -1,0 +1,32 @@
+# 25 October 2026 : ZenRay Meshes, edge pixels of a view -> numbered chains (connected components longer than min_px),
+# drawn in distinct colours with their id, so each chain can be named as a guide curve (beltline, DLO, crease ...).
+# FR : les contours deviennent des chaînes numérotées, à nommer comme courbes guides.
+# Usage: python LineChains.py <view_rgb.png> <edges.npy> <out.png> [min_px=30]
+import sys, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+
+P = {"min_px": 30, "scale": 2, "link_px": 1}
+
+
+def main(rgb_path, edges, out, min_px=None):
+    E = np.load(edges); min_px = int(min_px or P["min_px"])
+    lab, n = ndi.label(ndi.binary_dilation(E, iterations=P["link_px"]), structure=np.ones((3, 3)))
+    lab = np.where(E, lab, 0)
+    rgb = np.asarray(Image.open(rgb_path).convert("L")).astype(float)
+    s = P["scale"]; img = Image.fromarray(np.stack([rgb * 0.45 + 70] * 3, -1).astype(np.uint8)).resize((E.shape[1] * s, E.shape[0] * s), Image.NEAREST)
+    d = ImageDraw.Draw(img); f = ImageFont.truetype("/Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf", 13)
+    rng = np.random.default_rng(3); chains = {}
+    for k in range(1, n + 1):
+        pts = np.argwhere(lab == k)
+        if len(pts) < min_px: continue
+        col = tuple(int(c) for c in rng.integers(90, 255, 3)); cid = len(chains) + 1
+        for y, x in pts: d.rectangle((x * s, y * s, x * s + s - 1, y * s + s - 1), fill=col)
+        cy, cx = pts[len(pts) // 2]; d.text((cx * s + 4, cy * s - 14), str(cid), font=f, fill=(255, 255, 255))
+        chains[cid] = pts[:, ::-1].tolist()
+    img.save(out); json.dump(chains, open(out.replace(".png", "_chains.json"), "w")); print(out, len(chains))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

@@ -1,0 +1,33 @@
+# 25 October 2026 : ZenRay Meshes, internal design lines of a sheet view (panel joints, creases, glass edges) by edge
+# detection inside the silhouette, drawn over the view with a coordinate grid so curves can be traced and snapped.
+# FR : les lignes intérieures du dessin (joints, plis, vitrages) se lisent par détection de contours dans la silhouette.
+# Usage: python FeatureLines.py <views_dir> <frame_dir> <view> <out.png> [sigma=1.6]
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from skimage import feature
+
+P = {"sigma": 1.6, "low": 0.04, "high": 0.10, "erode_px": 3, "grid_px": 25, "scale": 2}
+
+
+def main(vdir, fdir, view, out, sigma=None):
+    sheet = json.load(open(os.path.join(vdir, "sheet.json"))); pan = [p for p in sheet["panels"] if p["name"] == view][0]
+    rgb = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], view))).convert("L")).astype(float) / 255
+    mask = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_mask.png" % (pan["index"], view)))) > 127
+    E = feature.canny(rgb, sigma=float(sigma or P["sigma"]), low_threshold=P["low"], high_threshold=P["high"])
+    E &= ndi.binary_erosion(mask, iterations=P["erode_px"])
+    np.save(out.replace(".png", "_edges.npy"), E)
+    s = P["scale"]; img = Image.fromarray((np.stack([rgb * 120 + 60] * 3, -1)).astype(np.uint8)).resize((rgb.shape[1] * s, rgb.shape[0] * s), Image.NEAREST)
+    d = ImageDraw.Draw(img)
+    for y, x in np.argwhere(E): d.rectangle((x * s, y * s, x * s + s - 1, y * s + s - 1), fill=(240, 90, 60))
+    f = ImageFont.truetype("/Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf", 11)
+    for x in range(0, rgb.shape[1], P["grid_px"]):
+        d.line((x * s, 0, x * s, img.height), fill=(80, 130, 200), width=1); d.text((x * s + 2, 2), str(x), font=f, fill=(150, 200, 255))
+    for y in range(0, rgb.shape[0], P["grid_px"]):
+        d.line((0, y * s, img.width, y * s), fill=(80, 130, 200), width=1); d.text((2, y * s + 2), str(y), font=f, fill=(150, 200, 255))
+    img.save(out); print(out, int(E.sum()))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

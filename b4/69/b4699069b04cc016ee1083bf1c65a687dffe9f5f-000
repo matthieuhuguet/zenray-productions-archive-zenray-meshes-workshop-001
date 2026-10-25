@@ -1,0 +1,82 @@
+# 25 October 2026 : ZenRay Meshes, CHASSIS and detail components (clean quads, named) : wheel wells (arch liners),
+# brake discs and calipers, mirrors, underbody tunnel and bolt heads, suspension arms. All values in
+# work/car/chassis_params.json (HDA interface) ; positions from the measured axles in wheel_params.json.
+# FR : coques de passage, freins, rétroviseurs, tunnel, boulons, triangles ; valeurs dans un JSON.
+# Usage: python ChassisBuild.py <chassis_params.json> <wheel_params.json> <out.npz>
+import sys, os, json, math
+import numpy as np
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+from WheelBuild import Mesh, revolve
+
+
+def tube(m, a, b, r, name, sides=8):
+    """straight tube between a and b as a quad ring grid (two rings)."""
+    a, b = np.array(a, float), np.array(b, float); d = b - a; d /= np.linalg.norm(d)
+    n = np.cross(d, [0, 1, 0]); n = n if np.linalg.norm(n) > 1e-3 else np.cross(d, [1, 0, 0]); n /= np.linalg.norm(n); bb = np.cross(d, n)
+    t = np.linspace(0, 2 * np.pi, sides, endpoint=False)
+    ring = lambda c: c + r * (np.cos(t)[:, None] * n + np.sin(t)[:, None] * bb)
+    m.grid(np.stack([ring(a), ring(b)], 1), name, close_u=True)
+
+
+def box(m, c, s, name):
+    c, s = np.array(c, float), np.array(s, float) / 2
+    for ax in range(3):
+        for sg in (-1, 1):
+            u, v = [k for k in range(3) if k != ax]
+            G = np.zeros((2, 2, 3))
+            for i, du in enumerate((-1, 1)):
+                for j, dv in enumerate((-1, 1)):
+                    p = c.copy(); p[ax] += sg * s[ax]; p[u] += du * s[u]; p[v] += dv * s[v]; G[i, j] = p
+            m.grid(G, name, flip=(sg < 0) ^ (ax == 1))
+
+
+def main(cparams, wparams, out):
+    C = json.load(open(cparams)); W = json.load(open(wparams)); m = Mesh(); hwf = None
+    mp = os.path.join(os.path.dirname(os.path.abspath(cparams)), C.get("measure", "arch_v1_measure.json"))
+    if os.path.exists(mp):
+        pr = json.load(open(mp))["profiles"]; zs_, hw_ = np.array(pr["z"]), np.array(pr["hw"])
+        hwf = lambda zz: float(np.interp(-zz, -zs_, hw_))
+    for inst in W["instances"]:
+        s = 1 if inst["x"] > 0 else -1; c = np.array([inst["x"], inst["y"], inst["z"]]); tag = inst["tag"]
+        # wheel well : half cylinder liner above the tyre (angles from front to back over the top), inside facing
+        R = W["tyre_r"] + C["well_clearance"]; w = W["tyre_w"] / 2 + C["well_side"]; seg = C["well_segments"]
+        ang = np.linspace(math.radians(C["well_from_deg"]), math.radians(C["well_to_deg"]), seg)
+        # the liner spans from inboard of the tyre to the tyre's OUTER face only (it poked out of the body in plan, 25 October 2026)
+        G = np.stack([np.stack([np.full(seg, c[0] + dx), c[1] + R * np.sin(ang), c[2] + R * np.cos(ang)], 1) for dx in (-s * w, s * (W["tyre_w"] / 2 - 0.01))], 1)
+        if hwf is not None:   # 25 October 2026: the liner never shows past the body in plan (top view half width at its z)
+            lim = np.array([hwf(zz) for zz in G[..., 2].ravel()]).reshape(G.shape[:2]) - C.get("well_plan_margin", 0.02)
+            G[..., 0] = np.sign(G[..., 0]) * np.minimum(np.abs(G[..., 0]), np.maximum(lim, abs(c[0]) - w))
+        m.grid(G, "CAR_wheelwell_" + tag, flip=s < 0)
+        # brake disc (behind the spokes) and caliper
+        dx_disc = s * (W["face_x"] - C["disc_inset"])
+        disc = revolve(np.array([(0, C["disc_r"] * 0.35), (0, C["disc_r"]), (-C["disc_t"], C["disc_r"]), (-C["disc_t"], C["disc_r"] * 0.35)]), 48)
+        disc[..., 0] = disc[..., 0] * s + c[0] + dx_disc; disc[..., 1] += c[1]; disc[..., 2] += c[2]
+        m.grid(disc, "CAR_wheel_brake_disc_" + tag, close_u=True, flip=s < 0)
+        a = math.radians(C["caliper_deg"]); cc = c + [dx_disc - s * 0.01, C["disc_r"] * 0.85 * math.sin(a), C["disc_r"] * 0.85 * math.cos(a)]
+        box(m, cc, (C["caliper_size"][0], C["caliper_size"][1], C["caliper_size"][2]), "CAR_wheel_brake_caliper_" + tag)
+        # suspension: two wishbone arms (tubes) from the hub to the floor, front and back pick up points
+        hub = c + [-s * 0.12, 0, 0]
+        for k, dy in enumerate((-0.08, 0.10)):
+            for dz in (-C["arm_spread"], C["arm_spread"]):
+                tube(m, hub + [0, dy, 0], [s * C["arm_inner_x"], c[1] + dy * 0.6, c[2] + dz], C["arm_r"], "CAR_susp_%s_%s" % ("front" if inst["z"] > 0 else "rear", tag))
+    # mirrors (stalk + housing) at the A pillar base, both sides
+    for s, tag in ((1, "L"), (-1, "R")):
+        x, y, z = C["mirror_pos"]; x *= s
+        box(m, (x, y, z), C["mirror_size"], "CAR_mirror_" + tag)
+        tube(m, (x - s * C["mirror_size"][0] * 0.4, y - 0.02, z), (x - s * (C["mirror_size"][0] * 0.5 + C["mirror_stalk"]), y - 0.06, z + 0.02), 0.012, "CAR_mirror_" + tag)
+    # underbody tunnel (raised V plate along the centre) and bolt heads on the floor
+    zt0, zt1 = C["tunnel_z"]; hw = C["tunnel_half_w"]; y0 = C["floor_y"] - 0.004
+    G = np.array([[[-hw, y0, zt1], [hw, y0, zt1]], [[-hw * 0.4, y0, zt0], [hw * 0.4, y0, zt0]]])
+    m.grid(G, "CAR_under_tunnel_C", flip=True)
+    for i, zb in enumerate(np.linspace(C["bolts_z"][0], C["bolts_z"][1], C["bolts_n"])):
+        for xb in C["bolts_x"]:
+            for sx in (1, -1):
+                bolt = revolve(np.array([(0, 0.0001), (0, 0.012), (-0.006, 0.012), (-0.006, 0.0001)]), 8)
+                bolt = bolt[..., [1, 0, 2]]; bolt[..., 0] += sx * xb; bolt[..., 1] = y0 + bolt[..., 1] * 1.0; bolt[..., 2] += zb
+                m.grid(bolt, "CAR_under_bolt", close_u=True)
+    np.savez(out, P=np.array(m.P, np.float32), Q=np.array(m.Q, np.int32), names=np.array(m.N))
+    print(json.dumps({"points": len(m.P), "quads": len(m.Q), "parts": len(set(m.N))}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

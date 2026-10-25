@@ -1,0 +1,40 @@
+# 25 October 2026 : ZenRay Meshes, quick shaded contact sheet of a mesh (side, front, top, three quarter), orthographic,
+# GPU, no Houdini viewport needed. Optional reference sheet panels next to it for an eye comparison.
+# FR : planche ombrée rapide (côté, face, dessus, trois-quarts) pour juger un modèle à l'œil.
+# Usage: python ShadedViews.py <mesh.obj> <out.png> [res=700]
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+import Raster
+
+P = {"bg": 96, "key": (-0.45, 0.6, 0.65), "ambient": 0.28, "res": 700, "pad": 1.08}
+VIEWS = {  # right axis, up axis (camera looks along right x up)
+    # 25 October 2026: "front" with right +x shows the NOSE (checked: right -x showed the rear light bar) ; REAR_VIEWS for the back
+    "side": ((0, 0, -1), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0)), "top": ((0, 0, -1), (-1, 0, 0)),
+    "three_quarter": ((0.70, 0, -0.71), (-0.25, 0.94, -0.25))}
+REAR_VIEWS = {"back": ((-1, 0, 0), (0, 1, 0)), "three_quarter_rear": ((-0.70, 0, 0.71), (0.2, 0.96, 0.2))}
+
+
+def shade(N, M):
+    k = np.array(P["key"]); k /= np.linalg.norm(k)
+    v = np.clip(P["ambient"] + (1 - P["ambient"]) * np.clip((N * k).sum(-1), 0, 1), 0, 1)
+    return np.where(M, v * 235, P["bg"]).astype(np.uint8)
+
+
+def main(mesh, out, res=None):
+    res = int(res or P["res"]); m = trimesh.load(mesh, force="mesh", process=False)
+    V = m.vertices; c = (V.max(0) + V.min(0)) / 2; ext = np.linalg.norm(V.max(0) - V.min(0))
+    r = Raster.Renderer(V, m.faces); tiles = []
+    for name, (rx, uy) in VIEWS.items():
+        rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy)
+        tz = np.cross(rx, uy)
+        M, _, N, _ = r.render(c, res / (ext * P["pad"]), (rx.tolist(), uy.tolist(), tz.tolist()), res)
+        tiles.append(shade(N, M))
+    r.release()
+    top = np.concatenate(tiles[:2], 1); bot = np.concatenate(tiles[2:], 1)
+    Image.fromarray(np.concatenate([top, bot], 0)).save(out); print(out)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

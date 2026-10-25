@@ -1,0 +1,52 @@
+# 25 October 2026 : ZenRay Meshes car, COMPONENT SPLIT in Houdini : the subdivided body splits into named panels
+# (cage face attribute "panel" -> primitive split), each panel gets its joint gap (border points pulled inward along
+# the surface) and its thickness (inward extrusion), and a "name" attribute CAR_body_<panel>. Parameters on CTRL_zrm.
+# FR : la caisse subdivisée se sépare en panneaux nommés, avec jeu de joint et épaisseur ; paramètres sur CTRL_zrm.
+# Run in Houdini: exec(open(this).read()) ; idempotent (rebuilds its own nodes).
+import hou
+
+geo = hou.node("/obj/ZRM_Car"); ctrl = geo.node("CTRL_zrm")
+ptg = ctrl.parmTemplateGroup()
+for n, l, v in (("panel_gap", "Panel Joint Gap (m)", 0.004), ("panel_thick", "Panel Thickness (m)", 0.012), ("glass_inset", "Glass Inset (m)", 0.008)):
+    if not ctrl.parm(n): ptg.append(hou.FloatParmTemplate(n, l, 1, default_value=(v,)))
+ctrl.setParmTemplateGroup(ptg)
+for nm in ("panel_split", "panel_gap_w", "panel_thick_x", "panel_name", "OUT_panels", "panel_normals_pre", "panel_clean"):
+    n_ = geo.node(nm); n_ and n_.destroy()
+sub = geo.node("cage_subd")
+sp = geo.createNode("primitivesplit", "panel_split"); sp.setInput(0, sub)
+pn = [p.name() for p in sp.parms()]
+for cand in ("attribname", "attrib", "attribute"):
+    if cand in pn: sp.parm(cand).set("panel"); break
+w = geo.createNode("attribwrangle", "panel_gap_w"); w.setInput(0, sp); w.parm("class").set(2)
+w.parm("snippet").set('''// 25 October 2026 : joint gap. A border point (on an unshared edge) moves into its own panel by half the gap,
+// along the surface: average direction toward its neighbours that are not on the border, made tangent to the normal.
+float g = chf("../CTRL_zrm/panel_gap") * 0.5;
+string p = prim(0, "panel", pointprims(0, @ptnum)[0]);
+if (startswith(p, "glass")) g += chf("../CTRL_zrm/glass_inset");
+int nb[] = neighbours(0, @ptnum);
+int border = 0;
+foreach (int q; nb) { int e = pointedge(0, @ptnum, q); if (e >= 0 && hedge_equivcount(0, e) < 2) border = 1; }
+if (border) {
+    vector dir = 0; int c = 0;
+    foreach (int q; nb) {
+        int e = pointedge(0, @ptnum, q);
+        if (e >= 0 && hedge_equivcount(0, e) >= 2) { dir += point(0, "P", q) - @P; c++; }
+    }
+    if (c > 0) { vector n = normalize(v@N); dir -= n * dot(dir, n); @P += normalize(dir) * g; }
+}''')
+nm_ = geo.createNode("normal", "panel_normals_pre"); nm_.setInput(0, sp); w.setInput(0, nm_)
+cl = geo.createNode("clean", "panel_clean"); cl.setInput(0, w)   # 25 October 2026: degenerate faces (collapsed rows) made the extrusion explode
+for pn_, v_ in (("deldegengeo", 1), ("fusepts", 1)):
+    if cl.parm(pn_): cl.parm(pn_).set(v_)
+ex = geo.createNode("polyextrude::2.0", "panel_thick_x"); ex.setInput(0, cl)
+ex.parm("extrusionmode").set(1)   # point normal: no miter blow up
+ex.parm("dist").setExpression('-ch("../CTRL_zrm/panel_thick")'); ex.parm("outputback").set(1)
+na = geo.createNode("attribwrangle", "panel_name"); na.setInput(0, ex); na.parm("class").set(1)
+na.parm("snippet").set('s@name = "CAR_body_" + s@panel;   // 25 October 2026')
+out = geo.createNode("null", "OUT_panels"); out.setInput(0, na)
+sw = geo.node("body_switch"); sw.setInput(2, out)
+for n_ in (nm_, sp, w, cl, ex, na, out): n_.moveToGoodPosition()
+g = out.geometry()
+result = {"prims": len(g.prims()), "panels": sorted(set(g.primStringAttribValues("name"))) if g.findPrimAttrib("name") else None,
+          "errors": [n.name() + ": " + " ".join(n.errors()) for n in (sp, w, ex, na) if n.errors()],
+          "split_parm": [p for p in pn if "attr" in p]}

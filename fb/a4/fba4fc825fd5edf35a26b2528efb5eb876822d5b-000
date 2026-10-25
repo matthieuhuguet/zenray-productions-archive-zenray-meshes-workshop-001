@@ -1,0 +1,38 @@
+# 25 October 2026 : ZenRay Meshes, the cage's named rows (3D guide curves of the model) projected over the sheet views,
+# to judge by eye whether each model line lands on the drawn design line. FR : les rangées du modèle projetées sur la planche.
+# Usage: python ProjectRows.py <cage_prefix> <frame_dir> <views_dir> <out.png> [views=right,top,front]
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from SilFit import project
+
+COL = {"sill": (90, 200, 255), "door_low": (255, 210, 60), "belt": (255, 120, 60), "belt_top": (255, 60, 160), "glass_base": (120, 255, 120),
+       "roof_edge": (200, 120, 255), "roof_centre": (255, 255, 255), "floor_edge": (150, 150, 150), "fender_inner": (110, 110, 110)}
+
+
+def main(prefix, fdir, vdir, out, views="right,top,front"):
+    V = np.array([list(map(float, l.split()[1:4])) for l in open(prefix + "_cage.obj") if l.startswith("v ")])
+    J = json.load(open(prefix + "_cage.json")); R = J["ring"]; S = len(V) // R; rows = J["rows"]; nh = R // 2 + 1
+    exp = json.load(open(prefix + "_cage.json")).get("exp_rows") or rows
+    G = V.reshape(S, R, 3); meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    tiles = []; f = ImageFont.truetype("/Users/zenray/Library/Fonts/InterVariable.ttf", 13)
+    for vn in views.split(","):
+        pan = [p for p in sheet["panels"] if p["name"] == vn][0]; v = [x for x in meta["views"] if x["name"] == vn][0]
+        im = Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], vn))).convert("RGB"); s = 3
+        im = im.resize((im.width * s, im.height * s)); d = ImageDraw.Draw(im)
+        for i, r in enumerate(rows):
+            j = nh - 1 + i if i < nh - 1 else None                       # +x side index of the row in the ring
+            if j is None or r not in COL: continue
+            P = G[:, j % R, :]
+            uv, _, _, _ = project(P, meta, v)
+            d.line([(x * s, y * s) for x, y in uv], fill=COL[r], width=2)
+        y0 = 8
+        for r, c in COL.items(): d.text((8, y0), r, font=f, fill=c); y0 += 16
+        tiles.append(np.asarray(im))
+    h = max(t.shape[0] for t in tiles)
+    Image.fromarray(np.concatenate([np.pad(t, ((0, h - t.shape[0]), (0, 6), (0, 0))) for t in tiles], 1)).save(out); print(out)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

@@ -1,0 +1,72 @@
+# 25 October 2026 : ZenRay Meshes car, FACETED NOSE component. The reference nose is hard surface (flat hood trapezoid,
+# flat cheeks, vertical fascia), which a creased subdivision rounds whatever the settings. The body is clipped by the plane
+# z = cut_z (ahead of the front wheel arch) in Houdini, and the nose ahead of it is built here as RULED FACETS : straight
+# strips between three sections of the named rows : the body section at cut_z (read on the exported body), a middle
+# section and the tip section (nose keypoints of work/car/lines/nose_rows.json, plus centre points in nose_params.json).
+# Each band between two rows is one named panel ; the tip is closed by the fascia polygon. Output npz (P, Q, names).
+# FR : nez en facettes réglées entre la coupe de la caisse, une section milieu et la pointe ; un panneau nommé par bande.
+# Usage: python NoseFacets.py <nose_params.json> <body_panels.npz> <out.npz>
+import sys, os, json
+import numpy as np
+
+
+def main(params, body, out):
+    W = os.path.dirname(os.path.abspath(params)); C = json.load(open(params))
+    NR = json.load(open(os.path.join(W, "lines/nose_rows.json")))["rows"]
+    rows = C["rows"]                                    # bottom to top, the right half (x >= 0)
+    zc, zm, zt = C["cut_z"], C["mid_z"], C["tip_z"]
+    # body section at cut_z : points of the body mesh within a thin slab, outer skin only (largest |x| per height bin)
+    d = np.load(body, allow_pickle=True); P = d["P"]
+    sl = P[(np.abs(P[:, 2] - zc) < C["slab_m"]) & (P[:, 0] >= -1e-4)]
+    bins = np.round(sl[:, 1] / C["bin_m"]).astype(int); sec = {}
+    for b in np.unique(bins):
+        q = sl[bins == b]; sec[int(b)] = q[np.argmax(q[:, 0])]
+    secP = np.array([sec[b] for b in sorted(sec)])        # outer outline of the section, bottom to top
+    ax = sl[np.abs(sl[:, 0]) < C["axis_m"]]; top_y = float(ax[:, 1].max()); bot_y = float(ax[:, 1].min())
+    # the row heights at the cut come from the cage ring at the nearest station (the same named rows as the body)
+    cj = json.load(open(os.path.join(W, "arch_v1_cage.json"))); E = cj["exp_rows"]; R = cj["ring"]; st = np.array(cj["stations"])
+    CV = np.array([list(map(float, l.split()[1:])) for l in open(os.path.join(W, "arch_v1_cage.obj")) if l.startswith("v ")]).reshape(len(st), R, 3)
+    k_st = int(np.argmin(np.abs(st - zc))); nh = len(E)
+    def at_cut(r):
+        """the point of row r on the cut : centre rows on the axis (body top or bottom), side rows on the outline nearest
+        to the cage row point."""
+        if r == "roof_centre": return np.array([0.0, top_y, zc])
+        if r == "floor_centre": return np.array([0.0, bot_y, zc])
+        c = CV[k_st, nh - 1 + E.index(r)]; dd = np.hypot(secP[:, 0] - abs(c[0]), secP[:, 1] - c[1]); k = int(np.argmin(dd))
+        return np.array([secP[k, 0], secP[k, 1], zc])
+    def at_kp(r, z):
+        if r in NR:
+            kp = np.array(NR[r]); return np.array([np.interp(z, kp[:, 0], kp[:, 1]), np.interp(z, kp[:, 0], kp[:, 2]), z])
+        x, y = C["tip_points"][r]; t = (z - zc) / (zt - zc); a = at_cut(r)
+        return np.array([a[0] + t * (x - a[0]), a[1] + t * (y - a[1]), z])
+    # 25 October 2026: the tip is not a vertical face ; each row ends on the side view front extreme at its own height
+    # (measured profile z_front(y)), and the middle section sits at the same fraction between the cut and that tip.
+    mp = json.load(open(os.path.join(W, "arch_v1_measure.json")))["profiles"]; ey = np.array(mp["ext_y"]); ez = np.array(mp["z_front"], float); ok = np.isfinite(ez)
+    f_mid = (zm - zc) / (zt - zc); S = [[at_cut(r) for r in rows], [], []]
+    for r in rows:
+        y0 = at_kp(r, zt)[1]
+        zt_r = float(np.clip(np.interp(y0, ey[ok], ez[ok]), zc + 0.1, zt)) if C.get("tip_from_profile", 1) else zt
+        S[2].append(at_kp(r, zt_r)); S[1].append(at_kp(r, zc + f_mid * (zt_r - zc)))
+    S = np.array(S)                                       # (3 sections, n rows, 3)
+    allP, allQ, allN = [], [], []
+    def add(poly, name):
+        b = len(allP); allP.extend([list(map(float, p)) for p in poly]); allQ.append(list(range(b, b + len(poly)))); allN.append(name)
+    for sd, tag in ((1, "R"), (-1, "L")):                 # +x is the car's left in this build ; names follow the body
+        M = S.copy(); M[..., 0] *= sd; tg = "L" if sd > 0 else "R"
+        for i in range(S.shape[0] - 1):
+            for j in range(S.shape[1] - 1):
+                band = C["bands"][j]; nm = "CAR_body_nose_" + band + ("_C" if band in C["centre_bands"] else "_" + tg)
+                q = [M[i, j], M[i, j + 1], M[i + 1, j + 1], M[i + 1, j]]
+                add(q if sd > 0 else q[::-1], nm)
+    # tip : the fascia closes the front between the left and right tip polylines
+    tip = S[-1]; mir = tip * [-1, 1, 1]
+    for j in range(len(tip) - 1):   # quad strips between the left and right tip polylines (a concave n-gon triangulated badly)
+        if abs(tip[j, 0]) < 1e-6 and abs(tip[j + 1, 0]) < 1e-6: continue
+        add([tip[j], tip[j + 1], mir[j + 1], mir[j]][::-1], "CAR_body_nose_fascia_C")
+    json.dump({"_date": "25 October 2026", "cut_z": zc}, open(out.replace(".npz", "_cut.json"), "w"))
+    np.savez(out, P=np.array(allP, np.float32), Q=np.array(allQ, dtype=object), names=np.array(allN))
+    print(json.dumps({"faces": len(allQ), "names": sorted(set(allN))}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
