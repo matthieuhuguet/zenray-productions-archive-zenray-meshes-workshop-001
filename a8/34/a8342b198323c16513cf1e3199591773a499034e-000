@@ -37,10 +37,11 @@ def rasterize(mesh, c, scale, view):
     px = v @ rx * scale + R / 2
     py = R / 2 - v @ uy * scale
     pz = v @ tz
-    zbuf = np.full((R, R), -np.inf); nbuf = np.zeros((R, R))
+    zbuf = np.full((R, R), -np.inf); nbuf = np.zeros((R, R)); ncam = np.zeros((R, R, 3))
     tri = mesh.faces
     fn = mesh.face_normals @ tz
-    for t, n in zip(tri, fn):
+    fcam = np.stack([mesh.face_normals @ rx, mesh.face_normals @ uy, mesh.face_normals @ tz], 1)
+    for t, n, nc in zip(tri, fn, fcam):
         x, y, z = px[t], py[t], pz[t]
         x0, x1 = int(max(np.floor(x.min()), 0)), int(min(np.ceil(x.max()), R - 1))
         y0, y1 = int(max(np.floor(y.min()), 0)), int(min(np.ceil(y.max()), R - 1))
@@ -60,7 +61,9 @@ def rasterize(mesh, c, scale, view):
         sub = zbuf[y0:y1 + 1, x0:x1 + 1]; nsub = nbuf[y0:y1 + 1, x0:x1 + 1]
         upd = inside & (zz > sub)
         sub[upd] = zz[upd]; nsub[upd] = abs(n)
+        csub = ncam[y0:y1 + 1, x0:x1 + 1]; csub[upd] = nc if n >= 0 else -nc
     mask = np.isfinite(zbuf)
+    rasterize.last_normal = ncam
     return mask, zbuf, nbuf
 
 
@@ -74,6 +77,8 @@ def cmd_views(gt, out):
         Image.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(out, "mask_%s.png" % v))
         img = (shade * 255).astype(np.uint8); Image.fromarray(img).save(os.path.join(out, "shade_%s.png" % v))
         zz = np.where(mask, z, 0); np.save(os.path.join(out, "depth_%s.npy" % v), np.where(mask, z, np.nan))
+        nimg = np.where(mask[..., None], (rasterize.last_normal * 0.5 + 0.5), 0.5)
+        Image.fromarray((nimg * 255).astype(np.uint8)).save(os.path.join(out, "normal_%s.png" % v))
         tiles.append(img)
     sheet = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
     Image.fromarray(sheet).save(os.path.join(out, "sheet.png"))
@@ -104,12 +109,34 @@ def score(pred_path, gt_path, vdir):
     return res
 
 
+
+def image_score(pred_path, vdir, angle_deg=10.0):
+    """THE target score (no 3D truth needed): re-render the reconstruction in the six views of the reference sheet and
+    count, over the union of both silhouettes, the pixels where both are filled AND the normals agree within angle_deg.
+    Silhouette alone lies (concavities hide behind a perfect outline), the normal term sees them."""
+    pm = load(pred_path)
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    c, s = np.array(meta["center"]), meta["px_per_m"]
+    cos_t = np.cos(np.radians(angle_deg))
+    per = {}
+    for v in VIEWS:
+        ref = np.asarray(Image.open(os.path.join(vdir, "mask_%s.png" % v))) > 127
+        rn = np.asarray(Image.open(os.path.join(vdir, "normal_%s.png" % v))).astype(float) / 255 * 2 - 1
+        mk = rasterize(pm, c, s, v)[0]; pn = rasterize.last_normal
+        rn /= np.linalg.norm(rn, axis=-1, keepdims=True) + 1e-9
+        both = ref & mk
+        ok = both & ((rn * pn).sum(-1) > cos_t)
+        per[v] = float(ok.sum() / max((ref | mk).sum(), 1))
+    return {"image_score": float(np.mean(list(per.values()))), "per_view": per, "angle_deg": angle_deg}
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "views":
         cmd_views(sys.argv[2], sys.argv[3])
     elif cmd == "score":
         r = score(sys.argv[2], sys.argv[3], sys.argv[4]); print(json.dumps(r, indent=1))
+    elif cmd == "iscore":
+        print(json.dumps(image_score(sys.argv[2], sys.argv[3]), indent=1))
     elif cmd == "selftest":
         gt, vdir = sys.argv[2], sys.argv[3]
         good = score(gt, gt, vdir)

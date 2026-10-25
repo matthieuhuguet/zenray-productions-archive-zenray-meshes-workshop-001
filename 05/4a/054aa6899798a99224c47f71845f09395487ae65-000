@@ -142,6 +142,154 @@ def m02b_hull_separable(vdir, out, n=512, smooth=0.8):
 
 METHODS["M02b"] = m02b_hull_separable
 
+
+def m04_hull_shading_eikonal(vdir, out, n=384, light_floor=0.25, light_gain=0.7, max_slope=6.0, smooth=0.8):
+    """M04: visual hull, then each view's shading is read as |n . view| (viewport headlight), turned into a slope,
+    and the eikonal equation |grad h| = slope with h = 0 on the silhouette gives a relief height per view.
+    A voxel survives only if, for every view, it lies within the ray's mid depth + h toward that viewer."""
+    import skfmm
+    meta, masks, shade = load_views(vdir)
+    n = int(n); R = meta["res"]; s = meta["px_per_m"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij")
+    P = np.stack([X, Y, Z], -1)
+    hull = np.ones((n, n, n), bool)
+    proj = {}
+    for v in VIEWS_ORDER:
+        px, py = project(meta, P.reshape(-1, 3), v)
+        ix, iy = np.clip(px.astype(int), 0, R - 1), np.clip(py.astype(int), 0, R - 1)
+        proj[v] = (ix, iy)
+        hull &= masks[v][iy, ix].reshape(n, n, n)
+    occ = hull.copy()
+    for v in VIEWS_ORDER:
+        m = masks[v]
+        nz = np.clip((shade[v] - light_floor) / light_gain, 1.0 / np.sqrt(1 + max_slope ** 2), 1.0)
+        slope = np.sqrt(1.0 / nz ** 2 - 1.0)
+        phi = np.where(m, -1.0, 1.0)
+        speed = 1.0 / np.maximum(slope, 1e-3)
+        try:
+            h = np.asarray(skfmm.travel_time(np.ma.MaskedArray(phi, ~m), speed, dx=1.0 / s).filled(0))
+        except Exception:
+            continue
+        h = np.where(m, np.abs(h), 0)
+        tz = np.array(meta["views"][v][2], float)
+        d = (P.reshape(-1, 3) @ tz).reshape(n, n, n)     # depth toward the viewer
+        ix, iy = proj[v]
+        # mid depth of the hull along each ray of this view
+        dh = np.where(hull, d, np.nan)
+        key = iy * R + ix
+        flat_d = dh.reshape(-1)
+        okk = ~np.isnan(flat_d)
+        mn = np.full(R * R, np.inf); mx = np.full(R * R, -np.inf)
+        np.minimum.at(mn, key[okk], flat_d[okk]); np.maximum.at(mx, key[okk], flat_d[okk])
+        mid = ((mn + mx) / 2)[key].reshape(n, n, n)
+        occ &= d <= mid + h[iy, ix].reshape(n, n, n) + 1.0 / s
+    return to_mesh(occ, ax, c, out, float(smooth))
+
+METHODS["M04"] = m04_hull_shading_eikonal
+
+
+def m00_oracle_depth(vdir, out, n=384, smooth=0.8):
+    """M00 (oracle, diagnosis only): carve with the TRUE depth of each of the six views. It is the ceiling of any
+    method that reads only six orthographic views; it is not a method."""
+    meta, masks, _ = load_views(vdir)
+    n = int(n); R = meta["res"]; s = meta["px_per_m"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij"); P = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    occ = np.ones(len(P), bool)
+    for v in VIEWS_ORDER:
+        dm = np.load(os.path.join(vdir, "depth_%s.npy" % v))
+        px, py = project(meta, P, v)
+        ix, iy = np.clip(px.astype(int), 0, R - 1), np.clip(py.astype(int), 0, R - 1)
+        tz = np.array(meta["views"][v][2], float)
+        dd = dm[iy, ix]
+        occ &= ~np.isnan(dd) & (P @ tz <= np.nan_to_num(dd, nan=-1e9) + 1.5 / s)
+    return to_mesh(occ.reshape(n, n, n), ax, c, out, float(smooth))
+
+METHODS["M00"] = m00_oracle_depth
+
+
+def integrate_normals(nrm, mask, px_per_m, min_nz=0.08, jump=0.6):
+    """Least squares integration of a camera space normal map into depth (metres, toward viewer), per region.
+    Gradient equations are dropped across normal jumps (depth discontinuities) and where the surface is grazing."""
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import lsqr
+    H, W = mask.shape
+    idx = -np.ones((H, W), int); ys, xs = np.nonzero(mask); idx[ys, xs] = np.arange(len(ys))
+    nz = np.clip(nrm[..., 2], min_nz, None)
+    gx = -nrm[..., 0] / nz / px_per_m        # d depth / d column, metres per pixel
+    gy = nrm[..., 1] / nz / px_per_m         # d depth / d row (rows go down, y up)
+    rows, cols, vals, rhs = [], [], [], []
+    r = 0
+    for dy, dx, g in ((0, 1, gx), (1, 0, gy)):
+        a = idx[: H - dy, : W - dx]; b = idx[dy:, dx:]
+        ok = (a >= 0) & (b >= 0)
+        na, nb = nrm[: H - dy, : W - dx], nrm[dy:, dx:]
+        ok &= (np.abs(na - nb).sum(-1) < jump) & (nrm[: H - dy, : W - dx, 2] > min_nz) & (nrm[dy:, dx:, 2] > min_nz)
+        ga = 0.5 * (g[: H - dy, : W - dx] + g[dy:, dx:])
+        aa, bb, gg = a[ok], b[ok], ga[ok]
+        k = np.arange(r, r + len(aa)); r += len(aa)
+        rows += [k, k]; cols += [bb, aa]; vals += [np.ones(len(aa)), -np.ones(len(aa))]; rhs.append(gg)
+    # weak anchor to zero so every region is defined
+    k = np.arange(r, r + len(ys)); r += len(ys)
+    rows.append(k); cols.append(np.arange(len(ys))); vals.append(np.full(len(ys), 1e-3)); rhs.append(np.zeros(len(ys)))
+    A = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(r, len(ys)))
+    z = lsqr(A, np.concatenate(rhs), atol=1e-8, btol=1e-8, iter_lim=4000)[0]
+    D = np.full((H, W), np.nan); D[ys, xs] = z
+    # regions = connected parts of the gradient graph, each gets its own unknown offset
+    import scipy.ndimage as nd
+    edges_ok = mask.copy()
+    return D
+
+
+def m05_normal_integration(vdir, out, n=320, smooth=0.8, tol_px=2.0):
+    """M05: the sheet gives a camera space NORMAL map per view (input contract to request from the image prompt).
+    Each view is integrated into a depth map; its unknown offset (per connected region) is fixed by the visual hull's
+    nearest depth on that region; then voxels are carved exactly like the depth oracle."""
+    meta, masks, _ = load_views(vdir)
+    n = int(n); R = meta["res"]; s = meta["px_per_m"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij"); P = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    hull = np.ones(len(P), bool); proj = {}
+    for v in VIEWS_ORDER:
+        px, py = project(meta, P, v)
+        ix, iy = np.clip(px.astype(int), 0, R - 1), np.clip(py.astype(int), 0, R - 1)
+        proj[v] = (ix, iy); hull &= masks[v][iy, ix]
+    occ = hull.copy()
+    for v in VIEWS_ORDER:
+        nimg = np.asarray(Image.open(os.path.join(vdir, "normal_%s.png" % v))).astype(float) / 255 * 2 - 1
+        m = masks[v]
+        D = integrate_normals(nimg, m, s)
+        tz = np.array(meta["views"][v][2], float)
+        ix, iy = proj[v]
+        d = P @ tz
+        key = iy * R + ix
+        mx = np.full(R * R, -np.inf)
+        np.maximum.at(mx, key[hull], d[hull])
+        hullfront = mx.reshape(R, R)
+        # offset per region: regions = connected components of mask where normals are continuous
+        jumps = np.zeros_like(m)
+        jumps[:, 1:] |= np.abs(nimg[:, 1:] - nimg[:, :-1]).sum(-1) > 0.6
+        jumps[1:, :] |= np.abs(nimg[1:] - nimg[:-1]).sum(-1) > 0.6
+        lab, nl = ndi.label(m & ~jumps)
+        Dfix = np.full_like(D, np.nan)
+        for i in range(1, nl + 1):
+            reg = lab == i
+            ok = reg & np.isfinite(hullfront) & np.isfinite(D)
+            if ok.sum() < 3:
+                continue
+            off = np.percentile((hullfront - D)[ok], 5)   # surface lies at or behind the hull front: smallest gap
+            Dfix[reg] = D[reg] + off
+        Dfix = ndi.generic_filter(np.nan_to_num(Dfix, nan=-1e9), np.max, size=3)
+        dd = Dfix[iy, ix]
+        occ &= d <= dd + tol_px / s
+    return to_mesh(occ.reshape(n, n, n), ax, c, out, float(smooth))
+
+METHODS["M05"] = m05_normal_integration
+
 if __name__ == "__main__":
     name, vdir, out = sys.argv[1:4]
     kw = dict(a.split("=") for a in sys.argv[4:])
