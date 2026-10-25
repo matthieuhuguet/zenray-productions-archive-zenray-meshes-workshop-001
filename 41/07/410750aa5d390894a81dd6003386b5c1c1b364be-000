@@ -1,0 +1,306 @@
+# 25 October 2026 : ZenRay Meshes, deterministic shape generator (guide curves and topology templates), no AI.
+# EN: every family of catalog.json is a definition here; index n -> a point of the family's parameter box through a
+# Halton sequence (one prime per parameter), so n = 0, 1, 2 ... enumerates an unbounded set of valid shapes and the same
+# n always gives the same shape. Output: named 3D guide curves (and quads for SubD templates) as JSON, plus contact
+# sheets. FR : chaque famille est une définition ; l'index n donne toujours la même forme valide, sans fin.
+# Usage: python ShapeGen.py sheet <family|all> [start=0] [count=64]
+#        python ShapeGen.py export <family> <n> <out.json>
+import sys, os, json, math
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CAT = json.load(open(os.path.join(HERE, "catalog.json")))["families"]
+OUT = os.path.abspath(os.path.join(HERE, "..", "..", "versions", "shapegen"))
+PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+SHEET = {"cell": 260, "cols": 8, "bg": (246, 245, 241), "ink": (40, 40, 40), "accent": (204, 124, 94), "loop": (90, 140, 210),
+         "font": "/Users/zenray/Library/Fonts/InterVariable.ttf", "num_font": "/Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf"}
+
+
+def halton(i, b):
+    f, r = 1.0, 0.0
+    while i > 0:
+        f /= b; r += f * (i % b); i //= b
+    return r
+
+
+def params(family, n):
+    """Index n -> parameter dict (n + 1 so n = 0 is not the box corner)."""
+    out = {}
+    for k, (name, box) in enumerate(CAT[family]["params"].items()):
+        u = halton(n + 1, PRIMES[k % len(PRIMES)])
+        if isinstance(box[0], str):
+            out[name] = box[min(int(u * len(box)), len(box) - 1)]
+        elif all(isinstance(b, int) for b in box):
+            out[name] = int(round(box[0] + u * (box[1] - box[0])))
+        else:
+            out[name] = box[0] + u * (box[1] - box[0])
+    return out
+
+
+def C(name, pts, closed=False):
+    p = np.asarray(pts, float)
+    if p.shape[1] == 2: p = np.c_[p, np.zeros(len(p))]
+    return {"name": name, "pts": p.round(5).tolist(), "closed": closed}
+
+
+def arc(cx, cy, r, a0, a1, n=48):
+    t = np.linspace(a0, a1, n); return np.c_[cx + r * np.cos(t), cy + r * np.sin(t)]
+
+
+def superellipse(a, b, e, n=96, cx=0, cy=0):
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False); c, s = np.cos(t), np.sin(t)
+    return np.c_[cx + a * np.sign(c) * np.abs(c) ** (2 / e), cy + b * np.sign(s) * np.abs(s) ** (2 / e)]
+
+
+def bezier(P, n=40):
+    P = np.asarray(P, float); t = np.linspace(0, 1, n)[:, None]; k = len(P) - 1
+    return sum(math.comb(k, i) * (1 - t) ** (k - i) * t ** i * P[i] for i in range(k + 1))
+
+
+# ---------------------------------------------------------------- families (definitions)
+def car_profile(p):
+    L, H = p["length_m"], p["height_m"]; wb = p["wheelbase_ratio"] * L; fo = p["front_overhang"] * L
+    zf, zr = L / 2 - fo, L / 2 - fo - wb; tr = 0.33 + 0.08 * (H - 1.05)
+    hood_end = L / 2 - p["hood_len"] * L; belt = 0.55 * H; nose_h = belt * (0.72 - p["nose_drop"])
+    rake = math.radians(p["rake_deg"]); ws_top = hood_end - (H - belt) / math.tan(rake)
+    peak = L / 2 - p["roof_peak"] * L
+    t = p["tail_type"]
+    tail_top = {"fastback": belt * 1.02, "notchback": belt * 1.05, "hatch": H * 0.82, "kammback": H * 0.86, "wedge": belt * 1.12}[t]
+    roof_end = {"fastback": -L * 0.42, "notchback": peak - 0.25 * L, "hatch": -L * 0.4, "kammback": -L * 0.44, "wedge": -L * 0.47}[t]
+    top = [(L / 2, nose_h * 0.6), (L / 2 - 0.05, nose_h), (hood_end, belt)]
+    top += bezier([(hood_end, belt), (ws_top + 0.1, H * 0.97), (peak, H), (roof_end, H * 0.9 if t != "fastback" else belt * 1.25)], 30).tolist()
+    if t == "notchback": top += [(roof_end - 0.15, belt * 1.06), (-L / 2 + 0.08, belt * 1.05)]
+    top += [(-L / 2, tail_top), (-L / 2, 0.3 * H)]
+    bottom = [(-L / 2, 0.3 * H), (zr - tr * 1.15, 0.2 * H)] + arc(zr, tr, tr * 1.12, np.pi, 0, 20).tolist()
+    bottom += [(zf - tr * 1.12, 0.17 * H)] + arc(zf, tr, tr * 1.12, np.pi, 0, 20).tolist() + [(L / 2, nose_h * 0.6)]
+    return [C("a_line", np.r_[np.array(top), np.array(bottom)], True), C("wheel_front", arc(zf, tr, tr, 0, 2 * np.pi), True),
+            C("wheel_rear", arc(zr, tr, tr, 0, 2 * np.pi), True), C("beltline", [(hood_end, belt), (-L / 2 + 0.1, belt * 1.04)])]
+
+
+def dlo(p):
+    L = p["length"]; b = p["belt_h"]; top = 1.0
+    a0 = (L / 2, b); a1 = (L / 2 - p["a_rake"], top - p["roof_bow"])
+    c_x = -L / 2
+    pts = [a0] + bezier([a1, (0.2, top), (-0.2, top - 0.02), (c_x + 0.15, top - 0.12)], 24).tolist()
+    cs = p["c_shape"]
+    if cs == "kink": pts += [(c_x, b + 0.18), (c_x + 0.1, b + 0.05), (c_x + 0.05, b)]
+    elif cs == "fin": pts += [(c_x - 0.1, b)]
+    elif cs == "round": pts += arc(c_x + 0.15, b + 0.15, 0.15, np.pi / 2, np.pi, 10).tolist()[::-1] + [(c_x, b)]
+    else: pts += [(c_x, b)]
+    out = [C("dlo", pts, True), C("beltline", [(L / 2 + 0.1, b), (c_x - 0.1, b)])]
+    if p["b_split"]: out.append(C("pillar_b", [(-0.05, b), (0.02, top - 0.01)]))
+    return out
+
+
+def rim(p):
+    R = 1.0; lip = R - p["lip_w"]; hub = p["hub_r"]; n = p["spokes"]; st = p["style"]; w = p["spoke_w"]; cz = p["concave_m"] * 8
+    out = [C("lip_outer", arc(0, 0, R, 0, 2 * np.pi, 96), True), C("lip_inner", arc(0, 0, lip, 0, 2 * np.pi, 96), True),
+           C("hub", arc(0, 0, hub, 0, 2 * np.pi, 48), True)]
+    z = lambda r: -cz * (1 - (r - hub) / max(lip - hub, 1e-6))          # concave dish: spokes sink toward the hub
+    for k in range(n if st != "dish" else 0):
+        a = 2 * np.pi * k / n
+        if st == "mesh":
+            for sgn in (1, -1):
+                r = np.linspace(hub, lip, 12); t = a + sgn * 0.35 * (r - hub) / (lip - hub)
+                out.append(C("mesh_%d_%d" % (k, sgn), np.c_[r * np.cos(t), r * np.sin(t), z(r)]))
+            continue
+        tw = math.radians(p["twist_deg"]) if st in ("twist", "turbine") else 0
+        offs = [-p["split_gap"] - w / 2, p["split_gap"] + w / 2] if st == "split" else [0.0]
+        for o in offs:
+            for side in (-1, 1):
+                r = np.linspace(hub, lip, 16); e = w / 2 * side * (1.4 if st == "turbine" else 1)
+                t = a + tw * (r - hub) / (lip - hub) + (o + e) / r
+                if st == "y" and side == 1: t = t + 0.25 * np.clip((r - (hub + lip) / 2) / (lip - hub), 0, 1)
+                out.append(C("spoke_%d_%+.2f_%d" % (k, o, side), np.c_[r * np.cos(t), r * np.sin(t), z(r)]))
+    if st == "dish":
+        for k in range(n):
+            a = 2 * np.pi * k / n; out.append(C("dish_hole_%d" % k, superellipse(0.08, 0.05, 2.5, 32, 0.62 * np.cos(a), 0.62 * np.sin(a)), True))
+    return out
+
+
+def tyre_profile(p):
+    w, h = p["width"] * 3, p["width"] * 3 * p["aspect"]; r = p["shoulder_r"] * 3; bu = p["bulge"] * 3
+    side = bezier([(-w / 2, 0), (-w / 2 - bu, h * 0.5), (-w / 2, h - r)], 16)
+    sh = arc(-w / 2 + r, h - r, r, np.pi, np.pi / 2, 10)
+    tread = [(-w / 2 + r, h), (w / 2 - r, h)]
+    prof = np.r_[side, sh, tread, arc(w / 2 - r, h - r, r, np.pi / 2, 0, 10), bezier([(w / 2, h - r), (w / 2 + bu, h * 0.5), (w / 2, 0)], 16)]
+    out = [C("section", prof)]
+    for g in range(p["grooves"]):
+        x = -w / 2 + r + (g + 1) * (w - 2 * r) / (p["grooves"] + 1); d = p["tread_depth"] * 3
+        out.append(C("groove_%d" % g, [(x - 0.01, h), (x - 0.01, h - d), (x + 0.01, h - d), (x + 0.01, h)]))
+    return out
+
+
+def grille(p):
+    a = 1.0; b = a * p["aspect"] * 2; fr = p["frame"]
+    if fr == "trapezoid": F = [(-a, b / 2), (a, b / 2), (a * 0.8, -b / 2), (-a * 0.8, -b / 2)]
+    elif fr == "hexagon": F = [(-a, 0), (-a * 0.7, b / 2), (a * 0.7, b / 2), (a, 0), (a * 0.7, -b / 2), (-a * 0.7, -b / 2)]
+    elif fr == "kidney": F = superellipse(a * 0.45, b / 2, 3.0, 64, -a * 0.5).tolist()
+    elif fr == "slot": F = superellipse(a, b / 4, 6, 64).tolist()
+    elif fr == "split": F = superellipse(a * 0.45, b / 2, 4, 48, -0.52).tolist()
+    else: F = superellipse(a, b / 2, 4, 96).tolist()
+    out = [C("frame", F, True)]
+    if fr in ("kidney", "split"): out.append(C("frame_mirror", np.array(F) * [-1, 1], True))
+    n, th, ang, inf = p["count"], p["thickness"], math.radians(p["angle_deg"]), p["infill"]
+    if inf in ("h_slats", "v_slats", "chevron", "crosshatch"):
+        for k in range(n):
+            u = -1 + (k + 0.5) * 2 / n
+            if inf == "h_slats": out.append(C("slat_%d" % k, [(-a, u * b / 2), (a, u * b / 2 + math.tan(ang) * 0.2)]))
+            elif inf == "v_slats": out.append(C("slat_%d" % k, [(u * a, -b / 2), (u * a + math.tan(ang) * b, b / 2)]))
+            elif inf == "chevron": out.append(C("chev_%d" % k, [(-a, u * b / 2 - 0.15), (0, u * b / 2 + 0.1), (a, u * b / 2 - 0.15)]))
+            else:
+                out.append(C("x1_%d" % k, [(u * a - b / 2, -b / 2), (u * a + b / 2, b / 2)])); out.append(C("x2_%d" % k, [(u * a + b / 2, -b / 2), (u * a - b / 2, b / 2)]))
+    else:
+        cell = 2 * a / n
+        for i in range(n + 1):
+            for j in range(max(int(b / cell) + 1, 1)):
+                x = -a + i * cell + (cell / 2 if j % 2 and inf != "dots" else 0); y = -b / 2 + (j + 0.5) * cell * (0.87 if inf == "honeycomb" else 1)
+                if abs(x) > a * 0.95 or abs(y) > b / 2: continue
+                rr = cell * 0.5 * th + 0.01
+                if inf == "honeycomb": out.append(C("cell_%d_%d" % (i, j), superellipse(rr, rr, 2, 6, x, y), True))
+                elif inf == "diamond": out.append(C("cell_%d_%d" % (i, j), [(x - rr, y), (x, y + rr), (x + rr, y), (x, y - rr)], True))
+                else: out.append(C("dot_%d_%d" % (i, j), arc(x, y, rr * 0.6, 0, 2 * np.pi, 12), True))
+    return out
+
+
+def _bar(x0, x1, y, t, slant=0.0):
+    return [(x0, y + t / 2), (x1, y + t / 2 + slant), (x1, y - t / 2 + slant), (x0, y - t / 2)]
+
+
+def headlight(p):
+    L, t, s, e, g = p["length"], p["thick"], math.tan(math.radians(p["slant_deg"])), p["elements"], p["sig"]
+    if g == "blade": return [C("blade", _bar(-L / 2, L / 2, 0, t, s * L), True)]
+    if g == "L": return [C("drl", [(-L / 2, t), (L / 2, t + s * L), (L / 2, t / 2 + s * L), (-L / 2 + t, t / 2), (-L / 2 + t, -L / 3), (-L / 2, -L / 3)], True)]
+    if g == "C": return [C("drl", np.r_[arc(0, 0, L / 2, np.pi / 2, 3 * np.pi / 2, 30), arc(0, 0, L / 2 - t, 3 * np.pi / 2, np.pi / 2, 30)], True)]
+    if g == "U": return [C("drl", np.r_[arc(0, 0, L / 2, np.pi, 2 * np.pi, 30), arc(0, 0, L / 2 - t, 2 * np.pi, np.pi, 30)], True)]
+    if g == "arrow": return [C("drl", [(-L / 2, 0), (0, t * 2), (L / 2, t * 2.5), (L / 2, t * 1.5), (0, t), (-L / 2 + t, 0)], True)]
+    if g == "chevron": return [C("chev_%d" % k, [(-L / 2 + k * t * 1.5, 0), (0, L / 4), (L / 2 - k * t * 1.5, 0)]) for k in range(e)]
+    if g == "dots": return [C("dot_%d" % k, arc(-L / 2 + (k + 0.5) * L / e, s * k * 0.1, t, 0, 2 * np.pi, 16), True) for k in range(e)]
+    if g == "projector_cluster": return [C("housing", superellipse(L / 2, L / 5, 4, 64), True)] + [C("lens_%d" % k, arc(-L / 3 + k * L / 3, 0, L / 10, 0, 2 * np.pi, 20), True) for k in range(3)]
+    return [C("upper", _bar(-L / 2, L / 2, L / 6, t, s * L), True), C("lower", superellipse(L / 4, L / 10, 3, 48, 0, -L / 6), True)]
+
+
+def taillight(p):
+    L, t, n, s, g = p["length"], p["thick"], p["segments"], math.tan(math.radians(p["slant_deg"])), p["sig"]
+    if g == "full_bar": return [C("bar", _bar(-1, 1, 0, t, s), True)]
+    if g == "segmented_bar": return [C("seg_%d" % k, _bar(-1 + k * 2 / n + 0.02, -1 + (k + 1) * 2 / n - 0.02, 0, t), True) for k in range(n)]
+    if g == "C": return [C("c_%d" % sd, np.r_[arc(sd * 0.7, 0, L / 3, np.pi / 2, 3 * np.pi / 2, 20), arc(sd * 0.7, 0, L / 3 - t, 3 * np.pi / 2, np.pi / 2, 20)] * [sd, 1] + [0 if sd > 0 else 1.4, 0], True) for sd in (1, -1)]
+    if g == "L": return [C("l_%d" % sd, np.array([(0.3, t), (L + 0.3, t), (L + 0.3, -L / 3), (L + 0.3 - t, -L / 3), (L + 0.3 - t, 0), (0.3, 0)]) * [sd, 1], True) for sd in (1, -1)]
+    if g == "slim_pair": return [C("slim_%d" % sd, np.array(_bar(0.3, 0.3 + L, 0, t, s)) * [sd, 1], True) for sd in (1, -1)]
+    if g == "arrow": return [C("arr_%d" % sd, np.array([(0.3, 0), (0.3 + L, t * 2), (0.3 + L, -t * 2)]) * [sd, 1], True) for sd in (1, -1)]
+    if g == "ring_pair": return [C("ring_%d" % sd, arc(sd * 0.6, 0, L / 4, 0, 2 * np.pi, 32), True) for sd in (1, -1)]
+    return [C("px_%d_%d" % (i, j), superellipse(0.03, 0.03, 8, 8, -0.9 + i * 0.12, -0.15 + j * 0.1), True) for i in range(16) for j in range(4) if (i + j) % 2]
+
+
+def subd_pattern(p):
+    """Quad templates as point grids plus faces; support loops sit at distance `spacing` from the held edge."""
+    g, lo, sp, pat = p["grid"], p["loops"], p["spacing"], p["pattern"]
+    xs = list(np.linspace(-1, 1, g + 1)); ys = list(np.linspace(-1, 1, g + 1))
+    out = []
+    if pat in ("panel_gap_straight", "gap_T_junction", "chamfer_edge"):
+        for k in range(1, lo + 1): xs += [-k * sp, k * sp]
+        if pat == "gap_T_junction":
+            for k in range(1, lo + 1): ys += [0.3 + k * sp, 0.3 - k * sp]
+            ys.append(0.3)
+        xs.append(0.0)
+    if pat in ("corner_L", "corner_3way"):
+        for k in range(1, lo + 1): xs += [1 - k * sp]; ys += [1 - k * sp]
+    xs, ys = sorted(set(np.round(xs, 4))), sorted(set(np.round(ys, 4)))
+    if pat in ("hole_in_grid", "boss", "pocket", "slot"):
+        n = p["sides"] - p["sides"] % 4; rad = 0.45
+        rings = [rad] + [rad + k * sp for k in range(1, lo + 1)] + [0.95]
+        t = np.linspace(0, 2 * np.pi, n, endpoint=False) + np.pi / n
+        for i, rr in enumerate(rings):
+            if pat == "slot": pts = superellipse(rr * 1.6, rr * 0.55, 2, n)
+            else:
+                sq = rr == 0.95                          # last ring is the square border: circle to square transition
+                den = np.maximum(np.abs(np.cos(t)), np.abs(np.sin(t))) if sq else np.ones_like(t)
+                pts = np.c_[np.cos(t), np.sin(t)] * rr / den[:, None]
+            out.append(C("ring_%d%s" % (i, "_support" if 0 < i <= lo else ""), pts, True))
+        inner, outer = out[0]["pts"], out[len(rings) - 1]["pts"]
+        for k in range(n): out.append(C("spoke_%d" % k, [inner[k], outer[k]]))
+        if pat in ("boss", "pocket"):
+            dz = 0.2 if pat == "boss" else -0.2
+            out[0]["pts"] = [[x, y, dz] for x, y, _ in out[0]["pts"]]
+        return out
+    for x in xs: out.append(C(("loop_support_x%.2f" if abs(x) < 0.5 and x != 0 else "edge_x%.2f") % x, [(x, -1), (x, 1)]))
+    for y in ys: out.append(C(("loop_support_y%.2f" if 0.1 < y < 0.6 and pat == "gap_T_junction" else "edge_y%.2f") % y, [(-1, y), (1, y)]))
+    if pat == "panel_gap_curved":
+        for k in range(-lo, lo + 1):
+            out.append(C("gap_curve_%+d" % k, bezier([(-1, -0.6 + k * sp), (-0.2, 0.4 + k * sp), (0.3, -0.3 + k * sp), (1, 0.5 + k * sp)], 40)))
+    if pat == "panel_gap_straight": out.append(C("gap", [(0, -1, -0.05), (0, 1, -0.05)]))
+    if pat == "chamfer_edge": out.append(C("chamfer", [(-sp, -1, 0), (sp, -1, -0.1)]))
+    if pat == "corner_3way": out.append(C("pole_3", [(1, 1, 0), (1 - sp, 1 - sp, 0.05)]))
+    return out
+
+
+def tree_architecture(p):
+    """2D skeleton from architectural characters: monopodial axis grows from its apex, sympodial axis is relayed by a
+    lateral after each module (terminal flowering); rhythmic branching makes tiers, continuous makes one branch per
+    node, diffuse makes random nodes; plagiotropic branches grow near horizontal."""
+    rng = np.random.default_rng(int(p["tiers"] * 1000 + p["angle_deg"]))
+    out = []; A = math.radians(p["angle_deg"])
+
+    def axis(x, y, ang, length, order, name):
+        pts = [(x, y)]; nodes = 8 if p["branching"] != "rhythmic" else p["tiers"]
+        for i in range(1, nodes + 1):
+            seg = length / nodes; ang2 = ang + (p["droop"] * 0.08 * order if p["orientation"] != "orthotropic" or order else 0)
+            ang = ang2; x += seg * math.cos(ang); y += seg * math.sin(ang); pts.append((x, y))
+            make = {"rhythmic": True, "continuous": True, "diffuse": rng.random() < 0.4, "none": False}[p["branching"]]
+            if make and order < p["orders"] and i < nodes:
+                for sd in ((-1, 1) if p["branching"] == "rhythmic" else ((-1) ** i,)):
+                    child = ang + sd * A
+                    if p["orientation"] in ("plagiotropic", "mixed") and order == 0: child = math.pi / 2 + sd * (math.pi / 2 - 0.15)
+                    axis(x, y, child, length * p["ratio"] * (1 - i / (nodes + 1)) * 1.4, order + 1, "%s_%d%s" % (name, i, "L" if sd < 0 else "R"))
+        out.append(C("axis_o%d_%s" % (order, name), pts))
+        if p["growth"] == "sympodial" and order == 0 and length > 0.3:
+            axis(x, y, ang + A * 0.4, length * 0.6, order, name + "_relay")
+    axis(0, 0, math.pi / 2, 1.6, 0, "trunk")
+    return out
+
+
+GEN = {k: globals()[k] for k in CAT}
+
+
+def generate(family, n):
+    p = params(family, n); curves = GEN[family](p)
+    return {"_date": "25 October 2026", "family": family, "n": n, "params": p, "curves": curves}
+
+
+def draw_cell(d, box, data, fonts):
+    x0, y0, s = box; pad = 18
+    P = np.concatenate([np.array(c["pts"])[:, :2] for c in data["curves"]]) if data["curves"] else np.zeros((1, 2))
+    lo, hi = P.min(0), P.max(0); span = max((hi - lo).max(), 1e-6); sc = (s - 2 * pad) / span
+    cx, cy = (lo + hi) / 2
+    tr = lambda q: [(x0 + s / 2 + (x - cx) * sc, y0 + s / 2 + 8 - (y - cy) * sc) for x, y in q]
+    for c in data["curves"]:
+        q = tr(np.array(c["pts"])[:, :2]); q = q + q[:1] if c["closed"] else q
+        col = SHEET["loop"] if "support" in c["name"] or "spoke_" in c["name"] and data["family"] == "subd_pattern" else SHEET["ink"]
+        if data["family"] == "subd_pattern" and "support" not in c["name"]: col = (150, 150, 150)
+        if c["name"] in ("gap", "gap_curve_+0", "chamfer", "pole_3", "ring_0"): col = SHEET["accent"]
+        if len(q) > 1: d.line(q, fill=col, width=2)
+    d.text((x0 + 8, y0 + 6), str(data["n"]), font=fonts[0], fill=SHEET["accent"])
+    lab = next((str(v) for k, v in data["params"].items() if isinstance(v, str)), "")
+    d.text((x0 + 40, y0 + 8), lab, font=fonts[1], fill=(110, 110, 110))
+
+
+def sheet(family, start=0, count=64):
+    s, cols = SHEET["cell"], SHEET["cols"]; rows = math.ceil(count / cols)
+    img = Image.new("RGB", (cols * s, rows * s + 40), SHEET["bg"]); d = ImageDraw.Draw(img)
+    fonts = (ImageFont.truetype(SHEET["num_font"], 18), ImageFont.truetype(SHEET["font"], 13))
+    d.text((12, 10), "%s : %s" % (family, CAT[family]["what"][:150]), font=ImageFont.truetype(SHEET["font"], 16), fill=SHEET["ink"])
+    for i in range(count):
+        n = start + i; draw_cell(d, ((i % cols) * s, 40 + (i // cols) * s, s), generate(family, n), fonts)
+    os.makedirs(OUT, exist_ok=True); path = os.path.join(OUT, "%s_n%04d-%04d.png" % (family, start, start + count - 1)); img.save(path)
+    return path
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[0] == "sheet":
+        fams = list(CAT) if a[1] == "all" else [a[1]]
+        kw = dict(x.split("=") for x in a[2:])
+        for f in fams: print(sheet(f, int(kw.get("start", 0)), int(kw.get("count", 64))))
+    elif a[0] == "export":
+        json.dump(generate(a[1], int(a[2])), open(a[3], "w")); print(a[3])
