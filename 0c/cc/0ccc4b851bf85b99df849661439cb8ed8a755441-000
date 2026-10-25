@@ -1,0 +1,45 @@
+# 25 October 2026 : ZenRay Meshes, CLEANLINESS of a lofted body grid (the judge a car modeler uses, not the sheet score) :
+# per character row, inflections of x(z) and y(z) (curvature sign changes above a noise floor) ; per station, folds (a row
+# above its upper neighbour, or rows crossing in x) ; per row, mean crease angle with the next band (how crisp the line is).
+# Verdict: clean = 0 folds and at most max_inflections per row. FR : propreté mesurée : inflexions, plis, angle des arêtes.
+# Usage: python ShapeCheck.py <loft.npz> <cage_prefix> [z0=-2.10] [z1=1.86] [max_inflections=2]
+import sys, json
+import numpy as np
+
+
+def main(npz, prefix, z0=-2.10, z1=1.86, max_inf=2):
+    z0, z1, max_inf = float(z0), float(z1), int(max_inf)
+    d = np.load(npz, allow_pickle=True); nt, R = d["grid_shape"]; G = d["P"].reshape(nt, R, 3); cols = d["grid_cols"]
+    cj = json.load(open(prefix + "_cage.json")); E = cj["exp_rows"]; nh = len(E); Ro = cj["ring"]
+    sel = (G[:, 0, 2] >= z0) & (G[:, 0, 2] <= z1); G = G[sel]
+    # +x half columns in bottom to top order : original ring columns nh-1 .. 2nh-3 then 0 (roof centre)
+    half = [k for k in range(len(cols)) if cols[k] >= nh - 1] + [k for k in range(len(cols)) if cols[k] == 0][:1]
+    res = {"rows": {}, "folds": 0}
+    z = G[:, half[0], 2]
+    import os   # 25 October 2026: the wheel arch zones (cut and snapped onto the arc) are not counted as waviness
+    wp = os.path.join(os.path.dirname(prefix), "wheel_params.json"); arch = np.zeros(len(z), bool)
+    if os.path.exists(wp):
+        Wp = json.load(open(wp))
+        for i in Wp["instances"]: arch |= np.abs(z - i["z"]) < Wp["tyre_r"] * 1.6
+    for k in half:
+        name = E[cols[k] - (nh - 1)] if cols[k] >= nh - 1 else "roof_centre"
+        inf = 0
+        for a in (0, 1):
+            v = G[:, k, a]; c2 = np.gradient(np.gradient(v, z), z); c2[np.abs(c2) < 0.05] = 0; c2[arch] = 0; sgn = np.sign(c2[c2 != 0])
+            inf += int((np.diff(sgn) != 0).sum()) if len(sgn) > 1 else 0
+        res["rows"].setdefault(name, {"inflections": 0}); res["rows"][name]["inflections"] = max(res["rows"][name]["inflections"], inf)
+    ys = G[:, half, 1]; xs = np.abs(G[:, half, 0])
+    up = [i for i, k in enumerate(half) if cols[k] - (nh - 1) >= E.index("sill") or cols[k] == 0]
+    res["folds"] = int((np.diff(ys[:, up], axis=1) < -0.002).sum())
+    for i in range(1, len(half) - 1):   # crease angle at row i between band (i-1,i) and band (i,i+1), in the section plane
+        a_ = G[:, half[i - 1], :2] - G[:, half[i], :2]; b_ = G[:, half[i + 1], :2] - G[:, half[i], :2]
+        cs = (a_ * b_).sum(1) / (np.linalg.norm(a_, axis=1) * np.linalg.norm(b_, axis=1) + 1e-9)
+        name = E[cols[half[i]] - (nh - 1)] if cols[half[i]] >= nh - 1 else "?"
+        res["rows"].setdefault(name, {})["crease_deg"] = round(float(180 - np.degrees(np.arccos(np.clip(cs, -1, 1))).mean()), 1)
+    bad = [n for n, v in res["rows"].items() if v.get("inflections", 0) > max_inf]
+    res["clean"] = res["folds"] == 0 and not bad; res["too_wavy"] = bad
+    print(json.dumps(res))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

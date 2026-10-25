@@ -10,7 +10,10 @@ from PIL import Image
 import Raster
 
 VIEWS = {"three_quarter_front": ((0.70, 0, -0.71), (-0.25, 0.94, -0.25)), "three_quarter_rear": ((-0.70, 0, 0.71), (0.25, 0.94, 0.25)),
-         "side": ((0, 0, -1), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0))}
+         "side": ((0, 0, -1), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0)),
+         # 26 October 2026: extra views for close ups (CV_VIEWS picks four, CV_FOCUS "z0,z1" frames a part of the length)
+         "back": ((-1, 0, 0), (0, 1, 0)), "top": ((0, 0, -1), (-1, 0, 0)), "low_rear": ((-0.75, 0, 0.66), (0.08, 0.99, 0.09)),
+         "low_front": ((0.75, 0, -0.66), (-0.08, 0.99, -0.09))}
 KEY = np.array([-0.35, 0.75, 0.55]); KEY /= np.linalg.norm(KEY)
 
 
@@ -19,11 +22,14 @@ def main(npz, out, exclude="", cusp=30, res=900):
     if "T" in d.files and exclude:
         subs = [s for s in exclude.split(",") if s]; N = d["names"]; keep = np.array([not any(s in n for s in subs) for n in N])[d["T"]]; F = F[keep]
     res = int(res); r = Raster.Renderer(P, F, smooth_deg=float(cusp)); V = P[np.unique(F)]
+    fz = os.environ.get("CV_FOCUS")
+    if fz: z0, z1 = map(float, fz.split(",")); V = V[(V[:, 2] >= z0) & (V[:, 2] <= z1)]
     c = (V.max(0) + V.min(0)) / 2; ext = np.linalg.norm(V.max(0) - V.min(0)); tiles = []
-    for name, (rx, uy) in VIEWS.items():
+    names = os.environ.get("CV_VIEWS", "three_quarter_front,three_quarter_rear,side,front").split(",")
+    for name, (rx, uy) in [(n, VIEWS[n]) for n in names]:
         rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
         M, _, N_, _ = r.render(c, res / (ext * 1.05), (rx.tolist(), uy.tolist(), tz.tolist()), res)
-        Lc = np.array([KEY @ rx, KEY @ uy, KEY @ tz]); sh = np.clip(0.18 + 0.82 * np.clip((N_ * Lc).sum(-1), 0, 1), 0, 1)
+        Lc = np.array([0.30, 0.55, 0.78]); Lc /= np.linalg.norm(Lc); sh = np.clip(0.18 + 0.82 * np.clip((N_ * Lc).sum(-1), 0, 1), 0, 1)
         img = np.where(M, sh * 235, 92).astype(np.uint8); tiles.append(img)
     r.release()
     Image.fromarray(np.concatenate([np.concatenate(tiles[:2], 1), np.concatenate(tiles[2:], 1)], 0)).save(out); print(out)

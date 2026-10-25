@@ -10,7 +10,8 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
 
-P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02, "bg_model": "median", "bg_thresh_q": 9.0, "tex_thresh": 3.0, "close_iter": 2}
+P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02, "bg_model": "median", "bg_thresh_q": 9.0, "tex_thresh": 3.0, "close_iter": 2,
+     "shadow_drop": 0, "shadow_lo": 3.0, "shadow_hi": 30.0, "shadow_sd": 2.5}   # 26 October 2026: cast shadow removal, off by default
 
 
 def separators(g, axis):
@@ -62,6 +63,14 @@ def cutout(rgb):
         bgL = Xf(yn, xn) @ coef
         mu = ndi.uniform_filter(L, 5); sd = np.sqrt(np.maximum(ndi.uniform_filter(L * L, 5) - mu * mu, 0))
         m = (np.abs(L - bgL) > P["bg_thresh_q"]) | (sd > P["tex_thresh"])
+    if P.get("shadow_drop", 0):
+        # 26 October 2026: a soft cast shadow (car top view : 8 to 10 levels under the backdrop, smooth) passed the colour
+        # test and stretched the car 0.2 m at the rear and 6 cm on one side ; a pixel a little DARKER than the backdrop
+        # (shadow_lo to shadow_hi levels) and smooth (local deviation under shadow_sd) is backdrop in shadow, not object.
+        # FR : l'ombre portée, un peu plus sombre que le fond et lisse, n'est pas l'objet.
+        L_ = a.mean(-1); bgL_ = float(np.asarray(bg).mean()); mu_ = ndi.uniform_filter(L_, 5)
+        sd_ = np.sqrt(np.maximum(ndi.uniform_filter(L_ * L_, 5) - mu_ * mu_, 0))
+        m &= ~((L_ < bgL_ - P["shadow_lo"]) & (L_ > bgL_ - P["shadow_hi"]) & (sd_ < P["shadow_sd"]))
     m = ndi.binary_opening(m, iterations=1)
     lab, n = ndi.label(m)
     area = m.size
