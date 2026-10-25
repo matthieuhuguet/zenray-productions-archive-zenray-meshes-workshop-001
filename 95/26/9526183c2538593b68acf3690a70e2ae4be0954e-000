@@ -1,0 +1,84 @@
+# 25 October 2026 (objective = symmetrised hull masks since v17) : ZenRay Meshes, the archetype LEARNS its rule values on an instance (coordinate search, no AI).
+# EN: every numeric construction rule of the archetype (PARAMS) plus the Houdini side parameters (crease weight, track,
+# global scale) is tuned to maximise the mean silhouette IoU of the kept views; each evaluation = build the cage in
+# Python, recook and export in the live Houdini through the zrhoudini bridge, render the six views on the GPU.
+# The best values are written to <work>/arch_params.json (instance) and logged; their median over the dataset becomes
+# the archetype's defaults. FR : l'archétype apprend ses valeurs de règles sur une instance, par la note de la planche.
+# Usage: python ArchetypeFit.py <work_dir> [rounds=2]
+import sys, os, json, subprocess, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "archetypes"))
+import numpy as np
+import ArchetypeCar as A
+import FitScale as FS
+from PIL import Image
+
+PY_BRIDGE = ["python3", "/Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py", "hom"]
+SPACE = {  # rule: (min, max, step) ; py = Python archetype rule, hou = CTRL_zrm parameter
+    "end_inset": ("py", 0.0, 0.06, 0.01), "end_face_scale": ("py", 0.8, 1.0, 0.03), "arch_pad": ("py", 1.0, 1.15, 0.02),
+    "sill_h": ("py", 0.02, 0.15, 0.02), "door_low_frac": ("py", 0.2, 0.7, 0.08), "glass_inset": ("py", 0.0, 0.1, 0.015),
+    "roof_edge_drop": ("py", 0.0, 0.08, 0.012), "fender_gap": ("py", 0.0, 0.08, 0.015),
+    "crease_weight": ("hou", 0.5, 6.0, 0.75), "track_half": ("hou", 0.8, 1.05, 0.005), "track_half_rear": ("hou", 0.8, 1.05, 0.005),   # fine step 25 October 2026
+    "floor_lift": ("py", -0.02, 0.05, 0.005), "belt_drop": ("py", 0.6, 0.95, 0.03),   # 25 October 2026
+    # wheel component rules (25 October 2026): tyre shoulder bevel, widths and radius learned against the hull
+    "shoulder": ("hou", 0.0, 0.06, 0.01), # tyre_r, tyre_w, tyre_w_rear are MEASURED (Hough, end views) and never learned: the search shrank them to its bounds
+    # to erase the wheels from the silhouette (25 October 2026, rule: a measured dimension is not a learnable rule)
+}
+
+
+def evaluate(wd, values, meta, masks):
+    py = {k: v for k, v in values.items() if SPACE[k][0] == "py"}
+    f_ = os.path.join(wd, "arch_params.json"); keep = json.load(open(f_)) if os.path.exists(f_) else {}
+    keep.update(py); json.dump(keep, open(f_, "w"), indent=1)      # merge: a subset run never erases other learned rules (25 October 2026)
+    A.PARAMS.update(py)
+    MEASURE_RULES = ("belt_drop", "segments")   # rules read by measure(): never served from the cache (25 October 2026)
+    m = A.measure(wd) if (not hasattr(evaluate, "m") or any(k in values for k in MEASURE_RULES)) else evaluate.m
+    evaluate.m = m
+    A.build(m, os.path.join(wd, "arch_v1"))
+    hv = {k: v for k, v in values.items() if SPACE[k][0] == "hou"}
+    out = os.path.abspath(os.path.join(wd, "car_fit_eval.obj"))   # absolute: Houdini has another working directory
+    code = "import hou\nc=hou.node('/obj/ZRM_Car/CTRL_zrm')\n" + "".join("c.parm('%s').set(%r)\n" % (k, v) for k, v in hv.items()) + \
+        "geo=hou.node('/obj/ZRM_Car'); geo.node('IN_cage').parm('reload').pressButton(); geo.node('cage_creases').cook(force=True)\n" + \
+        "ex=geo.node('EXPORT_obj'); ex.parm('sopoutput').set(%r); ex.parm('execute').pressButton(); result='ok'" % out
+    subprocess.run(PY_BRIDGE + [code, "live"], capture_output=True, text=True, timeout=120)
+    import trimesh
+    mesh = trimesh.load(out, force="mesh", process=False)
+    sc, per = FS.mean_iou(mesh.vertices, mesh.faces, meta, masks)
+    return sc, per
+
+
+def main(wd, rounds=2, only=None):
+    if only:   # 25 October 2026: learn a subset of rules (one component at a time)
+        for k in [k for k in SPACE if k not in only.split(",")]: SPACE.pop(k)
+    meta = json.load(open(os.path.join(wd, "frame/frame.json")))
+    masks = {v["name"]: np.asarray(Image.open(os.path.join(wd, "frame_hull/mask_%s.png" % v["name"]))) > 127 for v in meta["views"]}
+    A.load_overrides(wd)
+    cur = {k: (A.PARAMS[k] if s[0] == "py" else None) for k, s in SPACE.items()}
+    # current Houdini values
+    r = subprocess.run(PY_BRIDGE + ["import hou\nc=hou.node('/obj/ZRM_Car/CTRL_zrm')\nresult={k: c.evalParm(k) for k in %r}" % [k for k, s in SPACE.items() if s[0] == "hou"], "live"], capture_output=True, text=True)
+    cur.update(json.loads(r.stdout)["result"])
+    best, per = evaluate(wd, cur, meta, masks)
+    log = [{"t": time.strftime("%H:%M:%S"), "values": dict(cur), "mean": best, "per": per}]
+    print(json.dumps({"start": round(best, 4), "per": {k: round(v, 4) for k, v in per.items()}}), flush=True)
+    for rd in range(int(rounds)):
+        for k, (side, lo, hi, step) in SPACE.items():
+            for sgn in (1, -1):
+                while True:
+                    t = dict(cur); t[k] = float(np.clip(cur[k] + sgn * step, lo, hi))
+                    if t[k] == cur[k]:
+                        break
+                    sc, pv = evaluate(wd, t, meta, masks)
+                    if sc > best + 1e-5:
+                        best, per, cur = sc, pv, t
+                        log.append({"t": time.strftime("%H:%M:%S"), "rule": k, "value": t[k], "mean": best, "per": per})
+                        print(json.dumps({"round": rd, "rule": k, "value": round(t[k], 4), "mean": round(best, 4)}), flush=True)
+                    else:
+                        break
+    evaluate(wd, cur, meta, masks)            # leave the best state built in Houdini
+    json.dump({"_date": "25 October 2026", "best_mean": best, "per_view": per, "values": cur, "log": log},
+              open(os.path.join(wd, "archetype_fit.json"), "w"), indent=1)
+    print(json.dumps({"best": round(best, 4), "per": {k: round(v, 4) for k, v in per.items()}, "values": cur}), flush=True)
+
+
+if __name__ == "__main__":
+    kw = dict(x.split("=", 1) for x in sys.argv[2:])
+    main(os.path.abspath(sys.argv[1]), int(kw.get("rounds", 2)), kw.get("only"))

@@ -1,0 +1,97 @@
+# 25 October 2026 : ZenRay Meshes, generic rule 7 : SILHOUETTE FIT OF THE CAGE through the linear subdivision matrix.
+# EN: limit surface V = S @ C (S from SubdivMatrix.py, exact). Each iteration renders the model in every kept view,
+# finds the subdivided vertices lying on the model contour, and asks each of them to move, in the image plane, to the
+# target contour (signed distance field of the symmetrised hull mask, gradient direction). The cage displacement is the
+# damped least squares solution of S_sel dC = d, with a Laplacian smoothness term on the cage and the left/right
+# mirror enforced; topology, creases and quad flow never change. The result is stored as per cage vertex offsets
+# "dv" in work/car/cage_comp.json, which the archetype applies last at build time (HDA: rules, then the fit).
+# FR : la cage se règle sur les contours de l'enveloppe à travers la matrice de subdivision ; la topologie ne change pas.
+# Usage: python SilFit.py [iters=12] [lam=0.3] [step=0.7]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy import sparse, ndimage as ndi
+from scipy.sparse.linalg import lsqr
+from scipy.spatial import cKDTree
+import Raster, SheetScore as SS, HullScore as HS
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car"
+P = {"bias_px": 1.0,   # learned 25 October 2026: 0 -> 0.9795, 0.5 -> 0.9811, 1.0 -> 0.9818, 1.5 -> 0.9799
+      "iters": 12, "lam": 0.3, "step": 0.7, "mu": 0.02, "contour_px": 1.5, "max_move_px": 6.0}
+
+
+def project(Pw, meta, v):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]; xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    return np.stack([xc + (Pw @ rx - ucen) * s, yc - (Pw @ uy - vcen) * s], 1), rx, uy, s
+
+
+def laplacian(n, faces_cage):
+    rows, cols = [], []
+    for f in faces_cage:
+        for k in range(4):
+            rows += [f[k], f[(k + 1) % 4]]; cols += [f[(k + 1) % 4], f[k]]
+    A = sparse.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n)); A.data[:] = 1
+    deg = np.asarray(A.sum(1)).ravel()
+    return sparse.diags(np.ones(n)) - sparse.diags(1 / np.maximum(deg, 1)) @ A
+
+
+def main(iters=P["iters"], lam=P["lam"], step=P["step"]):
+    S = sparse.load_npz(os.path.join(W, "subdiv_S.npz")); F = np.load(os.path.join(W, "subdiv_faces.npy"))
+    wm = np.load(os.path.join(W, "wheels_mesh.npz")); WP, WF = wm["P"], wm["F"]
+    C0 = np.load("/tmp/zrm_cage_P.npy"); n = len(C0)
+    cage_f = [tuple(int(t) - 1 for t in l.split()[1:5]) for l in open(os.path.join(W, "arch_v1_cage.obj")) if l.startswith("f ")]
+    L = laplacian(n, cage_f)
+    mir = cKDTree(C0).query(C0 * np.array([-1, 1, 1]))[1]
+    meta, shapes, H = HS.hull_masks(os.path.join(W, "frame"), os.path.join(W, "hull.obj"), True)
+    views = [v for v in meta["views"] if v["kept"]]
+    sdf = {}
+    for v in views:
+        h = H[v["name"]]; sdf[v["name"]] = ndi.distance_transform_edt(~h) - ndi.distance_transform_edt(h)   # + outside
+    Ftri = np.concatenate([F[:, [0, 1, 2]], F[:, [0, 2, 3]]])
+    cp_path = os.path.join(W, "cage_comp.json"); cp0 = json.load(open(cp_path))
+    prev = np.array(cp0["dv"]) if "dv" in cp0 and len(cp0["dv"]) == n else np.zeros((n, 3))
+    C = C0 + prev; best = (-1, C.copy()); log = []          # resumable: start from the offsets already found (25 October 2026)
+    for it in range(int(iters) + 1):
+        V = S @ C
+        allV = np.concatenate([V, WP]); allF = np.concatenate([Ftri, WF + len(V)])
+        r = Raster.Renderer(allV, allF); per = {}; d_sum = np.zeros_like(V); d_cnt = np.zeros(len(V))
+        for v in views:
+            M, _ = SS.render_in_panel(r, meta, v, shapes[v["name"]]); h = H[v["name"]]
+            per[v["name"]] = float((M & h).sum() / max((M | h).sum(), 1))
+            edge = ndi.distance_transform_edt(M) <= P["contour_px"]
+            uv, rx, uy, s = project(V, meta, v)
+            ix = np.clip(np.round(uv[:, 0]).astype(int), 0, h.shape[1] - 1); iy = np.clip(np.round(uv[:, 1]).astype(int), 0, h.shape[0] - 1)
+            on = edge[iy, ix] & M[iy, ix]
+            sd = sdf[v["name"]]; gy, gx = np.gradient(ndi.gaussian_filter(sd, 1.0))
+            g = np.stack([gx[iy, ix], gy[iy, ix]], 1); g /= np.linalg.norm(g, axis=1, keepdims=True) + 1e-9
+            mv = -np.clip(sd[iy, ix] + P["bias_px"], -P["max_move_px"], P["max_move_px"])[:, None] * g   # bias: aim inside the contour (rasteriser coverage)      # pixels, toward the target contour
+            world = (mv[:, 0:1] * rx[None] - mv[:, 1:2] * uy[None]) / s
+            d_sum[on] += world[on]; d_cnt[on] += 1
+        r.release()
+        mean = float(np.mean(list(per.values()))); log.append({"iter": it, "mean": round(mean, 4), "per": {k: round(x, 4) for k, x in per.items()}})
+        print(json.dumps(log[-1]), flush=True)
+        if mean > best[0]: best = (mean, C.copy())
+        if it == iters: break
+        sel = np.where(d_cnt > 0)[0]; d = d_sum[sel] / d_cnt[sel, None] * step
+        Ssel = S[sel]
+        A = sparse.vstack([Ssel, lam * L, P["mu"] * sparse.identity(n)]).tocsr()
+        dC = np.zeros_like(C)
+        for k in range(3):
+            b = np.concatenate([d[:, k], np.zeros(n), np.zeros(n)])
+            dC[:, k] = lsqr(A, b, atol=1e-8, btol=1e-8, iter_lim=2000)[0]
+        dC = 0.5 * (dC + dC[mir] * np.array([-1, 1, 1]))     # left/right mirror
+        C = C + dC
+    mean, C = best
+    cp = json.load(open(cp_path))
+    cp["dv"] = (C - C0).tolist(); cp["dv_note"] = "25 October 2026: silhouette fit offsets (SilFit.py), applied last"
+    json.dump(cp, open(cp_path, "w"))
+    json.dump({"_date": "25 October 2026", "best_mean": mean, "log": log, "params": {"iters": iters, "lam": lam, "step": step, **P}}, open(os.path.join(W, "silfit.json"), "w"), indent=1)
+    print(json.dumps({"best_mean": round(mean, 4)}))
+
+
+if __name__ == "__main__":
+    kw = dict(a.split("=") for a in sys.argv[1:]); P["bias_px"] = float(kw.get("bias", P["bias_px"])); main(int(kw.get("iters", P["iters"])), float(kw.get("lam", P["lam"])), float(kw.get("step", P["step"])))

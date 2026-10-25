@@ -1,0 +1,89 @@
+# 25 October 2026 : ZenRay Meshes, step 2 : put the six cut out views into one world frame and measure their consistency.
+# EN: each panel says which world axis its image right and image up show (params JSON). Every world axis is measured by
+# several views (its extent in pixels); per view scales (px per metre) are solved by least squares in log space with one
+# known real dimension, and the residual of each view says how much the generator contradicted itself. Views above
+# `max_residual` are dropped from reconstruction (reported, never silently). Output: aligned masks on one metric grid.
+# FR : met les vues dans un même repère, calcule l'échelle de chaque vue, mesure et écarte les vues incohérentes.
+# Usage: python SheetFit.py <fit_params.json>
+import sys, os, json
+import numpy as np
+from PIL import Image
+
+AX = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+
+
+def main(pfile):
+    P = json.load(open(pfile))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(pfile)))
+    vdir = os.path.join(root, P["views_dir"]); out = os.path.join(root, P["out_dir"]); os.makedirs(out, exist_ok=True)
+    sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    views = []
+    for pan in sheet["panels"]:
+        spec = P["panels"].get(pan["name"])
+        if spec is None:
+            continue
+        m = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_mask.png" % (pan["index"], pan["name"])))) > 127
+        ys, xs = np.nonzero(m)
+        rx, uy = np.array(AX[spec["right"]], float), np.array(AX[spec["up"]], float)
+        tz = np.cross(rx, uy)
+        views.append(dict(name=pan["name"], mask=m, rx=rx, uy=uy, tz=tz, ext_px={int(np.argmax(np.abs(rx))): np.ptp(xs) + 1, int(np.argmax(np.abs(uy))): np.ptp(ys) + 1},
+                          bbox=(xs.min(), ys.min(), xs.max(), ys.max())))
+    # least squares: log px = log s_v + log D_axis ; unknowns: log s_v (all views), log D_axis (3); gauge: D_ref fixed
+    nv = len(views); rows, rhs = [], []
+    for i, v in enumerate(views):
+        for a, px in v["ext_px"].items():
+            r = np.zeros(nv + 3); r[i] = 1; r[nv + a] = 1; rows.append(r); rhs.append(np.log(px))
+    ref_axis = {"x": 0, "y": 1, "z": 2}[P["known_axis"]]
+    r = np.zeros(nv + 3); r[nv + ref_axis] = 1; rows.append(r * 100); rhs.append(np.log(P["known_size_m"]) * 100)
+    sol, *_ = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)
+    scales = np.exp(sol[:nv]); dims = np.exp(sol[nv:])
+    report = {"dims_m": dims.round(4).tolist(), "views": []}
+    for i, v in enumerate(views):
+        res = {"xyz"[a]: float(round(100 * (px / (scales[i] * dims[a]) - 1), 2)) for a, px in v["ext_px"].items()}
+        worst = max(abs(x) for x in res.values())
+        v["px_per_m"] = float(scales[i]); v["residual_pct"] = res; v["kept"] = bool(worst <= P["max_residual_pct"]) and v["name"] not in P.get("drop_views", [])   # 25 October 2026: explicit drops, reported
+        report["views"].append({"name": v["name"], "px_per_m": round(v["px_per_m"], 2), "residual_pct": res, "kept": v["kept"]})
+    # symmetry registration (rule for mirror symmetric archetypes, P["symmetric_axis"] = "x"): in every view that shows
+    # that axis, find the image line that best mirrors the silhouette onto itself and centre the bbox on it, keeping
+    # the extent; generated sheets often drift the object a few pixels inside its panel.
+    sym = P.get("symmetric_axis")
+    if sym:
+        sa = {"x": 0, "y": 1, "z": 2}[sym]
+        for v in views:
+            for img_axis, vec in ((1, v["rx"]), (0, v["uy"])):
+                if int(np.argmax(np.abs(vec))) != sa:
+                    continue
+                m = v["mask"]; prof = m.sum(axis=1 - img_axis if img_axis == 1 else 1).astype(float) if False else None
+                proj = m.any(axis=0) if img_axis == 1 else m.any(axis=1)
+                mm = m if img_axis == 1 else m.T
+                n = mm.shape[1]; best, bc = -1, None
+                lo_i, hi_i = np.where(proj)[0][[0, -1]]
+                for c2 in range(2 * lo_i + 20, 2 * hi_i - 19):     # c2 = twice the mirror column (half pixel steps)
+                    idx = np.arange(n); mir = c2 - idx
+                    ok = (mir >= 0) & (mir < n)
+                    a = mm[:, idx[ok]]; b = mm[:, mir[ok]]
+                    iou = (a & b).sum() / max((a | b).sum(), 1)
+                    if iou > best:
+                        best, bc = iou, c2 / 2.0
+                E = v["ext_px"][sa]
+                bb = list(v["bbox"])
+                if img_axis == 1:
+                    bb[0], bb[2] = int(round(bc - (E - 1) / 2)), int(round(bc + (E - 1) / 2))
+                else:
+                    bb[1], bb[3] = int(round(bc - (E - 1) / 2)), int(round(bc + (E - 1) / 2))
+                v["bbox"] = tuple(bb); v["sym_axis_px"] = float(bc); v["sym_iou"] = float(best)
+                report.setdefault("symmetry", {})[v["name"]] = {"axis_px": round(bc, 1), "mirror_iou": round(best, 4)}
+    # aligned metric frame: each kept view maps its bbox onto the world extent of its two axes
+    lo = -dims / 2; lo[1] = 0.0           # y from the ground
+    meta = {"dims_m": dims.tolist(), "lo": lo.tolist(), "views": []}
+    for v in views:
+        Image.fromarray((v["mask"] * 255).astype(np.uint8)).save(os.path.join(out, "mask_%s.png" % v["name"]))
+        meta["views"].append({"name": v["name"], "rx": v["rx"].tolist(), "uy": v["uy"].tolist(), "tz": v["tz"].tolist(),
+                              "px_per_m": v["px_per_m"], "bbox": [int(b) for b in v["bbox"]], "kept": bool(v["kept"])})
+    json.dump(meta, open(os.path.join(out, "frame.json"), "w"), indent=1)
+    json.dump(report, open(os.path.join(out, "consistency.json"), "w"), indent=1)
+    print(json.dumps(report, indent=1))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

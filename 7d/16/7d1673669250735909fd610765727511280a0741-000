@@ -1,0 +1,61 @@
+# 25 October 2026 : ZenRay Meshes, the TREE archetype learns its rule values on an instance (coordinate search).
+# EN: rules of TreeGrow (growth, pruning, foliage shell) and of the Houdini build (leaf size, cards per clump) are tuned
+# to maximise the mean silhouette IoU of the kept views; each evaluation regrows the skeleton in Python, rebuilds
+# /obj/ZRM_Tree through the zrhoudini bridge and renders the views on the GPU. Writes work/tree/tree_fit.json.
+# FR : l'archétype arbre apprend ses valeurs de règles sur la planche.
+# Usage: python TreeFit.py [rounds=2]
+import sys, os, json, subprocess, time
+H = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, H); sys.path.insert(0, os.path.join(H, "archetypes"))
+import numpy as np, trimesh
+from PIL import Image
+import FitScale as FS
+
+W = os.path.abspath(os.path.join(H, "..", "work", "tree")); PY = "/Users/zenray/.venvs/zenray-uv/bin/python"
+BR = ["python3", "/Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py", "hom"]
+SPACE = {"shell_clumps": ("grow", 800, 6000, 600), "shell_depth_m": ("grow", 0.3, 2.5, 0.3), "influence_m": ("grow", 1.0, 4.0, 0.4),
+         "kill_m": ("grow", 0.2, 1.0, 0.1), "step_m": ("grow", 0.15, 0.5, 0.05), "attractors": ("grow", 2000, 12000, 1500),
+         "root_flare": ("grow", 1.0, 2.5, 0.2), "leaf_size": ("hou", 0.3, 1.6, 0.15), "cards": ("hou", 2, 8, 1),
+         "leaf_scatter": ("hou", 0.0, 0.9, 0.15), "sides": ("hou", 6, 12, 2)}
+
+
+def evaluate(v, meta, masks):
+    args = ["%s=%s" % (k, int(x) if k in ("shell_clumps", "attractors") else x) for k, x in v.items() if SPACE[k][0] == "grow"]
+    subprocess.run([PY, "-I", os.path.join(H, "archetypes", "TreeGrow.py"), os.path.join(W, "hull_B.npz"), os.path.join(W, "tree_v1_measure.json"),
+                    os.path.join(W, "tree_fit_skeleton.json")] + args, capture_output=True, text=True, check=True)
+    out = os.path.join(W, "tree_fit_eval.obj")
+    hv = {k: x for k, x in v.items() if SPACE[k][0] == "hou"}
+    code = ("import hou\ngeo=hou.node('/obj/ZRM_Tree'); c=geo.node('CTRL_zrm')\n" + "".join("c.parm('%s').set(%r)\n" % (k, int(x) if k in ('cards', 'sides') else x) for k, x in hv.items()) +
+            "sk=geo.node('skeleton_chains'); code=sk.parm('python').eval()\nimport re\ncode=re.sub(r\"json.load\\(open\\('[^']*'\\)\\)\", \"json.load(open('%s'))\", code)\nsk.parm('python').set(code)\n" % os.path.join(W, "tree_fit_skeleton.json") +
+            "ex=geo.node('EXPORT_obj'); ex.parm('sopoutput').set(%r); ex.parm('execute').pressButton(); result='ok'" % out)
+    r = subprocess.run(BR + [code, "live"], capture_output=True, text=True, timeout=300)
+    m = trimesh.load(out, force="mesh", process=False)
+    return FS.mean_iou(m.vertices, m.faces, meta, masks)
+
+
+def main(rounds=2):
+    fd = os.path.join(W, "frame_B"); meta = json.load(open(os.path.join(fd, "frame.json")))
+    masks = {v["name"]: np.asarray(Image.open(os.path.join(fd, "mask_%s.png" % v["name"]))) > 127 for v in meta["views"]}
+    import TreeGrow
+    cur = {k: TreeGrow.P[k] for k, s in SPACE.items() if s[0] == "grow"}
+    cur.update({"leaf_size": 0.55, "cards": 4, "leaf_scatter": 0.5, "sides": 8})
+    best, per = evaluate(cur, meta, masks); log = [{"values": dict(cur), "mean": best}]
+    print(json.dumps({"start": round(best, 4), "per": {k: round(x, 4) for k, x in per.items()}}), flush=True)
+    for rd in range(int(rounds)):
+        for k, (side, lo, hi, st) in SPACE.items():
+            for sg in (1, -1):
+                while True:
+                    t = dict(cur); t[k] = float(np.clip(cur[k] + sg * st, lo, hi))
+                    if t[k] == cur[k]: break
+                    sc, pv = evaluate(t, meta, masks)
+                    if sc > best + 1e-4:
+                        best, per, cur = sc, pv, t; log.append({"rule": k, "value": t[k], "mean": best})
+                        print(json.dumps({"round": rd, "rule": k, "value": t[k], "mean": round(best, 4)}), flush=True)
+                    else:
+                        break
+    evaluate(cur, meta, masks)
+    json.dump({"_date": "25 October 2026", "best_mean": best, "per_view": per, "values": cur, "log": log}, open(os.path.join(W, "tree_fit.json"), "w"), indent=1)
+    print(json.dumps({"best": round(best, 4), "per": {k: round(x, 4) for k, x in per.items()}, "values": cur}), flush=True)
+
+
+if __name__ == "__main__":
+    main(*[int(x.split("=")[1]) for x in sys.argv[1:]])

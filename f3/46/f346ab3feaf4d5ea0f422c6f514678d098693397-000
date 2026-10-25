@@ -1,0 +1,79 @@
+# 25 October 2026 : ZenRay Meshes, generic rule 5 : limit surface compensation of an archetype cage.
+# EN: the creased Catmull-Clark subdivision lands inside its cage; per station we compare the SUBDIVIDED body (read in
+# the live Houdini) with the measured profiles (half width from the top view, roof line from the side view, nose and
+# tail ends) and update a width factor, a roof offset and the end offsets in work/car/cage_comp.json, which the
+# archetype applies at build time. Damped fixed point iteration. FR : la cage se pousse jusqu'à ce que la surface
+# subdivisée tombe sur les profils mesurés.
+# Usage: python CageComp.py [iters=4] [gain=0.9]
+import sys, os, json, subprocess
+import numpy as np
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"; PY = "/Users/zenray/.venvs/zenray-uv/bin/python"
+BR = ["python3", "/Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py", "hom"]
+CP = os.path.join(W, "work/car/cage_comp.json"); NPY = os.path.join(W, "work/car/cage_subd_P.npy")
+P = {"learn_ends": 1,   # 25 October 2026: ends learn on their own (subdivision pulls the nose 3.9 cm and the tail 7.7 cm short)
+     "learn_width_roof_ends": 0,   # 25 October 2026: measured widths/roof are NOT the IoU optimum (v18 0.964 vs 0.9727 without); only shoulders and skirts learn by default
+     "iters": 4, "gain": 0.9, "sx_range": [0.85, 1.3], "dy_range": [-0.15, 0.25], "dz_range": [-0.3, 0.3]}
+
+
+def build_and_read():
+    subprocess.run([PY, "-I", os.path.join(W, "Scripts/archetypes/ArchetypeCar.py"), os.path.join(W, "work/car"), os.path.join(W, "work/car/arch_v1")],
+                   check=True, capture_output=True, text=True)
+    code = ("import hou, numpy as np\ng=hou.node('/obj/ZRM_Car'); g.node('IN_cage').parm('reload').pressButton(); g.node('cage_creases').cook(force=True)\n"
+            "geo=g.node('cage_subd').geometry(); np.save(%r, np.array(geo.pointFloatAttribValues('P'), dtype=np.float32).reshape(-1,3)); result=len(geo.points())" % NPY)
+    subprocess.run(BR + [code, "live"], check=True, capture_output=True, text=True, timeout=300)
+    return np.load(NPY)
+
+
+def main(iters=P["iters"], gain=P["gain"]):
+    m = json.load(open(os.path.join(W, "work/car/arch_v1_measure.json"))); pr = m["profiles"]
+    zs_p = np.array(pr["z"]); at = lambda a, z: float(np.interp(-z, -zs_p, np.array(a)))
+    if os.path.exists(CP): os.remove(CP)
+    for it in range(int(iters) + 1):
+        X = build_and_read()
+        st = np.array(json.load(open(os.path.join(W, "work/car/arch_v1_cage.json")))["stations"]); S = len(st)
+        cp = json.load(open(CP)) if os.path.exists(CP) else {"sx": [1.0] * S, "dy": [0.0] * S, "dz_nose": 0.0, "dz_tail": 0.0}
+        err_w, err_t = [], []
+        for i, z in enumerate(st):
+            gap = np.diff(st)
+            h = 0.5 * min(abs(gap[i - 1]) if i > 0 else 1, abs(gap[i]) if i < S - 1 else 1)
+            sel = X[np.abs(X[:, 2] - z) < max(h, 0.01)]
+            if i in (0, S - 1) or len(sel) < 4:
+                continue
+            Wh = m["wheels"]; ra = Wh["tyre_r"] * 1.1
+            if min(abs(z - Wh["front_z"]), abs(z - Wh["rear_z"])) > ra * 1.05:   # underside (skirts, overhangs)
+                ovh = z > Wh["front_z"] + ra or z < Wh["rear_z"] - ra
+                tb = max(at(pr["ybot"], z), 0.0) if ovh else m["floor_y"]
+                cp.setdefault("dyb", [0.0] * S)
+                if it < iters: cp["dyb"][i] = float(np.clip(cp["dyb"][i] + gain * (tb - sel[:, 1].min()), -0.12, 0.12))
+            tw, tt = at(pr["hw"], z), at(pr["ytop"], z)
+            aw, atop = np.abs(sel[:, 0]).max(), sel[:, 1].max()
+            err_w.append(tw - aw); err_t.append(tt - atop)
+            if it < iters:
+                cp["sx"][i] = float(np.clip(cp["sx"][i] * (1 + gain * (tw / max(aw, 1e-3) - 1)), *P["sx_range"]))
+                cp["dy"][i] = float(np.clip(cp["dy"][i] + gain * (tt - atop), *P["dy_range"]))
+        # width by height above the belt (end views see the max over the length): one factor curve over y
+        Fy = np.array(pr["F_y"]); tgt = 0.5 * (np.array(pr["F"]) + np.array(pr["F_back"])); yb = m["belt_y"]
+        fy = np.array(cp.get("fy", [1.0] * len(Fy))); err_y = []
+        for k, y in enumerate(Fy):
+            if y < yb or tgt[k] < 0.05: continue
+            sl = X[np.abs(X[:, 1] - y) < 0.5 * (Fy[1] - Fy[0]) + 0.004]
+            if len(sl) < 3: continue
+            aw = np.abs(sl[:, 0]).max(); err_y.append(tgt[k] - aw)
+            if it < iters: fy[k] = float(np.clip(fy[k] * (1 + gain * (tgt[k] / max(aw, 1e-3) - 1)), 0.8, 1.35))
+        cp["fy"] = fy.tolist(); cp["fy_y"] = Fy.tolist()
+        en, et = float(m["keys"]["nose"] - X[:, 2].max()), float(m["keys"]["tail"] - X[:, 2].min())
+        if it < iters:
+            # end stations follow their neighbours; the end faces get the length correction
+            cp["sx"][0], cp["sx"][-1] = cp["sx"][1], cp["sx"][-2]; cp["dy"][0], cp["dy"][-1] = cp["dy"][1], cp["dy"][-2]
+            cp["dz_nose"] = float(np.clip(cp["dz_nose"] + gain * en, *P["dz_range"])); cp["dz_tail"] = float(np.clip(cp["dz_tail"] + gain * et, *P["dz_range"]))
+            if not P["learn_width_roof_ends"]:
+                cp["sx"] = [1.0] * S; cp["dy"] = [0.0] * S
+                if not P["learn_ends"]: cp["dz_nose"] = 0.0; cp["dz_tail"] = 0.0
+            cp["_date"] = "25 October 2026"; json.dump(cp, open(CP, "w"))
+        print(json.dumps({"iter": it, "width_err_mm": round(1000 * float(np.mean(np.abs(err_w))), 1), "roof_err_mm": round(1000 * float(np.mean(np.abs(err_t))), 1), "shoulder_err_mm": round(1000 * float(np.mean(np.abs(err_y))) if err_y else 0, 1),
+                          "nose_mm": round(1000 * en, 1), "tail_mm": round(1000 * et, 1)}), flush=True)
+
+
+if __name__ == "__main__":
+    kw = dict(a.split("=") for a in sys.argv[1:]); main(int(kw.get("iters", P["iters"])), float(kw.get("gain", P["gain"])))

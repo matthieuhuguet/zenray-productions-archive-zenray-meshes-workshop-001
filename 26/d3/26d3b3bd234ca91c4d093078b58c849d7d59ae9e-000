@@ -1,0 +1,84 @@
+# 25 October 2026 : ZenRay Meshes tree archetype, Houdini build : trunk + limb chains swept as clean quad tubes,
+# leaf clumps of quad cards at the tips. Native SOPs (Python SOP only reads the skeleton JSON into curves).
+# EN: chains: from the root, every node continues with its thickest child, the other children start new chains at
+# the parent position (one tube per branch, like a modeller or SpeedTree); pscale = radius; Sweep 2.0 with a circle of
+# `sides` sides; leaf clump = `cards` crossed quad cards copied to every tip with random orientation and size.
+# FR : chaque branche est un tube propre balayé le long de sa chaîne, des touffes de cartes de feuilles aux extrémités.
+# Run in Houdini: g = {'SKEL': ..., 'OUT': ...}; exec(open(this).read(), g)
+import hou, os
+
+SKEL = globals()["SKEL"]; OUT = globals()["OUT"]
+obj = hou.node("/obj")
+old = obj.node("ZRM_Tree")
+if old:
+    old.destroy()
+geo = obj.createNode("geo", "ZRM_Tree")
+ctrl = geo.createNode("null", "CTRL_zrm")
+ptg = ctrl.parmTemplateGroup()
+f = hou.FolderParmTemplate("tree", "Tree")
+for n, l, v in (("sides", "Tube Sides", 8), ("cards", "Cards per Clump", 4)):
+    f.addParmTemplate(hou.IntParmTemplate(n, l, 1, default_value=(v,), min=3, max=32))
+for n, l, v in (("leaf_size", "Leaf Card Size (m)", 0.55), ("leaf_scatter", "Clump Size Random", 0.5), ("min_radius", "Min Branch Radius (m)", 0.02)):
+    f.addParmTemplate(hou.FloatParmTemplate(n, l, 1, default_value=(v,)))
+ptg.append(f); ctrl.setParmTemplateGroup(ptg)
+sk = geo.createNode("python", "skeleton_chains")
+sk.parm("python").set('''# 25 October 2026 : skeleton JSON -> one polyline per branch chain, pscale = radius, tips as a point group
+import hou, json, numpy as np
+node = hou.pwd(); geo = node.geometry()
+d = json.load(open(%r))
+N = np.array(d["nodes"]); par = d["parent"]; r = np.array(d["radius"]); minr = node.parent().node("CTRL_zrm").evalParm("min_radius")
+ch = [[] for _ in N]
+for i, q in enumerate(par):
+    if q >= 0: ch[q].append(i)
+geo.addAttrib(hou.attribType.Point, "pscale", 0.0); geo.addAttrib(hou.attribType.Prim, "kind", "")
+def poly(pts, rads, kind):
+    if len(pts) < 2: return
+    pp = geo.createPoints([hou.Vector3(*p) for p in pts])
+    for p_, rr in zip(pp, rads): p_.setAttribValue("pscale", float(max(rr, minr)))
+    pr = geo.createPolygon(False)
+    for p_ in pp: pr.addVertex(p_)
+    pr.setAttribValue("kind", kind)
+t = d["trunk"]; poly(t["points"] + [N[0].tolist()], t["radius"] + [float(r[0])], "trunk")
+stack = [(0, None)]
+while stack:
+    start, frm = stack.pop()
+    chain = ([frm] if frm is not None else []) + [start]; n = start
+    while ch[n]:
+        kids = sorted(ch[n], key=lambda c: -r[c]); n2 = kids[0]
+        for k in kids[1:]: stack.append((k, n))
+        chain.append(n2); n = n2
+    poly([N[i].tolist() for i in chain], [r[i] for i in chain], "limb")
+tg = geo.createPointGroup("tips")
+for i in d["tips"]:
+    p_ = geo.createPoint(); p_.setPosition(hou.Vector3(*N[i])); p_.setAttribValue("pscale", 0.0); tg.add(p_)
+for c in d.get("clumps", []):
+    p_ = geo.createPoint(); p_.setPosition(hou.Vector3(*c)); p_.setAttribValue("pscale", 0.0); tg.add(p_)
+''' % SKEL)
+# branches: sweep
+lim = geo.createNode("blast", "branches_only"); lim.setInput(0, sk); lim.parm("group").set("tips"); lim.parm("grouptype").set(3); lim.parm("negate").set(0)
+cl = geo.createNode("delete", "drop_points"); cl.setInput(0, lim); cl.parm("entity").set(1) if cl.parm("entity") else None
+sw = geo.createNode("sweep::2.0", "branch_tubes"); sw.setInput(0, lim)      # input 0 = backbone curves
+sw.parm("surfaceshape").set(1); sw.parm("surfacetype").set(5); sw.parm("endcaptype").set(0)   # tube, quads, open
+sw.parm("cols").setExpression('ch("../CTRL_zrm/sides")'); sw.parm("radius").set(1.0)
+sw.parm("transformbyattribs").set(1); sw.parm("applyscale").set(1)                          # pscale = branch radius
+# leaves: crossed cards clump copied to tips
+tips = geo.createNode("blast", "tips_only"); tips.setInput(0, sk); tips.parm("group").set("tips"); tips.parm("grouptype").set(3); tips.parm("negate").set(1)
+rnd = geo.createNode("attribwrangle", "tip_random"); rnd.setInput(0, tips); rnd.parm("class").set(2)
+rnd.parm("snippet").set('''// random orientation and size per clump (25 October 2026)
+float s = chf("../CTRL_zrm/leaf_size") * fit01(rand(@ptnum + 7), 1 - chf("../CTRL_zrm/leaf_scatter"), 1 + chf("../CTRL_zrm/leaf_scatter"));
+@pscale = s;
+vector4 q = quaternion(radians(rand(@ptnum) * 360), {0,1,0});
+q = qmultiply(q, quaternion(radians(fit01(rand(@ptnum + 3), -40, 40)), {1,0,0}));
+p@orient = q;''')
+card = geo.createNode("grid", "leaf_card"); card.parm("rows").set(2); card.parm("cols").set(2); card.parm("sizex").set(1.0); card.parm("sizey").set(0.6); card.parm("orient").set(0)
+cards = geo.createNode("copyxform", "clump_cards"); cards.setInput(0, card); cards.parm("ncy").setExpression('ch("../CTRL_zrm/cards")'); cards.parm("ry").setExpression('180/ch("../CTRL_zrm/cards")')
+cp = geo.createNode("copytopoints::2.0", "leaf_clumps"); cp.setInput(0, cards); cp.setInput(1, rnd)
+nb = geo.createNode("name", "name_branches"); nb.setInput(0, sw); nb.parm("name1").set("branches")
+nl = geo.createNode("name", "name_leaves"); nl.setInput(0, cp); nl.parm("name1").set("leaves")
+mg = geo.createNode("merge", "tree"); mg.setInput(0, nb); mg.setInput(1, nl)
+outn = geo.createNode("null", "OUT_tree"); outn.setInput(0, mg); outn.setDisplayFlag(True); outn.setRenderFlag(True)
+ex = geo.createNode("rop_geometry", "EXPORT_obj"); ex.setInput(0, outn); ex.parm("sopoutput").set(OUT)
+geo.layoutChildren(); ex.parm("execute").pressButton()
+g = outn.geometry()
+result = {"prims": len(g.prims()), "points": len(g.points()), "quad_pct": round(100.0 * sum(1 for p in g.prims() if p.numVertices() == 4) / max(len(g.prims()), 1), 1),
+          "errors": [n.name() + ": " + " ".join(n.errors()) for n in geo.children() if n.errors()]}

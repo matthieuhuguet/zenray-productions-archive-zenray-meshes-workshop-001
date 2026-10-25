@@ -1,0 +1,23 @@
+#!/bin/zsh
+# 25 October 2026 : ZenRay Meshes car loop step : measure + build the archetype cage, reload and export in the live
+# Houdini (zrhoudini bridge), score against the sheet, append the result to work/car/STATE.json. Usage: RunCar.sh <tag>
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=${1:-iter}
+cd $W
+$PY -I Scripts/archetypes/ArchetypeCar.py work/car work/car/arch_v1 > work/car/last_build.json
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "import hou
+geo=hou.node('/obj/ZRM_Car'); geo.node('IN_cage').parm('reload').pressButton(); geo.node('cage_creases').cook(force=True)
+ex=geo.node('EXPORT_obj'); ex.parm('sopoutput').set('$W/work/car/car_$TAG.obj'); ex.parm('execute').pressButton()
+g=geo.node('OUT_car').geometry(); result={'prims':len(g.prims()),'quad_pct':round(100.0*sum(1 for p in g.prims() if p.numVertices()==4)/len(g.prims()),2)}" live > work/car/last_houdini.json
+$PY -I Scripts/SheetScore.py work/car/frame work/car/views work/car/car_$TAG.obj versions/Car_${TAG}_board_25-October-2026.png > work/car/last_score.json
+$PY -I Scripts/HullScore.py work/car/frame work/car/hull.obj work/car/car_$TAG.obj 1 versions/Car_${TAG}_hull_25-October-2026.png > work/car/last_hull.json
+$PY - <<PYEOF
+import json
+s=json.load(open('work/car/STATE.json')); sc=json.load(open('work/car/last_score.json')); h=json.load(open('work/car/last_houdini.json'))
+gap={v: round(sc['silhouette_iou'][v]-s['target_iou'][v],4) for v in s['target_iou']}
+hs=json.load(open('work/car/last_hull.json'))
+s.setdefault('history',[]).append({'tag':'$TAG','iou':sc['silhouette_iou'],'hull_iou':hs['hull_iou'],'hull_mean':hs['mean'],'gap_to_target':gap,'houdini':h.get('result')})
+s['last']={'version':'$TAG','iou':sc['silhouette_iou']}
+json.dump(s,open('work/car/STATE.json','w'),indent=1,ensure_ascii=False)
+print(json.dumps({'hull_mean':hs['mean'],'hull':hs['hull_iou'],'iou':sc['silhouette_iou'],'gap':gap,'houdini':h.get('result')}))
+PYEOF

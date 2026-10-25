@@ -1,0 +1,92 @@
+# 25 October 2026 : ZenRay Meshes, car build in Houdini, component by component, native SOPs only.
+# EN: BODY = measurement hull -> VDB -> minus wheel arches -> VDB smooth -> polygons -> Quad Remesh (clean quads, edge
+# flow following the curvature) -> one Catmull-Clark level. WHEEL = TYRE (tube with bevelled shoulders, clean rings) +
+# RIM (disc with N spokes), copied to the four measured hubs. All values on CTRL_zrm (HDA logic), measured defaults.
+# FR : carrosserie en quads propres par Quad Remesh, roues refaites comme composants propres, valeurs sur CTRL_zrm.
+# Run in Houdini: g = {}; exec(open(this).read(), g); result = g['result']
+import hou, json, os
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car"
+C = json.load(open(os.path.join(W, "car_components.json")))["wheels"]
+
+obj = hou.node("/obj")
+old = obj.node("ZRM_Car")
+if old:
+    old.destroy()
+geo = obj.createNode("geo", "ZRM_Car")
+ctrl = geo.createNode("null", "CTRL_zrm")
+ptg = ctrl.parmTemplateGroup()
+f1 = hou.FolderParmTemplate("body", "Body")
+f1.addParmTemplate(hou.FloatParmTemplate("voxel", "Voxel Size (m)", 1, default_value=(0.012,), min=0.004, max=0.05))
+f1.addParmTemplate(hou.IntParmTemplate("smooth_iter", "Smooth Iterations", 1, default_value=(4,), min=0, max=30))
+f1.addParmTemplate(hou.IntParmTemplate("quads", "Body Quads", 1, default_value=(14000,), min=1000, max=200000))
+f1.addParmTemplate(hou.IntParmTemplate("subdiv", "Subdivision Levels", 1, default_value=(1,), min=0, max=3))
+f1.addParmTemplate(hou.FloatParmTemplate("arch_margin", "Wheel Arch Margin (m)", 1, default_value=(0.03,), min=0, max=0.2))
+f2 = hou.FolderParmTemplate("wheel", "Wheel")
+for n, l, v in (("tyre_r", "Tyre Radius (m)", C["tyre_r"]), ("tyre_w", "Tyre Width (m)", C["tyre_w"]), ("rim_r", "Rim Radius (m)", C["rim_r"] * 0.78),
+                ("track_half", "Half Track (m)", C["track_half"]), ("front_z", "Front Axle Z (m)", C["front_z"]), ("rear_z", "Rear Axle Z (m)", C["rear_z"]),
+                ("shoulder", "Tyre Shoulder Bevel (m)", 0.035)):
+    f2.addParmTemplate(hou.FloatParmTemplate(n, l, 1, default_value=(v,)))
+f2.addParmTemplate(hou.IntParmTemplate("spokes", "Spokes", 1, default_value=(int(C["spokes"]),), min=3, max=12))
+ptg.append(f1); ptg.append(f2); ctrl.setParmTemplateGroup(ptg)
+CH = lambda n: 'ch("../CTRL_zrm/%s")' % n
+
+# hubs: four points
+hubs = geo.createNode("attribwrangle", "hubs"); hubs.parm("class").set(0)
+hubs.parm("snippet").set('''
+float th = chf("../CTRL_zrm/track_half"), r = chf("../CTRL_zrm/tyre_r");
+float zs[] = array(chf("../CTRL_zrm/front_z"), chf("../CTRL_zrm/rear_z"));
+float sides[] = array(-1.0, 1.0);
+foreach (float z; zs)
+  foreach (float sx; sides) {
+    int p = addpoint(0, set(sx * th, r, z));
+    setpointattrib(0, "side", p, sx);
+    setpointattrib(0, "orient", p, sx > 0 ? quaternion(radians(-90), {0,0,1}) : quaternion(radians(90), {0,0,1}));
+  }
+''')
+# BODY
+hull = geo.createNode("file", "IN_hull"); hull.parm("file").set(os.path.join(W, "hull.obj"))
+vb = geo.createNode("vdbfrompolygons", "vdb_body"); vb.setInput(0, hull); vb.parm("voxelsize").setExpression(CH("voxel"))
+cyl = geo.createNode("tube", "arch_cutter_tube"); cyl.parm("type").set(1); cyl.parm("cap").set(1); cyl.parm("orient").set(1)
+cyl.parm("rad1").setExpression(CH("tyre_r") + "+" + CH("arch_margin")); cyl.parm("rad2").setExpression(CH("tyre_r") + "+" + CH("arch_margin"))
+cyl.parm("height").setExpression(CH("tyre_w") + "+2*" + CH("arch_margin")); cyl.parm("cols").set(48)
+xfc = geo.createNode("xform", "arch_cutter_axis"); xfc.setInput(0, cyl); xfc.parm("rz").set(90)
+cpc = geo.createNode("copytopoints::2.0", "arch_cutters"); cpc.setInput(0, xfc); cpc.setInput(1, hubs); cpc.parm("useimplicitn").set(0)
+vc = geo.createNode("vdbfrompolygons", "vdb_cutters"); vc.setInput(0, cpc); vc.setInput(1, vb)
+comb = geo.createNode("vdbcombine", "body_minus_arches"); comb.setInput(0, vb); comb.setInput(1, vc); comb.parm("operation").set("sdfdifference")
+sm = geo.createNode("vdbsmoothsdf", "smooth_body"); sm.setInput(0, comb); sm.parm("iterations").setExpression(CH("smooth_iter"))
+cv = geo.createNode("convertvdb", "body_poly"); cv.setInput(0, sm); cv.parm("conversion").set("poly")
+qr = geo.createNode("quadremesh", "body_quads"); qr.setInput(0, cv)
+qr.parm("targetquadcount").setExpression(CH("quads"))
+sd = geo.createNode("subdivide", "body_subd"); sd.setInput(0, qr); sd.parm("iterations").setExpression(CH("subdiv"))
+nb = geo.createNode("name", "name_body"); nb.setInput(0, sd); nb.parm("name1").set("body")
+# TYRE: tube along local Y, bevel the shoulders, clean quad rings
+ty = geo.createNode("tube", "tyre_tube"); ty.parm("type").set(1); ty.parm("cap").set(1)
+ty.parm("rad1").setExpression(CH("tyre_r")); ty.parm("rad2").setExpression(CH("tyre_r")); ty.parm("height").setExpression(CH("tyre_w"))
+ty.parm("cols").set(64); ty.parm("rows").set(2)
+grp = geo.createNode("groupcreate", "tyre_edges"); grp.setInput(0, ty); grp.parm("groupname").set("shoulders"); grp.parm("grouptype").set(2)
+grp.parm("groupbase").set(0); grp.parm("groupedges").set(1); grp.parm("dominedgeangle").set(1); grp.parm("minedgeangle").set(60)
+bv = geo.createNode("polybevel::3.0", "tyre_shoulder"); bv.setInput(0, grp); bv.parm("group").set("shoulders")
+bv.parm("offset").setExpression(CH("shoulder")); bv.parm("divisions").set(3)
+nt = geo.createNode("name", "name_tyre"); nt.setInput(0, bv); nt.parm("name1").set("tyre")
+# RIM: thin disc + spokes, outward face
+rimc = geo.createNode("tube", "rim_disc"); rimc.parm("type").set(1); rimc.parm("cap").set(1)
+rimc.parm("rad1").setExpression(CH("rim_r")); rimc.parm("rad2").setExpression(CH("rim_r")); rimc.parm("height").set(0.03); rimc.parm("cols").set(64)
+xr = geo.createNode("xform", "rim_out"); xr.setInput(0, rimc); xr.parm("ty").setExpression(CH("tyre_w") + "*0.5+0.01")
+sp = geo.createNode("box", "spoke"); sp.parm("sizex").set(0.06); sp.parm("sizey").set(0.04); sp.parm("sizez").setExpression(CH("rim_r") + "*0.95")
+sp.parm("tz").setExpression(CH("rim_r") + "*0.47"); sp.parm("ty").setExpression(CH("tyre_w") + "*0.5+0.035")
+spc = geo.createNode("copyxform", "spokes"); spc.setInput(0, sp); spc.parm("ncy").setExpression(CH("spokes")); spc.parm("ry").setExpression("360/" + CH("spokes"))
+mr = geo.createNode("merge", "rim"); mr.setInput(0, xr); mr.setInput(1, spc)
+nr = geo.createNode("name", "name_rim"); nr.setInput(0, mr); nr.parm("name1").set("rim")
+mw = geo.createNode("merge", "wheel"); mw.setInput(0, nt); mw.setInput(1, nr)
+cw = geo.createNode("copytopoints::2.0", "wheels"); cw.setInput(0, mw); cw.setInput(1, hubs); cw.parm("useimplicitn").set(0)
+ma = geo.createNode("merge", "car"); ma.setInput(0, nb); ma.setInput(1, cw)
+nrm = geo.createNode("normal", "normals"); nrm.setInput(0, ma); nrm.parm("cuspangle").set(40)
+out = geo.createNode("null", "OUT_car"); out.setInput(0, nrm); out.setDisplayFlag(True); out.setRenderFlag(True)
+ex = geo.createNode("rop_geometry", "EXPORT_obj"); ex.setInput(0, out); ex.parm("sopoutput").set(os.path.join(W, "car_result.obj"))
+geo.layoutChildren()
+ex.parm("execute").pressButton()
+g = out.geometry()
+quads = sum(1 for p in g.prims() if p.numVertices() == 4)
+result = {"points": len(g.points()), "prims": len(g.prims()), "quad_pct": round(100.0 * quads / max(len(g.prims()), 1), 1),
+          "errors": [n.name() + ": " + " ".join(n.errors()) for n in geo.children() if n.errors()]}

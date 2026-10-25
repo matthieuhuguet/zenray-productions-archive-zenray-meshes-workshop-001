@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi
 
-P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02}
+P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02, "bg_model": "median", "bg_thresh_q": 9.0, "tex_thresh": 3.0, "close_iter": 2}
 
 
 def separators(g, axis):
@@ -26,9 +26,15 @@ def separators(g, axis):
     return lines
 
 
-def panels(img):
+def panels(img, grid=None):
     g = np.asarray(img.convert("L")).astype(float)
     H, W = g.shape
+    if grid:
+        # explicit grid "rows=620;cols=418,836" when the object itself has long straight lines (trunk, ground)
+        spec = dict(kv.split("=") for kv in grid.split(";"))
+        rws = [0] + [int(x) for x in spec.get("rows", "").split(",") if x] + [H]
+        cls = [0] + [int(x) for x in spec.get("cols", "").split(",") if x] + [W]
+        return [(r0 + 3, r1 - 3, c0 + 3, c1 - 3) for r0, r1 in zip(rws[:-1], rws[1:]) for c0, c1 in zip(cls[:-1], cls[1:])]
     rows = [0] + separators(g, 0) + [H]
     out = []
     for r0, r1 in zip(rows[:-1], rows[1:]):
@@ -45,6 +51,17 @@ def cutout(rgb):
     border = np.concatenate([a[:6].reshape(-1, 3), a[-6:].reshape(-1, 3), a[:, :6].reshape(-1, 3), a[:, -6:].reshape(-1, 3)])
     bg = np.median(border, 0)
     m = np.linalg.norm(a - bg, axis=-1) > P["bg_thresh"]
+    if P.get("bg_model") == "quadratic":
+        # 25 October 2026 : smooth background (vignette) fitted on the border, plus local texture: a light object on a
+        # grey studio backdrop differs little in colour but is never smooth
+        L = a.mean(-1); H, W_ = L.shape; yy, xx = np.mgrid[0:H, 0:W_]; b = 6
+        bm = np.zeros_like(L, bool); bm[:b] = bm[-b:] = True; bm[:, :b] = bm[:, -b:] = True
+        Xf = lambda y, x: np.stack([np.ones_like(x), x, y, x * x, x * y, y * y], -1) / 1.0
+        xn, yn = xx / W_, yy / H
+        coef, *_ = np.linalg.lstsq(Xf(yn[bm], xn[bm]), L[bm], rcond=None)
+        bgL = Xf(yn, xn) @ coef
+        mu = ndi.uniform_filter(L, 5); sd = np.sqrt(np.maximum(ndi.uniform_filter(L * L, 5) - mu * mu, 0))
+        m = (np.abs(L - bgL) > P["bg_thresh_q"]) | (sd > P["tex_thresh"])
     m = ndi.binary_opening(m, iterations=1)
     lab, n = ndi.label(m)
     area = m.size
@@ -60,14 +77,14 @@ def cutout(rgb):
             cube = {"px": int(round((h + w) / 2)), "bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
             continue
         keep |= comp
-    keep = ndi.binary_fill_holes(ndi.binary_closing(keep, iterations=2))
+    keep = ndi.binary_fill_holes(ndi.binary_closing(keep, iterations=P.get("close_iter", 2)))
     return keep, cube
 
 
-def main(sheet, out, names):
+def main(sheet, out, names, grid=None):
     os.makedirs(out, exist_ok=True)
     img = Image.open(sheet).convert("RGB"); rgb = np.asarray(img)
-    pans = panels(img)
+    pans = panels(img, grid)
     names = names.split(",")
     rep = {"sheet": sheet, "panels": []}
     for k, (r0, r1, c0, c1) in enumerate(pans):
@@ -90,4 +107,6 @@ def main(sheet, out, names):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    for kv in [a for a in sys.argv[3:] if "=" in a and a.split("=")[0] in P]:   # 25 October 2026: rule overrides k=v
+        k_, v_ = kv.split("=", 1); P[k_] = type(P[k_])(v_); sys.argv.remove(kv)
+    main(*sys.argv[1:5])

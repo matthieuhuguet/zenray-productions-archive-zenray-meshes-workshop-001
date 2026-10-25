@@ -1,0 +1,54 @@
+# 25 October 2026 : ZenRay Meshes, generic tool : the subdivision of a cage is LINEAR in the cage positions (creases
+# fixed), so the limit surface is V_sub = S @ V_cage. This script extracts S from the live Houdini subdivide node by
+# subdividing batches of one-hot point attributes (OpenSubdiv interpolates point attributes with the same weights as
+# P), checks S @ P_cage == P_sub, and saves S (sparse) for fast fitting in Python.
+# FR : la subdivision est linéaire ; on extrait sa matrice une fois, puis la surface se calcule en Python.
+# Usage: python SubdivMatrix.py <geo node> <cage node> <subdivide node> <out.npz> [batch=64]
+import sys, json, subprocess
+import numpy as np
+from scipy import sparse
+
+BR = ["python3", "/Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py", "hom"]
+
+
+def hom(code):
+    r = subprocess.run(BR + [code, "live"], capture_output=True, text=True, timeout=600)
+    return json.loads(r.stdout)["result"]
+
+
+def main(geo, cage, subd, out, batch=64):
+    batch = int(batch)
+    n = hom("import hou\nresult=len(hou.node(%r).geometry().points())" % (geo + "/" + cage))
+    tmp = "/tmp/zrm_subdiv_batch.npy"
+    setup = ("import hou\ng=hou.node(%r); src=g.node(%r); ref=g.node(%r)\n"
+             "for nm in ('ZRM_S_onehot','ZRM_S_subd'):\n    n_=g.node(nm)\n    n_ and n_.destroy()\n"
+             "w=g.createNode('attribwrangle','ZRM_S_onehot'); w.setInput(0,src); w.parm('class').set(2)\n"
+             "sd=g.createNode('subdivide','ZRM_S_subd'); sd.setInput(0,w)\n"
+             "for p in ref.parms():\n    try: sd.parm(p.name()).set(p.eval())\n    except Exception: pass\n"
+             "result=len(ref.geometry().points())") % (geo, cage, subd)
+    m = hom(setup)
+    rows, cols, vals = [], [], []
+    for b0 in range(0, n, batch):
+        k = min(batch, n - b0)
+        code = ("import hou, numpy as np\ng=hou.node(%r); w=g.node('ZRM_S_onehot')\n"
+                "w.parm('snippet').set('for (int j = 0; j < %d; j++) setpointattrib(0, sprintf(\"zrm_w%%d\", j), @ptnum, (@ptnum == %d + j) ? 1.0 : 0.0, \"set\");')\n"
+                "geo=g.node('ZRM_S_subd').geometry()\n"
+                "A=np.stack([np.array(geo.pointFloatAttribValues('zrm_w%%d' %% j)) for j in range(%d)],1)\n"
+                "np.save(%r, A.astype(np.float32)); result=A.shape") % (geo, k, b0, k, tmp)
+        hom(code)
+        A = np.load(tmp)
+        r, c = np.nonzero(np.abs(A) > 1e-7)
+        rows.append(r); cols.append(c + b0); vals.append(A[r, c])
+    S = sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(m, n))
+    # check against the real subdivided positions
+    hom("import hou, numpy as np\ng=hou.node(%r)\nnp.save('/tmp/zrm_cage_P.npy', np.array(g.node(%r).geometry().pointFloatAttribValues('P')).reshape(-1,3))\n"
+        "np.save('/tmp/zrm_sub_P.npy', np.array(g.node(%r).geometry().pointFloatAttribValues('P')).reshape(-1,3)); result=1" % (geo, cage, subd))
+    Pc, Ps = np.load("/tmp/zrm_cage_P.npy"), np.load("/tmp/zrm_sub_P.npy")
+    err = float(np.abs(S @ Pc - Ps).max())
+    hom("import hou\ng=hou.node(%r)\nfor nm in ('ZRM_S_subd','ZRM_S_onehot'):\n    n_=g.node(nm)\n    n_ and n_.destroy()\nresult=1" % geo)
+    sparse.save_npz(out, S)
+    print(json.dumps({"cage_points": n, "sub_points": m, "nnz": int(S.nnz), "max_err_m": err}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

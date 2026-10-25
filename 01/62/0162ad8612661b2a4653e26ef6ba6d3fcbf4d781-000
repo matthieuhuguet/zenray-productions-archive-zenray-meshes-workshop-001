@@ -1,0 +1,325 @@
+# 25 October 2026 : ZenRay Meshes ARCHETYPE "car" v1 : construction rules first, then fit to the sheet.
+# EN: a car is built on a CANONICAL quad cage whose edge loops sit on the design lines:
+#   stations along the length (named): nose, hood_lead, cowl (windshield base), roof_front, roof_rear, deck, tail,
+#   plus stations around each axle so the wheel arches are real loops;
+#   rows around the half section (named): floor_centre, floor_edge, fender_inner, sill, door_low, belt (shoulder),
+#   glass_base, roof_edge, roof_centre; mirrored to a closed ring.
+# MEASURE reads the sheet frame (profiles: roof line and underside from the side view, half width from the top view,
+# width by height from the front view) and finds the key stations by a piecewise linear fit of the roof line (dynamic
+# programming, 6 segments). BUILD makes the cage (all quads, mirror symmetric) and lists the CREASE edges (design
+# lines: sill, belt, roof edge, cowl, roof front, deck, nose, tail) for a creased Catmull-Clark subdivision in Houdini.
+# Every number lives in PARAMS (rules) or in the measured JSON (instance): the archetype is the definition, the car is
+# an instance. FR : la voiture se construit sur une cage canonique dont les boucles suivent les lignes du design.
+# Usage: python ArchetypeCar.py <work_dir> <out_prefix>
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+PARAMS = {  # construction rules of the archetype (shared by every car)
+    "split_rows": [],   # 25 October 2026: a midpoint row is inserted after each named row listed here (denser section, more fit freedom)
+    "floor_lift": 0.0,   # 25 October 2026: offset of the floor centre (subdivision lowers it by a few mm)
+    "measure_frame": "frame_hull",   # generic rule 6 (25 October 2026): profiles are read on the symmetrised visual hull, the consistent target
+    "segments": 6,                    # roof line pieces: nose-hood, hood, windshield, roof, rear glass, tail
+    "between": {"nose": 4, "hood_lead": 4, "cowl": 4, "roof_front": 5, "roof_rear": 4, "deck": 4},
+    "end_inset": 0.025, "end_face_scale": 0.94,
+    "arch_stations": [1.0, 0.75, 0.4, 0.0],   # fractions of the arch radius around each axle (each side)
+    "arch_pad": 1.06, "sill_h": 0.07, "door_low_frac": 0.45, "belt_drop": 0.80,
+    "glass_inset": 0.03, "roof_edge_drop": 0.035, "fender_gap": 0.03, "cabin_min": 0.10,
+    "crease_rows": ["sill", "door_low", "belt", "roof_edge"], "soft_crease_rows": ["roof_centre"], "crease_stations": ["nose", "cowl", "roof_front", "deck", "tail"],
+}
+# learned defaults and per instance overrides (written by ArchetypeFit.py): the archetype keeps its rules in PARAMS,
+# an instance may override any numeric rule through <work>/arch_params.json (25 October 2026)
+def load_overrides(wd):
+    f = os.path.join(wd, "arch_params.json")
+    if os.path.exists(f):
+        PARAMS.update({k: v for k, v in json.load(open(f)).items() if k in PARAMS})
+
+
+ROWS = ["floor_centre", "floor_edge", "fender_inner", "sill", "door_low", "belt", "glass_base", "roof_edge", "roof_centre"]
+
+
+def axis_map(meta, v):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"])
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2       # centre alignment, same rule as SheetHull.view_px
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    return rx[a], uy[b], (lambda u, vv: (xc + (u - ucen) * s, yc + (vcen - vv) * s))
+
+
+def sample(mask, to_px, us, vs):
+    out = np.zeros((len(us), len(vs)), bool)
+    for i, u in enumerate(us):
+        for j, v in enumerate(vs):
+            px, py = to_px(u, v); ix, iy = int(round(px)), int(round(py))
+            out[i, j] = 0 <= iy < mask.shape[0] and 0 <= ix < mask.shape[1] and mask[iy, ix]
+    return out
+
+
+def piecewise(z, y, k):
+    """Best k segment piecewise linear fit (dynamic programming on sample indices): returns breakpoint indices."""
+    n = len(z)
+    def cost(i, j):
+        zz, yy = z[i:j + 1], y[i:j + 1]
+        A = np.stack([zz, np.ones_like(zz)], 1); c, *_ = np.linalg.lstsq(A, yy, rcond=None)
+        return float(((A @ c - yy) ** 2).sum())
+    C = np.full((k + 1, n), np.inf); B = np.zeros((k + 1, n), int); C[0, 0] = 0
+    pre = {}
+    for s in range(1, k + 1):
+        for j in range(1, n):
+            for i in range(s - 1, j):
+                if C[s - 1, i] == np.inf:
+                    continue
+                key = (i, j)
+                if key not in pre:
+                    pre[key] = cost(i, j)
+                v = C[s - 1, i] + pre[key]
+                if v < C[s, j]:
+                    C[s, j], B[s, j] = v, i
+    br = [n - 1]; j = n - 1
+    for s in range(k, 0, -1):
+        j = B[s, j]; br.append(j)
+    return br[::-1]
+
+
+def measure(wd):
+    meta = json.load(open(os.path.join(wd, PARAMS["measure_frame"], "frame.json"))); W = json.load(open(os.path.join(wd, "car_components.json")))["wheels"]
+    V = {v["name"]: v for v in meta["views"]}; lo = np.array(meta["lo"]); D = np.array(meta["dims_m"])
+    zs = np.linspace(lo[2] + D[2] - 1e-3, lo[2] + 1e-3, 120)            # front (+z) to back
+    ys = np.linspace(lo[1], lo[1] + D[1], 300)
+    side = np.asarray(Image.open(os.path.join(wd, PARAMS["measure_frame"], "mask_right.png"))) > 127
+    sa, sb, tp = axis_map(meta, V["right"])
+    S = sample(side, lambda u, v: tp(u, v), zs * sa, ys * sb)
+    ytop = np.array([ys[np.where(r)[0].max()] if r.any() else np.nan for r in S])
+    ok = np.isfinite(ytop); ytop = np.interp(np.arange(len(zs)), np.where(ok)[0], ytop[ok])
+    # underside: lowest pixel of the run hanging from the roof, wheels excluded by arches later
+    ybot = []
+    for r in S:
+        k = np.where(r)[0]
+        if not len(k):
+            ybot.append(np.nan); continue
+        run = [k.max()]
+        for kk in k[::-1][1:]:
+            if run[-1] - kk <= 2: run.append(kk)
+            else: break
+        ybot.append(ys[min(run)])
+    ybot = np.array(ybot); ok = np.isfinite(ybot); ybot = np.interp(np.arange(len(zs)), np.where(ok)[0], ybot[ok])
+    away = np.array([min(abs(z - W["front_z"]), abs(z - W["rear_z"])) > 1.3 * W["tyre_r"] for z in zs])
+    floor = float(np.percentile(ybot[away & (np.arange(len(zs)) > 5) & (np.arange(len(zs)) < len(zs) - 6)], 30))   # sill line between the wheels (lower third)
+    top = np.asarray(Image.open(os.path.join(wd, PARAMS["measure_frame"], "mask_top.png"))) > 127
+    ta, tb, tpt = axis_map(meta, V["top"])
+    xs = np.linspace(lo[0], lo[0] + D[0], 300)
+    T = sample(top, lambda u, v: tpt(u, v), zs * ta, xs * tb)
+    hw = np.array([np.ptp(xs[np.where(r)[0]]) / 2 if r.any() else 0.0 for r in T])
+    def width_by_height(view):
+        msk = np.asarray(Image.open(os.path.join(wd, PARAMS["measure_frame"], "mask_%s.png" % view))) > 127
+        fa, fb, tpf = axis_map(meta, V[view])
+        out = []
+        for y in ys:
+            _, py = tpf(0.0, y * fb); row = msk[int(np.clip(round(py), 0, msk.shape[0] - 1))]
+            c0 = int(round(tpf(0.0, 0.0)[0]))
+            if 0 <= c0 < len(row) and row[c0]:
+                l = c0
+                while l > 0 and row[l - 1]: l -= 1
+                r = c0
+                while r < len(row) - 1 and row[r + 1]: r += 1
+                out.append(max(c0 - l, r - c0) / V[view]["px_per_m"])
+            else:
+                out.append(0.0)
+        return ndi.gaussian_filter1d(np.array(out), 1.0)
+    F = width_by_height("front"); Fb = width_by_height("back")
+    # SIDE SKIRTS (25 October 2026): the end views give the clearance under the CENTRE of the floor, the side view the
+    # lowest point anywhere across (the skirts, hidden behind the tyres in the end views)
+    def centre_clear(view):
+        msk = np.asarray(Image.open(os.path.join(wd, PARAMS["measure_frame"], "mask_%s.png" % view))) > 127
+        yy, xx = np.nonzero(msk); cx = (xx.min() + xx.max()) // 2; col = np.where(msk[:, cx])[0]
+        return (yy.max() - col.max()) / V[view]["px_per_m"]
+    floor_centre = float(max(floor, 0.5 * (centre_clear("front") + centre_clear("back"))))
+    # belt (shoulder) height: where the front half width drops below belt_drop of its maximum, going up
+    fmax = F.max(); above = np.where((F < PARAMS["belt_drop"] * fmax) & (ys > ys[np.argmax(F)]))[0]
+    y_belt = float(ys[above[0]]) if len(above) else float(lo[1] + 0.6 * D[1])
+    br = piecewise(zs, ndi.gaussian_filter1d(ytop, 1.5), PARAMS["segments"])
+    names = ["nose", "hood_lead", "cowl", "roof_front", "roof_rear", "deck", "tail"]
+    keys = {n: float(zs[i]) for n, i in zip(names, br)}
+    zfront, zback = [], []
+    for j in range(len(ys)):
+        k = np.where(S[:, j])[0]
+        zfront.append(float(zs[k.min()]) if len(k) else np.nan); zback.append(float(zs[k.max()]) if len(k) else np.nan)
+    prof_ext = {"ext_y": ys.tolist(), "z_front": zfront, "z_back": zback}
+    prof = {"z": zs.tolist(), "ytop": ytop.tolist(), "ybot": ybot.tolist(), "hw": ndi.gaussian_filter1d(hw, 1.0).tolist(),
+            "F_y": ys.tolist(), "F": F.tolist(), "F_back": Fb.tolist(), **prof_ext}
+    return {"_date": "25 October 2026", "dims_m": D.tolist(), "floor_y": floor, "floor_centre_y": floor_centre, "belt_y": y_belt, "keys": keys,
+            "wheels": W, "profiles": prof}
+
+
+def build(m, out_prefix):
+    P = PARAMS; pr = m["profiles"]; W = m["wheels"]
+    zs_p, ytop_p, hw_p = np.array(pr["z"]), np.array(pr["ytop"]), np.array(pr["hw"])
+    Fy, Fv = np.array(pr["F_y"]), np.array(pr["F"])
+    at = lambda arr, z: float(np.interp(-z, -zs_p, arr))            # profiles are sampled with z decreasing
+    Fbv = np.array(pr.get("F_back", pr["F"]))
+    zf, zb = m["keys"]["cowl"], m["keys"]["deck"]
+    def Fat(y, z=None):
+        # width by height from the nearest end view: front view ahead of the windshield, back view behind the rear
+        # glass, linear blend in between (generic rule, 25 October 2026)
+        a = float(np.interp(y, Fy, Fv)); b = float(np.interp(y, Fy, Fbv))
+        if z is None: return a
+        t = float(np.clip((zf - z) / max(zf - zb, 1e-6), 0, 1))
+        return (1 - t) * a + t * b
+    names = ["nose", "hood_lead", "cowl", "roof_front", "roof_rear", "deck", "tail"]
+    st, tags = [], {}
+    for a, b in zip(names[:-1], names[1:]):
+        za, zb = m["keys"][a], m["keys"][b]; n = P["between"][a]
+        for t in range(n):
+            st.append(za + (zb - za) * t / n)
+        tags[a] = za
+    st.append(m["keys"]["tail"]); tags["tail"] = m["keys"]["tail"]
+    r_arch = W["tyre_r"] * P["arch_pad"]
+    for zc in (W["front_z"], W["rear_z"]):
+        for f in P["arch_stations"]:
+            for sgn in (-1, 1):
+                st.append(zc + sgn * f * r_arch)
+    st = np.array(sorted(set(np.round(st, 5)), reverse=True))
+    st = st[(st <= m["keys"]["nose"]) & (st >= m["keys"]["tail"])]
+    x_in_f = W["track_half"] - W["tyre_w"] / 2 - P["fender_gap"]
+    x_in_r = W.get("track_half_rear", W["track_half"]) - W.get("tyre_w_rear", W["tyre_w"]) / 2 - P["fender_gap"]
+    dz_any = lambda z: min(abs(z - W["front_z"]), abs(z - W["rear_z"])) > r_arch * 1.05
+    # nose and tail: the extreme stations are pulled inside by end_inset (wide rounded ends), plus a flat end face
+    L = m["keys"]["nose"] - m["keys"]["tail"]
+    z_nose_in, z_tail_in = m["keys"]["nose"] - P["end_inset"] * L, m["keys"]["tail"] + P["end_inset"] * L
+    st = np.clip(st, z_tail_in, z_nose_in); st = np.array(sorted(set(np.round(st, 5)), reverse=True))
+    rings = []
+    for z in st:
+        yt, hw = at(ytop_p, z), at(hw_p, z)
+        # underside: the sill line between the axles, the real profile in the overhangs (diffuser and splitter recess)
+        overhang = z > W["front_z"] + r_arch or z < W["rear_z"] - r_arch
+        yb = max(at(np.array(pr["ybot"]), z), 0.0) if overhang else m["floor_y"]
+        yc = max(yb, m.get("floor_centre_y", yb) + P["floor_lift"]) if not overhang else yb      # floor centre above the skirts
+        dz = min(abs(z - W["front_z"]), abs(z - W["rear_z"]))
+        x_in = x_in_f if abs(z - W["front_z"]) < abs(z - W["rear_z"]) else x_in_r
+        arch = W["tyre_r"] + np.sqrt(max(r_arch ** 2 - dz ** 2, 0.0)) if dz < r_arch else -1.0
+        cabin = yt > m["belt_y"] + P["cabin_min"]
+        yb_belt = min(m["belt_y"], yt - 0.02)
+        y_sill = yb + P["sill_h"]
+        rows = {}
+        rows["floor_centre"] = (0.0, yc)
+        rows["floor_edge"] = (min(x_in, hw * 0.95), yc)
+        y_fi = max(arch, yb + 0.02)
+        if arch < 0 and yc > yb + 0.005:   # skirt: lowest point under the sill, inside the tyre shadow
+            x_sk = min(0.5 * (x_in + hw), hw * 0.97)
+            rows["fender_inner"] = (x_sk, yb)
+        else:
+            rows["fender_inner"] = (min(x_in, hw * 0.95), min(y_fi, yt - 0.06))
+        wF = lambda y: min(hw, max(Fat(y, z), 0.05))
+        y_s = min(max(y_sill, arch), yt - 0.05)
+        rows["sill"] = (hw, y_s)
+        y_dl = yb + P["door_low_frac"] * (yb_belt - yb)
+        y_dl = min(max(y_dl, arch + 0.02 if arch > 0 else -1), yt - 0.04)
+        rows["door_low"] = (hw, y_dl)
+        y_b = max(yb_belt, rows["door_low"][1] + 0.01)
+        rows["belt"] = (wF(y_b) * 0.985, y_b)
+        if cabin:
+            rows["glass_base"] = (min(hw, Fat(yb_belt + 0.05, z)) - P["glass_inset"], yb_belt + 0.03)
+            rows["roof_edge"] = (min(hw, Fat(yt - P["roof_edge_drop"], z)) * 0.97, yt - P["roof_edge_drop"])
+        else:
+            rows["glass_base"] = (hw * 0.9, max(yt - 0.03, rows["belt"][1] + 0.005))
+            rows["roof_edge"] = (hw * 0.6, yt - 0.005)
+        rows["roof_centre"] = (0.0, yt)
+        half = []
+        for k_, r in enumerate(ROWS):
+            half.append((rows[r][0], rows[r][1], z))
+            if r in P["split_rows"] and k_ + 1 < len(ROWS):
+                a_, b_ = rows[r], rows[ROWS[k_ + 1]]; half.append((0.5 * (a_[0] + b_[0]), 0.5 * (a_[1] + b_[1]), z))
+        ring = [(-x, y, z) for (x, y, z) in half[::-1]] + half[1:-1]
+        rings.append(ring)
+    V = np.array(rings)
+    def end_face(ring, z_tip):
+        # the end face keeps the inset section's widths (scaled) but takes the HEIGHTS of the profile at the tip
+        f = ring.copy(); f[:, 0] *= P["end_face_scale"]
+        y0, y1 = ring[:, 1].min(), ring[:, 1].max(); t = (ring[:, 1] - y0) / max(y1 - y0, 1e-6)
+        yt_tip = min(at(ytop_p, z_tip), y1); yb_tip = y0              # the end face never reaches below the body
+        f[:, 1] = yb_tip + t * (yt_tip - yb_tip)
+        # each end vertex sits at the side silhouette's extreme at ITS height (slanted noses and tails)
+        ey = np.array(pr["ext_y"]); ez = np.array(pr["z_front"] if z_tip > 0 else pr["z_back"]); ok = np.isfinite(ez)
+        zz = np.interp(f[:, 1], ey[ok], ez[ok])
+        inner = ring[0, 2]
+        f[:, 2] = np.where(z_tip > 0, np.clip(zz, inner + 0.01, z_tip), np.clip(zz, z_tip, inner - 0.01))
+        # plan view rounding (25 October 2026): each end vertex takes the top view half width at ITS own z
+        if P.get("end_plan_follow", 1):
+            hz = np.array([at(hw_p, zz_) for zz_ in f[:, 2]]); hin = max(at(hw_p, inner), 1e-3)
+            f[:, 0] = ring[:, 0] * np.clip(hz / hin, P.get("end_plan_min", 0.35), 1.0) * P.get("end_plan_scale", 1.0)
+        return f
+    V = np.concatenate([end_face(V[0], m["keys"]["nose"])[None], V, end_face(V[-1], m["keys"]["tail"])[None]])
+    st = np.concatenate([[m["keys"]["nose"]], st, [m["keys"]["tail"]]])
+    S, R = V.shape[0], V.shape[1]
+    # LIMIT SURFACE COMPENSATION (generic rule 5, 25 October 2026): Catmull-Clark shrinks the cage, so each station
+    # carries a width factor, a roof offset and (end faces) a length offset learned by CageComp.py from the subdivided
+    # surface against the measured profiles; the rules stay the same, only the cage moves out to where the limit
+    # surface must land. FR : la cage est poussée pour que la surface subdivisée tombe sur les profils mesurés.
+    cpath = os.path.join(os.path.dirname(out_prefix), "cage_comp.json")
+    if os.path.exists(cpath):
+        cp = json.load(open(cpath))
+        if len(cp.get("sx", [])) == S:
+            for i in range(S):
+                V[i, :, 0] *= cp["sx"][i]
+                y0, y1 = V[i, :, 1].min(), V[i, :, 1].max()
+                V[i, :, 1] += cp["dy"][i] * (V[i, :, 1] - y0) / max(y1 - y0, 1e-6)
+                if "dyb" in cp:   # underside offset acts on the skirt (outer bottom), never on the floor centre the end views see
+                    xr = np.abs(V[i, :, 0]) / max(np.abs(V[i, :, 0]).max(), 1e-6); wx = np.clip((xr - 0.78) / 0.12, 0, 1)
+                    V[i, :, 1] += cp["dyb"][i] * wx * np.clip((y1 - V[i, :, 1]) / max(y1 - y0, 1e-6), 0, 1) ** 3
+            V[0, :, 2] += cp.get("dz_nose", 0.0); V[-1, :, 2] += cp.get("dz_tail", 0.0)
+            if "fy" in cp:   # shoulders and roof: width factor by height above the belt (end views)
+                above = V[:, :, 1] > m["belt_y"]
+                V[:, :, 0] = np.where(above, V[:, :, 0] * np.interp(V[:, :, 1], cp["fy_y"], cp["fy"]), V[:, :, 0])
+    if os.path.exists(cpath):   # SILHOUETTE FIT offsets (SilFit.py, 25 October 2026), applied last, same topology only
+        cp = json.load(open(cpath))
+        if "dv" in cp and len(cp["dv"]) == S * R:
+            V = V + np.array(cp["dv"]).reshape(S, R, 3)
+    EXP = []
+    for r in ROWS:
+        EXP.append(r)
+        if r in P["split_rows"] and r != ROWS[-1]: EXP.append(None)
+    nh = len(EXP)
+    # ring index of each named row on the +x side and its mirror
+    ridx = {r: (nh - 1 - i, nh - 1 + i if 0 < i < nh - 1 else None) for i, r in enumerate(EXP) if r is not None}
+    idx = lambda i, j: i * R + (j % R)
+    faces = [(idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j)) for i in range(S - 1) for j in range(R)]
+    # caps: the ring is mirror symmetric (j and R-1-j... ), close it with quads between symmetric pairs
+    h = R // 2
+    for i, flip in ((0, True), (S - 1, False)):
+        for j in range(h - 1):
+            a, b, c2, d = idx(i, j), idx(i, j + 1), idx(i, R - 2 - j), idx(i, R - 1 - j)
+            q = (a, b, c2, d)
+            faces.append(q[::-1] if flip else q)
+    creases = []
+    for r in P["crease_rows"]:
+        for jj in ridx[r]:
+            if jj is None: continue
+            creases += [(idx(i, jj), idx(i + 1, jj)) for i in range(S - 1)]
+    soft = []
+    for r in P["soft_crease_rows"]:
+        for jj in ridx[r]:
+            if jj is None: continue
+            soft += [(idx(i, jj), idx(i + 1, jj)) for i in range(S - 1)]
+    for sname in P["crease_stations"]:
+        i = int(np.argmin(np.abs(st - m["keys"][sname])))
+        creases += [(idx(i, j), idx(i, j + 1)) for j in range(R)]
+    with open(out_prefix + "_cage.obj", "w") as fo:
+        fo.write("# ZenRay Meshes archetype car v1 cage, 25 October 2026\n")
+        for v in V.reshape(-1, 3):
+            fo.write("v %.5f %.5f %.5f\n" % tuple(v))
+        for f in faces:
+            fo.write("f %d %d %d %d\n" % tuple(k + 1 for k in f[::-1]))
+    json.dump({"creases": creases, "soft_creases": soft, "stations": st.tolist(), "rows": ROWS, "ring": R}, open(out_prefix + "_cage.json", "w"))
+    return {"stations": int(S), "ring": int(R), "quads": len(faces), "creases": len(creases)}
+
+
+if __name__ == "__main__":
+    wd, outp = sys.argv[1], sys.argv[2]
+    load_overrides(wd)
+    m = measure(wd); json.dump(m, open(outp + "_measure.json", "w"), indent=1)
+    print(json.dumps({"keys": {k: round(v, 3) for k, v in m["keys"].items()}, "belt_y": round(m["belt_y"], 3), "floor_y": round(m["floor_y"], 3)}))
+    print(json.dumps(build(m, outp)))

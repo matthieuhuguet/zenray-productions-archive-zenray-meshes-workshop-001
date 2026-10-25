@@ -1,0 +1,60 @@
+# 25 October 2026 : ZenRay Meshes, step 3 : metric visual hull from the KEPT views of a generated sheet (measurement only).
+# EN: a voxel is kept when every kept view sees it inside its silhouette (or all but `tolerate` views, robust to one
+# contradicting view). The result is a MEASUREMENT volume (bgeo-ready points / numpy), never a deliverable: the clean
+# surface is built in Houdini from it (VDB smooth then Quad Remesh). Also writes per view silhouette IoU of the hull.
+# FR : enveloppe métrique des vues retenues, simple mesure ; la surface propre se construit ensuite dans Houdini.
+# Usage: python SheetHull.py <frame_dir> <out.npz> [voxel_m=0.01] [tolerate=0]
+import sys, os, json
+import numpy as np
+from PIL import Image
+
+
+def view_px(meta, v, P):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"])
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]
+    vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]
+    # centre alignment (25 October 2026): the world centre of each axis goes to the centre of the view's bbox, so a
+    # view whose scale disagrees with the consensus splits its error on both sides instead of one edge
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    px = xc + (P @ rx - ucen) * s
+    py = yc + (vcen - P @ uy) * s
+    return px, py
+
+
+def main(fdir, out, voxel_m=0.01, tolerate=0):
+    meta = json.load(open(os.path.join(fdir, "frame.json")))
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"])
+    pad = 0.03 * D.max()
+    axes = [np.arange(lo[i] - pad, lo[i] + D[i] + pad, float(voxel_m)) for i in range(3)]
+    X, Y, Z = np.meshgrid(*axes, indexing="ij"); P = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    votes = np.zeros(len(P), np.int16); kept = [v for v in meta["views"] if v["kept"]]
+    masks = {}
+    for v in kept:
+        m = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127; masks[v["name"]] = m
+        px, py = view_px(meta, v, P)
+        ix, iy = np.round(px).astype(int), np.round(py).astype(int)
+        ok = (ix >= 0) & (iy >= 0) & (ix < m.shape[1]) & (iy < m.shape[0])
+        inside = np.zeros(len(P), bool); inside[ok] = m[iy[ok], ix[ok]]
+        votes += inside
+    occ = (votes >= len(kept) - int(tolerate)).reshape(X.shape)
+    np.savez_compressed(out, occ=occ, origin=np.array([a[0] for a in axes]), voxel=float(voxel_m))
+    # silhouette agreement of the hull with each kept view
+    pts = P[occ.ravel()]
+    rep = {}
+    for v in kept:
+        m = masks[v["name"]]; px, py = view_px(meta, v, pts)
+        img = np.zeros_like(m); ix, iy = np.clip(np.round(px).astype(int), 0, m.shape[1] - 1), np.clip(np.round(py).astype(int), 0, m.shape[0] - 1)
+        img[iy, ix] = True
+        from scipy import ndimage as ndi
+        img = ndi.binary_closing(img, iterations=2)
+        rep[v["name"]] = round(float((img & m).sum() / max((img | m).sum(), 1)), 4)
+    print(json.dumps({"voxels": int(occ.sum()), "grid": list(occ.shape), "silhouette_iou": rep}))
+
+
+if __name__ == "__main__":
+    a = sys.argv
+    main(a[1], a[2], **{k: (float(v) if "." in v else int(v)) for k, v in (x.split("=") for x in a[3:])})

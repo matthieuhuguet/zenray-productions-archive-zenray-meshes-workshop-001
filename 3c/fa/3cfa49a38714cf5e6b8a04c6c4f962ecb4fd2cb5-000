@@ -1,0 +1,95 @@
+# 25 October 2026 : ZenRay Meshes ARCHETYPE "tree" v1 : construction rules (trunk, limbs, foliage clumps), then fit.
+# EN: components of the archetype, in construction order:
+#   TRUNK  : one sweep along a 3D centre curve, radius profile r(y); its curve is read as the centre of the thick
+#            wood in the front view (x(y)) and in the side view (z(y)), the radius as half the thick width;
+#   LIMBS  : sweeps from the crown base, one per thick branch leaving the trunk (2D skeleton branches of the wood mask
+#            in front and side views, matched by height), radius tapering;
+#   CROWN  : foliage clumps (ellipsoid clusters of leaf cards) placed on the textured part of the silhouettes.
+# Wood vs foliage: the wood is smooth and thick (low local variance, distance to the silhouette edge above r_min),
+# the foliage is textured. This file measures the trunk (v1); limbs and crown follow in the same file.
+# FR : archétype arbre, tronc balayé le long d'une courbe 3D mesurée, puis branches et touffes de feuillage.
+# Usage: python ArchetypeTree.py <frame_dir> <views_dir> <out_prefix>
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+PARAMS = {"var_window": 7, "wood_max_std": 0.045, "thick_px": 6, "rows": 80, "crown_split_ratio": 1.6, "median_rows": 5}
+
+
+def view_map(meta, name):
+    v = [x for x in meta["views"] if x["name"] == name][0]
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]; xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    to_world_u = lambda px: (ucen + (px - xc) / s) * rx[a]       # image column -> world coordinate on axis a
+    to_world_v = lambda py: (vcen - (py - yc) / s) * uy[b]       # image row -> world coordinate on axis b
+    return v, a, b, to_world_u, to_world_v, s
+
+
+def wood_mask(rgb, mask):
+    g = np.asarray(Image.fromarray(rgb).convert("L")).astype(float) / 255
+    k = PARAMS["var_window"]
+    mu = ndi.uniform_filter(g, k); sd = np.sqrt(np.maximum(ndi.uniform_filter(g * g, k) - mu * mu, 0))
+    smooth = mask & (sd < PARAMS["wood_max_std"])
+    smooth = ndi.binary_opening(smooth, iterations=1)
+    dt = ndi.distance_transform_edt(mask)
+    thick = smooth & (dt > PARAMS["thick_px"])
+    # keep the part connected to the base of the tree
+    lab, n = ndi.label(ndi.binary_closing(thick, iterations=2))
+    ys, xs = np.nonzero(mask); base = ys.max()
+    keep = np.zeros_like(thick)
+    for i in range(1, n + 1):
+        comp = lab == i
+        if np.nonzero(comp)[0].max() > base - 0.08 * (base - ys.min()):
+            keep |= comp
+    return keep, sd
+
+
+def trunk_line(wood, mask, to_u, to_v, s):
+    ys, xs = np.nonzero(mask); top, base = ys.min(), ys.max()
+    rows = np.linspace(base, top, PARAMS["rows"]).astype(int)
+    pts = []
+    prev_w = None
+    for r in rows:
+        c = np.where(wood[r])[0]
+        if not len(c):
+            break
+        runs = np.split(c, np.where(np.diff(c) > 2)[0] + 1)
+        run = max(runs, key=len) if prev_w is None else min(runs, key=lambda q: abs(q.mean() - prev_w))
+        w = (run[-1] - run[0] + 1)
+        if len(pts) >= PARAMS["median_rows"]:
+            ref = np.median([q[3] for q in pts[-PARAMS["median_rows"]:]]) * s * 2
+            if w > PARAMS["crown_split_ratio"] * ref:      # the crown starts where the width jumps
+                break
+        prev_w = run.mean()
+        pts.append((float(to_v(r)), float(to_u(run.mean())), float(w / s / 2), float(w / s / 2)))
+    return pts       # (y, u, radius) ; last kept row = crown base
+
+
+def main(fdir, vdir, outp):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    res = {}
+    for name in ("front", "right"):
+        pan = [p for p in sheet["panels"] if p["name"] == name][0]
+        rgb = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], name))).convert("RGB"))
+        mask = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % name))) > 127
+        wood, sd = wood_mask(rgb, mask)
+        v, a, b, tu, tv, s = view_map(meta, name)
+        res[name] = {"axis": "xyz"[a], "line": trunk_line(mask, mask, tu, tv, s)}   # trunk = silhouette below the crown (bark is textured too)
+        Image.fromarray(np.stack([mask * 90 + wood * 165] * 3, -1).astype(np.uint8)).save(outp + "_wood_%s.png" % name)
+    # 3D trunk: y common; x from front, z from side, radius = mean of both half widths
+    f = np.array([p[:3] for p in res["front"]["line"]]); r = np.array([p[:3] for p in res["right"]["line"]])
+    ytop = min(f[:, 0].max(), r[:, 0].max()); ys = np.linspace(0, ytop, 40)
+    xs = np.interp(ys, f[:, 0], f[:, 1]); zs = np.interp(ys, r[:, 0], r[:, 1])
+    rad = 0.5 * (np.interp(ys, f[:, 0], f[:, 2]) + np.interp(ys, r[:, 0], r[:, 2]))
+    trunk = {"points": np.stack([xs, ys, zs], 1).round(4).tolist(), "radius": rad.round(4).tolist(), "crown_base_y": float(ytop)}
+    json.dump({"_date": "25 October 2026", "trunk": trunk, "views": res}, open(outp + "_measure.json", "w"), indent=1)
+    print(json.dumps({"crown_base_y": round(ytop, 2), "base_radius": round(float(rad[0]), 3), "top_radius": round(float(rad[-1]), 3),
+                      "lean_x": round(float(xs[-1] - xs[0]), 2), "lean_z": round(float(zs[-1] - zs[0]), 2)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:4])

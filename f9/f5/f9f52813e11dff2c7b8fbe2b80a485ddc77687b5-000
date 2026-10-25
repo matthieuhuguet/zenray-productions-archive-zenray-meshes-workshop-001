@@ -1,0 +1,67 @@
+# 25 October 2026 : ZenRay Meshes, wheel component fit : per axle radius, width, track and position, each kept inside
+# a BAND around its measured value (the rule "a measured dimension is not learned" holds outside the band: an open
+# search shrank the tyres to erase them). The body stays fixed (V = S @ cage, offsets included); the wheel mesh is
+# transformed rigidly per axle (radial scale, axial scale, new centre), rendered with the body, scored against the
+# symmetrised hull. Writes work/car/wheel_fit.json. FR : les roues s'ajustent dans une bande autour de leur mesure.
+# Usage: python WheelFit.py [band=0.05] [rounds=3]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy import sparse
+import Raster, SheetScore as SS, HullScore as HS
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car"
+STEP = {"r": 0.004, "w": 0.005, "track": 0.004, "z": 0.003}
+
+
+def main(band=0.05, rounds=3):
+    band, rounds = float(band), int(rounds)
+    S = sparse.load_npz(os.path.join(W, "subdiv_S.npz")); F = np.load(os.path.join(W, "subdiv_faces.npy"))
+    C = np.load("/tmp/zrm_cage_P_now.npy"); V = S @ C
+    Ftri = np.concatenate([F[:, [0, 1, 2]], F[:, [0, 2, 3]]])
+    wm = np.load(os.path.join(W, "wheels_mesh.npz")); WP, WF = wm["P"], wm["F"]
+    meas = json.load(open(os.path.join(W, "car_components.json")))["wheels"]
+    cur0 = {"front": {"r": meas["tyre_r"], "w": 0.295, "track": 0.969, "z": meas["front_z"]},
+            "rear": {"r": meas["tyre_r"], "w": 0.295, "track": 0.97, "z": meas["rear_z"]}}
+    axle = np.where(WP[:, 2] > 0, "front", "rear"); side = np.sign(WP[:, 0])
+    meta, shapes, H = HS.hull_masks(os.path.join(W, "frame"), os.path.join(W, "hull.obj"), True)
+    views = [v for v in meta["views"] if v["kept"]]
+
+    def place(par):
+        out = WP.copy()
+        for a in ("front", "rear"):
+            m = axle == a; p0, p = cur0[a], par[a]
+            c0 = np.stack([side[m] * p0["track"], np.full(m.sum(), p0["r"]), np.full(m.sum(), p0["z"])], 1)
+            loc = WP[m] - c0
+            loc[:, 0] *= p["w"] / p0["w"]; loc[:, 1:] *= p["r"] / p0["r"]
+            out[m] = loc + np.stack([side[m] * p["track"], np.full(m.sum(), p["r"]), np.full(m.sum(), p["z"])], 1)
+        return out
+
+    def score(par):
+        allV = np.concatenate([V, place(par)]); allF = np.concatenate([Ftri, WF + len(V)])
+        r = Raster.Renderer(allV, allF); per = {}
+        for v in views:
+            M, _ = SS.render_in_panel(r, meta, v, shapes[v["name"]]); h = H[v["name"]]
+            per[v["name"]] = float((M & h).sum() / max((M | h).sum(), 1))
+        r.release(); return float(np.mean(list(per.values()))), per
+
+    cur = json.loads(json.dumps(cur0)); best, per = score(cur); start = best
+    for rd in range(rounds):
+        for a in ("front", "rear"):
+            for k, st in STEP.items():
+                lo_, hi_ = cur0[a][k] * (1 - band), cur0[a][k] * (1 + band)
+                if k == "z": lo_, hi_ = cur0[a][k] - 0.005, cur0[a][k] + 0.005   # position measured on both side views (25 October 2026)
+                for sg in (1, -1):
+                    while True:
+                        t = json.loads(json.dumps(cur)); t[a][k] = float(np.clip(cur[a][k] + sg * st, min(lo_, hi_), max(lo_, hi_)))
+                        if t[a][k] == cur[a][k]: break
+                        sc, pv = score(t)
+                        if sc > best + 1e-5: best, per, cur = sc, pv, t
+                        else: break
+    json.dump({"_date": "25 October 2026", "start": start, "best": best, "per": per, "values": cur, "measured": cur0, "band": band},
+              open(os.path.join(W, "wheel_fit.json"), "w"), indent=1)
+    print(json.dumps({"start": round(start, 4), "best": round(best, 4), "values": cur, "per": {k: round(x, 4) for k, x in per.items()}}))
+
+
+if __name__ == "__main__":
+    main(**dict(a.split("=") for a in sys.argv[1:]))

@@ -1,0 +1,59 @@
+# 25 October 2026 : ZenRay Meshes, car preparation : hull measurement mesh + wheel components measured on the sheet.
+# EN: exports the metric hull (marching cubes, measurement only) for Houdini, and measures the wheel component from the
+# side views: Hough circles give centres and rim radius; the tyre radius is the distance centre to ground; the track
+# (x of the wheels) and tyre width come from the front view's bottom band. Writes car_components.json.
+# FR : mesure les roues sur la planche et exporte l'enveloppe de mesure de la carrosserie pour Houdini.
+# Usage: python CarPrep.py
+import os, json, sys
+import numpy as np
+from PIL import Image
+from skimage import feature, transform, measure
+import trimesh
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car"
+P = {"hough_radii_px": [30, 60], "tyre_band_frac": 0.025}
+
+
+def main():
+    fr = json.load(open(os.path.join(W, "frame/frame.json"))); sheet = json.load(open(os.path.join(W, "views/sheet.json")))
+    lo = np.array(fr["lo"]); D = np.array(fr["dims_m"])
+    h = np.load(os.path.join(W, "hull.npz")); occ, org, vx = h["occ"], h["origin"], float(h["voxel"])
+    v, f, _, _ = measure.marching_cubes(np.pad(occ.astype(np.float32), 1), 0.5, spacing=(vx, vx, vx))
+    v = v - vx + org
+    trimesh.Trimesh(v, f[:, ::-1], process=False).export(os.path.join(W, "hull.obj"))
+    wheels = []
+    for name in ("left", "right"):
+        vw = [x for x in fr["views"] if x["name"] == name][0]; pan = [p for p in sheet["panels"] if p["name"] == name][0]
+        g = np.asarray(Image.open(os.path.join(W, "views/%02d_%s_rgb.png" % (pan["index"], name))).convert("L")).astype(float) / 255
+        e = feature.canny(g, sigma=1.5); radii = np.arange(*P["hough_radii_px"])
+        acc, cx, cy, r = transform.hough_circle_peaks(transform.hough_circle(e, radii), radii, total_num_peaks=2, min_xdistance=80)
+        s = vw["px_per_m"]; bb = vw["bbox"]; x0 = (bb[0] + bb[2]) / 2
+        rx = np.array(vw["rx"]); a = int(np.argmax(np.abs(rx)))
+        umin = (lo[a] if rx[a] > 0 else -(lo[a] + D[a])) + D[a] / 2      # centre alignment
+        ground_px = vw["bbox"][3]
+        for c_x, c_y, rr in zip(cx, cy, r):
+            u = umin + (c_x - x0) / s
+            z = u * rx[a]                                  # world z of the wheel centre
+            wheels.append({"view": name, "z": float(z), "center_y": float((ground_px - c_y) / s), "rim_r": float(rr / s), "tyre_r": float((ground_px - c_y) / s)})
+    zs = sorted(w["z"] for w in wheels)
+    front_z = float(np.mean([w["z"] for w in wheels if w["z"] > 0])); rear_z = float(np.mean([w["z"] for w in wheels if w["z"] < 0]))
+    tyre_r = float(np.mean([w["tyre_r"] for w in wheels])); rim_r = float(np.mean([w["rim_r"] for w in wheels]))
+    # track and tyre width per axle: front tyres on the front view, rear tyres on the back view (bottom band)
+    def track(view):
+        vf = [x for x in fr["views"] if x["name"] == view][0]
+        m = np.asarray(Image.open(os.path.join(W, "frame/mask_%s.png" % view))) > 127
+        yb = vf["bbox"][3]; band = m[int(yb - P["tyre_band_frac"] * tyre_r * 2 * vf["px_per_m"]):yb + 1]
+        cols = np.where(band.any(0))[0]
+        runs = [r_ for r_ in np.split(cols, np.where(np.diff(cols) > 3)[0] + 1) if len(r_) > 5]
+        s_ = vf["px_per_m"]; tw = float(np.mean([len(runs[0]), len(runs[-1])]) / s_)
+        half = (runs[-1][-1] - runs[0][0] + 1) / s_ / 2
+        return tw, float(half - tw / 2)
+    tyre_w, track_f = track("front"); tyre_w_r, track_r = track("back")
+    comp = {"_date": "25 October 2026", "dims_m": D.tolist(), "lo": lo.tolist(), "wheels": {"front_z": front_z, "rear_z": rear_z, "tyre_r": tyre_r, "rim_r": rim_r,
+            "tyre_w": tyre_w, "track_half": track_f, "track_half_rear": track_r, "tyre_w_rear": tyre_w_r, "spokes": 5}, "detections": wheels}
+    json.dump(comp, open(os.path.join(W, "car_components.json"), "w"), indent=1)
+    print(json.dumps(comp["wheels"], indent=1))
+
+
+if __name__ == "__main__":
+    main()

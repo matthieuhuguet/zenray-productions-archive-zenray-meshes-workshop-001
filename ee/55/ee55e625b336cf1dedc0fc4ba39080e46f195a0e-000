@@ -1,0 +1,51 @@
+# 25 October 2026 : ZenRay Meshes, archetype global parameters fitted by the sheet score: scale along x, y, z.
+# EN: generated views disagree on scale by 1 to 2 percent; the symmetric model cannot match every view's own scale,
+# so its three global dimensions are parameters chosen to maximise the MEAN silhouette IoU of the kept views
+# (coordinate search, GPU rendering). Writes the best factors to work/<obj>/global_scale.json.
+# FR : les trois dimensions globales sont des paramètres réglés par la note moyenne des vues.
+# Usage: python FitScale.py <frame_dir> <mesh.obj> <out.json>
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import trimesh
+from PIL import Image
+import Raster, SheetScore as SS
+
+
+def mean_iou(verts, faces, meta, masks):
+    r = Raster.Renderer(verts, faces); out = {}
+    for v in meta["views"]:
+        if not v["kept"]:
+            continue
+        M, _ = SS.render_in_panel(r, meta, v, masks[v["name"]].shape)
+        m = masks[v["name"]]; out[v["name"]] = float((M & m).sum() / max((M | m).sum(), 1))
+    r.release()
+    return float(np.mean(list(out.values()))), out
+
+
+def main(fdir, mesh_path, out):
+    meta = json.load(open(os.path.join(fdir, "frame.json")))
+    masks = {v["name"]: np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127 for v in meta["views"]}
+    mesh = trimesh.load(mesh_path, force="mesh", process=False)
+    V0, F = mesh.vertices.copy(), mesh.faces
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); c = lo + D / 2; c[1] = 0.0     # scale about the ground centre
+    s = np.ones(3); best, per = mean_iou(V0, F, meta, masks)
+    start = (best, per)
+    for step in (0.02, 0.01, 0.005, 0.0025):
+        improved = True
+        while improved:
+            improved = False
+            for ax in range(3):
+                for sgn in (-1, 1):
+                    t = s.copy(); t[ax] += sgn * step
+                    V = (V0 - c) * t + c
+                    sc, pv = mean_iou(V, F, meta, masks)
+                    if sc > best + 1e-5:
+                        best, per, s, improved = sc, pv, t, True
+    json.dump({"_date": "25 October 2026", "scale_xyz": s.tolist(), "about": c.tolist(), "mean_iou": best, "per_view": per,
+               "start_mean": start[0]}, open(out, "w"), indent=1)
+    print(json.dumps({"scale_xyz": s.round(4).tolist(), "start": round(start[0], 4), "best": round(best, 4), "per_view": {k: round(v, 4) for k, v in per.items()}}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:4])

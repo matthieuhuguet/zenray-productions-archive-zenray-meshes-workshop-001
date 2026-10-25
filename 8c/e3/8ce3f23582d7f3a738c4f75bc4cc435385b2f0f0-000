@@ -1,0 +1,55 @@
+# 25 October 2026 : ZenRay Meshes, generic rule 6 : score against the VISUAL HULL projections, the one consistent
+# target a generated sheet allows. EN: generated views disagree (scale, length, asymmetry), so no single object can
+# reach every view's own silhouette; the visual hull reaches every per view ceiling at once by construction, and its
+# mirror symmetrised version is the reachable target of a symmetric archetype. This script renders the hull (optionally
+# symmetrised along x) and the model in each kept view and returns IoU(model, hull). 0.999 here = done.
+# FR : la cible cohérente est l'enveloppe visuelle (symétrisée), jamais les vues qui se contredisent.
+# Usage: python HullScore.py <frame_dir> <hull.obj> <mesh.obj> [sym=1] [board.png]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+import Raster, SheetScore as SS
+
+
+def renders(verts, faces, meta, shapes):
+    r = Raster.Renderer(verts, faces); out = {}
+    for v in meta["views"]:
+        if v["kept"]:
+            out[v["name"]], _ = SS.render_in_panel(r, meta, v, shapes[v["name"]])
+    r.release(); return out
+
+
+def hull_masks(fdir, hull, sym=True):
+    meta = json.load(open(os.path.join(fdir, "frame.json")))
+    shapes = {v["name"]: np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))).shape for v in meta["views"]}
+    h = trimesh.load(hull, force="mesh", process=False)
+    H = renders(h.vertices, h.faces, meta, shapes)
+    if sym:   # mirrored hull: union of the hull and its mirror, the best symmetric target (bound (A+B)/(A+2B))
+        hv = h.vertices.copy(); hv[:, 0] *= -1
+        Hm = renders(hv, h.faces[:, ::-1], meta, shapes)
+        H = {k: H[k] | Hm[k] for k in H}
+    return meta, shapes, H
+
+
+def score(meta, shapes, H, mesh):
+    m = trimesh.load(mesh, force="mesh", process=False)
+    M = renders(m.vertices, m.faces, meta, shapes)
+    return {k: round(float((M[k] & H[k]).sum() / max((M[k] | H[k]).sum(), 1)), 4) for k in H}, M
+
+
+def main(fdir, hull, mesh, sym="1", board=None):
+    meta, shapes, H = hull_masks(fdir, hull, sym == "1")
+    iou, M = score(meta, shapes, H, mesh)
+    if board:
+        tiles = []
+        for k in H:
+            rgb = np.full(H[k].shape + (3,), 90, np.uint8); rgb[H[k] & M[k]] = (200, 200, 200)
+            rgb[H[k] & ~M[k]] = (220, 40, 40); rgb[M[k] & ~H[k]] = (50, 110, 230); tiles.append(rgb)
+        hmax = max(t.shape[0] for t in tiles)
+        Image.fromarray(np.concatenate([np.pad(t, ((0, hmax - t.shape[0]), (0, 4), (0, 0))) for t in tiles], 1)).save(board)
+    print(json.dumps({"hull_iou": iou, "mean": round(float(np.mean(list(iou.values()))), 4)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

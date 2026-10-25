@@ -1,0 +1,62 @@
+# 25 October 2026 : ZenRay Meshes, score a reconstruction against the GENERATED sheet itself (the target score).
+# EN: renders the mesh in each panel's own frame (same px per metre, same placement as SheetFit), compares the silhouette
+# to the panel's cut out (IoU), and composes a review board: reference panel | reproduction (grey viewport) | overlay.
+# FR : note la reproduction contre la planche elle-même, vue par vue, et monte la planche de relecture.
+# Usage: python SheetScore.py <frame_dir> <views_dir> <mesh.obj> <board.png>
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import trimesh
+from PIL import Image, ImageDraw, ImageFont
+import Raster
+
+
+def render_in_panel(mesh_r, meta, v, shape):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]
+    vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]
+    R = int(max(shape))
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2       # centre alignment, same rule as SheetHull.view_px
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    cu = ucen + (R / 2 - xc) / s; cv = vcen + (yc - R / 2) / s
+    c = cu * rx + cv * uy
+    M, Dp, N, F = mesh_r.render(c, s, (rx.tolist(), uy.tolist(), tz.tolist()), R)
+    M = M[: shape[0], : shape[1]]; N = N[: shape[0], : shape[1]]
+    key = np.array([-0.4, 0.55, 0.73]); key /= np.linalg.norm(key)
+    val = np.clip(0.3 + 0.6 * np.clip((N * key).sum(-1), 0, 1) + 0.1 * N[..., 2], 0, 1)
+    return M, np.where(M, val * 255, 118).astype(np.uint8)
+
+
+def main(fdir, vdir, mesh_path, board):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    mesh = trimesh.load(mesh_path, force="mesh", process=False)
+    mr = Raster.Renderer(mesh.vertices, mesh.faces)
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 16)
+    tiles, scores = [], {}
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        M, img = render_in_panel(mr, meta, v, mref.shape)
+        iou = float((M & mref).sum() / max((M | mref).sum(), 1)); scores[v["name"]] = round(iou, 4)
+        ov = np.stack([ref] * 3, -1).copy()
+        ov[mref & ~M] = (220, 60, 60); ov[M & ~mref] = (60, 120, 230)
+        row = np.hstack([np.stack([ref] * 3, -1), np.stack([img] * 3, -1), ov])
+        im = Image.fromarray(row.astype(np.uint8)); d = ImageDraw.Draw(im)
+        d.text((6, 6), "%s  ref | reproduction | rouge = manque, bleu = en trop   IoU %.4f %s" % (v["name"], iou, "" if v["kept"] else "(vue écartée)"), font=font, fill=(255, 255, 0))
+        tiles.append(im); im.save(board.replace(".png", "_%s.png" % v["name"]))
+    mr.release()
+    Wd = max(t.width for t in tiles); Ht = sum(t.height for t in tiles)
+    out = Image.new("RGB", (Wd, Ht), (40, 40, 40)); y = 0
+    for t in tiles:
+        out.paste(t, (0, y)); y += t.height
+    out.save(board)
+    kept = [scores[v["name"]] for v in meta["views"] if v["kept"]]
+    print(json.dumps({"silhouette_iou": scores, "mean_kept": round(float(np.mean(kept)), 4), "board": board}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:5])

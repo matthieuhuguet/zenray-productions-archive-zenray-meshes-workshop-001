@@ -1,0 +1,269 @@
+# 25 October 2026 : ZenRay Meshes ARCHETYPE "quadruped" v1 (horse, dog, cow, deer...) : construction rules, no AI.
+# EN: components in construction order:
+#   BODY  = torso + neck + head as ONE quad loft along the length: in the side view, the silhouette OPENED by a disk of
+#           radius body_open_m (legs, tail and mane strands are thinner and vanish) gives per column the topmost run,
+#           i.e. the back line and the belly line, which become ring sections (super ellipse); the half width comes from
+#           the front view at torso height and is capped by k x half height for neck and head;
+#   LEGS  = what the side silhouette has outside the body: each connected part below the body is skeletonised, its
+#           longest path from the body to the hoof is a chain whose radius is the distance to the silhouette edge;
+#           front and hind pairs are split by the torso centre, their left/right x comes from the front and back views;
+#   TAIL  = the part behind the rump above the hocks, same chain rule.
+# Every number lives in PARAMS (rules) ; the measured instance is written to <out>_measure.json.
+# FR : archétype quadrupède : un seul loft pour corps, encolure et tête, puis pattes et queue en tubes mesurés.
+# Usage: python ArchetypeQuadruped.py <frame_dir> <out_prefix>
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage.morphology import skeletonize, disk, opening as binary_opening
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ArchetypeCar import axis_map
+
+PARAMS = {"width_cap": 1.25, "branch_min_m": 0.15, "leg_smooth_px": 6, "leg_rmax_px": 9, "leg_anchor_m": 0.18, "torso_open_m": 0.22, "body_open_m": 0.11, "ring": 16, "stations": 70, "superellipse": 2.4, "width_ratio_head": 0.55,
+          "leg_ring": 8, "leg_step_m": 0.05, "leg_min_len_m": 0.25, "leg_x_top_scale": 0.75, "min_radius_m": 0.02,
+          "foot_y_m": 0.5, "body_dilate_m": 0.03, "smooth": 1.5}
+
+
+def side_image(meta, fdir, name):
+    v = [x for x in meta["views"] if x["name"] == name][0]
+    M = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % name))) > 127
+    sa, sb, tp = axis_map(meta, v)
+    s = v["px_per_m"]
+    # inverse map pixel -> world (u along +a axis, v along +b axis)
+    x0, y0 = tp(0.0, 0.0)
+    to_world = lambda px, py: ((px - x0) / s * sa, (y0 - py) / s * sb)
+    return M, s, to_world
+
+
+def chain_from_component(comp, dt, s, to_world, top_hint):
+    sk = skeletonize(comp)
+    pts = np.argwhere(sk)
+    if len(pts) < 5:
+        return None
+    # graph BFS over skeleton pixels (8 neighbours)
+    idx = {tuple(p): i for i, p in enumerate(pts)}
+    nb = [[idx[(p[0] + dy, p[1] + dx)] for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy or dx) and (p[0] + dy, p[1] + dx) in idx] for p in pts]
+    def bfs(a):
+        d = -np.ones(len(pts), int); d[a] = 0; q = [a]; par = -np.ones(len(pts), int)
+        for u in q:
+            for w in nb[u]:
+                if d[w] < 0: d[w] = d[u] + 1; par[w] = u; q.append(w)
+        return d, par
+    start = int(np.argmin(np.linalg.norm(pts - np.array(top_hint), axis=1)))
+    d, par = bfs(start); end = int(np.argmax(d))
+    d2, par2 = bfs(end); start2 = int(np.argmax(d2))      # diameter of the skeleton, oriented from the body side
+    path = [start2]
+    while path[-1] != end:
+        path.append(par2[path[-1]])
+    if np.linalg.norm(pts[path[0]] - np.array(top_hint)) > np.linalg.norm(pts[path[-1]] - np.array(top_hint)):
+        path = path[::-1]
+    Pp = pts[path].astype(float)
+    # smooth the medial path (edge noise: hair, feathering), radius = local max of the distance to the edge (25 October 2026)
+    sg = PARAMS["leg_smooth_px"]; Pp = np.stack([ndi.gaussian_filter1d(Pp[:, 0], sg, mode="nearest"), ndi.gaussian_filter1d(Pp[:, 1], sg, mode="nearest")], 1)
+    dmax = ndi.maximum_filter(dt, size=PARAMS["leg_rmax_px"])
+    out = []
+    for r, c in Pp:
+        ri, ci = int(round(r)), int(round(c))
+        out.append((to_world(c, r), dmax[ri, ci] / s))
+    return out
+
+
+def chains_all_branches(comp, dt, s, to_world, top_hint, min_len_px):
+    """Every skeleton branch longer than min_len_px, as smoothed chains (25 October 2026): two legs that overlap in
+    the side view form one component with two long branches; hair spurs are shorter and dropped."""
+    sk = skeletonize(comp); pts = np.argwhere(sk)
+    if len(pts) < 5: return []
+    idx = {tuple(p): i for i, p in enumerate(pts)}
+    nb = [[idx[(p[0] + dy, p[1] + dx)] for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy or dx) and (p[0] + dy, p[1] + dx) in idx] for p in pts]
+    root = int(np.argmin(np.linalg.norm(pts - np.array(top_hint), axis=1)))
+    # BFS tree from the root, then longest-path decomposition (like the tree archetype chains)
+    par = -np.ones(len(pts), int); order = [root]; seen = {root}
+    for u in order:
+        for w in nb[u]:
+            if w not in seen: seen.add(w); par[w] = u; order.append(w)
+    kids = [[] for _ in pts]
+    for i in order[1:]: kids[par[i]].append(i)
+    depth = np.zeros(len(pts))
+    for u in order[::-1]:
+        depth[u] = 1 + max([depth[k] for k in kids[u]], default=0)
+    chains, stack = [], [(root, None)]
+    while stack:
+        u, frm = stack.pop(); ch = ([frm] if frm is not None else []) + [u]
+        while kids[u]:
+            ks = sorted(kids[u], key=lambda k: -depth[k])
+            for k in ks[1:]:
+                if depth[k] >= min_len_px: stack.append((k, u))
+            u = ks[0]; ch.append(u)
+        if len(ch) >= min_len_px: chains.append(ch)
+    out = []
+    dmax = ndi.maximum_filter(dt, size=PARAMS["leg_rmax_px"]); sg = PARAMS["leg_smooth_px"]
+    for ch in chains:
+        Pp = pts[ch].astype(float)
+        Pp = np.stack([ndi.gaussian_filter1d(Pp[:, 0], sg, mode="nearest"), ndi.gaussian_filter1d(Pp[:, 1], sg, mode="nearest")], 1)
+        out.append([(to_world(c, r), dmax[int(round(r)), int(round(c))] / s) for r, c in Pp])
+    return out
+
+
+def main(fdir, outp):
+    P = PARAMS; meta = json.load(open(os.path.join(fdir, "frame.json")))
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"])
+    M, s, to_w = side_image(meta, fdir, "right")
+    dt = ndi.distance_transform_edt(M)
+    body = binary_opening(M, disk(int(round(P["body_open_m"] * s))))
+    lab, n = ndi.label(body); sizes = ndi.sum(body, lab, range(1, n + 1)); body = lab == (1 + int(np.argmax(sizes)))
+    cols = np.where(body.any(0))[0]
+    # per column: topmost run of the opened body (back line, belly line)
+    sec = []
+    for c in np.linspace(cols.min(), cols.max(), P["stations"]).astype(int):
+        r = np.where(body[:, c])[0]
+        if not len(r): continue
+        runs = np.split(r, np.where(np.diff(r) > 1)[0] + 1); run = runs[0]
+        (z, ytop), (_, ybot) = to_w(c, run[0]), to_w(c, run[-1])
+        sec.append((z, ytop, ybot))
+    sec = np.array(sorted(sec))
+    # TWO SCALE OPENING (25 October 2026): a big disk keeps only the torso (a raised forearm, thinner, vanishes); where
+    # the big opening exists its belly line wins, elsewhere (neck, head) the small opening gives the section
+    big = binary_opening(M, disk(int(round(P["torso_open_m"] * s))))
+    lb, nb_ = ndi.label(big)
+    if nb_:
+        big = lb == (1 + int(np.argmax(ndi.sum(big, lb, range(1, nb_ + 1)))))
+        for k_, (z, yt, yb) in enumerate(sec):
+            px = int(round(np.interp(z, [to_w(0, 0)[0], to_w(1, 0)[0]], [0, 1]))) if False else None
+        bc = {}
+        for c in np.where(big.any(0))[0]:
+            r = np.where(big[:, c])[0]; bc[c] = to_w(c, r[0])[0], to_w(c, r[-1])[1]
+        bz = np.array([v[0] for v in bc.values()]); bb = np.array([v[1] for v in bc.values()])
+        order = np.argsort(bz); bz, bb = bz[order], bb[order]
+        inside = (sec[:, 0] >= bz.min()) & (sec[:, 0] <= bz.max())
+        sec[inside, 2] = np.interp(sec[inside, 0], bz, bb)
+    sec[:, 1] = ndi.gaussian_filter1d(sec[:, 1], P["smooth"]); sec[:, 2] = ndi.gaussian_filter1d(sec[:, 2], P["smooth"])
+    # torso half width from the front view at mid torso height
+    F, sf, to_wf = side_image(meta, fdir, "front")
+    hh = (sec[:, 1] - sec[:, 2]) / 2; ic = np.argmax(hh); y_t = (sec[ic, 1] + sec[ic, 2]) / 2
+    _, y0f = to_wf(0, 0); x0f = None
+    vf = [x for x in meta["views"] if x["name"] == "front"][0]; _, _, tpf = axis_map(meta, vf)
+    pxc, pyc = tpf(0.0, y_t); row = F[int(round(pyc))]; cc = np.where(row)[0]
+    W_body = (cc.max() - cc.min()) / 2 / sf if len(cc) else D[0] / 2
+    z_mid = sec[ic, 0]
+    x0c, _ = tpf(0.0, 0.0)
+    def run_hw(y):
+        row = F[int(np.clip(round(tpf(0.0, y)[1]), 0, F.shape[0] - 1))]; c0 = int(round(x0c))
+        if not (0 <= c0 < len(row)) or not row[c0]:
+            near = np.where(row)[0]
+            if not len(near): return 0.0
+            c0 = int(near[np.argmin(np.abs(near - c0))])
+        l = c0
+        while l > 0 and row[l - 1]: l -= 1
+        r = c0
+        while r < len(row) - 1 and row[r + 1]: r += 1
+        return (r - l + 1) / 2 / sf
+    def front_hw(cy, h):
+        # half width = central run of the FRONT view at the section's heights (median over its middle half), 25 October 2026
+        ws = [run_hw(y) for y in np.linspace(cy - 0.5 * h, cy + 0.5 * h, 7)]
+        return float(np.clip(np.median(ws), P["min_radius_m"], W_body * P["width_cap"]))
+    # body loft rings
+    R = P["ring"]; rings = []
+    for z, yt, yb in sec:
+        cy, h = (yt + yb) / 2, max((yt - yb) / 2, 0.01)
+        w = front_hw(cy, h)
+        t = np.linspace(0, 2 * np.pi, R, endpoint=False); e = 2 / P["superellipse"]
+        ct, st = np.cos(t), np.sin(t)
+        x = w * np.sign(ct) * np.abs(ct) ** e; y = cy + h * np.sign(st) * np.abs(st) ** e
+        rings.append(np.stack([x, y, np.full(R, z)], 1))
+    V = list(np.concatenate(rings)); F_ = []
+    S = len(rings)
+    for i in range(S - 1):
+        for j in range(R):
+            a, b = i * R + j, i * R + (j + 1) % R; F_.append((a, b, b + R, a + R))
+    for i, flip in ((0, True), (S - 1, False)):   # caps as quads between symmetric pairs (ring is symmetric about y axis)
+        base = i * R; h_ = R // 2
+        for j in range(1, h_ // 2 + 0):
+            pass
+        c = len(V); V.append(np.array([0.0, rings[i][:, 1].mean(), rings[i][0, 2]]))
+        for j in range(0, R, 2):
+            q = (base + j, base + (j + 1) % R, base + (j + 2) % R, c)
+            F_.append(q[::-1] if flip else q)
+    # legs and tail: side silhouette outside the (slightly dilated) body
+    rest = M & ~ndi.binary_dilation(body, iterations=int(round(P["body_dilate_m"] * s)))
+    chains = []
+    def _add_chain(ch, comp_id, branch):
+        L = sum(np.hypot(ch[i + 1][0][0] - ch[i][0][0], ch[i + 1][0][1] - ch[i][0][1]) for i in range(len(ch) - 1))
+        if L < P["leg_min_len_m"]: return
+        (z0, y0_), r0 = ch[0]
+        if branch == 0: ch = [((z0, y0_ + P["leg_anchor_m"]), r0 * 1.1)] + ch   # the main branch starts inside the body (no gap)
+        zs = np.array([p[0][0] for p in ch]); ys = np.array([p[0][1] for p in ch])
+        kind = "leg" if ys.min() < P["foot_y_m"] else "tail"
+        chains.append({"comp": int(comp_id), "branch": int(branch), "kind": kind, "z": zs.tolist(), "y": ys.tolist(), "r": [max(p[1], P["min_radius_m"]) for p in ch]})
+
+    lab, n = ndi.label(rest)
+    by = {int(c): np.where(body[:, c])[0].max() for c in cols}
+    for k in range(1, n + 1):
+        comp = lab == k
+        if comp.sum() < (P["leg_min_len_m"] * s) * 3: continue
+        rr, cc2 = np.nonzero(comp)
+        top = (rr.min(), int(np.median(cc2[rr < rr.min() + 4])))
+        for bi, ch in enumerate(chains_all_branches(comp, dt, s, to_w, top, int(P["branch_min_m"] * s))):
+            _add_chain(ch, k, bi)
+    # left/right x of legs from the end views (front pair in the front view, hind pair in the back view)
+    def leg_x(view):
+        v = [x for x in meta["views"] if x["name"] == view][0]; Mv = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % view))) > 127
+        _, _, tpv = axis_map(meta, v); xs = np.linspace(lo[0], lo[0] + D[0], 200)
+        occ = np.array([any(0 <= int(round(tpv(x * (1 if v['rx'][0] > 0 else -1), y)[1])) < Mv.shape[0] and Mv[int(round(tpv(x * (1 if v['rx'][0] > 0 else -1), y)[1])), int(np.clip(round(tpv(x * (1 if v['rx'][0] > 0 else -1), y)[0]), 0, Mv.shape[1] - 1))] for y in np.linspace(0.15, 0.6, 10)) for x in xs])
+        lab1, n1 = ndi.label(occ)
+        cs = sorted([(int((lab1 == i).sum()), float(xs[lab1 == i].mean())) for i in range(1, n1 + 1)], reverse=True)[:2]
+        xx = sorted(c[1] for c in cs)
+        return xx if len(xx) == 2 else [-W_body * 0.5, W_body * 0.5]
+    xF, xH = leg_x("front"), leg_x("back")
+    fr = [c for c in chains if c["kind"] == "leg" and np.mean(c["z"][:3]) > z_mid]
+    hi_ = [c for c in chains if c["kind"] == "leg" and np.mean(c["z"][:3]) <= z_mid]
+    for group, xx in ((fr, xH if False else xF), (hi_, xH)):
+        group.sort(key=lambda c: -len(c["z"]))
+        if len(group) == 1:
+            g2 = dict(group[0]); group.append(g2); chains.append(g2)
+        xs_ = sorted(xx, reverse=True)
+        for c, x in zip(group[:2], xs_): c["x"] = x            # the two longest branches are the two legs of the pair
+        for c in group[2:]:                                    # shorter branches (hooves, fetlocks) follow their component
+            same = [g for g in group[:2] if g.get("comp") == c.get("comp")]
+            c["x"] = same[0]["x"] if same else xs_[0]
+    for c in chains:
+        c.setdefault("x", 0.0)
+    # tubes
+    def tube(c):
+        pts = np.stack([np.full(len(c["z"]), c["x"]), c["y"], c["z"]], 1)
+        if c["kind"] == "leg":   # the top of a leg sits inside the body, closer to the centre line
+            f = np.linspace(P["leg_x_top_scale"], 1, len(pts)) ** 2; pts[:, 0] *= np.clip(f, 0, 1)
+        # resample by arc length
+        dl = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+        m = max(int(dl[-1] / P["leg_step_m"]), 2); u = np.linspace(0, dl[-1], m)
+        Q = np.stack([np.interp(u, dl, pts[:, k]) for k in range(3)], 1); r = ndi.gaussian_filter1d(np.interp(u, dl, c["r"]), 1.0)
+        T = np.gradient(Q, axis=0); T /= np.linalg.norm(T, axis=1, keepdims=True) + 1e-9
+        nrm = np.cross(T[0], [1, 0, 0]); nrm = nrm if np.linalg.norm(nrm) > 1e-3 else np.cross(T[0], [0, 1, 0]); nrm /= np.linalg.norm(nrm)
+        ring_pts = []
+        for i in range(len(Q)):
+            if i: nrm = nrm - T[i] * np.dot(nrm, T[i]); nrm /= np.linalg.norm(nrm) + 1e-9
+            b = np.cross(T[i], nrm); t = np.linspace(0, 2 * np.pi, P["leg_ring"], endpoint=False)
+            ring_pts.append(Q[i] + r[i] * (np.cos(t)[:, None] * nrm + np.sin(t)[:, None] * b))
+        return np.concatenate(ring_pts), len(Q)
+    for c in chains:
+        Vt, n_ = tube(c); base = len(V); V.extend(list(Vt)); Rr = P["leg_ring"]
+        for i in range(n_ - 1):
+            for j in range(Rr):
+                a, b = base + i * Rr + j, base + i * Rr + (j + 1) % Rr; F_.append((a, b, b + Rr, a + Rr))
+        for i, flip in ((0, True), (n_ - 1, False)):
+            bs = base + i * Rr
+            for j in range(0, Rr - 2, 2):
+                q = (bs, bs + j + 1, bs + j + 2, bs + (j + 3) % Rr) if j + 3 < Rr or (j + 3) % Rr == 0 else None
+                if q: F_.append(q[::-1] if flip else q)
+    V = np.array(V)
+    with open(outp + ".obj", "w") as fo:
+        fo.write("# ZenRay Meshes archetype quadruped v1, 25 October 2026\n")
+        for v in V: fo.write("v %.5f %.5f %.5f\n" % tuple(v))
+        for f in F_: fo.write("f %d %d %d %d\n" % tuple(k + 1 for k in f[::-1]))
+    json.dump({"_date": "25 October 2026", "params": P, "W_body": W_body, "z_mid": z_mid, "sections": sec.tolist(), "chains": chains,
+               "x_front": xF, "x_hind": xH}, open(outp + "_measure.json", "w"))
+    Image.fromarray((np.stack([M * 70 + body * 120 + rest * 60] * 3, -1)).astype(np.uint8)).save(outp + "_parts.png")
+    print(json.dumps({"stations": len(sec), "W_body": round(W_body, 3), "chains": [(c["kind"], len(c["z"]), round(c["x"], 2)) for c in chains], "quads": len(F_)}))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])

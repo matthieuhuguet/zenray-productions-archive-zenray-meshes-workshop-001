@@ -1,0 +1,22 @@
+#!/bin/zsh
+# 25 October 2026 : ZenRay Meshes car, full fit chain in one command (HDA order: rules, compensation, silhouette fit).
+# 1 archetype build + CageComp (shoulders, skirts) ; 2 subdivision matrix S and faces from the live Houdini ;
+# 3 SilFit (cage offsets "dv") ; 4 RunCar score and STATE. A topology change (stations, rows) restarts dv from zero.
+# Usage: FitCar.sh <tag> [silfit k=v ...]
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1; shift
+cd $W
+$PY - <<'PYEOF'
+import json; p='work/car/cage_comp.json'
+try: c=json.load(open(p))
+except Exception: c={}
+c.pop('dv', None); json.dump(c, open(p,'w'))
+PYEOF
+$PY -I Scripts/CageComp.py iters=3 | tail -1
+$PY -I Scripts/SubdivMatrix.py /obj/ZRM_Car cage_creases cage_subd work/car/subdiv_S.npz | tail -1
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "import hou, numpy as np
+g=hou.node('/obj/ZRM_Car'); sg=g.node('cage_subd').geometry()
+np.save('$W/work/car/subdiv_faces.npy', np.array([[v.point().number() for v in p.vertices()] for p in sg.prims()], dtype=np.int32))
+result=1" live > /dev/null
+$PY -I Scripts/SilFit.py iters=16 step=0.3 lam=0.5 "$@" | tail -1
+zsh Scripts/RunCar.sh $TAG | tail -1 | cut -c1-160
