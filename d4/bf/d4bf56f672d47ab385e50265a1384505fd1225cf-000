@@ -1,0 +1,93 @@
+# 25 October 2026 : ZenRay Meshes, step 1 of the software : split a generated 6 views sheet into views, cut each
+# object out of its flat grey background, drop the scale cube, and measure the cross view consistency.
+# EN: separators are the thin straight lines the generator draws between panels (rows / columns whose difference to
+# their neighbours is strong along most of their length). Each panel: background = its median border colour; object =
+# pixels far from it, largest components kept; the small square scale cube (bottom left) is removed by shape.
+# FR : découpe la planche en vues, détoure l'objet, retire le cube d'échelle, mesure la cohérence entre vues.
+# Usage: python SheetSplit.py <sheet.png> <out_dir> <view names in reading order, comma separated>
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02}
+
+
+def separators(g, axis):
+    # axis 0: horizontal lines (rows), axis 1: vertical lines (cols)
+    d = np.abs(np.diff(g, axis=axis))
+    strong = d > P["line_strength"]
+    cover = strong.mean(axis=1 - axis) if strong.size else np.zeros(0)
+    idx = np.where(cover > P["line_cover"])[0]
+    lines = []
+    for i in idx:
+        if not lines or i - lines[-1] > P["min_gap"]:
+            lines.append(int(i))
+    return lines
+
+
+def panels(img):
+    g = np.asarray(img.convert("L")).astype(float)
+    H, W = g.shape
+    rows = [0] + separators(g, 0) + [H]
+    out = []
+    for r0, r1 in zip(rows[:-1], rows[1:]):
+        band = g[r0:r1]
+        cols = [0] + separators(band, 1) + [W]
+        for c0, c1 in zip(cols[:-1], cols[1:]):
+            if r1 - r0 > 60 and c1 - c0 > 60:
+                out.append((r0 + 2, r1 - 2, c0 + 2, c1 - 2))
+    return out
+
+
+def cutout(rgb):
+    a = rgb.astype(float)
+    border = np.concatenate([a[:6].reshape(-1, 3), a[-6:].reshape(-1, 3), a[:, :6].reshape(-1, 3), a[:, -6:].reshape(-1, 3)])
+    bg = np.median(border, 0)
+    m = np.linalg.norm(a - bg, axis=-1) > P["bg_thresh"]
+    m = ndi.binary_opening(m, iterations=1)
+    lab, n = ndi.label(m)
+    area = m.size
+    keep = np.zeros_like(m); cube = None
+    for i in range(1, n + 1):
+        comp = lab == i; s = comp.sum()
+        if s < P["min_area_frac"] * area:
+            continue
+        ys, xs = np.nonzero(comp)
+        h, w = np.ptp(ys) + 1, np.ptp(xs) + 1
+        squareish = 0.7 < h / w < 1.4 and s > 0.6 * h * w
+        if squareish and s < P["cube_max_frac"] * area:
+            cube = {"px": int(round((h + w) / 2)), "bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
+            continue
+        keep |= comp
+    keep = ndi.binary_fill_holes(ndi.binary_closing(keep, iterations=2))
+    return keep, cube
+
+
+def main(sheet, out, names):
+    os.makedirs(out, exist_ok=True)
+    img = Image.open(sheet).convert("RGB"); rgb = np.asarray(img)
+    pans = panels(img)
+    names = names.split(",")
+    rep = {"sheet": sheet, "panels": []}
+    for k, (r0, r1, c0, c1) in enumerate(pans):
+        name = names[k] if k < len(names) else "view%d" % k
+        crop = rgb[r0:r1, c0:c1]
+        m, cube = cutout(crop)
+        ys, xs = np.nonzero(m)
+        bb = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())] if len(xs) else None
+        Image.fromarray(crop).save(os.path.join(out, "%02d_%s_rgb.png" % (k, name)))
+        Image.fromarray((m * 255).astype(np.uint8)).save(os.path.join(out, "%02d_%s_mask.png" % (k, name)))
+        rec = {"index": k, "name": name, "rect": [c0, r0, c1, r1], "object_bbox": bb,
+               "object_w_px": None if bb is None else bb[2] - bb[0] + 1, "object_h_px": None if bb is None else bb[3] - bb[1] + 1,
+               "cube": cube}
+        if cube and bb:
+            rec["object_w_cubes"] = round(rec["object_w_px"] / cube["px"], 2); rec["object_h_cubes"] = round(rec["object_h_px"] / cube["px"], 2)
+        rep["panels"].append(rec)
+    json.dump(rep, open(os.path.join(out, "sheet.json"), "w"), indent=1)
+    for r in rep["panels"]:
+        print(r["index"], r["name"], "panel", r["rect"], "obj w x h px", r["object_w_px"], r["object_h_px"], "cube", r["cube"] and r["cube"]["px"], "in cubes", r.get("object_w_cubes"), r.get("object_h_cubes"))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:4])
