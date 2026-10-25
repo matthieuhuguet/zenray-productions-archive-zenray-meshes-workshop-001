@@ -6,6 +6,7 @@
 # FR : banc d'essai, six vues orthographiques d'un maillage connu et score 3D de toute reconstruction.
 # Usage: python Bench.py views <gt.obj> <out_dir> | score <pred.obj> <gt.obj> <views_dir> | selftest <gt.obj> <views_dir>
 import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import trimesh
 from PIL import Image
@@ -30,7 +31,25 @@ def frame(mesh):
     return c, scale
 
 
+_GPU = {}
+
+
 def rasterize(mesh, c, scale, view):
+    """GPU path (Raster.py, moderngl) when available, CPU path below otherwise; both return mask, depth, |n.view|
+    and set rasterize.last_normal (camera space normal facing the viewer)."""
+    try:
+        import Raster
+        key = id(mesh)
+        if key not in _GPU:
+            _GPU.clear(); _GPU[key] = Raster.Renderer(mesh.vertices, mesh.faces)
+        M, D, N, F = _GPU[key].render(c, scale, VIEWS[view], P["res"])
+        rasterize.last_normal = np.where(M[..., None], N, 0); rasterize.last_fid = F
+        return M, np.where(M, D, -np.inf), np.where(M, N[..., 2], 0)
+    except ImportError:
+        return rasterize_cpu(mesh, c, scale, view)
+
+
+def rasterize_cpu(mesh, c, scale, view):
     R = P["res"]
     rx, uy, tz = (np.array(a, float) for a in VIEWS[view])
     v = mesh.vertices - c
@@ -64,6 +83,7 @@ def rasterize(mesh, c, scale, view):
         csub = ncam[y0:y1 + 1, x0:x1 + 1]; csub[upd] = nc if n >= 0 else -nc
     mask = np.isfinite(zbuf)
     rasterize.last_normal = ncam
+    rasterize.last_fid = None
     return mask, zbuf, nbuf
 
 

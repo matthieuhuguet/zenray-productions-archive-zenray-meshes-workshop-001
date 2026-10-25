@@ -1,0 +1,215 @@
+# 25 October 2026 : ZenRay Meshes M12 : optimise a surface mesh against the six normal maps and silhouettes (no AI).
+# EN: each iteration renders the six views on the GPU (Raster.py), reads for every visible face the target normal of
+# the reference sheet under it, rotates the face's edges toward that normal, pulls the silhouette rim vertices onto
+# the reference contour, and solves a sparse least squares for the new vertex positions (gradient domain deformation,
+# separable per axis because the views are axis aligned). The image score is measured every iteration.
+# FR : la surface est déformée pour que ses faces prennent l'orientation de la normal map et son contour la silhouette.
+# Usage: python Optimize.py <views_dir> <init.obj> <out.obj> [k=v ...]
+import sys, os, json, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import trimesh
+import scipy.sparse as sp
+from scipy.sparse.linalg import factorized
+from scipy import ndimage as ndi
+from PIL import Image
+import Raster, Bench
+
+P = {"target_faces": 40000, "iters": 30, "w_edge": 1.0, "w_rim": 4.0, "w_anchor": 0.02, "alpha": 0.8,
+     "rim_band": 0.35, "mode": "rotate", "w_depth": 2.0, "w_lap": 1.0, "max_jump_m": 0.03, "max_step_m": 0.005, "taubin": 2, "remesh_every": 0, "res": 512, "min_votes": 1}
+
+
+def rot_to(a, b):
+    """Rotation matrices taking unit vectors a to b (N,3)->(N,3,3), Rodrigues."""
+    v = np.cross(a, b); c = (a * b).sum(1); sn = np.linalg.norm(v, axis=1)
+    k = v / (sn[:, None] + 1e-12)
+    K = np.zeros((len(a), 3, 3))
+    K[:, 0, 1], K[:, 0, 2], K[:, 1, 2] = -k[:, 2], k[:, 1], -k[:, 0]
+    K[:, 1, 0], K[:, 2, 0], K[:, 2, 1] = k[:, 2], -k[:, 1], k[:, 0]
+    ang = np.arctan2(sn, c)
+    I = np.eye(3)[None]
+    return I + np.sin(ang)[:, None, None] * K + (1 - np.cos(ang))[:, None, None] * (K @ K)
+
+
+def load_ref(vdir):
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    ref = {}
+    for v in Bench.VIEWS:
+        m = np.asarray(Image.open(os.path.join(vdir, "mask_%s.png" % v))) > 127
+        n = np.asarray(Image.open(os.path.join(vdir, "normal_%s.png" % v))).astype(float) / 255 * 2 - 1
+        n /= np.linalg.norm(n, axis=-1, keepdims=True) + 1e-9
+        contour = m & ~ndi.binary_erosion(m)
+        _, ind = ndi.distance_transform_edt(~contour, return_indices=True)
+        ref[v] = {"mask": m, "normal": n, "near": ind}
+    return meta, ref
+
+
+def prepare(mesh, target_faces, taubin):
+    mesh = trimesh.Trimesh(mesh.vertices, mesh.faces, process=True)
+    parts = mesh.split(only_watertight=False)
+    if len(parts) > 1:
+        mesh = trimesh.util.concatenate([p for p in parts if len(p.faces) > 0.002 * len(mesh.faces)])
+    if len(mesh.faces) > target_faces:
+        import fast_simplification
+        v, f = fast_simplification.simplify(mesh.vertices, mesh.faces, 1 - target_faces / len(mesh.faces))
+        mesh = trimesh.Trimesh(v, f, process=True)
+    if taubin:
+        trimesh.smoothing.filter_taubin(mesh, iterations=int(taubin))
+    return mesh
+
+
+def step(mesh, meta, ref, p):
+    V = mesh.vertices.copy(); F = mesh.faces
+    c, s, R = np.array(meta["center"]), meta["px_per_m"], meta["res"]
+    fn = mesh.face_normals
+    acc = np.zeros((len(F), 3)); cnt = np.zeros(len(F))
+    rim_rows = {0: [], 1: [], 2: []}    # axis -> list of (vertex, target coordinate)
+    rend = Raster.Renderer(V, F)
+    vn = mesh.vertex_normals
+    for v, axes in Bench.VIEWS.items():
+        rx, uy, tz = (np.array(a, float) for a in axes)
+        M, D, N, fid = rend.render(c, s, axes, R)
+        r = ref[v]
+        sel = M & r["mask"] & (fid >= 0)
+        fsel = fid[sel]
+        nt = r["normal"][sel]
+        nw = nt[:, 0:1] * rx + nt[:, 1:2] * uy + nt[:, 2:3] * tz
+        np.add.at(acc, fsel, nw); np.add.at(cnt, fsel, 1)
+        # silhouette rim: vertices nearly perpendicular to the view, pulled onto the nearest reference contour pixel
+        # rim = vertices that project onto the CURRENT rendered contour and are nearly perpendicular to the view
+        cur_contour = ndi.binary_dilation(M & ~ndi.binary_erosion(M), iterations=1)
+        q = V - c
+        pxa = np.clip((q @ rx * s + R / 2).astype(int), 0, R - 1); pya = np.clip((R / 2 - q @ uy * s).astype(int), 0, R - 1)
+        rimv = np.where((np.abs(vn @ tz) < p["rim_band"]) & cur_contour[pya, pxa])[0]
+        px, py = pxa[rimv], pya[rimv]
+        ny, nx = r["near"][0][py, px], r["near"][1][py, px]
+        tx = (nx + 0.5 - R / 2) / s; ty = (R / 2 - ny - 0.5) / s
+        for axis_vec, target in ((rx, tx), (uy, ty)):
+            ia = int(np.argmax(np.abs(axis_vec))); sg = axis_vec[ia]
+            rim_rows[ia].append((rimv, c[ia] + target * sg))
+    rend.release()
+    seen = cnt >= p["min_votes"]
+    tgt = fn.copy()
+    tgt[seen] = acc[seen] / (np.linalg.norm(acc[seen], axis=1, keepdims=True) + 1e-12)
+    tgt = fn + p["alpha"] * (tgt - fn); tgt /= np.linalg.norm(tgt, axis=1, keepdims=True) + 1e-12
+    Rm = rot_to(fn, tgt)
+    # edge equations: for each face, 3 edges (i,j), (v_i - v_j) = R_f (V_i - V_j) about the face centroid
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    fi = np.tile(np.arange(len(F)), 3)
+    d0 = V[e[:, 0]] - V[e[:, 1]]
+    d1 = np.einsum("nij,nj->ni", Rm[fi], d0)
+    ne, nv = len(e), len(V)
+    rows = np.concatenate([np.arange(ne), np.arange(ne)])
+    cols = np.concatenate([e[:, 0], e[:, 1]])
+    vals = np.concatenate([np.ones(ne), -np.ones(ne)]) * p["w_edge"]
+    A_e = sp.csr_matrix((vals, (rows, cols)), shape=(ne, nv))
+    A_a = sp.identity(nv, format="csr") * p["w_anchor"]
+    out = V.copy()
+    for ax in range(3):
+        blocks = [A_e, A_a]; rhs = [d1[:, ax] * p["w_edge"], V[:, ax] * p["w_anchor"]]
+        if rim_rows[ax]:
+            idx = np.concatenate([a for a, _ in rim_rows[ax]]); tg = np.concatenate([b for _, b in rim_rows[ax]])
+            blocks.append(sp.csr_matrix((np.full(len(idx), p["w_rim"]), (np.arange(len(idx)), idx)), shape=(len(idx), nv)))
+            rhs.append(tg * p["w_rim"])
+        A = sp.vstack(blocks).tocsc(); b = np.concatenate(rhs)
+        solve = factorized((A.T @ A).tocsc())
+        out[:, ax] = solve(A.T @ b)
+    mesh.vertices = out
+    return mesh, float(seen.mean())
+
+
+def integrate_view(nrm, mask, s):
+    import Methods
+    return Methods.integrate_normals(nrm, mask, s)
+
+
+def step_depth(mesh, meta, ref, p, cache):
+    """M12b: per view, the reference normal map integrated into depth (cached), its unknown offset per region taken
+    from the CURRENT mesh depth (median), gives target points; visible vertices are pulled along the view axis toward
+    them, with a Laplacian (shape keeping) term. Separable per axis."""
+    V = mesh.vertices.copy(); F = mesh.faces
+    c, s, R = np.array(meta["center"]), meta["px_per_m"], meta["res"]
+    rend = Raster.Renderer(V, F)
+    rows = {0: [], 1: [], 2: []}
+    for v, axes in Bench.VIEWS.items():
+        rx, uy, tz = (np.array(a, float) for a in axes)
+        M, D, N, fid = rend.render(c, s, axes, R)
+        r = ref[v]
+        if v not in cache:
+            Z = integrate_view(r["normal"], r["mask"], s)
+            jumps = np.zeros_like(r["mask"])
+            jumps[:, 1:] |= np.abs(r["normal"][:, 1:] - r["normal"][:, :-1]).sum(-1) > 0.6
+            jumps[1:, :] |= np.abs(r["normal"][1:] - r["normal"][:-1]).sum(-1) > 0.6
+            lab, _ = ndi.label(r["mask"] & ~jumps)
+            cache[v] = (Z, lab)
+        Z, lab = cache[v]
+        both = M & r["mask"] & np.isfinite(Z) & (lab > 0)
+        # offsets per region from the current mesh
+        diff = np.where(both, D - Z, np.nan)
+        off = ndi.median(np.nan_to_num(diff), labels=np.where(both, lab, 0), index=np.arange(1, lab.max() + 1))
+        off = np.concatenate([[0.0], np.asarray(off)])
+        target = Z + off[lab]
+        # vertices visible in this view: project, check rendered face id belongs to a face of the vertex (cheap: depth test)
+        q = V - c
+        px = np.clip((q @ rx * s + R / 2).astype(int), 0, R - 1); py = np.clip((R / 2 - q @ uy * s).astype(int), 0, R - 1)
+        dv = q @ tz
+        vis = both[py, px] & (np.abs(D[py, px] - dv) < 2.5 / s)
+        idx = np.where(vis)[0]
+        td = target[py[idx], px[idx]]
+        keep = np.abs(td - dv[idx]) < p["max_jump_m"]                    # robust: far targets are outliers
+        idx = idx[keep]; td = dv[idx] + np.clip(td[keep] - dv[idx], -p["max_step_m"], p["max_step_m"])  # trust region
+        ia = int(np.argmax(np.abs(tz))); sg = tz[ia]
+        rows[ia].append((idx, c[ia] + td * sg))
+    rend.release()
+    # Laplacian of the current shape (uniform), kept
+    nv = len(V)
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]); e = np.concatenate([e, e[:, ::-1]])
+    Adj = sp.csr_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(nv, nv)); Adj.data[:] = 1
+    deg = np.asarray(Adj.sum(1)).ravel()
+    L = sp.diags(deg) - Adj
+    delta = L @ V
+    out = V.copy()
+    for ax in range(3):
+        blocks = [L * p["w_lap"], sp.identity(nv, format="csr") * p["w_anchor"]]
+        rhs = [delta[:, ax] * p["w_lap"], V[:, ax] * p["w_anchor"]]
+        if rows[ax]:
+            idx = np.concatenate([a for a, _ in rows[ax]]); tg = np.concatenate([b for _, b in rows[ax]])
+            blocks.append(sp.csr_matrix((np.full(len(idx), p["w_depth"]), (np.arange(len(idx)), idx)), shape=(len(idx), nv)))
+            rhs.append(tg * p["w_depth"])
+        A = sp.vstack(blocks).tocsc(); b = np.concatenate(rhs)
+        out[:, ax] = factorized((A.T @ A).tocsc())(A.T @ b)
+    mesh.vertices = out
+    return mesh, 1.0
+
+
+def main(vdir, init, out, **kw):
+    p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P})
+    gt = kw.get("gt")
+    meta, ref = load_ref(vdir)
+    mesh = prepare(trimesh.load(init, force="mesh", process=False), p["target_faces"], p["taubin"])
+    log = []
+    cache = {}
+    tmp = out.replace(".obj", "_iter.obj")
+    for it in range(p["iters"] + 1):
+        mesh.export(tmp)
+        isc = Bench.image_score(tmp, vdir)["image_score"]
+        rec = {"iter": it, "image_score": round(isc, 4), "faces": len(mesh.faces)}
+        if gt and (it % 5 == 0 or it == p["iters"]):
+            sc = Bench.score(tmp, gt, vdir); rec.update({"F0.5": round(sc["fscore_0.005"], 4), "F1": round(sc["fscore_0.01"], 4)})
+        log.append(rec); print(json.dumps(rec), flush=True)
+        if it == p["iters"]:
+            break
+        t = time.time()
+        if p["mode"] == "depth":
+            mesh, seen = step_depth(mesh, meta, ref, p, cache)
+        else:
+            mesh, seen = step(mesh, meta, ref, p)
+        if p["remesh_every"] and (it + 1) % p["remesh_every"] == 0:
+            mesh = prepare(mesh, p["target_faces"], 0)
+    mesh.export(out)
+    json.dump({"params": p, "log": log}, open(out.replace(".obj", ".log.json"), "w"), indent=1)
+
+
+if __name__ == "__main__":
+    vdir, init, out = sys.argv[1:4]
+    main(vdir, init, out, **dict(a.split("=", 1) for a in sys.argv[4:]))

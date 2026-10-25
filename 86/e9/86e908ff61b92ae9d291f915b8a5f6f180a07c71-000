@@ -1,0 +1,52 @@
+# 25 October 2026 : ZenRay Meshes M11 : Topo Transfer of a template with animation topology onto a target (Houdini native).
+# EN: the template is Manny bent and re-proportioned (a stand-in for a generic base mesh), the targets are the true Manny
+# and a reconstruction. Topo Transfer (non rigid ICP, Houdini 22) wraps the template, keeping its edge loops.
+# FR : un gabarit à topologie d'animation est habillé sur la cible par Topo Transfer, sa topologie est conservée.
+# Run in Houdini: g = {'WORK': ..., 'TARGETS': {'gt': path, 'hull': path}, 'ITERS': 10}; exec(open(this).read(), g)
+import hou, os
+
+WORK = globals()["WORK"]; TARGETS = globals()["TARGETS"]; ITERS = globals().get("ITERS", 10)
+TEMPLATE = globals().get("TEMPLATE", "/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/manny_character.obj")
+geo = hou.node("/obj").node("ZRM_TopoTest") or hou.node("/obj").createNode("geo", "ZRM_TopoTest")
+for c in geo.children():
+    c.destroy()
+tf = geo.createNode("file", "IN_template"); tf.parm("file").set(TEMPLATE)
+cl = geo.createNode("clean", "clean_template"); cl.setInput(0, tf)
+fu = geo.createNode("fuse::2.0", "fuse_template"); fu.setInput(0, cl)
+pd = geo.createNode("polydoctor", "doctor_template"); pd.setInput(0, fu)
+for pn, val in (("nonmanifoldpt", "repair"), ("disconnectpt", "repair"), ("illformed", "repair"), ("fixwindings", 1), ("deletesmallmanifolds", 1)):
+    if pd.parm(pn):
+        try: pd.parm(pn).set(val)
+        except Exception: pass
+dw = geo.createNode("attribwrangle", "deform_template"); dw.setInput(0, pd)
+# a generic base: wider, shorter, arms 12 degrees lower, so the wrap has real work to do
+dw.parm("snippet").set("""
+float s = clamp((abs(@P.x) - 0.18) / 0.15, 0, 1);
+float a = radians(-12.0) * sign(@P.x) * s;
+vector piv = set(0.18 * sign(@P.x), 1.42, 0);
+vector p = @P - piv;
+float ca = cos(a), sa = sin(a);
+if (s > 0) @P = piv + set(p.x * ca - p.y * sa, p.x * sa + p.y * ca, p.z);
+@P *= set(1.10, 0.94, 1.12);
+""")
+outs = {}
+for name, path in TARGETS.items():
+    t = geo.createNode("file", "IN_target_" + name); t.parm("file").set(path)
+    tt = geo.createNode("topotransfer", "topo_" + name)
+    tt.setInput(0, dw); tt.setInput(1, t)
+    if tt.parm("enablelandmarks") and not globals().get("LANDMARKS"):
+        tt.parm("enablelandmarks").set(0)
+    if tt.parm("iterations"):
+        tt.parm("iterations").set(ITERS)
+    ex = geo.createNode("rop_geometry", "EXPORT_" + name); ex.setInput(0, tt)
+    outp = os.path.join(WORK, "topo_%s.obj" % name); ex.parm("sopoutput").set(outp)
+    try:
+        ex.parm("execute").pressButton()
+        g = tt.geometry()
+        outs[name] = {"out": outp, "points": len(g.points()), "prims": len(g.prims()), "errors": tt.errors(), "warnings": tt.warnings()[:2]}
+    except Exception as e:
+        outs[name] = {"error": str(e)[:400], "node_errors": tt.errors()}
+ex = geo.createNode("rop_geometry", "EXPORT_template"); ex.setInput(0, dw)
+ex.parm("sopoutput").set(os.path.join(WORK, "topo_template.obj")); ex.parm("execute").pressButton()
+geo.layoutChildren()
+result = outs

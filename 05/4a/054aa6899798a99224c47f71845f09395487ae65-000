@@ -10,6 +10,7 @@ from scipy import ndimage as ndi
 from skimage import measure
 import trimesh
 
+LP_TIE = 0.005   # tolerance on the LP optimum when choosing the most balanced spans
 VIEWS_ORDER = ["front", "back", "right", "left", "top", "bottom"]
 
 
@@ -289,6 +290,140 @@ def m05_normal_integration(vdir, out, n=320, smooth=0.8, tol_px=2.0):
     return to_mesh(occ.reshape(n, n, n), ax, c, out, float(smooth))
 
 METHODS["M05"] = m05_normal_integration
+
+
+def xs_map(meta, va, vb, R):
+    ra = np.array(meta["views"][va][0], float); rb = np.array(meta["views"][vb][0], float)
+    ua = np.array(meta["views"][va][1], float); ub = np.array(meta["views"][vb][1], float)
+    return (ra @ rb > 0, ua @ ub > 0)
+
+
+def span_lp(ia, ib, ma, mb, ha, hb, same, R, pct=1.0, erode=0, max_grad=0.0):
+    """Opposite views a, b: thickness at every common pixel is (ha - sa (1 - a)) + (hb - sb (1 - b)) >= 0.
+    The true spans are the largest that keep every thickness non negative (thin parts and rims touch zero):
+    maximise sa * sum(1 - a) + sb * sum(1 - b) under those constraints (2 variable linear program).
+    pct trims the tightest constraints as noise."""
+    from scipy.optimize import linprog
+    if erode:
+        ma = ndi.binary_erosion(ma, iterations=int(erode)); mb = ndi.binary_erosion(mb, iterations=int(erode))
+    if max_grad:
+        # only smooth regions: blurred depth discontinuities give false tight constraints
+        for im, mm in ((ia, ma), (ib, mb)):
+            gy, gx = np.gradient(im)
+            mm &= ~ndi.binary_dilation(np.hypot(gx, gy) > max_grad, iterations=3)
+    ys, xs = np.nonzero(ma)
+    xb = xs if same[0] else R - 1 - xs
+    yb = ys if same[1] else R - 1 - ys
+    ok = mb[yb, xb]
+    a = 1 - ia[ys[ok], xs[ok]]; b = 1 - ib[yb[ok], xb[ok]]
+    H = ha + hb
+    A = np.stack([a, b], 1)
+    bnd = [(0, 4 * H), (0, 4 * H)]
+    if pct > 0 and len(a) > 200:
+        # noise and quantisation: drop the pct percent of pixels that bind first at the balanced solution
+        r0 = linprog(c=[-a.sum(), -b.sum()], A_ub=A, b_ub=np.full(len(a), H), bounds=bnd, method="highs")
+        slack = H - A @ r0.x
+        keep = slack > np.percentile(slack, pct)
+        A = A[keep]; a = a[keep]; b = b[keep]
+    r1 = linprog(c=[-a.sum(), -b.sum()], A_ub=A, b_ub=np.full(len(a), H), bounds=bnd, method="highs")
+    best = -r1.fun
+    # tie break: among optimal solutions (same objective), the most balanced spans (symmetric pairs are degenerate)
+    c2 = [0, 0, 1]
+    A2 = np.vstack([np.hstack([A, np.zeros((len(A), 1))]), [1, -1, -1], [-1, 1, -1], [-a.sum(), -b.sum(), 0]])
+    b2 = np.concatenate([np.full(len(A), H), [0, 0, -best * (1 - LP_TIE)]])
+    r2 = linprog(c=c2, A_ub=A2, b_ub=b2, bounds=bnd + [(0, None)], method="highs")
+    x = r2.x if r2.success else r1.x
+    return float(x[0]), float(x[1])
+
+
+def m06_depth_sheet(vdir, out, n=320, bits=8, blur=0.0, noise=0.0, smooth=0.8, tol_px=1.5, seed=0, affine="oracle", lp_pct=1.0, lp_erode=0, lp_grad=0.0):
+    """M06: the sheet gives a DEPTH map per view, as an image generator would: normalised per view to 0..1 over the
+    object (near = white), quantised to `bits`, optionally blurred and noisy. The per view affine is recovered exactly
+    from the visual hull's extent along the view axis (the other views fix it), then voxels are carved like M00."""
+    meta, masks, _ = load_views(vdir)
+    rng = np.random.default_rng(int(seed))
+    n = int(n); R = meta["res"]; s = meta["px_per_m"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij"); Pp = np.stack([X, Y, Z], -1).reshape(-1, 3)
+    hull = np.ones(len(Pp), bool); proj = {}
+    for v in VIEWS_ORDER:
+        px, py = project(meta, Pp, v)
+        ix, iy = np.clip(px.astype(int), 0, R - 1), np.clip(py.astype(int), 0, R - 1)
+        proj[v] = (ix, iy); hull &= masks[v][iy, ix]
+    occ = hull.copy()
+    imgs, spans = {}, {}
+    for v in VIEWS_ORDER:
+        dt = np.load(os.path.join(vdir, "depth_%s.npy" % v)); mm = masks[v]
+        lo_, hi_ = np.nanmin(dt), np.nanmax(dt)
+        im = np.where(mm, (dt - lo_) / (hi_ - lo_), 0)
+        if blur:
+            w = ndi.gaussian_filter(mm.astype(float), float(blur)); im = ndi.gaussian_filter(im, float(blur)) / np.maximum(w, 1e-6)
+        if noise:
+            im = im + rng.normal(0, float(noise), im.shape)
+        qq = (2 ** int(bits)) - 1
+        imgs[v] = np.round(np.clip(im, 0, 1) * qq) / qq
+    if affine in ("rim", "lp"):
+        # opposite views share their silhouette rim (mirrored); there the front and back surfaces meet:
+        # hhi_a - span_a (1 - a) = -(hhi_b - span_b (1 - b)), linear in the two spans, solved by least squares.
+        pairs = [("front", "back"), ("right", "left"), ("top", "bottom")]
+        for va, vb in pairs:
+            tza = np.array(meta["views"][va][2], float); tzb = np.array(meta["views"][vb][2], float)
+            da = Pp[hull] @ tza; db = Pp[hull] @ tzb
+            ha, hb = da.max(), db.max()
+            ma = masks[va]; rim = ma & ~ndi.binary_erosion(ma, iterations=2)
+            ys, xs = np.nonzero(rim)
+            # pixel (x, y) of view a is pixel (R-1-x, y) of view b when the right axis flips (front/back, left/right), (x, R-1-y) for top/bottom
+            ra = np.array(meta["views"][va][0], float); rb = np.array(meta["views"][vb][0], float)
+            ua = np.array(meta["views"][va][1], float); ub = np.array(meta["views"][vb][1], float)
+            xb = xs if ra @ rb > 0 else R - 1 - xs
+            yb = ys if ua @ ub > 0 else R - 1 - ys
+            ok = masks[vb][yb, xb]
+            a = imgs[va][ys[ok], xs[ok]]; b = imgs[vb][yb[ok], xb[ok]]
+            spans[va], spans[vb] = span_lp(imgs[va], imgs[vb], masks[va], masks[vb], ha, hb, xs_map(meta, va, vb, R), R, float(lp_pct), int(lp_erode), float(lp_grad))
+    for v in VIEWS_ORDER:
+        tz = np.array(meta["views"][v][2], float)
+        dtrue = np.load(os.path.join(vdir, "depth_%s.npy" % v))
+        m = masks[v]
+        lo, hi = np.nanmin(dtrue), np.nanmax(dtrue)
+        img = np.where(m, (dtrue - lo) / (hi - lo), 0)          # what a generator would draw
+        if blur:
+            w = ndi.gaussian_filter(m.astype(float), float(blur)); img = ndi.gaussian_filter(img, float(blur)) / np.maximum(w, 1e-6)
+        if noise:
+            img = img + rng.normal(0, float(noise), img.shape)
+        q = (2 ** int(bits)) - 1
+        img = np.round(np.clip(img, 0, 1) * q) / q
+        # recover the affine from the hull: depth range of the hull along tz
+        d = Pp @ tz
+        hhi = d[hull].max()                     # front extreme: known from the hull (equals the object's)
+        if affine == "oracle":
+            hlo = lo                            # diagnosis: true deepest visible depth
+        elif affine in ("rim", "lp"):
+            hlo = hhi - spans[v]
+        else:
+            # estimate the depth span: the largest span whose carving keeps every perpendicular silhouette whole
+            best = None
+            for frac in np.linspace(0.15, 1.0, 18):
+                span = frac * (hhi - d[hull].min())
+                dd0 = np.where(m, hhi - span + img * span, np.nan)[proj[v][1], proj[v][0]]
+                keep = hull & ~np.isnan(dd0) & (d <= np.nan_to_num(dd0, nan=-1e9) + tol_px / s + span / q)
+                worst = 1.0
+                for w in VIEWS_ORDER:
+                    if abs(np.dot(np.array(meta["views"][w][2], float), tz)) > 0.5:
+                        continue
+                    ix2, iy2 = proj[w]
+                    cov = np.zeros(R * R, bool); cov[(iy2 * R + ix2)[keep]] = True
+                    mw = masks[w].ravel(); worst = min(worst, (cov & mw).sum() / max(mw.sum(), 1))
+                if worst > 0.995:
+                    best = span; break
+            hlo = hhi - (best if best is not None else (hhi - d[hull].min()))
+        dep = np.where(m, hlo + img * (hhi - hlo), np.nan)
+        ix, iy = proj[v]
+        dd = dep[iy, ix]
+        occ &= ~np.isnan(dd) & (d <= np.nan_to_num(dd, nan=-1e9) + tol_px / s + (hhi - hlo) / q)
+    return to_mesh(occ.reshape(n, n, n), ax, c, out, float(smooth))
+
+METHODS["M06"] = m06_depth_sheet
 
 if __name__ == "__main__":
     name, vdir, out = sys.argv[1:4]

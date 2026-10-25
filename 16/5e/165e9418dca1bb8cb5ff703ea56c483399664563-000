@@ -1,0 +1,154 @@
+# 25 October 2026 : ZenRay Meshes M12c : vertex optimisation by true differentiable rendering (Mitsuba 3, Metal GPU, no AI).
+# EN: six near orthographic cameras (telephoto at 500x the half extent, because Mitsuba's silhouette derivatives need a
+# perspective camera) render the mesh twice per view: an emissive white mask (direct_projective, silhouette gradients)
+# and the world space normal (aov). The loss compares them to the reference sheet's masks and normal maps. Vertices are
+# updated with the "Large Steps" parametrisation (Nicolet et al. 2021): u = (I + lambda L) x, Adam on u, x = solve.
+# FR : optimisation des sommets par vrai rendu différentiable, masques et normales des six vues, pas « Large Steps ».
+# Usage: python DiffOpt.py <views_dir> <init.obj> <out.obj> [k=v ...]
+import sys, os, json, math, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import trimesh
+import scipy.sparse as sp
+from scipy.sparse.linalg import splu
+from PIL import Image
+import mitsuba as mi
+import drjit as dr
+mi.set_variant("metal_ad_rgb")
+import Bench
+
+P = {"res": 256, "iters": 200, "lr": 0.002, "lam": 20.0, "w_mask": 1.0, "w_normal": 1.0, "spp": 4,
+     "target_faces": 30000, "eval_every": 25, "telephoto": 500.0, "flip_x": 1, "remesh_every": 0}
+
+
+def load_refs(vdir, res):
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    refs = {}
+    for v, axes in Bench.VIEWS.items():
+        rx, uy, tz = (np.array(a, float) for a in axes)
+        m = Image.open(os.path.join(vdir, "mask_%s.png" % v)).resize((res, res), Image.BILINEAR)
+        m = np.asarray(m).astype(np.float32) / 255
+        n = np.asarray(Image.open(os.path.join(vdir, "normal_%s.png" % v)).resize((res, res), Image.NEAREST)).astype(np.float32) / 255 * 2 - 1
+        nw = n[..., 0:1] * rx + n[..., 1:2] * uy + n[..., 2:3] * tz
+        nw /= np.linalg.norm(nw, axis=-1, keepdims=True) + 1e-9
+        nw *= (m > 0.5)[..., None]
+        refs[v] = {"mask": m, "normal": nw.astype(np.float32)}
+    return meta, refs
+
+
+def sensors(meta, p):
+    c = np.array(meta["center"]); half = meta["res"] / 2 / meta["px_per_m"]; D = p["telephoto"] * half
+    out = {}
+    for i, (v, axes) in enumerate(Bench.VIEWS.items()):
+        rx, uy, tz = (np.array(a, float) for a in axes)
+        out["sensor_%d" % i] = {"type": "perspective", "fov": math.degrees(2 * math.atan(half / D)), "fov_axis": "x",
+                               "near_clip": D - 4 * half, "far_clip": D + 4 * half,
+                               "to_world": mi.ScalarTransform4f().look_at(origin=list(c + tz * D), target=list(c), up=list(uy)),
+                               "film": {"type": "hdrfilm", "width": p["res"], "height": p["res"], "rfilter": {"type": "box"}, "sample_border": True},
+                               "sampler": {"type": "independent", "sample_count": p["spp"]}}
+    return out
+
+
+def build_scene(mesh_path, sens, integ):
+    d = {"type": "scene", "integrator": integ,
+         "m": {"type": "obj", "filename": mesh_path, "face_normals": True, "bsdf": {"type": "diffuse"},
+               "emitter": {"type": "area", "radiance": {"type": "rgb", "value": [1, 1, 1]}}}}
+    d.update(sens)
+    return mi.load_dict(d)
+
+
+def laplacian(nv, faces):
+    e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]); e = np.concatenate([e, e[:, ::-1]])
+    A = sp.csr_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(nv, nv)); A.data[:] = 1
+    return sp.diags(np.asarray(A.sum(1)).ravel()) - A
+
+
+def main(vdir, init, out, **kw):
+    p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P})
+    gt = kw.get("gt")
+    meta, refs = load_refs(vdir, p["res"])
+    mesh = trimesh.load(init, force="mesh", process=True)
+    if len(mesh.faces) > p["target_faces"]:
+        import fast_simplification
+        v, f = fast_simplification.simplify(mesh.vertices, mesh.faces, 1 - p["target_faces"] / len(mesh.faces))
+        mesh = trimesh.Trimesh(v, f, process=True)
+    work = out.replace(".obj", "_work.obj"); mesh.export(work)
+    sens = sensors(meta, p)
+    s_mask = build_scene(work, sens, {"type": "direct_projective", "sppi": 0})
+    s_nrm = build_scene(work, sens, {"type": "aov", "aovs": "nn:geo_normal"})
+    pm, pn = mi.traverse(s_mask), mi.traverse(s_nrm)
+    key = "m.vertex_positions"
+    x0 = np.array(pm[key]).reshape(-1, 3)
+    F = np.array(pm["m.faces"]).reshape(-1, 3)
+    nv = len(x0)
+    M = (sp.identity(nv) + p["lam"] * laplacian(nv, F)).tocsc()
+    lu = splu(M)
+    u = M @ x0
+    m1 = np.zeros_like(u); m2 = np.zeros_like(u); b1, b2, eps = 0.9, 0.999, 1e-8
+    refT = {v: (mi.TensorXf(r["mask"][..., None].repeat(3, -1)), mi.TensorXf(r["normal"])) for v, r in refs.items()}
+    log = []
+    flip = p["flip_x"]
+
+    def evaluate(it, x):
+        tm = trimesh.Trimesh(x, F, process=False); tmp = out.replace(".obj", "_eval.obj"); tm.export(tmp)
+        rec = {"iter": it, "image_score": round(Bench.image_score(tmp, vdir)["image_score"], 4)}
+        if gt:
+            sc = Bench.score(tmp, gt, vdir); rec.update({"F0.5": round(sc["fscore_0.005"], 4), "F1": round(sc["fscore_0.01"], 4)})
+        print(json.dumps(rec), flush=True); log.append(rec)
+
+    x = x0.copy()
+    diag = float(np.linalg.norm(x0.max(0) - x0.min(0)))
+    for it in range(p["iters"] + 1):
+        if it % p["eval_every"] == 0 or it == p["iters"]:
+            evaluate(it, x)
+        if it == p["iters"]:
+            break
+        t = time.time()
+        g_total = np.zeros_like(x); L_total = 0.0
+        for sp_i, (v, (rm, rn)) in enumerate(refT.items()):
+            for scene, params, ref, w in ((s_mask, pm, rm, p["w_mask"]), (s_nrm, pn, rn, p["w_normal"])):
+                params[key] = mi.Float(x.ravel().astype(np.float32)); dr.enable_grad(params[key]); params.update()
+                img = mi.render(scene, params, sensor=sp_i, spp=p["spp"], seed=it * 13 + sp_i)
+                if flip:
+                    img = img[:, ::-1, :] if False else img
+                loss = w * dr.mean(dr.square(img - ref))
+                dr.backward(loss)
+                g_total += np.array(dr.grad(params[key])).reshape(-1, 3)
+                L_total += float(np.array(loss).ravel()[0])
+        # Large Steps: gradient in u space, Adam, back to x
+        gu = lu.solve(g_total)
+        # AdamUniform (Nicolet 2021): one scale for the whole mesh (max of the second moment), so noisy vertices
+        # never get a large normalised step; lr is a fraction of the bounding box diagonal.
+        m1 = b1 * m1 + (1 - b1) * gu; m2 = b2 * m2 + (1 - b2) * gu * gu
+        mh = m1 / (1 - b1 ** (it + 1)); vh = m2 / (1 - b2 ** (it + 1))
+        u = u - p["lr"] * diag * mh / (np.sqrt(vh.max()) + eps)
+        x = lu.solve(u)
+        if it % 10 == 0:
+            print(json.dumps({"iter": it, "loss": round(L_total, 6), "sec": round(time.time() - t, 2)}), flush=True)
+    trimesh.Trimesh(x, F, process=False).export(out)
+    json.dump({"params": p, "log": log}, open(out.replace(".obj", ".log.json"), "w"), indent=1)
+
+
+def check(vdir, gt_obj, res=256):
+    """Orientation check: render the TRUE mesh with the Mitsuba cameras; masks must match the reference masks."""
+    p = dict(P); p["res"] = res
+    meta, refs = load_refs(vdir, res)
+    sens = sensors(meta, p)
+    s = build_scene(gt_obj, sens, {"type": "direct_projective", "sppi": 0})
+    sn = build_scene(gt_obj, sens, {"type": "aov", "aovs": "nn:geo_normal"})
+    for i, v in enumerate(Bench.VIEWS):
+        a = np.array(mi.render(s, sensor=i, spp=16))[..., 0] > 0.5
+        n = np.array(mi.render(sn, sensor=i, spp=16))
+        r = refs[v]["mask"] > 0.5
+        for name, aa in (("as_is", a), ("flip_x", a[:, ::-1])):
+            print(v, name, "IoU %.4f" % ((aa & r).sum() / max((aa | r).sum(), 1)))
+        both = a & r
+        print(v, "normal cos median %.3f" % np.median((n[both] * refs[v]["normal"][both]).sum(-1)))
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "check":
+        check(sys.argv[2], sys.argv[3])
+    else:
+        vdir, init, out = sys.argv[1:4]
+        main(vdir, init, out, **dict(a.split("=", 1) for a in sys.argv[4:]))
