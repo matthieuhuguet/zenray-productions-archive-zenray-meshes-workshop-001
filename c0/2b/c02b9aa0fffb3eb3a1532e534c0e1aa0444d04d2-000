@@ -66,8 +66,29 @@ for b_ in (cy, cyr):
     bp.setInput(1, b_); n_ = len(bp.geometry().prims())
     if bb is None or n_ > bb[0]: bb = (n_, b_)
 bp.setInput(1, bb[1])
+# 25 October 2026: the arch cut leaves thin detached slivers of the rocker behind the rear wheels ; connected pieces whose
+# area is under sliver_area (m2, CTRL_zrm) are deleted (connectivity per panel, Python SOP)
+cn = geo.node("arch_cut_clean") or geo.createNode("python", "arch_cut_clean"); cn.setInput(0, bp)
+cn.parm("python").set("""# 25 October 2026 : delete small detached pieces left by the arch boolean
+import hou
+geo = hou.pwd().geometry(); lim = hou.node('../CTRL_zrm').parm('sliver_area').eval()
+prims = geo.prims(); parent = list(range(len(prims)))
+def f(i):
+    while parent[i] != i: parent[i] = parent[parent[i]]; i = parent[i]
+    return i
+by_pt = {}
+for pr in prims:
+    for v in pr.vertices(): by_pt.setdefault(v.point().number(), []).append(pr.number())
+for lst in by_pt.values():
+    for k in lst[1:]: parent[f(k)] = f(lst[0])
+area = {}
+for pr in prims: r = f(pr.number()); area[r] = area.get(r, 0.0) + pr.intrinsicValue('measuredarea')
+geo.deletePrims([pr for pr in prims if area[f(pr.number())] < lim], True)
+""")
+if not ctrl.parm("sliver_area"):
+    ptg2 = ctrl.parmTemplateGroup(); ptg2.append(hou.FloatParmTemplate("sliver_area", "Arch Cut Sliver Area (m2)", 1, default_value=(0.02,))); ctrl.setParmTemplateGroup(ptg2)
 asw = geo.node("arch_cut_switch") or geo.createNode("switch", "arch_cut_switch")
-asw.setInput(0, na); asw.setInput(1, bp); asw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
+asw.setInput(0, na); asw.setInput(1, cn); asw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
 for n_ in (bp, asw): n_.moveToGoodPosition()
 for n_ in (ld, lr, cy, cyr, bo, sw): n_.moveToGoodPosition()
 g = bo.geometry()
