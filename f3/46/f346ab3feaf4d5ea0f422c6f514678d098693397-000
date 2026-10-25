@@ -30,6 +30,14 @@ def build_and_read():
     return build_and_read_subd()
 
 
+def loft_width_at(y):
+    import trimesh
+    d = np.load(os.path.join(W, "work/car/loft_comp.npz")); Q = d["Q"]
+    m = trimesh.Trimesh(d["P"], np.concatenate([Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]]), process=False)
+    sec = m.section(plane_origin=[0, y, 0], plane_normal=[0, 1, 0])
+    return None if sec is None else float(np.abs(sec.vertices[:, 0]).max())
+
+
 def build_and_read_subd():
     subprocess.run([PY, "-I", os.path.join(W, "Scripts/archetypes/ArchetypeCar.py"), os.path.join(W, "work/car"), os.path.join(W, "work/car/arch_v1")],
                    check=True, capture_output=True, text=True)
@@ -71,9 +79,14 @@ def main(iters=P["iters"], gain=P["gain"]):
         fy = np.array(cp.get("fy", [1.0] * len(Fy))); err_y = []
         for k, y in enumerate(Fy):
             if y < yb or tgt[k] < 0.05: continue
-            sl = X[np.abs(X[:, 1] - y) < 0.5 * (Fy[1] - Fy[0]) + 0.004]
-            if len(sl) < 3: continue
-            aw = np.abs(sl[:, 0]).max(); err_y.append(tgt[k] - aw)
+            if LOFT:   # 25 October 2026: the loft has points only on its rows, so the width at a height is read on a real section
+                aw = loft_width_at(y)
+                if aw is None: continue
+            else:
+                sl = X[np.abs(X[:, 1] - y) < 0.5 * (Fy[1] - Fy[0]) + 0.004]
+                if len(sl) < 3: continue
+                aw = np.abs(sl[:, 0]).max()
+            err_y.append(tgt[k] - aw)
             if it < iters: fy[k] = float(np.clip(fy[k] * (1 + gain * (tgt[k] / max(aw, 1e-3) - 1)), 0.8, 1.35))
         cp["fy"] = fy.tolist(); cp["fy_y"] = Fy.tolist()
         en, et = float(m["keys"]["nose"] - X[:, 2].max()), float(m["keys"]["tail"] - X[:, 2].min())

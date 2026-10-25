@@ -72,6 +72,10 @@ def main(cparams, wparams, out):
         tube(m, (x - s * C["mirror_size"][0] * 0.4, y - 0.02, z), (x - s * (C["mirror_size"][0] * 0.5 + C["mirror_stalk"]), y - 0.06, z + 0.02), 0.012, "CAR_mirror_" + tag)
     # underbody tunnel (raised V plate along the centre) and bolt heads on the floor
     zt0, zt1 = C["tunnel_z"]; hw = C["tunnel_half_w"]; y0 = C["floor_y"] - 0.004
+    bn = os.path.join(os.path.dirname(os.path.abspath(cparams)), "body_nose.npz")
+    if C.get("floor_from_body", 1) and os.path.exists(bn):   # 25 October 2026: the loft floor sits at 0.121, under the parts at 0.146
+        Pb = np.load(bn)["P"]; mid = Pb[(np.abs(Pb[:, 0]) < 0.5) & (Pb[:, 2] > -1.0) & (Pb[:, 2] < 1.0)]
+        if len(mid): y0 = float(mid[:, 1].min()) - C.get("under_offset", 0.004)
     G = np.array([[[-hw, y0, zt1], [hw, y0, zt1]], [[-hw * 0.4, y0, zt0], [hw * 0.4, y0, zt0]]])
     m.grid(G, "CAR_under_tunnel_C", flip=True)
     for i, zb in enumerate(np.linspace(C["bolts_z"][0], C["bolts_z"][1], C["bolts_n"])):
@@ -80,6 +84,34 @@ def main(cparams, wparams, out):
                 bolt = revolve(np.array([(0, 0.0001), (0, 0.012), (-0.006, 0.012), (-0.006, 0.0001)]), 8)
                 bolt = bolt[..., [1, 0, 2]]; bolt[..., 0] += sx * xb; bolt[..., 1] = y0 + bolt[..., 1] * 1.0; bolt[..., 2] += zb
                 m.grid(bolt, "CAR_under_bolt", close_u=True)
+    # UNDER PLATES (25 October 2026): convex polygons read in bottom view pixels (central bolted plate, arrow, front and rear
+    # chevron plates), extruded down as thin slabs under the floor (layer k sits k x plate_step lower) ; bolt heads at px points
+    if C.get("plates") or C.get("bolts_px"):
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from DesignCurves import to_world
+        meta = json.load(open(os.path.join(os.path.dirname(os.path.abspath(cparams)), "frame/frame.json")))
+        def w2(px, py):
+            a, u, b, ww = to_world(meta, "bottom", np.array([float(px)]), np.array([float(py)])); d_ = {a: float(u[0]), b: float(ww[0])}
+            return d_.get("x", 0.0) - x_axis, d_.get("z", 0.0)
+        x_axis = 0.0; a0, u0, b0, w0 = to_world(meta, "bottom", np.array([300.0]), np.array([float(C.get("axis_py", 197))]))
+        x_axis = float(u0[0]) if a0 == "x" else float(w0[0])   # 25 October 2026: symmetry axis of the bottom panel (arrow centre)
+        for nm, pl in C.get("plates", {}).items():
+            yt = y0 - pl.get("layer", 1) * C.get("plate_step", 0.006); yb = yt - pl.get("thick", 0.006)
+            pts = [w2(*q) for q in pl["px"]]; cx = np.mean([p_[0] for p_ in pts]); cz = np.mean([p_[1] for p_ in pts]); n_ = len(pts)
+            bev = pl.get("bevel", C.get("plate_bevel", 0.012)); rad = np.mean([np.hypot(p_[0] - cx, p_[1] - cz) for p_ in pts])
+            sh = max(1 - bev / max(rad, 1e-3), 0.5); ptsb = [(cx + (p_[0] - cx) * sh, cz + (p_[1] - cz) * sh) for p_ in pts]
+            for yy, flip, pp in ((yb, True, ptsb), (yt, False, pts)):
+                for i in range(n_):
+                    a_, b_ = pp[i], pp[(i + 1) % n_]; mid = ((a_[0] + b_[0]) / 2, (a_[1] + b_[1]) / 2)
+                    G = np.array([[[cx, yy, cz], [a_[0], yy, a_[1]]], [[mid[0], yy, mid[1]], [b_[0], yy, b_[1]]]])
+                    m.grid(G, nm, flip=flip)
+            for i in range(n_):   # bevelled side walls (a vertical wall makes no visible line from below)
+                a_, b_ = pts[i], pts[(i + 1) % n_]; c_, d2 = ptsb[i], ptsb[(i + 1) % n_]
+                m.grid(np.array([[[a_[0], yt, a_[1]], [c_[0], yb, c_[1]]], [[b_[0], yt, b_[1]], [d2[0], yb, d2[1]]]]), nm)
+        for k, (px, py) in enumerate(C.get("bolts_px", [])):
+            xb, zb = w2(px, py); yb_ = y0 - C.get("plate_step", 0.006) - C.get("bolt_on_plate", 0.006)
+            bolt = revolve(np.array([(0, 0.0001), (0, 0.012), (-0.006, 0.012), (-0.006, 0.0001)]), 8)
+            bolt = bolt[..., [1, 0, 2]]; bolt[..., 0] += xb; bolt[..., 1] = yb_ + bolt[..., 1]; bolt[..., 2] += zb
+            m.grid(bolt, "CAR_under_bolt", close_u=True)
     np.savez(out, P=np.array(m.P, np.float32), Q=np.array(m.Q, np.int32), names=np.array(m.N))
     print(json.dumps({"points": len(m.P), "quads": len(m.Q), "parts": len(set(m.N))}))
 
