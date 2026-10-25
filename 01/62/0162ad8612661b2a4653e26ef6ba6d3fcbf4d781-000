@@ -24,6 +24,8 @@ PARAMS = {  # construction rules of the archetype (shared by every car)
     "design_curves": "lines/design_curves_side_world.json",   # 25 October 2026: traced guide curves drive the named rows
     "plan_curves": "lines/design_curves_top_world.json",
     "design_rows_x": {"belt_top": "plan_shoulder_upper", "glass_base": "plan_dlo_bottom", "roof_edge": "plan_dlo_top", "hood_edge": "plan_hood_edge"},
+    "cage_fair": {"on": 1, "knot_m": 0.35, "lam": 0.05, "end_weight": 30.0, "amount": 1.0, "arch_skip": 1.0,
+                  "arch_rows": ["floor_edge", "fender_inner", "sill", "door_low"], "rows_skip": []},   # 25 October 2026
     "joint_curves": {"door_rear": ["door_rear_joint", "pillar_b"], "door_front": "door_front_joint"},   # 25 October 2026
     # 25 October 2026: rear door cut and B pillar, mean of the left view (read on the sheet) and the right view traces ;
     # the two views differ by about 8 cm here
@@ -330,6 +332,29 @@ def build(m, out_prefix):
         ring = [(-x, y, z) for (x, y, z) in half[::-1]] + half[1:-1]
         rings.append(ring)
     V = np.array(rings)
+    # CAGE ROW FAIRING (25 October 2026): each named row of the cage is measured station by station and carries their noise
+    # (wavy sides, bumpy roof : seen once the subdivision was removed, RowLoft.py) ; every row is replaced by a penalised
+    # cubic B-spline along z (knots every knot_m, second difference penalty lam, ends held). Arch rows keep their values
+    # inside the wheel arches and are faired only outside. FR : chaque rangée de la cage est lissée le long de la voiture.
+    CF = P.get("cage_fair", {})
+    if CF.get("on", 0):
+        from scipy.interpolate import BSpline
+        zlo, zhi = float(st.min()), float(st.max()); kn = np.arange(zlo, zhi + 1e-9, CF["knot_m"])
+        if kn[-1] < zhi: kn = np.append(kn, zhi)
+        T_ = np.concatenate([[zlo] * 3, kn, [zhi] * 3])
+        def pfit(z, v, w, zq):
+            B = BSpline.design_matrix(np.clip(z, zlo, zhi), T_, 3).toarray(); nb = B.shape[1]
+            D = np.diff(np.eye(nb), 2, axis=0); A_ = B.T @ (w[:, None] * B) + CF["lam"] * D.T @ D
+            c_ = np.linalg.solve(A_, B.T @ (w * v)); return BSpline.design_matrix(np.clip(zq, zlo, zhi), T_, 3).toarray() @ c_
+        nhalf = (V.shape[1] + 2) // 2; S0 = len(st)
+        in_arch = np.array([min(abs(z - W["front_z"]), abs(z - W["rear_z"])) < r_arch * CF.get("arch_skip", 1.0) for z in st])
+        for j in range(V.shape[1]):
+            k = nhalf - 1 - j if j < nhalf else j - (nhalf - 1); rn = ROWS[k]
+            if rn in CF.get("rows_skip", []): continue
+            keep = ~in_arch if rn in CF["arch_rows"] else np.ones(S0, bool)
+            w = np.ones(keep.sum()); w[0] = w[-1] = CF["end_weight"]
+            for a in (0, 1):
+                fv = pfit(st[keep], V[keep, j, a], w, st[keep]); V[keep, j, a] = (1 - CF.get("amount", 1.0)) * V[keep, j, a] + CF.get("amount", 1.0) * fv
     # SLANTED JOINTS (25 October 2026): a joint station follows its traced side curve, z by height (the rear door cut is a
     # diagonal on the sheet, 22 cm from belt to sill) ; points outside the curve's heights keep the end values.
     for jn, cn in P.get("joint_curves", {}).items():
@@ -378,6 +403,8 @@ def build(m, out_prefix):
     # surface against the measured profiles; the rules stay the same, only the cage moves out to where the limit
     # surface must land. FR : la cage est poussée pour que la surface subdivisée tombe sur les profils mesurés.
     cpath = os.path.join(os.path.dirname(out_prefix), "cage_comp.json")
+    if os.environ.get("ZRM_NO_COMP"):   # 25 October 2026: row loft body, no subdivision so no limit surface compensation
+        cpath = cpath + ".off"; P["plan_clamp"] = float(os.environ.get("ZRM_PLAN_CLAMP", "1.0"))
     if os.path.exists(cpath):
         cp = json.load(open(cpath))
         if len(cp.get("sx", [])) == S:

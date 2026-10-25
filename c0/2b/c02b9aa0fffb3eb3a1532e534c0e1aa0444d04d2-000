@@ -1,0 +1,52 @@
+# 25 October 2026 : ZenRay Meshes car, wire the ROW LOFT body in Houdini : a Python SOP reads the loft npz (quads with the
+# "panel" prim attribute), a Boolean SOP subtracts one cylinder per wheel (radius tyre_r x arch_pad, axis x, from |x| =
+# arch_x0 outward) to open the wheel arches, and a switch on CTRL_zrm/body_method feeds panel_split (0 = creased
+# subdivision of the cage, 1 = row loft). FR : caisse en loft branchée derrière l'interrupteur body_method, passages de roue
+# découpés par des cylindres booléens. Run with g = {"LOFT": npz, "WHEELS": wheel_params.json}.
+import hou, json
+geo = hou.node("/obj/ZRM_Car"); ctrl = geo.node("CTRL_zrm"); npz = globals()["LOFT"]; Wp = json.load(open(globals()["WHEELS"]))
+ptg = ctrl.parmTemplateGroup()
+for n, l, v in (("arch_pad_loft", "Loft Arch Radius Pad", 1.08), ("arch_x0", "Loft Arch Cut from |x| (m)", 0.80)):
+    if not ctrl.parm(n): ptg.append(hou.FloatParmTemplate(n, l, 1, default_value=(v,)))
+# 25 October 2026: "body_method" already drives body_switch (2 = named panels) ; this switch is body_source
+if not ctrl.parm("body_source"): ptg.append(hou.IntParmTemplate("body_source", "Body Source (0 subd cage, 1 row loft)", 1, default_value=(0,)))
+ctrl.setParmTemplateGroup(ptg)
+ld = geo.node("IN_rowloft") or geo.createNode("python", "IN_rowloft")
+ld.parm("python").set('''# 25 October 2026 : row loft quads with their panel names, from %s
+import hou, numpy as np
+geo = hou.pwd().geometry(); d = np.load(%r, allow_pickle=True)
+pts = geo.createPoints([hou.Vector3(*p) for p in d["P"].tolist()]); pa = geo.addAttrib(hou.attribType.Prim, "panel", "")
+for q, nm in zip(d["Q"].tolist(), d["panel"].tolist()):
+    pr = geo.createPolygon()
+    for i in q: pr.addVertex(pts[i])
+    pr.setAttribValue(pa, nm)
+''' % (npz, npz))
+cy = geo.node("loft_arch_cyl") or geo.createNode("python", "loft_arch_cyl")
+cy.parm("python").set('''# 25 October 2026 : one closed cylinder per wheel, axis x, from |x| = arch_x0 to 2 m, radius tyre_r x arch_pad_loft
+import hou, math
+geo = hou.pwd().geometry(); W = %r; c = hou.node("../CTRL_zrm")
+R = W["tyre_r"] * c.parm("arch_pad_loft").eval(); x0 = c.parm("arch_x0").eval(); n = 48
+for inst in W["instances"]:
+    s = 1 if inst["x"] > 0 else -1; xs = (s * x0, s * 2.0); rings = []
+    for x in xs:
+        rings.append(geo.createPoints([hou.Vector3(x, inst["y"] + R * math.sin(2 * math.pi * k / n), inst["z"] + R * math.cos(2 * math.pi * k / n)) for k in range(n)]))
+    for k in range(n):
+        p = geo.createPolygon(); [p.addVertex(v) for v in (rings[0][k], rings[0][(k + 1) %% n], rings[1][(k + 1) %% n], rings[1][k])]
+    for r_, rev in ((rings[0], True), (rings[1], False)):
+        p = geo.createPolygon(); [p.addVertex(v) for v in (r_[::-1] if rev else r_)]
+''' % Wp)
+cyr = geo.node("loft_arch_cyl_rev") or geo.createNode("reverse", "loft_arch_cyl_rev"); cyr.setInput(0, cy)
+bo = geo.node("loft_arch_cut") or geo.createNode("boolean::2.0", "loft_arch_cut")
+lr = geo.node("loft_rev") or geo.createNode("reverse", "loft_rev"); lr.setInput(0, ld)   # Houdini winds outward faces the other way
+bo.setInput(0, lr); bo.setInput(1, cy)   # measured: loft reversed + cylinder as built keeps 3297 faces, other pairings 0 to 363
+for pn, v in (("booleanop", "subtract"), ("asurface", "solid"), ("bsurface", "solid")):
+    if bo.parm(pn):
+        try: bo.parm(pn).set(v)
+        except Exception: pass
+sw = geo.node("body_method_switch") or geo.createNode("switch", "body_method_switch")
+sw.setInput(0, geo.node("cage_subd")); sw.setInput(1, bo); sw.parm("input").setExpression('ch("../CTRL_zrm/body_source")')
+geo.node("panel_split").setInput(0, sw)
+for n_ in (ld, lr, cy, cyr, bo, sw): n_.moveToGoodPosition()
+g = bo.geometry()
+result = {"loft_prims": len(ld.geometry().prims()), "cut_prims": len(g.prims()) if g else None, "errors": ld.errors() + cy.errors() + bo.errors(),
+          "has_panel": bool(g and g.findPrimAttrib("panel"))}

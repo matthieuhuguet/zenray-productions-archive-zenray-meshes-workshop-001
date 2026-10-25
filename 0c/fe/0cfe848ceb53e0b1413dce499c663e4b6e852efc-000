@@ -1,0 +1,67 @@
+# 25 October 2026 : ZenRay Meshes car, BODY BY ROW LOFT (method change). The creased Catmull-Clark of the cage rounded
+# every band BETWEEN two character lines and carried the noise of each measured station along the car (lumpy, wavy sides),
+# while the sheet is made of clean bands split by crisp lines. Here every named row of the cage is a smooth curve along
+# the car (monotone cubic through the stations, no overshoot), sampled densely in z, and the surface between two rows is
+# straight across : crisp character lines across, smooth bands along, like the sheet. Panel names follow the cage faces.
+# FR : chaque rangée nommée devient une courbe lisse le long de la voiture, la surface est droite entre deux rangées.
+# Usage: python RowLoft.py <loft_params.json> <cage_prefix> <out.npz>
+import sys, os, json
+import numpy as np
+from scipy.interpolate import PchipInterpolator
+
+
+def main(params, prefix, out):
+    C = json.load(open(params)); cj = json.load(open(prefix + "_cage.json"))
+    st = np.array(cj["stations"]); R = cj["ring"]; S = len(st); panels = cj["panels"]
+    V = np.array([list(map(float, l.split()[1:])) for l in open(prefix + "_cage.obj") if l.startswith("v ")]).reshape(S, R, 3)
+    # dense samples per station interval : n_per_m along the length, at least 1 per interval
+    zs, seg = [], []
+    for i in range(S - 1):
+        n = max(1, int(abs(st[i] - st[i + 1]) * C["n_per_m"]))
+        for k in range(n): zs.append(i + k / n); seg.append(i)
+    zs.append(S - 1); seg.append(S - 2)
+    t = np.array(zs)                                     # station parameter (fractional index), monotone
+    G = np.zeros((len(t), R, 3))
+    for j in range(R):
+        for a in range(3):
+            G[:, j, a] = PchipInterpolator(np.arange(S), V[:, j, a])(t)
+    if C.get("fair", 1):
+        # 25 October 2026: FAIR ROWS. Each row (x and y along z) is a penalised cubic B-spline (P-spline : knots every knot_m,
+        # second difference penalty lam), ends held by a large weight ; the arch rows ignore the stations inside the wheel
+        # arches (the arches are cut afterwards), so the side runs clean from bumper to bumper.
+        from scipy.interpolate import BSpline
+        m = json.load(open(prefix + "_measure.json")) if os.path.exists(prefix + "_measure.json") else None
+        Wh = m["wheels"] if m else None; E = cj["exp_rows"]; nh = len(E)
+        row_of = lambda j: E[nh - 1 - j] if j < nh else E[j - (nh - 1)]
+        zt = np.interp(t, np.arange(S), V[:, 0, 2] * 0 + st)   # sample z along the car
+        zlo, zhi = st.min(), st.max(); kn = np.arange(zlo, zhi + 1e-9, C["knot_m"])
+        if kn[-1] < zhi: kn = np.append(kn, zhi)
+        T = np.concatenate([[zlo] * 3, kn, [zhi] * 3])
+        def fit(z, v, w, zq):
+            B = BSpline.design_matrix(np.clip(z, zlo, zhi), T, 3).toarray(); nb = B.shape[1]
+            D = np.diff(np.eye(nb), 2, axis=0); A = B.T @ (w[:, None] * B) + C["lam"] * D.T @ D
+            c = np.linalg.solve(A, B.T @ (w * v)); return BSpline.design_matrix(np.clip(zq, zlo, zhi), T, 3).toarray() @ c
+        ra = Wh["tyre_r"] * C["arch_pad"] if Wh else 0
+        for j in range(R):
+            r = row_of(j); z = V[:, j, 2]; keep = np.ones(S, bool)
+            if Wh and r in C["arch_rows"]:
+                keep = np.minimum(np.abs(z - Wh["front_z"]), np.abs(z - Wh["rear_z"])) > ra * C["arch_skip"]
+            w = np.where(np.arange(S)[keep] % (S - 1) == 0, C["end_weight"], 1.0)
+            for a in (0, 1):
+                G[:, j, a] = fit(z[keep], V[keep, j, a], w, zt)
+            G[:, j, 2] = zt
+    P = G.reshape(-1, 3); Q, N = [], []
+    idx = lambda i, j: i * R + (j % R)
+    for i in range(len(t) - 1):
+        for j in range(R):
+            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(panels[seg[i] * R + j])
+    h = R // 2                                           # end caps between symmetric ring pairs, as the cage
+    for i, flip, cap in ((0, True, panels[(S - 1) * R]), (len(t) - 1, False, panels[(S - 1) * R + h - 1])):
+        for j in range(h - 1):
+            q = (idx(i, j), idx(i, j + 1), idx(i, R - 2 - j), idx(i, R - 1 - j)); Q.append(q[::-1] if flip else q); N.append(cap)
+    np.savez(out, P=P.astype(np.float32), Q=np.array(Q, np.int32)[:, ::-1], names=np.array(["CAR_body_" + n for n in N]), panel=np.array(N))
+    print(json.dumps({"points": len(P), "quads": len(Q), "samples_z": len(t)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
