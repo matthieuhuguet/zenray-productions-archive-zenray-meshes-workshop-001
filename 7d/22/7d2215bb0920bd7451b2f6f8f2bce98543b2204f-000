@@ -1,0 +1,72 @@
+# 25 October 2026 : ZenRay Meshes comparison sheet : reference mesh vs reproduced mesh, same cameras, grey viewport look.
+# EN: one row per object, columns = front / side / three quarter, reference on the left half, reproduction on the right,
+# with the measured 3D scores written under each row. Rendered on the GPU (Raster.py), grey Lambert like a viewport.
+# FR : planche comparative, une ligne par objet, référence à gauche, reproduction à droite, mêmes caméras.
+# Usage: python CompareSheet.py <out.png>   (rows defined in ROWS below)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import trimesh
+from PIL import Image, ImageDraw, ImageFont
+import Raster
+
+B = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/"
+ROWS = [  # (label, reference, reproduction, scores log, method note)
+    ("Manny (personnage)", B + "gt/manny_character.obj", B + "m08/manny_character.obj", B + "m08/manny_character.log.json", "M08, objectif score image"),
+    ("Arche (hard surface)", B + "gt/arch_hard.obj", B + "m08/arch_hard_v3.obj", B + "m08/arch_hard_v3.log.json", "M08, objectif cohérence de profondeur"),
+    ("Eucalyptus, tronc et branches", B + "gt/eucalyptus_tree.obj", B + "m08/eucalyptus_tree.obj", B + "m08/eucalyptus_tree.log.json", "M08, objectif score image"),
+    ("Lys (plante)", B + "gt/lily_plant.obj", B + "m08/lily_plant_v2.obj", B + "m08/lily_plant_v2.log.json", "M08, objectif score image"),
+]
+P = {"tile": 360, "pad": 16, "label_h": 54, "bg": 205, "font": "/System/Library/Fonts/Supplemental/Arial.ttf"}
+
+
+def axes_for(yaw_deg, pitch_deg):
+    y, p = np.radians(yaw_deg), np.radians(pitch_deg)
+    tz = np.array([np.sin(y) * np.cos(p), np.sin(p), np.cos(y) * np.cos(p)])     # toward the viewer
+    rx = np.cross([0, 1, 0], tz); rx /= np.linalg.norm(rx)
+    uy = np.cross(tz, rx)
+    return rx.tolist(), uy.tolist(), tz.tolist()
+
+
+VIEWS = [("Face", axes_for(0, 0)), ("Profil", axes_for(90, 0)), ("3/4", axes_for(40, 22))]
+
+
+def shade(mesh, center, ppm, axes, res):
+    r = Raster.Renderer(mesh.vertices, mesh.faces)
+    M, D, N, F = r.render(center, ppm, axes, res)
+    r.release()
+    key = np.array([-0.45, 0.6, 0.66]); key /= np.linalg.norm(key)
+    lam = np.clip((N * key).sum(-1), 0, 1)
+    val = 0.28 + 0.62 * lam + 0.10 * N[..., 2]
+    img = np.where(M, np.clip(val, 0, 1) * 255, P["bg"]).astype(np.uint8)
+    return img
+
+
+def main(out):
+    font = ImageFont.truetype(P["font"], 20); small = ImageFont.truetype(P["font"], 16)
+    T, pad = P["tile"], P["pad"]
+    W = pad + 2 * (3 * (T + pad)) + pad
+    head = 60
+    H = head + len(ROWS) * (T + P["label_h"] + pad) + pad
+    sheet = Image.new("L", (W, H), 235); dr = ImageDraw.Draw(sheet)
+    dr.text((pad, 18), "RÉFÉRENCE (vérité 3D)", font=font, fill=20)
+    dr.text((pad + 3 * (T + pad) + pad, 18), "REPRODUCTION ZenRay Meshes (depuis 6 vues)", font=font, fill=20)
+    for i, (label, ref, rep, logp, note) in enumerate(ROWS):
+        y0 = head + i * (T + P["label_h"] + pad)
+        gm = trimesh.load(ref, force="mesh", process=False); rm = trimesh.load(rep, force="mesh", process=False)
+        lo, hi = gm.bounds; c = (lo + hi) / 2; ppm = T * 0.86 / float(np.linalg.norm(hi - lo))
+        for j, (vname, axes) in enumerate(VIEWS):
+            for side, mesh in ((0, gm), (1, rm)):
+                x0 = pad + side * (3 * (T + pad) + pad) + j * (T + pad)
+                sheet.paste(Image.fromarray(shade(mesh, c, ppm, axes, T)), (x0, y0))
+                if i == 0:
+                    dr.text((x0 + 4, y0 + 4), vname, font=small, fill=40)
+        res = json.load(open(logp)).get("result", {})
+        txt = "%s  |  3D juste à 0,5 %% : %.3f   à 1 %% : %.3f   |  %s" % (label, res.get("F0.5", float("nan")), res.get("F1", float("nan")), note)
+        dr.text((pad, y0 + T + 10), txt, font=font, fill=20)
+    sheet.save(out)
+    print(out, sheet.size)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
