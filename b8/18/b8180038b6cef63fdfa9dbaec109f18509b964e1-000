@@ -15,17 +15,30 @@ def main(params, body, out):
     zs, hw = np.array(pr["z"]), np.array(pr["hw"]); ey = np.array(pr["ext_y"]); eb = np.array(pr["z_back"], float); ok = np.isfinite(eb)
     if C.get("tip_z_points"): tz = np.array(C["tip_z_points"]); o = np.argsort(tz[:, 0]); ey, eb, ok = tz[o, 0], tz[o, 1], np.ones(len(tz), bool)
     P = np.load(body, allow_pickle=True)["P"]; sl = P[np.abs(P[:, 2] - zc) < C["slab_m"]]
-    xmax = float(np.abs(sl[:, 0]).max()) * C.get("width_scale", 1.0)
+    xsec = float(np.abs(sl[:, 0]).max()) * 0.97; xmax = float(np.abs(sl[:, 0]).max()) * C.get("width_scale", 1.0); y_low = float(sl[:, 1].min()) + C.get("bottom_lift_m", 0.0)
     def yrange(x):
         s = sl[np.abs(np.abs(sl[:, 0]) - abs(x)) < C["bin_m"] + 0.02 * (abs(x) > xmax * 0.95)]
-        return (float(s[:, 1].min()), float(s[:, 1].max())) if len(s) else (None, None)
-    def z_plan(x):
+        # 25 October 2026: the bottom of the face is the lowest point of the WHOLE section (the arch boolean eats the lower
+        # body at the cut, so a per column bottom collapsed onto the top and only the centre columns reached down : a seam)
+        if not len(s): return (None, None)
+        return (y_low if C.get("full_height", 0) else float(s[:, 1].min()), float(s[:, 1].max()))
+    rr = zs <= zc; zr, hr = zs[rr], hw[rr]; o_ = np.argsort(hr); zr, hr = zr[o_], np.maximum.accumulate(hr[o_])
+    def z_plan(x):   # 25 October 2026: plan_interp 1 interpolates (the nearest sample makes 4 cm steps), 0 keeps v99 behaviour
+        if C.get("plan_interp", 0): return float(np.interp(abs(x), hr, zr)) if abs(x) <= hr.max() else zc
         okp = (hw >= abs(x)) & (zs <= zc)
         return float(zs[okp].min()) if okp.any() else zc
     nx, ny = C["nx"], C["ny"]; xs = np.linspace(-xmax, xmax, nx); G = np.zeros((nx, ny, 3))
+    # 25 October 2026: the per column top height is noisy (sawtooth top edge seen in Houdini) ; it is taken from a smoothed
+    # profile of the section top over |x| (running max then moving average over top_smooth columns)
+    his = []
+    for x in xs:
+        lo_, hi_ = yrange(np.sign(x) * min(abs(x), xsec)); his.append(np.nan if hi_ is None else hi_)
+    his = np.array(his); okh = np.isfinite(his); his[~okh] = np.interp(np.flatnonzero(~okh), np.flatnonzero(okh), his[okh])
+    k_ = int(C.get("top_smooth", 5)); his_s = np.convolve(np.pad(his, k_ // 2, mode="edge"), np.ones(k_) / k_, mode="valid")
     lo_prev = hi_prev = None
     for i, x in enumerate(xs):
-        lo, hi = yrange(x)
+        lo, hi = yrange(np.sign(x) * min(abs(x), xsec))   # 25 October 2026: columns wider than the section take its outer heights
+        if hi is not None: hi = float(his_s[i])
         if lo is None: lo, hi = lo_prev, hi_prev
         lo_prev, hi_prev = lo, hi
         for j, t in enumerate(np.linspace(0, 1, ny)):

@@ -34,14 +34,18 @@ def ctx():
 class Renderer:
     """Upload a mesh once, render any number of views."""
 
-    def __init__(self, vertices, faces):
+    def __init__(self, vertices, faces, smooth_deg=0.0):
         g = ctx()
         v = np.asarray(vertices, np.float64); f = np.asarray(faces, np.int64)
         tri = v[f]                                            # (F,3,3) unindexed: flat normals and per face id
         n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
         n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
         ids = np.repeat(np.arange(len(f), dtype=np.float32), 3)
-        data = np.concatenate([tri.reshape(-1, 3).astype(np.float32), np.repeat(n, 3, 0).astype(np.float32), ids[:, None]], 1)
+        cn_ = np.repeat(n, 3, 0)
+        if smooth_deg > 0:   # 25 October 2026: smooth shading, vertex normals kept per corner only within smooth_deg (cusp)
+            vn = np.zeros_like(v); np.add.at(vn, f.ravel(), np.repeat(n, 3, 0)); vn /= np.linalg.norm(vn, axis=1, keepdims=True) + 1e-20
+            cv = vn[f.ravel()]; ok = (cv * cn_).sum(1) > np.cos(np.radians(smooth_deg)); cn_ = np.where(ok[:, None], cv, cn_)
+        data = np.concatenate([tri.reshape(-1, 3).astype(np.float32), cn_.astype(np.float32), ids[:, None]], 1)
         self.prog = g.program(vertex_shader=VS, fragment_shader=FS)
         self.vbo = g.buffer(np.ascontiguousarray(data).tobytes())
         self.vao = g.vertex_array(self.prog, [(self.vbo, "3f 3f 1f", "in_pos", "in_nrm", "in_id")])
