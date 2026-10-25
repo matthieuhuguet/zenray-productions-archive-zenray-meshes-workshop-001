@@ -1,0 +1,44 @@
+# 25 October 2026 : ZenRay Meshes car, TAIL FACE by the depth rule applied to a whole surface. The body is clipped at cut_z
+# (behind the rear arch, CarTail.py) ; the cap behind it is a quad grid over the body section at the cut : column x from
+# the section outline, height y between the section bottom and top at that x, and depth z = the most rearward position
+# both views allow : the top view (z where the plan half width still reaches |x|) and the side view (z_back(y)), never
+# behind the tail tip nor in front of the cut. Named CAR_body_tail_face_C ; output npz (P, Q, names) + _cut.json for CarTail.
+# FR : face arrière où chaque point recule jusqu'à la profondeur que permettent la vue de dessus et la vue de côté.
+# Usage: python TailFace.py <tail_face_params.json> <body_panels.npz> <out.npz>
+import sys, os, json
+import numpy as np
+
+
+def main(params, body, out):
+    W = os.path.dirname(os.path.abspath(params)); C = json.load(open(params)); zc = C["cut_z"]
+    m = json.load(open(os.path.join(W, "arch_v1_measure.json"))); pr = m["profiles"]; ztip = m["keys"]["tail"]
+    zs, hw = np.array(pr["z"]), np.array(pr["hw"]); ey = np.array(pr["ext_y"]); eb = np.array(pr["z_back"], float); ok = np.isfinite(eb)
+    if C.get("tip_z_points"): tz = np.array(C["tip_z_points"]); o = np.argsort(tz[:, 0]); ey, eb, ok = tz[o, 0], tz[o, 1], np.ones(len(tz), bool)
+    P = np.load(body, allow_pickle=True)["P"]; sl = P[np.abs(P[:, 2] - zc) < C["slab_m"]]
+    xmax = float(np.abs(sl[:, 0]).max()) * C.get("width_scale", 1.0)
+    def yrange(x):
+        s = sl[np.abs(np.abs(sl[:, 0]) - abs(x)) < C["bin_m"] + 0.02 * (abs(x) > xmax * 0.95)]
+        return (float(s[:, 1].min()), float(s[:, 1].max())) if len(s) else (None, None)
+    def z_plan(x):
+        okp = (hw >= abs(x)) & (zs <= zc)
+        return float(zs[okp].min()) if okp.any() else zc
+    nx, ny = C["nx"], C["ny"]; xs = np.linspace(-xmax, xmax, nx); G = np.zeros((nx, ny, 3))
+    lo_prev = hi_prev = None
+    for i, x in enumerate(xs):
+        lo, hi = yrange(x)
+        if lo is None: lo, hi = lo_prev, hi_prev
+        lo_prev, hi_prev = lo, hi
+        for j, t in enumerate(np.linspace(0, 1, ny)):
+            y = lo + t * (hi - lo); zb = float(np.interp(y, ey[ok], eb[ok]))
+            z = max(z_plan(x), zb, ztip); G[i, j] = (x, y, min(z, zc))
+    PP, Q, N = G.reshape(-1, 3).tolist(), [], []
+    for i in range(nx - 1):
+        for j in range(ny - 1):
+            a, b = i * ny + j, (i + 1) * ny + j; Q.append([a, a + 1, b + 1, b]); N.append("CAR_body_tail_face_C")
+    json.dump({"_date": "25 October 2026", "cut_z": zc, "cut_tilt": None}, open(out.replace(".npz", "_cut.json"), "w"))
+    np.savez(out, P=np.array(PP, np.float32), Q=np.array(Q, dtype=object), names=np.array(N))
+    print(json.dumps({"quads": len(Q), "xmax": round(xmax, 3), "z_range": [round(float(G[..., 2].min()), 3), round(float(G[..., 2].max()), 3)]}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
