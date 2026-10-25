@@ -1,0 +1,59 @@
+# 25 October 2026 : ZenRay Meshes car, WHEEL ARCH LIPS (CAR_arch_front_L/R, CAR_arch_rear_L/R) : a ring of quads around
+# each wheel opening, from angle a0 to a1 (degrees, 0 = toward the nose, 90 = up), between radius r_in and r_out around
+# the axle, posed on the real body side (ray along -x on body_nose.npz) plus protrude, closed by its back copy at depth
+# and its edges. Values in work/car/arch_lip_params.json ; axles from wheel_params.json.
+# FR : lèvres de passages de roue, anneau de quads posé sur le flanc réel ; paramètres dans un JSON.
+# Usage: python ArchBuild.py <arch_lip_params.json> <wheel_params.json> <body_nose.npz> <out.npz>
+import sys, json, math
+import numpy as np
+import trimesh
+
+
+def main(params, wparams, body, out):
+    A = json.load(open(params)); W = json.load(open(wparams)); d = np.load(body, allow_pickle=True)
+    bm = trimesh.Trimesh(d["P"], d["F"], process=False); ray = trimesh.ray.ray_triangle.RayMeshIntersector(bm)
+    allP, allQ, allN = [], [], []
+    for inst in W["instances"]:
+        if inst["x"] < 0: continue                                   # one side measured, mirrored below
+        front = inst["z"] > 0; R0 = W["tyre_r"] * A["r_in_pad"]; R1 = R0 + A["lip_w"]
+        ang = np.radians(np.linspace(A["a0_deg"], A["a1_deg"], A["segments"]))
+        G = np.zeros((len(ang), 2, 3))
+        for i, a in enumerate(ang):
+            for j, r in enumerate((R0, R1)):
+                z = inst["z"] + r * math.cos(a); y = inst["y"] + r * math.sin(a)
+                loc, _, _ = ray.intersects_location(np.array([[3.0, y, z]]), np.array([[-1.0, 0, 0]]), multiple_hits=False)
+                xs = float(loc[0, 0]) if len(loc) else inst["x"] + W["tyre_w"] / 2
+                G[i, j] = (xs + A["protrude"], y, z)
+        B = G.copy(); B[..., 0] -= A["depth"]
+        for sd, tag in ((1, "L"), (-1, "R")):
+            nm = "CAR_arch_%s_%s" % ("front" if front else "rear", tag)
+            P = np.concatenate([G.reshape(-1, 3), B.reshape(-1, 3)]) * [sd, 1, 1]; n = len(ang); b = sum(len(p) for p in allP); allP.append(P)
+            idx = lambda l, i, j: b + l * n * 2 + i * 2 + j
+            Q = []
+            for i in range(n - 1):
+                Q.append((idx(0, i, 0), idx(0, i + 1, 0), idx(0, i + 1, 1), idx(0, i, 1)))     # face
+                Q.append((idx(0, i, 0), idx(1, i, 0), idx(1, i + 1, 0), idx(0, i + 1, 0)))     # inner edge (toward the tyre)
+                Q.append((idx(0, i, 1), idx(0, i + 1, 1), idx(1, i + 1, 1), idx(1, i, 1)))     # outer edge
+            for q in Q: allQ.append(q if sd > 0 else q[::-1]); allN.append(nm)
+    # SIDE STRIPS (25 October 2026): thin frames along a side polyline [z, y] (A and B pillars between the glasses), width
+    # w across the line in the side plane, posed on the body side by the same ray, mirrored ; values in "strips"
+    for nm0, st_ in A.get("strips", {}).items():
+        pts = np.array(st_["zy"], float); w = st_["w"] / 2; ns = st_.get("steps", 8)
+        t = np.linspace(0, 1, ns); L = np.array([np.interp(t, np.linspace(0, 1, len(pts)), pts[:, k]) for k in (0, 1)]).T
+        dv = np.gradient(L, axis=0); nv = np.stack([-dv[:, 1], dv[:, 0]], 1); nv /= np.linalg.norm(nv, axis=1, keepdims=True)
+        G = np.zeros((ns, 2, 3))
+        for i in range(ns):
+            for j, sgn in enumerate((-1, 1)):
+                z, y = L[i] + sgn * w * nv[i]
+                loc, _, _ = ray.intersects_location(np.array([[3.0, y, z]]), np.array([[-1.0, 0, 0]]), multiple_hits=False)
+                G[i, j] = ((float(loc[0, 0]) if len(loc) else 1.0) + st_.get("protrude", 0.004), y, z)
+        for sd, tag in ((1, "L"), (-1, "R")):
+            P = G.reshape(-1, 3) * [sd, 1, 1]; b = sum(len(p) for p in allP); allP.append(P)
+            for i in range(ns - 1):
+                q = (b + 2 * i, b + 2 * i + 1, b + 2 * i + 3, b + 2 * i + 2); allQ.append(q if sd > 0 else q[::-1]); allN.append("%s_%s" % (nm0, tag))
+    np.savez(out, P=np.concatenate(allP).astype(np.float32), Q=np.array(allQ, np.int32), names=np.array(allN))
+    print(json.dumps({"quads": len(allQ), "parts": sorted(set(allN))}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
