@@ -1,0 +1,149 @@
+# 25 October 2026 : ZenRay Meshes, candidate methods run on the benchmark views (each returns a mesh in world space).
+# EN: one function per method principle; inputs are only what a reference sheet gives (view masks, shading, px/m).
+# Depth maps are never read by a method (they are diagnosis only).
+# FR : une fonction par méthode, entrées = ce que donne une planche de vues, jamais la profondeur.
+# Usage: python Methods.py <method> <views_dir> <out.obj> [k=v ...]
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import measure
+import trimesh
+
+VIEWS_ORDER = ["front", "back", "right", "left", "top", "bottom"]
+
+
+def load_views(vdir):
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    masks = {v: np.asarray(Image.open(os.path.join(vdir, "mask_%s.png" % v))) > 127 for v in VIEWS_ORDER}
+    shade = {v: np.asarray(Image.open(os.path.join(vdir, "shade_%s.png" % v))).astype(float) / 255 for v in VIEWS_ORDER}
+    return meta, masks, shade
+
+
+def grid(meta, n):
+    R, s = meta["res"], meta["px_per_m"]
+    half = R / 2 / s
+    c = np.array(meta["center"])
+    ax = np.linspace(-half, half, n)
+    X, Y, Z = np.meshgrid(ax, ax, ax, indexing="ij")
+    return c, half, ax, np.stack([X, Y, Z], -1)
+
+
+def project(meta, pts, view):
+    R, s = meta["res"], meta["px_per_m"]
+    rx, uy, tz = (np.array(a, float) for a in meta["views"][view])
+    px = pts @ rx * s + R / 2
+    py = R / 2 - pts @ uy * s
+    return px, py
+
+
+def to_mesh(occ, ax, c, out, smooth=0):
+    f = occ.astype(float)
+    if smooth:
+        f = ndi.gaussian_filter(f, smooth)
+    f = np.pad(f, 1)
+    step = ax[1] - ax[0]
+    verts, faces, _, _ = measure.marching_cubes(f, 0.5, spacing=(step, step, step))
+    verts = verts - step + ax[0] + c
+    m = trimesh.Trimesh(verts, faces[:, ::-1], process=False)
+    m.export(out)
+    return m
+
+
+def m02_visual_hull(vdir, out, n=192, views=None, smooth=0.8):
+    """M02: intersection of the six silhouette prisms (visual hull)."""
+    meta, masks, _ = load_views(vdir)
+    c, half, ax, G = grid(meta, int(n))
+    pts = G.reshape(-1, 3)
+    occ = np.ones(len(pts), bool)
+    for v in (views or VIEWS_ORDER):
+        px, py = project(meta, pts, v)
+        ix, iy = np.clip(px.astype(int), 0, meta["res"] - 1), np.clip(py.astype(int), 0, meta["res"] - 1)
+        occ &= masks[v][iy, ix]
+    return to_mesh(occ.reshape(G.shape[:3]), ax, c, out, float(smooth))
+
+
+def m01_inflate_front(vdir, out, n=192, ratio=1.0):
+    """M01: single front view, round inflation by the distance transform (no other view used)."""
+    meta, masks, _ = load_views(vdir)
+    c, half, ax, G = grid(meta, int(n))
+    s, R = meta["px_per_m"], meta["res"]
+    m = masks["front"]
+    dt = ndi.distance_transform_edt(m) / s
+    Rr = np.maximum(ndi.maximum_filter(dt, size=25), dt)
+    h = float(ratio) * np.sqrt(np.clip(Rr * Rr - (Rr - dt) ** 2, 0, None))
+    pts = G.reshape(-1, 3)
+    px, py = project(meta, pts, "front")
+    ix, iy = np.clip(px.astype(int), 0, R - 1), np.clip(py.astype(int), 0, R - 1)
+    zc = 0.0
+    occ = m[iy, ix] & (np.abs(pts[:, 2] - zc) <= h[iy, ix])
+    return to_mesh(occ.reshape(G.shape[:3]), ax, c, out, 0.8)
+
+
+def m03_hull_shading_carve(vdir, out, n=192, thresh=0.06, smooth=0.8):
+    """M03: visual hull, then carve voxels whose predicted Lambert shade disagrees with the reference shading
+    in the views that see them (a light photo-consistency test, for concavities)."""
+    meta, masks, shade = load_views(vdir)
+    c, half, ax, G = grid(meta, int(n))
+    pts = G.reshape(-1, 3)
+    occ = np.ones(len(pts), bool)
+    for v in VIEWS_ORDER:
+        px, py = project(meta, pts, v)
+        ix, iy = np.clip(px.astype(int), 0, meta["res"] - 1), np.clip(py.astype(int), 0, meta["res"] - 1)
+        occ &= masks[v][iy, ix]
+    occ = occ.reshape(G.shape[:3])
+    for it in range(6):
+        f = ndi.gaussian_filter(occ.astype(float), 1.0)
+        gx, gy, gz = np.gradient(f)
+        nrm = -np.stack([gx, gy, gz], -1); ln = np.linalg.norm(nrm, axis=-1) + 1e-9; nrm /= ln[..., None]
+        surf = occ & ~ndi.binary_erosion(occ)
+        idx = np.argwhere(surf)
+        carve = np.zeros(len(idx), int); seen = np.zeros(len(idx), int)
+        P = pts.reshape(G.shape)[surf]
+        N = nrm[surf]
+        for v in VIEWS_ORDER:
+            tz = np.array(meta["views"][v][2], float)
+            facing = N @ tz > 0.3
+            px, py = project(meta, P, v)
+            ix, iy = np.clip(px.astype(int), 0, meta["res"] - 1), np.clip(py.astype(int), 0, meta["res"] - 1)
+            pred = 0.25 + 0.7 * np.abs(N @ tz)
+            ref = shade[v][iy, ix]
+            bad = facing & masks[v][iy, ix] & (np.abs(pred - ref) > 0.25)
+            carve += bad; seen += facing
+        kill = (seen > 0) & (carve >= np.maximum(1, seen * 0.67))
+        if kill.sum() < 10:
+            break
+        occ[tuple(idx[kill].T)] = False
+    return to_mesh(occ, ax, c, out, float(smooth))
+
+
+METHODS = {"M01": m01_inflate_front, "M02": m02_visual_hull, "M03": m03_hull_shading_carve}
+
+
+def m02b_hull_separable(vdir, out, n=512, smooth=0.8):
+    """M02b: same visual hull, computed exactly at the mask resolution: orthographic axis views make the hull
+    separable, occ(x,y,z) = AND over views of the mask at the voxel's two coordinates (no per voxel projection)."""
+    meta, masks, _ = load_views(vdir)
+    n = int(n); R = meta["res"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    pix = np.clip(((ax * meta["px_per_m"]) + R / 2).astype(int), 0, R - 1)       # coordinate -> column (right = +)
+    pixd = np.clip((R / 2 - ax * meta["px_per_m"]).astype(int), 0, R - 1)         # coordinate -> row (up = +)
+    occ = np.ones((n, n, n), bool)
+    for v in VIEWS_ORDER:
+        rx, uy, tz = (np.array(a, float) for a in meta["views"][v])
+        ia = int(np.argmax(np.abs(rx))); ib = int(np.argmax(np.abs(uy)))
+        cols = pix if rx[ia] > 0 else pix[::-1]
+        rows = pixd if uy[ib] > 0 else pixd[::-1]
+        m2 = masks[v][np.ix_(rows, cols)]            # m2[j over axis ib, i over axis ia]
+        shape = [1, 1, 1]; shape[ib] = n; shape[ia] = n
+        occ &= (m2.T if ia < ib else m2).reshape(shape)
+    return to_mesh(occ, ax, c, out, float(smooth))
+
+METHODS["M02b"] = m02b_hull_separable
+
+if __name__ == "__main__":
+    name, vdir, out = sys.argv[1:4]
+    kw = dict(a.split("=") for a in sys.argv[4:])
+    m = METHODS[name](vdir, out, **kw)
+    print(name, out, len(m.vertices), "verts")

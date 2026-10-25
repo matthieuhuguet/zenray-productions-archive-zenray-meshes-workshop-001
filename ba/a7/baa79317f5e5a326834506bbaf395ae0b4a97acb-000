@@ -1,0 +1,62 @@
+# 25 October 2026 : ZenRay Meshes, step 3 : build the Houdini graph from the inflated components (native SOPs only).
+# EN: one /obj/ZRM_<Name> geo; per component: File -> Fuse -> VDB from Polygons -> VDB Smooth SDF -> Convert VDB
+# -> Quad Remesh (clean quads, edge flow follows the curvature) -> Normal, then a name attribute and a merge.
+# Every value is a spare parameter on the CTRL null (HDA logic): voxel size, smoothing, quad budget per component.
+# FR : un réseau natif par objet, valeurs sur le nœud CTRL, quads propres par Quad Remesh.
+# Run inside Houdini: g = {'NAME': 'Tree01', 'WORK': '<abs work dir>', 'COMPONENTS': [...]}; exec(open(this).read(), g)
+import hou, os
+
+NAME = globals().get("NAME", "Tree01")
+WORK = globals()["WORK"]
+COMPONENTS = globals()["COMPONENTS"]  # [{'mask': 'trunk', 'quads': 6000}, ...]
+
+obj = hou.node("/obj")
+old = obj.node("ZRM_" + NAME)
+if old:
+    old.destroy()
+geo = obj.createNode("geo", "ZRM_" + NAME)
+ctrl = geo.createNode("null", "CTRL_zrm")
+ptg = ctrl.parmTemplateGroup()
+folder = hou.FolderParmTemplate("zrm_build", "ZenRay Meshes Build")
+folder.addParmTemplate(hou.FloatParmTemplate("voxel", "Voxel Size (m)", 1, default_value=(0.03,), min=0.005, max=0.2))
+folder.addParmTemplate(hou.IntParmTemplate("smooth_iter", "Smooth Iterations", 1, default_value=(3,), min=0, max=20))
+for c in COMPONENTS:
+    folder.addParmTemplate(hou.IntParmTemplate("quads_" + c["mask"], "Quads %s" % c["mask"].title(), 1, default_value=(c["quads"],), min=100, max=100000))
+ptg.append(folder)
+ctrl.setParmTemplateGroup(ptg)
+
+outs = []
+for i, c in enumerate(COMPONENTS):
+    m = c["mask"]
+    f = geo.createNode("file", "IN_" + m)
+    f.parm("file").set(os.path.join(WORK, m + ".obj"))
+    fu = geo.createNode("fuse::2.0", "fuse_" + m); fu.setInput(0, f)
+    fu.parm("tol3d").set(0.0005)
+    vf = geo.createNode("vdbfrompolygons", "vdb_" + m); vf.setInput(0, fu)
+    vf.parm("voxelsize").setExpression('ch("../CTRL_zrm/voxel")')
+    vs = geo.createNode("vdbsmoothsdf", "smooth_" + m); vs.setInput(0, vf)
+    vs.parm("iterations").setExpression('ch("../CTRL_zrm/smooth_iter")')
+    cv = geo.createNode("convertvdb", "poly_" + m); cv.setInput(0, vs)
+    cv.parm("conversion").set("poly")
+    qr = geo.createNode("quadremesh", "quads_" + m); qr.setInput(0, cv)
+    for pn in ("targetquadcount", "targetcount", "quadcount"):
+        if qr.parm(pn):
+            qr.parm(pn).setExpression('ch("../CTRL_zrm/quads_%s")' % m); break
+    nm = geo.createNode("name", "name_" + m); nm.setInput(0, qr)
+    nm.parm("name1").set(m)
+    outs.append(nm)
+mg = geo.createNode("merge", "merge_components")
+for i, n in enumerate(outs):
+    mg.setInput(i, n)
+nr = geo.createNode("normal", "normals"); nr.setInput(0, mg)
+nr.parm("cuspangle").set(60)
+out = geo.createNode("null", "OUT_" + NAME.lower()); out.setInput(0, nr)
+out.setDisplayFlag(True); out.setRenderFlag(True)
+rop = geo.createNode("rop_geometry", "EXPORT_obj"); rop.setInput(0, out)
+rop.parm("sopoutput").set(os.path.join(WORK, "result_" + NAME + ".obj"))
+geo.layoutChildren()
+g = out.geometry()
+result = {"node": out.path(), "points": len(g.points()), "prims": len(g.prims()),
+          "errors": [n.path() + ": " + " ".join(n.errors()) for n in geo.children() if n.errors()]}
+qp = [p.name() for p in hou.node(geo.path() + "/quads_trunk").parms()][:40]
+result["quadremesh_parms"] = qp

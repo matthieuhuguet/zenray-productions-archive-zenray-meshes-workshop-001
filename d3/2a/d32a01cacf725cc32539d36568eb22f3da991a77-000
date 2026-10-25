@@ -1,0 +1,66 @@
+# 25 October 2026 : ZenRay Meshes, step 2 : inflate each component mask into a closed mesh (hypothesis H2 + H7, no AI).
+# EN: a single view hides the depth, so each component is inflated by its own shape: at distance d from the
+# silhouette edge, with local radius R (max of the distance transform nearby), the half thickness is
+# depth_ratio * sqrt(R^2 - (R - d)^2): a round cross section, the classic "Teddy" inflation. The front
+# silhouette is therefore matched by construction; the depth is an assumption, written as such.
+# FR : chaque masque est gonflé en volume fermé, section ronde, profondeur supposée et paramétrée.
+# Usage: python Inflate.py <params.json>  (reads work/<obj>/mask_*.png, writes work/<obj>/<component>.obj)
+import json, sys, os
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+P = json.load(open(sys.argv[1]))
+root = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[1])))
+wd = os.path.join(root, P["out_dir"])
+info = json.load(open(os.path.join(wd, "components.json")))
+ppm = info["px_per_m"]; W, H = info["size"]; gy = info["ground_y"]
+s = P["inflate_stride"]
+
+
+def inflate(mask, depth_ratio, radius_window, name, noise=0.0, seed=1):
+    m = mask[::s, ::s].astype(bool)
+    m = ndi.binary_fill_holes(m)
+    dt = ndi.distance_transform_edt(m) * s / ppm            # metres to the edge
+    R = ndi.maximum_filter(dt, size=max(3, int(radius_window / s)))
+    R = np.maximum(R, dt)
+    h = depth_ratio * np.sqrt(np.clip(R * R - (R - dt) ** 2, 0, None))
+    if noise:
+        rng = np.random.default_rng(seed)
+        nz = ndi.gaussian_filter(rng.standard_normal(h.shape), 2.0)
+        h *= 1.0 + noise * nz / max(nz.std(), 1e-6)
+    hh, ww = m.shape
+    # Vertices on the closed grid: front (z = +h) and back (z = -h); edge cells share h = 0 after padding.
+    mp = np.pad(m, 1); hp = np.pad(h, 1)
+    ys, xs = np.nonzero(ndi.binary_dilation(mp))
+    idx = -np.ones(mp.shape, np.int64)
+    idx[ys, xs] = np.arange(len(ys))
+    X = (xs - 1) * s / ppm - (W / 2) / ppm
+    Y = (gy - (ys - 1) * s) / ppm
+    Z = hp[ys, xs]
+    verts = np.concatenate([np.stack([X, Y, Z], 1), np.stack([X, Y, -Z], 1)])
+    nv = len(ys)
+    faces = []
+    for (y, x) in zip(*np.nonzero(mp[:-1, :-1] | mp[1:, 1:] | mp[:-1, 1:] | mp[1:, :-1])):
+        q = [idx[y, x], idx[y, x + 1], idx[y + 1, x + 1], idx[y + 1, x]]
+        if min(q) < 0:
+            continue
+        faces.append(q)
+    faces = np.array(faces)
+    with open(os.path.join(wd, name + ".obj"), "w") as f:
+        f.write("# ZenRay Meshes inflate, 25 October 2026\n")
+        for v in verts:
+            f.write("v %.5f %.5f %.5f\n" % tuple(v))
+        for q in faces:   # front, wound toward +z
+            f.write("f %d %d %d %d\n" % (q[0] + 1, q[3] + 1, q[2] + 1, q[1] + 1))
+        for q in faces:   # back
+            f.write("f %d %d %d %d\n" % (q[0] + 1 + nv, q[1] + 1 + nv, q[2] + 1 + nv, q[3] + 1 + nv))
+    return {"name": name, "verts": int(len(verts)), "faces": int(2 * len(faces)), "max_half_depth_m": float(h.max())}
+
+
+load = lambda n: np.asarray(Image.open(os.path.join(wd, n))) > 127
+rep = []
+for comp in P["components"]:
+    rep.append(inflate(load("mask_%s.png" % comp["mask"]), comp["depth_ratio"], comp["radius_window_px"], comp["mask"], comp.get("noise", 0.0)))
+json.dump(rep, open(os.path.join(wd, "inflate.json"), "w"), indent=1)
+print(json.dumps(rep))

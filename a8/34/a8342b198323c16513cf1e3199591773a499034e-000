@@ -1,0 +1,122 @@
+# 25 October 2026 : ZenRay Meshes benchmark : six orthographic views of a known mesh, and a 3D score of any reconstruction.
+# EN: methods are judged on objects whose true 3D shape we own. `views` renders the six views a method may read
+# (silhouette, grey Lambert shading, depth for diagnosis only), `score` compares a reconstructed mesh to the truth:
+# F-score at tau (share of surface within tau of the other surface, both ways), Chamfer distance, silhouette IoU.
+# The checker is tested both ways: truth vs truth = 1.0, truth vs a sphere = low (see `selftest`).
+# FR : banc d'essai, six vues orthographiques d'un maillage connu et score 3D de toute reconstruction.
+# Usage: python Bench.py views <gt.obj> <out_dir> | score <pred.obj> <gt.obj> <views_dir> | selftest <gt.obj> <views_dir>
+import sys, os, json
+import numpy as np
+import trimesh
+from PIL import Image
+from scipy.spatial import cKDTree
+
+P = {"res": 512, "fill": 0.9, "samples": 150000, "taus": [0.005, 0.01, 0.02]}
+# view name -> (right axis, up axis, toward-viewer axis), world Y up, front looks down -Z
+VIEWS = {"front": ((1, 0, 0), (0, 1, 0), (0, 0, 1)), "back": ((-1, 0, 0), (0, 1, 0), (0, 0, -1)),
+         "right": ((0, 0, -1), (0, 1, 0), (1, 0, 0)), "left": ((0, 0, 1), (0, 1, 0), (-1, 0, 0)),
+         "top": ((1, 0, 0), (0, 0, -1), (0, 1, 0)), "bottom": ((1, 0, 0), (0, 0, 1), (0, -1, 0))}
+
+
+def load(path):
+    m = trimesh.load(path, force="mesh", process=False)
+    return m
+
+
+def frame(mesh):
+    lo, hi = mesh.bounds
+    c = (lo + hi) / 2
+    scale = P["res"] * P["fill"] / float((hi - lo).max())   # pixels per metre, same for every view
+    return c, scale
+
+
+def rasterize(mesh, c, scale, view):
+    R = P["res"]
+    rx, uy, tz = (np.array(a, float) for a in VIEWS[view])
+    v = mesh.vertices - c
+    px = v @ rx * scale + R / 2
+    py = R / 2 - v @ uy * scale
+    pz = v @ tz
+    zbuf = np.full((R, R), -np.inf); nbuf = np.zeros((R, R))
+    tri = mesh.faces
+    fn = mesh.face_normals @ tz
+    for t, n in zip(tri, fn):
+        x, y, z = px[t], py[t], pz[t]
+        x0, x1 = int(max(np.floor(x.min()), 0)), int(min(np.ceil(x.max()), R - 1))
+        y0, y1 = int(max(np.floor(y.min()), 0)), int(min(np.ceil(y.max()), R - 1))
+        if x1 < x0 or y1 < y0:
+            continue
+        gx, gy = np.meshgrid(np.arange(x0, x1 + 1) + 0.5, np.arange(y0, y1 + 1) + 0.5)
+        d = (y[1] - y[2]) * (x[0] - x[2]) + (x[2] - x[1]) * (y[0] - y[2])
+        if abs(d) < 1e-12:
+            continue
+        a = ((y[1] - y[2]) * (gx - x[2]) + (x[2] - x[1]) * (gy - y[2])) / d
+        b = ((y[2] - y[0]) * (gx - x[2]) + (x[0] - x[2]) * (gy - y[2])) / d
+        cc = 1 - a - b
+        inside = (a >= 0) & (b >= 0) & (cc >= 0)
+        if not inside.any():
+            continue
+        zz = a * z[0] + b * z[1] + cc * z[2]
+        sub = zbuf[y0:y1 + 1, x0:x1 + 1]; nsub = nbuf[y0:y1 + 1, x0:x1 + 1]
+        upd = inside & (zz > sub)
+        sub[upd] = zz[upd]; nsub[upd] = abs(n)
+    mask = np.isfinite(zbuf)
+    return mask, zbuf, nbuf
+
+
+def cmd_views(gt, out):
+    os.makedirs(out, exist_ok=True)
+    m = load(gt); c, scale = frame(m)
+    tiles = []
+    for v in VIEWS:
+        mask, z, n = rasterize(m, c, scale, v)
+        shade = np.where(mask, 0.25 + 0.7 * n, 0.82)
+        Image.fromarray((mask * 255).astype(np.uint8)).save(os.path.join(out, "mask_%s.png" % v))
+        img = (shade * 255).astype(np.uint8); Image.fromarray(img).save(os.path.join(out, "shade_%s.png" % v))
+        zz = np.where(mask, z, 0); np.save(os.path.join(out, "depth_%s.npy" % v), np.where(mask, z, np.nan))
+        tiles.append(img)
+    sheet = np.vstack([np.hstack(tiles[:3]), np.hstack(tiles[3:])])
+    Image.fromarray(sheet).save(os.path.join(out, "sheet.png"))
+    json.dump({"gt": gt, "center": c.tolist(), "px_per_m": scale, "res": P["res"], "views": VIEWS}, open(os.path.join(out, "meta.json"), "w"), indent=1)
+    print("views written", out, "px/m %.1f" % scale)
+
+
+def score(pred_path, gt_path, vdir):
+    pm, gm = load(pred_path), load(gt_path)
+    diag = float(np.linalg.norm(gm.bounds[1] - gm.bounds[0]))
+    rng = np.random.default_rng(0)
+    ps = trimesh.sample.sample_surface(pm, P["samples"], seed=1)[0]
+    gs = trimesh.sample.sample_surface(gm, P["samples"], seed=2)[0]
+    dpg = cKDTree(gs).query(ps)[0]; dgp = cKDTree(ps).query(gs)[0]
+    res = {"chamfer_pct_diag": float(100 * (dpg.mean() + dgp.mean()) / 2 / diag)}
+    for tau in P["taus"]:
+        prec = float((dpg < tau * diag).mean()); rec = float((dgp < tau * diag).mean())
+        res["fscore_%g" % tau] = 0 if prec + rec == 0 else 2 * prec * rec / (prec + rec)
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    c, s = np.array(meta["center"]), meta["px_per_m"]
+    ious = {}
+    for v in VIEWS:
+        ref = np.asarray(Image.open(os.path.join(vdir, "mask_%s.png" % v))) > 127
+        mk = rasterize(pm, c, s, v)[0]
+        ious[v] = float((ref & mk).sum() / max((ref | mk).sum(), 1))
+    res["silhouette_iou"] = ious
+    res["silhouette_iou_mean"] = float(np.mean(list(ious.values())))
+    return res
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1]
+    if cmd == "views":
+        cmd_views(sys.argv[2], sys.argv[3])
+    elif cmd == "score":
+        r = score(sys.argv[2], sys.argv[3], sys.argv[4]); print(json.dumps(r, indent=1))
+    elif cmd == "selftest":
+        gt, vdir = sys.argv[2], sys.argv[3]
+        good = score(gt, gt, vdir)
+        m = load(gt); c = (m.bounds[0] + m.bounds[1]) / 2; r = float((m.bounds[1] - m.bounds[0]).max()) / 2
+        sph = trimesh.creation.icosphere(4, r); sph.apply_translation(c)
+        bad_path = os.path.join(vdir, "_selftest_sphere.obj"); sph.export(bad_path)
+        bad = score(bad_path, gt, vdir)
+        ok = good["fscore_0.005"] > 0.99 and good["silhouette_iou_mean"] > 0.99 and bad["fscore_0.005"] < 0.5
+        print(json.dumps({"truth_vs_truth": good, "truth_vs_sphere": bad, "checker_green_and_red": ok}, indent=1))
+        sys.exit(0 if ok else 1)

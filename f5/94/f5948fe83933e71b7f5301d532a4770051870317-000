@@ -1,0 +1,48 @@
+# 25 October 2026 : ZenRay Meshes benchmark : export ground-truth meshes we already own (hython, headless, never the live scene).
+# EN: the benchmark needs objects whose real 3D shape is known, so every method can be scored in 3D, not only on silhouettes.
+# FR : le banc d'essai a besoin d'objets dont on connaît la vraie forme 3D.
+# Usage: hython ExportGroundTruth.py <out_dir>
+import hou, sys, os, json
+
+OUT = sys.argv[1]
+os.makedirs(OUT, exist_ok=True)
+JOBS = [
+    ("arch_hard", "/Users/zenray/Create/Build/Productions/ZenRayHoudini/LouisianaBayou/LouisianaBayou.hiplc", "/obj/Entrance_Arch_Clean"),
+    ("eucalyptus_tree", "/Users/zenray/Create/Build/Productions/ZenRayHoudini/VegetationCollection01/hip/VegetationCollection01.hiplc", "/obj/Eucalyptus"),
+    ("lily_plant", "/Users/zenray/Create/Build/Productions/ZenRayHoudini/VegetationCollection01/hip/VegetationCollection01.hiplc", "/obj/Lily_Flower"),
+]
+report = []
+current = None
+for name, hip, objpath in JOBS:
+    try:
+        if hip != current:
+            hou.hipFile.load(hip, suppress_save_prompt=True, ignore_load_warnings=True)
+            current = hip
+        o = hou.node(objpath)
+        sop = o.displayNode()
+        g = hou.Geometry(); g.merge(sop.geometry())
+        # unpack packed prims so leaves and instances are real polygons
+        g.unpackPacked() if hasattr(g, "unpackPacked") else None
+        path = os.path.join(OUT, name + ".bgeo.sc"); g.saveToFile(path)
+        objp = os.path.join(OUT, name + ".obj"); g.saveToFile(objp)
+        bb = g.boundingBox()
+        report.append({"name": name, "src": objpath + "/" + sop.name(), "points": len(g.points()), "prims": len(g.prims()), "size": list(bb.sizevec())})
+    except Exception as e:
+        report.append({"name": name, "error": str(e)})
+# Manny from the exported FBX
+try:
+    hou.hipFile.clear(suppress_save_prompt=True)
+    fbx = "/Users/zenray/.claude/tmp/tmp-houdini-september-2026/tmp-bayou-louisiana/03_work/manny-scale/Manny_LowLOD.fbx"
+    geo = hou.node("/obj").createNode("geo", "manny")
+    f = geo.createNode("fbxcharacterimport") if False else None
+    imp = geo.createNode("file"); imp.parm("file").set(fbx)
+    g = hou.Geometry(); g.merge(imp.geometry())
+    xf = hou.hmath.buildScale(0.01, 0.01, 0.01)
+    g.transform(xf)
+    g.saveToFile(os.path.join(OUT, "manny_character.obj"))
+    bb = g.boundingBox()
+    report.append({"name": "manny_character", "points": len(g.points()), "prims": len(g.prims()), "size": list(bb.sizevec())})
+except Exception as e:
+    report.append({"name": "manny_character", "error": str(e)})
+json.dump(report, open(os.path.join(OUT, "ground_truth.json"), "w"), indent=1)
+print(json.dumps(report, indent=1))

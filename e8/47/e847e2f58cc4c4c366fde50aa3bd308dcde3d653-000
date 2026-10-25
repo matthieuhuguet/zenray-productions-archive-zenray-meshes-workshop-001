@@ -1,0 +1,122 @@
+# 25 October 2026 : ZenRay Meshes, step 1 : read a reference image into component masks (no AI).
+# EN: segments the reference by colour into components (background, scale figure, trunk, foliage, ground),
+# measures the scale from the figure (known height), and writes masks plus a JSON the Houdini builder reads.
+# FR : découpe la référence par la couleur en composants, mesure l'échelle sur la silhouette humaine, écrit masques et JSON.
+# Usage: python Segment.py <params.json>
+import json, sys, os
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+P = json.load(open(sys.argv[1]))
+root = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[1])))
+src = os.path.join(root, P["image"])
+out = os.path.join(root, P["out_dir"]); os.makedirs(out, exist_ok=True)
+
+rgb = np.asarray(Image.open(src).convert("RGB")).astype(np.float32) / 255.0
+H, W, _ = rgb.shape
+r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+mx, mn = rgb.max(-1), rgb.min(-1)
+sat = (mx - mn) / np.maximum(mx, 1e-4)
+val = mx
+
+# Background: vignetted light grey studio. Robust 2D quadratic per channel fitted on unsaturated bright pixels.
+yy, xx = np.mgrid[0:H, 0:W]
+u, v = xx / W - 0.5, yy / H - 0.5
+A = np.stack([np.ones_like(u), u, v, u * u, v * v, u * v], -1).reshape(-1, 6)
+cand = ((sat < P["bg_max_sat"]) & (val > P["bg_min_value"])).reshape(-1)
+flat = rgb.reshape(-1, 3)
+for _ in range(4):
+    coef, *_ = np.linalg.lstsq(A[cand], flat[cand], rcond=None)
+    bgimg = (A @ coef)
+    err = np.linalg.norm(flat - bgimg, axis=-1)
+    cand = cand & (err < P["bg_threshold"])
+bgimg = bgimg.reshape(H, W, 3)
+bg = np.median(bgimg.reshape(-1, 3), 0)
+dist_bg = np.linalg.norm(rgb - bgimg, axis=-1)
+obj = (dist_bg > P["bg_threshold"]) | (sat > P["obj_min_sat"])
+obj = ndi.binary_opening(obj, iterations=1)
+lab, n = ndi.label(obj)
+if n:
+    sizes = ndi.sum(obj, lab, range(1, n + 1))
+    obj = np.isin(lab, 1 + np.where(sizes >= P["obj_min_area"])[0])
+obj = ndi.binary_fill_holes(ndi.binary_closing(obj, iterations=P["close_iter"]))
+hue = np.zeros_like(val)
+d = np.maximum(mx - mn, 1e-4)
+hr = (mx == r); hg = (mx == g) & ~hr; hb = ~hr & ~hg
+hue[hr] = (60 * ((g - b) / d) % 360)[hr]; hue[hg] = (60 * ((b - r) / d) + 120)[hg]; hue[hb] = (60 * ((r - g) / d) + 240)[hb]
+
+# Scale figure: dark, unsaturated, in the user given box.
+fx0, fy0, fx1, fy1 = P["figure_box"]
+fig = np.zeros_like(obj)
+fig[fy0:fy1, fx0:fx1] = (val[fy0:fy1, fx0:fx1] < P["figure_max_value"]) & (sat[fy0:fy1, fx0:fx1] < P["figure_max_sat"])
+lab, n = ndi.label(fig)
+if n:
+    sizes = ndi.sum(fig, lab, range(1, n + 1)); fig = lab == (1 + int(np.argmax(sizes)))
+ys = np.where(fig.any(1))[0]
+fig_px = int(ys.max() - ys.min() + 1)
+px_per_m = fig_px / P["figure_height_m"]
+
+# Foliage: green hue (g dominant) and saturated. Trunk: the rest of the object above the ground line.
+# Local features (window k) so that shadowed needles keep the foliage label.
+k = P["feature_window"]
+hc, hs = np.cos(np.radians(hue)), np.sin(np.radians(hue))
+lh = np.degrees(np.arctan2(ndi.uniform_filter(hs * sat, k), ndi.uniform_filter(hc * sat, k))) % 360
+ls = ndi.uniform_filter(sat, k)
+lv = ndi.uniform_filter(val, k)
+lvar = ndi.uniform_filter(val * val, k) - lv * lv
+ground_y = P["ground_y"]
+seeds = obj & ~fig & (((lh > P["foliage_min_hue"]) & (lh < P["foliage_max_hue"]) & (ls > P["foliage_min_sat"])) | ((lv < P["foliage_dark_value"]) & (lvar > P["foliage_min_var"])))
+bark = (lh > P["bark_min_hue"]) & (lh < P["bark_max_hue"]) & (ls < P["bark_max_sat"]) & (lv > P["bark_min_value"])
+foliage = obj & ~fig & ndi.binary_dilation(seeds, iterations=P["foliage_grow"]) & ~(bark & ~seeds)
+foliage[ground_y - P["ground_band"]:] = False
+foliage = ndi.binary_closing(foliage, iterations=P["foliage_close"])
+foliage = ndi.binary_opening(foliage, iterations=1)
+# A foliage piece must face the outside: share at least foliage_min_bg_contact of its border with the background, otherwise it is moss on the bark.
+outside = ~obj
+flab0, fn0 = ndi.label(foliage)
+for i in range(1, fn0 + 1):
+    m = flab0 == i
+    rim = ndi.binary_dilation(m, iterations=2) & ~m
+    if rim.sum() == 0 or (rim & outside).sum() / rim.sum() < P["foliage_min_bg_contact"]:
+        foliage[m] = False
+trunk = obj & ~foliage & ~fig
+trunk[ground_y - P["ground_band"]:] = False
+trunk = ndi.binary_opening(trunk, iterations=P["trunk_open"])
+lab, n = ndi.label(trunk)
+if n:
+    sizes = ndi.sum(trunk, lab, range(1, n + 1))
+    trunk = np.isin(lab, 1 + np.where(sizes >= P["trunk_min_area"])[0])
+ground = obj & ~fig
+ground[: ground_y - P["ground_band"]] = False
+gx0, gx1 = P["ground_x"]
+ground[:, :gx0] = False; ground[:, gx1:] = False
+
+# Foliage clusters = components (each becomes one cluster mesh).
+flab, fn = ndi.label(foliage)
+clusters = []
+for i in range(1, fn + 1):
+    m = flab == i
+    a = int(m.sum())
+    if a < P["foliage_min_area"]:
+        continue
+    yy, xx = np.where(m)
+    clusters.append({"id": i, "area_px": a, "bbox": [int(xx.min()), int(yy.min()), int(xx.max()), int(yy.max())]})
+
+def save(m, name):
+    Image.fromarray((m * 255).astype(np.uint8)).save(os.path.join(out, name))
+
+save(obj, "mask_object.png"); save(fig, "mask_figure.png"); save(foliage, "mask_foliage.png")
+save(trunk, "mask_trunk.png"); save(ground, "mask_ground.png")
+np.save(os.path.join(out, "foliage_labels.npy"), flab.astype(np.int32))
+
+# Colour index preview: one flat colour per component.
+idx = np.zeros((H, W, 3), np.uint8) + 235
+idx[ground] = (150, 120, 90); idx[trunk] = (200, 120, 60); idx[foliage] = (60, 170, 70); idx[fig] = (40, 40, 200)
+Image.fromarray(idx).save(os.path.join(out, "components_index.png"))
+
+info = {"image": P["image"], "size": [W, H], "bg_rgb": bg.tolist(), "figure_px": fig_px, "px_per_m": px_per_m,
+        "ground_y": ground_y, "areas_px": {"object": int(obj.sum()), "trunk": int(trunk.sum()), "foliage": int(foliage.sum()),
+        "figure": int(fig.sum()), "ground": int(ground.sum())}, "foliage_clusters": clusters}
+json.dump(info, open(os.path.join(out, "components.json"), "w"), indent=1)
+print(json.dumps({k: info[k] for k in ("size", "figure_px", "px_per_m", "areas_px")}), len(clusters), "clusters")
