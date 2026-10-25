@@ -1,0 +1,133 @@
+# 25 October 2026 : ZenRay Meshes M08 : depth sheet whose six per view depth spans are found by the TARGET image score.
+# EN: analysis by synthesis on six numbers. For candidate spans, carve the hull with the depth sheet (M06), re-render the
+# six views and compare to the reference normal maps (Bench.image_score). Start from the thickness LP (M06 'lp'),
+# coordinate search with multiplicative steps. The depth sheet is degraded like a generator (8 bit, blur, noise).
+# FR : les six échelles de profondeur sont choisies par le score image lui-même, à partir de l'estimation LP.
+# Usage: python SpanFit.py <views_dir> <out.obj> [gt=...] [k=v]
+import sys, os, json, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import Methods as M, Bench
+
+P = {"objective": "both", "w_depth": 1.0, "n_search": 224, "n_final": 384, "bits": 8, "blur": 1.5, "noise": 0.01, "rounds": 3,
+     "factors": [0.7, 0.85, 1.0, 1.15, 1.35]}
+
+
+def degraded_depths(vdir, p):
+    """The depth sheet exactly as the method sees it (same degradation and seed as Methods.m06_depth_sheet)."""
+    from scipy import ndimage as ndi
+    meta, masks, _ = M.load_views(vdir)
+    rng = np.random.default_rng(0)
+    out = {}
+    for v in M.VIEWS_ORDER:
+        dt = np.load(os.path.join(vdir, "depth_%s.npy" % v)); m = masks[v]
+        im = np.where(m, (dt - np.nanmin(dt)) / (np.nanmax(dt) - np.nanmin(dt)), 0)
+        if p["blur"]:
+            w = ndi.gaussian_filter(m.astype(float), p["blur"]); im = ndi.gaussian_filter(im, p["blur"]) / np.maximum(w, 1e-6)
+        if p["noise"]:
+            im = im + rng.normal(0, p["noise"], im.shape)
+        q = 2 ** int(p["bits"]) - 1
+        out[v] = (np.round(np.clip(im, 0, 1) * q) / q, m)
+    return out
+
+
+def depth_consistency(mesh_path, vdir, imgs):
+    """Scale free self consistency: render the candidate in the six views, normalise its visible depth to 0..1 like the
+    sheet, compare with the sheet's depth images on the common pixels; times silhouette IoU. 1.0 = perfect."""
+    import trimesh, Raster
+    meta = json.load(open(os.path.join(vdir, "meta.json")))
+    mesh = trimesh.load(mesh_path, force="mesh", process=False)
+    rd = Raster.Renderer(mesh.vertices, mesh.faces)
+    tot = []
+    for v in M.VIEWS_ORDER:
+        Mk, D, N, F = rd.render(meta["center"], meta["px_per_m"], Bench.VIEWS[v], meta["res"])
+        img, m = imgs[v]
+        both = Mk & m
+        if both.sum() < 10:
+            tot.append(0.0); continue
+        d = D[both]; dn = (d - d.min()) / max(d.max() - d.min(), 1e-9)
+        err = np.mean(np.abs(dn - img[both]))
+        iou = both.sum() / max((Mk | m).sum(), 1)
+        tot.append((1 - err) * iou)
+    rd.release()
+    return float(np.mean(tot))
+
+
+def main(vdir, out, **kw):
+    p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P and k != "factors"})
+    gt = kw.get("gt")
+    deg = dict(bits=p["bits"], blur=p["blur"], noise=p["noise"])
+    imgs = degraded_depths(vdir, p)
+    tmp = out.replace(".obj", "_s.obj")
+    # initial spans from the thickness LP
+    import io, contextlib
+    spans = {}
+    M.m06_depth_sheet(vdir, tmp, n=p["n_search"], affine="lp", lp_pct=1.0, spans_out=spans, **deg) if False else None
+    meta, masks, _ = M.load_views(vdir)
+    # reuse the LP inside m06 by a dry run that records spans
+    rec = {}
+    orig = M.span_lp
+    def wrap(*a, **k):
+        r = orig(*a, **k); rec.setdefault("pairs", []).append(r); return r
+    M.span_lp = wrap
+    M.m06_depth_sheet(vdir, tmp, n=64, affine="lp", **deg)
+    M.span_lp = orig
+    names = [("front", "back"), ("right", "left"), ("top", "bottom")]
+    for (va, vb), (sa, sb) in zip(names, rec["pairs"]):
+        spans[va], spans[vb] = max(sa, 1e-3), max(sb, 1e-3)
+
+    def evaluate(sp, n):
+        M.m06_depth_sheet(vdir, tmp, n=n, affine="given", spans_given=sp, **deg)
+        if p["objective"] == "image":
+            return Bench.image_score(tmp, vdir)["image_score"]
+        if p["objective"] == "both":
+            return Bench.image_score(tmp, vdir)["image_score"] + p["w_depth"] * depth_consistency(tmp, vdir, imgs)
+        return depth_consistency(tmp, vdir, imgs)
+
+    # hull extent along each view axis = upper bound of the visible depth span
+    c, half, ax, G = M.grid(meta, 96)
+    Pp = G.reshape(-1, 3); hull = np.ones(len(Pp), bool)
+    for v in M.VIEWS_ORDER:
+        px, py = M.project(meta, Pp, v); R = meta["res"]
+        hull &= masks[v][np.clip(py.astype(int), 0, R - 1), np.clip(px.astype(int), 0, R - 1)]
+    ext = {v: float(np.ptp(Pp[hull] @ np.array(meta["views"][v][2], float))) for v in M.VIEWS_ORDER}
+    best = evaluate(spans, p["n_search"])
+    log = [{"step": "lp", "image_score": round(best, 4), "spans": {k: round(v, 3) for k, v in spans.items()}}]
+    # coarse pass: each view over the whole admissible range (fractions of the hull extent), LP value kept as a candidate
+    for v in M.VIEWS_ORDER:
+        cand = [(best, spans[v])]
+        for f in (0.1, 0.2, 0.35, 0.5, 0.7, 0.85, 1.0):
+            sp = dict(spans); sp[v] = f * ext[v]
+            cand.append((evaluate(sp, p["n_search"]), sp[v]))
+        sc, val = max(cand, key=lambda t: t[0])
+        best, spans[v] = sc, val
+    log.append({"step": "coarse", "image_score": round(best, 4), "spans": {k: round(v, 3) for k, v in spans.items()}})
+    print(json.dumps(log[-1]), flush=True)
+    print(json.dumps(log[-1]), flush=True)
+    for r in range(p["rounds"]):
+        for v in M.VIEWS_ORDER:
+            cand = []
+            for f in p["factors"]:
+                if f == 1.0:
+                    continue
+                sp = dict(spans); sp[v] = spans[v] * f
+                cand.append((evaluate(sp, p["n_search"]), f, sp))
+            sc, f, sp = max(cand, key=lambda t: t[0])
+            if sc > best:
+                best, spans = sc, sp
+        log.append({"step": "round %d" % (r + 1), "image_score": round(best, 4), "spans": {k: round(v, 3) for k, v in spans.items()}})
+        print(json.dumps(log[-1]), flush=True)
+    M.m06_depth_sheet(vdir, out, n=p["n_final"], affine="given", spans_given=spans, **deg)
+    res = {"image_score": Bench.image_score(out, vdir)["image_score"], "spans": spans}
+    if gt:
+        sc = Bench.score(out, gt, vdir); res.update({"F0.5": sc["fscore_0.005"], "F1": sc["fscore_0.01"]})
+        meta = json.load(open(os.path.join(vdir, "meta.json")))
+        true = {v: float(np.nanmax(np.load(os.path.join(vdir, "depth_%s.npy" % v))) - np.nanmin(np.load(os.path.join(vdir, "depth_%s.npy" % v)))) for v in M.VIEWS_ORDER}
+        res["span_error_pct"] = {v: round(100 * abs(spans[v] - true[v]) / true[v], 1) for v in M.VIEWS_ORDER}
+    print(json.dumps(res), flush=True)
+    json.dump({"params": p, "log": log, "result": res}, open(out.replace(".obj", ".log.json"), "w"), indent=1)
+
+
+if __name__ == "__main__":
+    vdir, out = sys.argv[1:3]
+    main(vdir, out, **dict(a.split("=", 1) for a in sys.argv[3:]))

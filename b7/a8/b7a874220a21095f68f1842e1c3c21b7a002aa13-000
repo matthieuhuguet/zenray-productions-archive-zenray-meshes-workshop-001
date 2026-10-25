@@ -1,0 +1,93 @@
+# 25 October 2026 : ZenRay Meshes M09 : six depth images become six point clouds; the per view depth spans are those that
+# make the clouds lie on ONE surface (trimmed mutual nearest neighbour distance). No voxel, no rendering, scale free.
+# EN: view v pixel (x, y) with sheet depth a in 0..1 -> world point c + x rx + y uy + (hhi_v - span_v (1 - a)) tz,
+# hhi_v = front extreme along tz, read on the perpendicular silhouettes. Then the six clouds are fused into a mesh by
+# carving with the fitted spans (M06) at full resolution.
+# FR : chaque image de profondeur devient un nuage ; les bonnes échelles font coïncider les six nuages.
+# Usage: python CloudFit.py <views_dir> <out.obj> [gt=...] [k=v]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.optimize import minimize
+from scipy import ndimage as ndi
+import Methods as M, Bench, SpanFit as S
+
+P = {"per_view": 25000, "trim": 0.6, "erode": 2, "max_grad": 0.04, "n_final": 384, "bits": 8, "blur": 1.5, "noise": 0.01}
+
+
+def clouds(vdir, imgs, meta, hhi, spans, sub):
+    R, s = meta["res"], meta["px_per_m"]; c = np.array(meta["center"])
+    out = {}
+    for v in M.VIEWS_ORDER:
+        rx, uy, tz = (np.array(a, float) for a in meta["views"][v])
+        ys, xs, a = sub[v]
+        x = (xs + 0.5 - R / 2) / s; y = (R / 2 - ys - 0.5) / s
+        d = hhi[v] - spans[v] * (1 - a)
+        out[v] = c + x[:, None] * rx + y[:, None] * uy + d[:, None] * tz
+    return out
+
+
+def objective(logs, vdir, imgs, meta, hhi, sub, p, trees_cache):
+    spans = {v: float(np.exp(l)) for v, l in zip(M.VIEWS_ORDER, logs)}
+    C = clouds(vdir, imgs, meta, hhi, spans, sub)
+    tot = []
+    for v in M.VIEWS_ORDER:
+        others = np.concatenate([C[w] for w in M.VIEWS_ORDER if w != v])
+        dist = cKDTree(others).query(C[v], k=1)[0]
+        k = int(len(dist) * p["trim"])
+        tot.append(np.partition(dist, k)[:k].mean())          # trimmed: only the part seen by other views counts
+    return float(np.mean(tot))
+
+
+def main(vdir, out, **kw):
+    p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P})
+    gt = kw.get("gt")
+    meta, masks, _ = M.load_views(vdir)
+    imgs = S.degraded_depths(vdir, {"bits": p["bits"], "blur": p["blur"], "noise": p["noise"]})
+    rng = np.random.default_rng(0)
+    # front extreme per view from the hull, and smooth interior pixels (blurred discontinuities excluded)
+    c, half, ax, G = M.grid(meta, 160)
+    Pp = G.reshape(-1, 3); hull = np.ones(len(Pp), bool); R = meta["res"]
+    for v in M.VIEWS_ORDER:
+        px, py = M.project(meta, Pp, v)
+        hull &= masks[v][np.clip(py.astype(int), 0, R - 1), np.clip(px.astype(int), 0, R - 1)]
+    hhi, ext, sub = {}, {}, {}
+    for v in M.VIEWS_ORDER:
+        tz = np.array(meta["views"][v][2], float); d = Pp[hull] @ tz
+        hhi[v] = float(d.max()); ext[v] = float(np.ptp(d))
+        img, m = imgs[v]
+        gy, gx = np.gradient(img)
+        ok = ndi.binary_erosion(m, iterations=p["erode"]) & ~ndi.binary_dilation(np.hypot(gx, gy) > p["max_grad"], iterations=2)
+        ys, xs = np.nonzero(ok)
+        if len(ys) > p["per_view"]:
+            i = rng.choice(len(ys), p["per_view"], replace=False); ys, xs = ys[i], xs[i]
+        sub[v] = (ys, xs, img[ys, xs])
+    x0 = np.log(np.array([0.5 * ext[v] for v in M.VIEWS_ORDER]))
+    # coarse grid per view first (log space), then Nelder Mead on all six
+    f = lambda l: objective(l, vdir, imgs, meta, hhi, sub, p, None)
+    best = x0.copy(); fb = f(best)
+    for sweep in range(2):
+        for i, v in enumerate(M.VIEWS_ORDER):
+            for frac in (0.08, 0.15, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0):
+                t = best.copy(); t[i] = np.log(frac * ext[v]); ft = f(t)
+                if ft < fb:
+                    best, fb = t, ft
+        print(json.dumps({"sweep": sweep, "objective_mm": round(1000 * fb, 3)}), flush=True)
+    res = minimize(f, best, method="Nelder-Mead", options={"xatol": 1e-3, "fatol": 1e-6, "maxiter": 600})
+    spans = {v: float(np.exp(l)) for v, l in zip(M.VIEWS_ORDER, res.x)}
+    print(json.dumps({"nelder_mead_mm": round(1000 * res.fun, 3)}), flush=True)
+    M.m06_depth_sheet(vdir, out, n=p["n_final"], affine="given", spans_given=spans, bits=p["bits"], blur=p["blur"], noise=p["noise"])
+    result = {"objective_mm": 1000 * res.fun, "spans": spans, "image_score": Bench.image_score(out, vdir)["image_score"]}
+    if gt:
+        sc = Bench.score(out, gt, vdir); result.update({"F0.5": sc["fscore_0.005"], "F1": sc["fscore_0.01"]})
+        true = {v: float(np.nanmax(np.load(os.path.join(vdir, "depth_%s.npy" % v))) - np.nanmin(np.load(os.path.join(vdir, "depth_%s.npy" % v)))) for v in M.VIEWS_ORDER}
+        result["span_error_pct"] = {v: round(100 * abs(spans[v] - true[v]) / true[v], 1) for v in M.VIEWS_ORDER}
+        result["objective_true_mm"] = 1000 * f(np.log(np.array([true[v] for v in M.VIEWS_ORDER])))
+    print(json.dumps(result), flush=True)
+    json.dump({"params": p, "result": result}, open(out.replace(".obj", ".log.json"), "w"), indent=1)
+
+
+if __name__ == "__main__":
+    vdir, out = sys.argv[1:3]
+    main(vdir, out, **dict(a.split("=", 1) for a in sys.argv[3:]))

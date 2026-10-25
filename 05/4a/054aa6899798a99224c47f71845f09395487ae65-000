@@ -336,7 +336,7 @@ def span_lp(ia, ib, ma, mb, ha, hb, same, R, pct=1.0, erode=0, max_grad=0.0):
     return float(x[0]), float(x[1])
 
 
-def m06_depth_sheet(vdir, out, n=320, bits=8, blur=0.0, noise=0.0, smooth=0.8, tol_px=1.5, seed=0, affine="oracle", lp_pct=1.0, lp_erode=0, lp_grad=0.0):
+def m06_depth_sheet(vdir, out, n=320, bits=8, blur=0.0, noise=0.0, smooth=0.8, tol_px=1.5, seed=0, affine="oracle", lp_pct=1.0, lp_erode=0, lp_grad=0.0, spans_given=None, return_spans=False):
     """M06: the sheet gives a DEPTH map per view, as an image generator would: normalised per view to 0..1 over the
     object (near = white), quantised to `bits`, optionally blurred and noisy. The per view affine is recovered exactly
     from the visual hull's extent along the view axis (the other views fix it), then voxels are carved like M00."""
@@ -400,6 +400,8 @@ def m06_depth_sheet(vdir, out, n=320, bits=8, blur=0.0, noise=0.0, smooth=0.8, t
             hlo = lo                            # diagnosis: true deepest visible depth
         elif affine in ("rim", "lp"):
             hlo = hhi - spans[v]
+        elif affine == "given":
+            hlo = hhi - float(spans_given[v])
         else:
             # estimate the depth span: the largest span whose carving keeps every perpendicular silhouette whole
             best = None
@@ -424,6 +426,87 @@ def m06_depth_sheet(vdir, out, n=320, bits=8, blur=0.0, noise=0.0, smooth=0.8, t
     return to_mesh(occ.reshape(n, n, n), ax, c, out, float(smooth))
 
 METHODS["M06"] = m06_depth_sheet
+
+
+def m07_normal_carving(vdir, out, n=256, angle=25.0, max_iter=400, smooth=0.8, min_views=2, min_facing=0.25, protect=1):
+    """M07: space carving where the 'colour' is the WORLD normal read in each view's normal map (Kutulakos and Seitz
+    photo hull, normals instead of colour). Start from the visual hull; for every view (axis aligned) the first
+    occupied voxel along each ray is that view's visible surface and reports the view's world normal. A voxel seen by
+    at least min_views views whose reported normals disagree by more than `angle` is not on the true surface: carved.
+    Repeated until stable. Needs only silhouettes and normal maps: no depth, no scale."""
+    meta, masks, _ = load_views(vdir)
+    n = int(n); R = meta["res"]; s = meta["px_per_m"]
+    c, half, ax, _ = grid(meta, 2)
+    ax = np.linspace(-half, half, n)
+    cos_t = np.cos(np.radians(float(angle)))
+    pix = np.clip((ax * s + R / 2).astype(int), 0, R - 1)
+    pixd = np.clip((R / 2 - ax * s).astype(int), 0, R - 1)
+    views = {}
+    occ = np.ones((n, n, n), bool)
+    for v in VIEWS_ORDER:
+        rx, uy, tz = (np.array(a, float) for a in meta["views"][v])
+        ia = int(np.argmax(np.abs(rx))); ib = int(np.argmax(np.abs(uy))); iz = int(np.argmax(np.abs(tz)))
+        cols = pix if rx[ia] > 0 else pix[::-1]
+        rows = pixd if uy[ib] > 0 else pixd[::-1]
+        nimg = np.asarray(Image.open(os.path.join(vdir, "normal_%s.png" % v))).astype(float) / 255 * 2 - 1
+        nw = nimg[..., 0:1] * rx + nimg[..., 1:2] * uy + nimg[..., 2:3] * tz
+        nw /= np.linalg.norm(nw, axis=-1, keepdims=True) + 1e-9
+        m2 = masks[v][np.ix_(rows, cols)]                 # [b, a]
+        n2 = nw[np.ix_(rows, cols)]                       # [b, a, 3]
+        views[v] = dict(ia=ia, ib=ib, iz=iz, sz=np.sign(tz[iz]), m2=m2, n2=n2)
+        shape = [1, 1, 1]; shape[ib] = n; shape[ia] = n
+        occ &= (m2.T if ia < ib else m2).reshape(shape)
+    hull_count = occ.sum()
+    for it in range(int(max_iter)):
+        acc = np.zeros((n, n, n, 3), np.float32); cnt = np.zeros((n, n, n), np.int16); bad = np.zeros((n, n, n), bool)
+        first_n = {}
+        for v, d in views.items():
+            # first occupied voxel along the view axis, toward the viewer is +sz
+            o = np.moveaxis(occ, d["iz"], 0)
+            if d["sz"] > 0:
+                o = o[::-1]
+            hit = o.any(0); k = o.argmax(0)
+            if d["sz"] > 0:
+                k = n - 1 - k
+            # o's remaining axes are the other two in increasing order; map to (b, a) image indices
+            other = [i for i in range(3) if i != d["iz"]]
+            K = k if other == [d["ib"], d["ia"]] else k.T          # K[b, a]
+            H = hit if other == [d["ib"], d["ia"]] else hit.T
+            H = H & d["m2"]
+            bb, aa = np.nonzero(H)
+            idx = [None, None, None]; idx[d["ia"]] = aa; idx[d["ib"]] = bb; idx[d["iz"]] = K[bb, aa]
+            nv = d["n2"][bb, aa].astype(np.float32)
+            facing = np.abs(nv[:, d["iz"]]) >= float(min_facing)      # grazing pixels are unreliable
+            idx = [i[facing] for i in idx]; nv = nv[facing]
+            np.add.at(acc, tuple(idx), nv); np.add.at(cnt, tuple(idx), 1)
+            first_n[v] = (tuple(idx), nv)
+        # consistency: each view's normal against the mean of all views seeing the voxel
+        mean = acc / np.maximum(cnt, 1)[..., None]
+        mean /= np.linalg.norm(mean, axis=-1, keepdims=True) + 1e-9
+        for v, (idx, nv) in first_n.items():
+            ok = cnt[idx] >= min_views
+            agree = (nv * mean[idx]).sum(-1)
+            badv = ok & (agree < cos_t)
+            bad[tuple(np.array(idx)[:, badv])] = True
+        if int(protect):
+            # never empty a ray whose pixel is inside a silhouette: the last voxel of such a ray is kept
+            for v, d in views.items():
+                cntr = occ.sum(d["iz"]); badr = (occ & bad).sum(d["iz"])
+                other = [i for i in range(3) if i != d["iz"]]
+                M2 = d["m2"] if other == [d["ib"], d["ia"]] else d["m2"].T
+                last = (cntr - badr <= 0) & M2
+                if last.any():
+                    sl = [slice(None)] * 3
+                    lastb = np.expand_dims(last, d["iz"])
+                    bad &= ~(lastb & occ)
+        nb = int(bad.sum())
+        if nb == 0:
+            break
+        occ &= ~bad
+    print("M07 iterations", it + 1, "carved", int(hull_count - occ.sum()), "of", int(hull_count), file=sys.stderr)
+    return to_mesh(occ, ax, c, out, float(smooth))
+
+METHODS["M07"] = m07_normal_carving
 
 if __name__ == "__main__":
     name, vdir, out = sys.argv[1:4]
