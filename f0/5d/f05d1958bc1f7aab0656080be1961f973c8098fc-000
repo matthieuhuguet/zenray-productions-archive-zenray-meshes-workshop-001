@@ -329,8 +329,25 @@ def m15_snake2d(V, RL, E, geo, root, r_root, base="m20", iters=20, eta=0.04, smo
 METHODS = {"m15": m15_snake2d, "m02": m02_colonize, "m04": m04_gram_fit, "m06": m06_hull_lift, "m11": m11_track, "m13": m13_snake, "m14": m14_fusion, "m20": m20_staged, "m01": m01_wp, "m07": m07_skeleton, "m10": m10_geodesic}
 
 
+def trunk_continuity(N, par, rad, r_root, length=3.0):
+    # the first limb path above the trunk top starts with the trunk radius and eases down to its own : no step between the trunk tube and the limb tube. FR : continuité de rayon du tronc au premier limbe.
+    kids = [[] for _ in N]
+    for i, p_ in enumerate(par):
+        if p_ >= 0: kids[p_].append(i)
+    path = [0]; L = 0.0
+    while kids[path[-1]] and L < length:
+        c = max(kids[path[-1]], key=lambda x: rad[x])
+        if len(kids[path[-1]]) >= 2 and sorted([rad[x] for x in kids[path[-1]]])[-2] > 0.6 * rad[c]: break   # a real fork : the path ends
+        L += float(np.linalg.norm(N[c] - N[path[-1]])); path.append(c)
+    end = rad[path[-1]]; Ls = np.concatenate([[0.0], np.cumsum([np.linalg.norm(N[path[k + 1]] - N[path[k]]) for k in range(len(path) - 1)])])
+    for k, i in enumerate(path): rad[i] = max(rad[i], r_root + (end - r_root) * (Ls[k] / max(Ls[-1], 1e-9)))
+    for i in range(1, len(N)): rad[i] = min(rad[i], rad[par[i]])   # taper stays monotone
+    return rad
+
+
 def run(mid, obj="tree", **kw):
     t0 = time.time(); ev = {k: kw.pop(k) for k in ("kmin", "pair", "comb") if k in kw}; V, RL, E, geo, root, r_root = setup(obj, **ev); N, par = METHODS[mid](V, RL, E, geo, root, r_root, **kw); rad = np.sqrt(B.radius_from_ridge(V, RL, N, par, r_root) * B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6)); rad[par < 0] = r_root   # geometric mean : the ridge scale alone is too fat at forks, the pipe model alone too thin
+    rad = trunk_continuity(N, par, rad, r_root)
     s = B.score(V, RL, N, par, rad); s["method"] = mid; s["ev"] = ev; s["seconds"] = round(time.time() - t0, 1); s["args"] = kw
     if os.path.exists(W + "work/%s/topo_w_truth.npz" % obj): s.update(truth_curves(obj, N, par))
     np.savez(W + "work/%s/branches_%s.npz" % (obj, mid), nodes=N, parent=par, radius=rad); B.board(V, N, par, rad, W + "versions/Branches_%s_%s.png" % (obj, mid), "%s %s F %s P %s Rthick %s Rmed %s nodes %d" % (obj, mid, s["F"], s["precision"], s["recall_thick"], s["recall_med"], len(N)))
