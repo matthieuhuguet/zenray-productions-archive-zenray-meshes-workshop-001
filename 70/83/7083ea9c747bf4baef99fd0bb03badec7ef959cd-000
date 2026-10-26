@@ -45,9 +45,14 @@ RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
 TITLE_KEYS = ["text", "width_ratio", "size_start", "centre_x", "centre_y", "instant_seconds", "render_scale",
               "start_seconds", "end_seconds", "reveal_seconds", "erase_seconds", "erase_lead_seconds",
               "duration_seconds", "fps", "format", "tall_zoom", "base_project_id", "project_id", "project_title",
-              "calibration_passes", "width_tolerance", "centre_tolerance_px"]
+              "calibration_passes", "width_tolerance", "centre_tolerance_px", "centre_mode_x", "centre_mode_y"]
 INDEX_ROWS = [
     ("params", "Params/thumbnail.json", "every parameter of the thumbnail, one JSON file"),
+    ("script-letterbox", "Scripts/Letterbox9x16.py", "the 9:16 (YouTube Shorts) versions, black bars, no crop, from the block shorts of the parameters"),
+    ("out-shorts-1080", "Out/thumbnail-9x16-1080x1920.jpg", "9:16 thumbnail, 1080 x 1920, JPG quality 95"),
+    ("out-shorts-1080-png", "Out/thumbnail-9x16-1080x1920.png", "9:16 thumbnail, 1080 x 1920, lossless"),
+    ("out-shorts-2160", "Out/thumbnail-9x16-2160x3840.jpg", "9:16 thumbnail, 2160 x 3840, JPG quality 95"),
+    ("out-shorts-2160-png", "Out/thumbnail-9x16-2160x3840.png", "9:16 thumbnail, 2160 x 3840, lossless"),
     ("script-thumbnail", "Scripts/Thumbnail.py", "builds every output from the parameters, then runs the check"),
     ("script-check", "Scripts/CheckThumbnail.py", "checks the outputs, exit code 1 on any failure"),
     ("motion-copy", "Motion/project.json", "copy of the title project of ZenRay Motion Design"),
@@ -196,7 +201,8 @@ def measure_ink(png_path, render_px, alpha_threshold):
         raise SystemExit("the title is invisible in %s" % png_path)
     return {"width": int(xs.max() - xs.min() + 1), "left": int(xs.min()), "right": int(xs.max()),
             "top": int(ys.min()), "bottom": int(ys.max()),
-            "centre_x": float(xs.mean()), "centre_y": float(ys.mean())}
+            "centre_x": float(xs.mean()), "centre_y": float(ys.mean()),
+            "box_x": float((xs.min() + xs.max()) / 2.0), "box_y": float((ys.min() + ys.max()) / 2.0)}   # 26 October 2026: box centre added, a title is centred by its margins
 
 
 def render_title(params, out_dir):
@@ -240,13 +246,16 @@ def render_title(params, out_dir):
             raise SystemExit("expected one snapshot in %s, found %d" % (snap_dir, len(frames)))
         ink = measure_ink(frames[0], render_px, alpha_threshold)
         width_error = ink["width"] / target_width - 1.0
-        offset_x = ink["centre_x"] - (render_px - 1) / 2.0
-        offset_y = ink["centre_y"] - (render_px - 1) / 2.0
+        # centre_mode "bbox" : equal left and right margins (the optical centring of a title) ; "mass" : the centre of mass of the ink. "Modeling" is heavier than "Car", so the two differ by ~41 px.
+        ref_x = ink["box_x"] if title["centre_mode_x"] == "bbox" else ink["centre_x"]
+        ref_y = ink["box_y"] if title["centre_mode_y"] == "bbox" else ink["centre_y"]
+        offset_x = ref_x - (render_px - 1) / 2.0
+        offset_y = ref_y - (render_px - 1) / 2.0
         history.append({"pass": number, "size": size, "centre_x": centre_x, "centre_y": centre_y,
                         "ink_width_px": ink["width"], "width_error": width_error,
                         "offset_x_px": offset_x, "offset_y_px": offset_y, "snapshot": str(frames[0])})
         print("title pass %d: size %.2f, centre %.2f x %.2f, ink width %d px (target %.0f), "
-              "mass centre offset %.2f x %.2f px"
+              "centre offset %.2f x %.2f px"
               % (number, size, centre_x, centre_y, ink["width"], target_width, offset_x, offset_y))
         if abs(width_error) <= tolerance_width and abs(offset_x) <= tolerance_centre and abs(offset_y) <= tolerance_centre:
             shutil.copyfile(frames[0], out_dir / "text-2160.png")
