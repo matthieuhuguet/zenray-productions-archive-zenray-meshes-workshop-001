@@ -22,6 +22,7 @@ for n, l, v in (("leaf_size", "Leaf Card Size (m)", 0.55), ("leaf_scatter", "Clu
     f.addParmTemplate(hou.FloatParmTemplate(n, l, 1, default_value=(v,)))
 f.addParmTemplate(hou.FloatParmTemplate("leaf_hang", "Leaf Hang (0 hangs from the point, 0.5 centred)", 1, default_value=(0.0,)))   # 26 October 2026
 f.addParmTemplate(hou.IntParmTemplate("leaf_shape", "Leaf Shape (0 square card, 1 lanceolate hanging leaf)", 1, default_value=(0,), min=0, max=1))   # 26 October 2026
+f.addParmTemplate(hou.IntParmTemplate("quad_caps", "Tube End Caps (1 clean quad Coons patch, 0 Sweep concentric grid with valence 16 poles)", 1, default_value=(1,), min=0, max=1))   # 26 October 2026 : the Sweep grid cap gave 32 degenerate quads and two valence 16 poles per tube (TopoCheck, 2 560 degenerate faces on w43)
 ptg.append(f); ctrl.setParmTemplateGroup(ptg)
 sk = geo.createNode("python", "skeleton_chains")
 sk.parm("python").set('''# 25 October 2026 : skeleton JSON -> one polyline per branch chain, pscale = radius, tips as a point group
@@ -63,7 +64,7 @@ for c in d.get("clumps", []):
 lim = geo.createNode("blast", "branches_only"); lim.setInput(0, sk); lim.parm("group").set("tips"); lim.parm("grouptype").set(3); lim.parm("negate").set(0)
 cl = geo.createNode("delete", "drop_points"); cl.setInput(0, lim); cl.parm("entity").set(1) if cl.parm("entity") else None
 sw = geo.createNode("sweep::2.0", "branch_tubes"); sw.setInput(0, lim)      # input 0 = backbone curves
-sw.parm("surfaceshape").set(1); sw.parm("surfacetype").set(5); sw.parm("endcaptype").set(2)   # tube, quads, closed at both ends by a quad grid cap (26 October 2026 : open tube ends showed as holes in the wood view)
+sw.parm("surfaceshape").set(1); sw.parm("surfacetype").set(5); sw.parm("endcaptype").setExpression('2 - 2 * ch("../CTRL_zrm/quad_caps")')   # tube, quads, closed at both ends by a quad grid cap (26 October 2026 : open tube ends showed as holes in the wood view)
 sw.parm("cols").setExpression('ch("../CTRL_zrm/sides")'); sw.parm("radius").set(1.0)
 sw.parm("transformbyattribs").set(1); sw.parm("applyscale").set(1)                          # pscale = branch radius
 # leaves: crossed cards clump copied to tips
@@ -90,7 +91,50 @@ cards = geo.createNode("copyxform", "clump_cards"); cards.setInput(0, sw_c); car
 blob = geo.createNode("sphere", "leaf_blob"); blob.parm("type").set(2); blob.parm("rows").set(5); blob.parm("cols").set(8); blob.parmTuple("rad").set((0.5, 0.42, 0.5))
 sw_s = geo.createNode("switch", "clump_shape_switch"); sw_s.setInput(0, cards); sw_s.setInput(1, blob); sw_s.parm("input").setExpression('ch("../CTRL_zrm/clump_shape")')
 cp = geo.createNode("copytopoints::2.0", "leaf_clumps"); cp.setInput(0, sw_s); cp.setInput(1, rnd)
-nb = geo.createNode("name", "name_branches"); nb.setInput(0, sw); nb.parm("name1").set("branches")
+# 26 October 2026: CLEAN QUAD CAPS. Every open tube end (a ring of n points, n a multiple of 4) is closed by a Coons patch of (n/4) x (n/4) quads built from the ring itself : interior points by transfinite interpolation of the four ring sides,
+# four valence 3 poles at the corners, no degenerate quad, no valence 16 pole (the Sweep grid cap had both). Boundary points are shared with the tube, so the mesh stays closed and manifold. FR : bouchons propres en patch de Coons.
+cap = geo.createNode("python", "quad_caps"); cap.setInput(0, sw)
+cap.parm("python").set('''import hou
+geo = hou.pwd().geometry()
+if hou.pwd().parent().node("CTRL_zrm").evalParm("quad_caps"):
+    cnt = {}; faces = []
+    for prim in geo.prims():
+        vs = [v.point().number() for v in prim.vertices()]; faces.append(vs)
+        for k in range(len(vs)):
+            e = tuple(sorted((vs[k], vs[(k + 1) % len(vs)]))); cnt[e] = cnt.get(e, 0) + 1
+    nxt = {}
+    for vs in faces:
+        for k in range(len(vs)):
+            a, b = vs[k], vs[(k + 1) % len(vs)]
+            if cnt[tuple(sorted((a, b)))] == 1: nxt[b] = a    # the tube runs a to b, the cap must run b to a
+    seen = set(); loops = []
+    for s0 in list(nxt):
+        if s0 in seen: continue
+        lp = [s0]; seen.add(s0); q = nxt[s0]
+        while q != s0 and q not in seen: lp.append(q); seen.add(q); q = nxt[q]
+        loops.append(lp)
+    for lp in loops:
+        n = len(lp)
+        if n < 8 or n % 4: continue
+        m = n // 4; P = [geo.point(i).position() for i in lp]; ids = {}
+        def B(i, j):    # boundary point of the grid
+            if j == 0: return i % n
+            if i == m: return (m + j) % n
+            if j == m: return (3 * m - i) % n
+            return (4 * m - j) % n
+        for i in range(m + 1):
+            for j in range(m + 1):
+                if i in (0, m) or j in (0, m): ids[(i, j)] = lp[B(i, j)]
+                else:
+                    u = i / float(m); v = j / float(m)
+                    pos = (1 - v) * P[B(i, 0)] + v * P[B(i, m)] + (1 - u) * P[B(0, j)] + u * P[B(m, j)] - ((1 - u) * (1 - v) * P[B(0, 0)] + u * (1 - v) * P[B(m, 0)] + (1 - u) * v * P[B(0, m)] + u * v * P[B(m, m)])
+                    pt = geo.createPoint(); pt.setPosition(pos); ids[(i, j)] = pt.number()
+        for i in range(m):
+            for j in range(m):
+                pl = geo.createPolygon()
+                for key in ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)): pl.addVertex(geo.point(ids[key]))
+''')
+nb = geo.createNode("name", "name_branches"); nb.setInput(0, cap); nb.parm("name1").set("branches")
 nl = geo.createNode("name", "name_leaves"); nl.setInput(0, cp); nl.parm("name1").set("leaves")
 # 26 October 2026: the ball joint of v32 is removed (it only made a collar and z-fighting patches ; the real fix of the step at the trunk top is the trunk extension chain of BranchMethods m20)
 mg = geo.createNode("merge", "tree"); mg.setInput(0, nb); mg.setInput(1, nl)

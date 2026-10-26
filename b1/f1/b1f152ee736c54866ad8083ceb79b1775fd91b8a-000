@@ -47,6 +47,7 @@ DEFAULTS = {
     "jobs": 16,           # parallel workers for the image stages
     "max_version": 0,     # car only: 0 keeps every version, N keeps the versions up to N
     "bg": "auto",         # "auto" measures the corner of each source, or a hex colour such as #606060
+    "caption_tolerance": 6,  # caption box: summed channel difference from the background that counts as caption
 }
 
 # Measured geometry of each source family, in source pixels.
@@ -195,14 +196,15 @@ def label_colour(background):
     return (20, 20, 20) if luminance > threshold else (245, 244, 240)
 
 
-def mask_caption(picture, box, background):
-    # Replace the yellow IoU caption of the comparison board by the flat background colour.
+def mask_caption(picture, box, background, tolerance):
+    # 26 October 2026 18:16: the whole caption box goes back to the flat background, antialiased halo included.
+    # Checked on all 29 tree boards: the box holds only the yellow caption and its halo, never tree geometry.
     pixels = picture.load()
     x0, y0, x1, y1 = box
     for y in range(y0, min(y1, picture.size[1])):
         for x in range(x0, min(x1, picture.size[0])):
-            red, green, blue = pixels[x, y][:3]
-            if red - blue > 20 and green - blue > 20 and abs(red - green) < 60:
+            pixel = pixels[x, y][:3]
+            if sum(abs(pixel[channel] - background[channel]) for channel in range(3)) > tolerance:
                 pixels[x, y] = background
 
 
@@ -213,7 +215,7 @@ def render_frame(job):
         picture = image.convert("RGB").crop(crop)
     background = settings["background"]
     if caption_box:
-        mask_caption(picture, caption_box, background)
+        mask_caption(picture, caption_box, background, settings["caption_tolerance"])
     size = settings["size"]
     margin = int(round(size * settings["margin"]))
     band = int(round(size * settings["label_band"])) if settings["label"] else 0
@@ -276,11 +278,27 @@ def main(argv=None):
         raise SystemExit("--max-version applies to the car only")
 
     geometry = OBJECTS[args.obj]
-    suffix = "" if args.size == DEFAULTS["size"] else "_%d" % args.size
+    # 26 October 2026 18:18: every non-default setting adds a name part, so a test run never overwrites a delivered file.
+    changed = []
+    if args.size != DEFAULTS["size"]:
+        changed.append("%d" % args.size)
+    if args.fps != DEFAULTS["fps"]:
+        changed.append("%dfps" % args.fps)
+    if args.label != DEFAULTS["label"]:
+        changed.append("nolabel")
+    if args.hold_seconds != DEFAULTS["hold_seconds"]:
+        changed.append("hold%gs" % args.hold_seconds)
+    if args.crf != DEFAULTS["crf"]:
+        changed.append("crf%d" % args.crf)
+    if args.max_version != DEFAULTS["max_version"]:
+        changed.append("upto%d" % args.max_version)
+    if args.bg != DEFAULTS["bg"]:
+        changed.append("bg%s" % args.bg.lstrip("#"))
+    suffix = "".join("_" + part for part in changed)
     stem = "Car" if args.obj == "car" else "Tree"
     out_path = os.path.abspath(args.out or os.path.join(EVOLUTION_DIR, "%s_evolution_%s%s.mp4" % (stem, DATE_TAG, suffix)))
     frames_dir = os.path.abspath(args.frames_dir or os.path.join(EVOLUTION_DIR, "frames_%s%s" % (args.obj, suffix)))
-    manifest_path = os.path.join(EVOLUTION_DIR, "manifest_%s%s.json" % (args.obj, suffix))
+    manifest_path = os.path.join(os.path.dirname(out_path), "manifest_%s%s.json" % (args.obj, suffix))
 
     names = read_names(args.listing)
     if args.obj == "car":
@@ -305,6 +323,7 @@ def main(argv=None):
         "margin": DEFAULTS["margin"],
         "label_band": DEFAULTS["label_band"],
         "label": args.label,
+        "caption_tolerance": DEFAULTS["caption_tolerance"],
         "font_px": int(round(args.size * DEFAULTS["label_font"])),
         "font_path": font_path,
         "background": background,
