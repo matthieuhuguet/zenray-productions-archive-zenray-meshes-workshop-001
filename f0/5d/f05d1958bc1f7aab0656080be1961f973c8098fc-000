@@ -223,7 +223,30 @@ def smooth_curves(nodes, parent, tol=0.08, step=0.35):
     return np.array(out_n), np.array(out_p)
 
 
-def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6, s_fac=0.8, step=0.35, tol=0.08):
+def prune_support(V, RL, nodes, parent, smin=0.25, chain_max=3.0):
+    # drop terminal curves that no view supports : node support = the strongest limb ridge under the node over the six views (a limb hidden in one view is seen in another) ; a terminal chain (tip back to the previous
+    # fork) whose mean support is below smin and shorter than chain_max metres is removed, repeated until stable. FR : élaguer les courbes terminales sans appui dans aucune vue.
+    from scipy.ndimage import maximum_filter
+    sup = np.zeros(len(nodes))
+    for vn in ("front", "back", "right", "left", "top", "bottom"):
+        M = maximum_filter(RL[vn], size=3); px, py = V.project(vn, nodes); ok = (px >= 0) & (px < M.shape[1] - 1) & (py >= 0) & (py < M.shape[0] - 1); v = np.zeros(len(nodes)); v[ok] = B._sample(M, py[ok], px[ok]); sup = np.maximum(sup, v)
+    for _ in range(6):
+        N_ = len(parent); kids = [[] for _ in range(N_)]
+        for i, p_ in enumerate(parent):
+            if p_ >= 0: kids[p_].append(i)
+        alive = np.ones(N_, bool); cut = 0
+        for i in range(N_):
+            if kids[i] or parent[i] < 0 or not alive[i]: continue
+            chain = [i]; c = parent[i]
+            while c >= 0 and len(kids[c]) == 1 and parent[c] >= 0: chain.append(c); c = parent[c]
+            L = sum(np.linalg.norm(nodes[a] - nodes[parent[a]]) for a in chain if parent[a] >= 0)
+            if L < chain_max and float(np.mean(sup[chain])) < smin: alive[chain] = False; cut += len(chain)
+        if cut == 0: break
+        idx = -np.ones(N_, int); idx[alive] = np.arange(alive.sum()); nodes = nodes[alive]; sup = sup[alive]; parent = np.array([idx[parent[i]] if parent[i] >= 0 else -1 for i in range(N_) if alive[i]])
+    return nodes, parent
+
+
+def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6, s_fac=0.8, step=0.35, tol=0.08, smin=0.0):
     # multi view, SpeedTree order : stage 1 thick limbs (ridges of large scale) from the trunk top, stage 2 branches (medium scale) hung on the limbs ; twigs stay procedural. FR : limbes puis branches.
     R_, A_ = B.load_ridge(V.obj); E_thick, _ = B.evidence_volume(V, B.limb_map(R_, A_, 3), h=geo[3], y0=V.crown_base - 0.3); cyl = _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up)
     # the trunk goes on above the crown base until the limbs part : a chain along the trunk axis, as long as the thick ridge supports it (at least ext_min, at most trunk_ext metres) ; without it the first
@@ -236,7 +259,7 @@ def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2
         chain.append(q_)
     N0_ = np.array(chain); P0_ = np.array([-1] + list(range(len(chain) - 1)))
     N, par = _grow(E_thick, geo, N0_, P0_, cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); N, par = prune_subtree(N, par, sub1)
-    N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); return prune_subtree(N, par, sub2)
+    N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); N, par = prune_subtree(N, par, sub2); return prune_support(V, RL, N, par, smin) if smin > 0 else (N, par)
 
 
 def _sample_vol(Ev, geo, P):

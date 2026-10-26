@@ -1,0 +1,32 @@
+# 26 October 2026 : ZenRay Meshes, RADIUS CALIBRATION on a synthetic tree whose true radii are known : at the nodes of the TRUTH skeleton (no reconstruction error), two photo estimators of the radius are compared with the true value
+# per radius bin : (1) the half prominence width of the grey profile (RadiusProbe), (2) the sato scale of the strongest ridge (BranchLab). The result is a correction curve to apply to the real tree. FR : calibration des estimateurs de rayon sur la vérité.
+# Usage: python RadiusCalib.py [obj=tree_syn]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import BranchLab as B, RadiusProbe as RP
+
+
+def main(obj="tree_syn"):
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, 0); d = json.load(open(B.W + "work/%s/tree_w_truth_skeleton.json" % obj)); N = np.array(d["nodes"]); par = np.array(d["parent"]); r = np.array(d["radius"])
+    np.savez("/tmp/claude-501/truth_nodes.npz", nodes=N, parent=par, radius=r); pr = {i: m for i, m, _ in RP.probe("/tmp/claude-501/truth_nodes.npz", obj, ret_nodes=True, min_y=V.crown_base)}
+    est_s = {}
+    for i in range(1, len(N)):
+        if N[i][1] < V.crown_base: continue
+        v = []
+        for vn in ("front", "back", "right", "left"):
+            px, py = V.project(vn, N[i][None]); ix, iy = int(round(px[0])), int(round(py[0]))
+            if not (3 <= ix < RL[vn].shape[1] - 3 and 3 <= iy < RL[vn].shape[0] - 3): continue
+            win = RL[vn][iy - 2: iy + 3, ix - 2: ix + 3]; 
+            if win.max() < 0.3: continue
+            a = np.unravel_index(win.argmax(), win.shape); v.append(B.SIGMAS[V.ridge_arg[vn][iy - 2 + a[0], ix - 2 + a[1]]] / V.ppm[vn])
+        if len(v) >= 2: est_s[i] = float(np.median(v))
+    bins = [(0.0, 0.05), (0.05, 0.08), (0.08, 0.12), (0.12, 0.2), (0.2, 0.35), (0.35, 0.8)]; out = {"obj": obj, "bins": []}
+    for lo, hi in bins:
+        ids = [i for i in range(1, len(N)) if lo <= r[i] < hi]; p_ = [pr[i] / r[i] for i in ids if i in pr]; s_ = [est_s[i] / r[i] for i in ids if i in est_s]
+        out["bins"].append({"true_radius_m": [lo, hi], "n_nodes": len(ids), "probe_over_true_median": round(float(np.median(p_)), 2) if len(p_) >= 3 else None, "probe_n": len(p_), "sato_scale_over_true_median": round(float(np.median(s_)), 2) if len(s_) >= 3 else None, "sato_n": len(s_)})
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
