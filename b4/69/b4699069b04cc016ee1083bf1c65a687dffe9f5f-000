@@ -108,11 +108,26 @@ def main(cparams, wparams, out):
         def w2(px, py):
             a, u, b, ww = to_world(meta, "bottom", np.array([float(px)]), np.array([float(py)])); d_ = {a: float(u[0]), b: float(ww[0])}
             return d_.get("x", 0.0) - x_axis, d_.get("z", 0.0)
+        ray_b = None
+        if os.path.exists(bn):   # 26 October 2026: the body for the plate clamp
+            import trimesh
+            _bd = np.load(bn); ray_b = trimesh.ray.ray_triangle.RayMeshIntersector(trimesh.Trimesh(_bd["P"], _bd["F"], process=False))
         x_axis = 0.0; a0, u0, b0, w0 = to_world(meta, "bottom", np.array([300.0]), np.array([float(C.get("axis_py", 197))]))
         x_axis = float(u0[0]) if a0 == "x" else float(w0[0])   # 25 October 2026: symmetry axis of the bottom panel (arrow centre)
         for nm, pl in C.get("plates", {}).items():
             yt = y0 - pl.get("layer", 1) * C.get("plate_step", 0.006); yb = yt - pl.get("thick", 0.006)
-            pts = [w2(*q) for q in pl["px"]]; cx = np.mean([p_[0] for p_ in pts]); cz = np.mean([p_[1] for p_ in pts]); n_ = len(pts)
+            pts = [w2(*q) for q in pl["px"]]
+            # 26 October 2026: BODY CLAMP ; the side slots read on the bottom view reached |x| 1.06 at y 0.14 where the rocker
+            # side is at 0.93 : 10 cm needles out of the body, seen in the top and bottom views. Each plate point stays
+            # clamp_margin_m inside the body side measured by a ray along -x at its height. FR : plaques bornées au flanc.
+            if pl.get("clamp_body", C.get("plate_body_clamp", 0)) and ray_b is not None:   # 26 October 2026: per plate (global clamp lost 0.03 of bottom lines)
+                cl_ = []
+                for (px_, pz_) in pts:
+                    loc_, _, _ = ray_b.intersects_location(np.array([[3.0 * (1 if px_ >= 0 else -1), yt, pz_]]), np.array([[-1.0 if px_ >= 0 else 1.0, 0, 0]]), multiple_hits=False)
+                    lim_ = abs(float(loc_[0, 0])) - C.get("clamp_margin_m", 0.015) if len(loc_) else abs(px_)
+                    cl_.append((float(np.sign(px_) * min(abs(px_), lim_)), pz_))
+                pts = cl_
+            cx = np.mean([p_[0] for p_ in pts]); cz = np.mean([p_[1] for p_ in pts]); n_ = len(pts)
             bev = pl.get("bevel", C.get("plate_bevel", 0.012)); rad = np.mean([np.hypot(p_[0] - cx, p_[1] - cz) for p_ in pts])
             sh = max(1 - bev / max(rad, 1e-3), 0.5); ptsb = [(cx + (p_[0] - cx) * sh, cz + (p_[1] - cz) * sh) for p_ in pts]
             for yy, flip, pp in ((yb, True, ptsb), (yt, False, pts)):

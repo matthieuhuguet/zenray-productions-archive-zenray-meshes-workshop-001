@@ -74,6 +74,37 @@ def main(params, body, out):
     if TM and TM.get("on", 1):
         ix = [rows.index(r) for r in TM["rows"] if r in rows]
         if ix: S[-1, ix] = S[-1, ix].mean(0)
+    # 26 October 2026: HOOD CROWN ; the hood band (roof_edge to roof_centre) was ONE flat strip, so at the cut it met the
+    # crowned body hood in a crease (top view line at z 2.08 the sheet does not draw) and its front edge was a straight
+    # segment where the top view draws an arc. Columns are inserted : at the cut on the real body top (slab, max y at
+    # their x), at the tip flat in y (the front view draws the hood front edge straight) and on an arc in z (tip_z_centre
+    # to the corner, power arc_p), the middle section in between. FR : capot bombé à la coupe, bord avant en arc.
+    HC = C.get("hood_crown")
+    if HC and HC.get("on", 1) and not tail and "roof_edge" in rows and "roof_centre" in rows:
+        je, jc = rows.index("roof_edge"), rows.index("roof_centre"); n_ = int(HC.get("n", 6)); ns = float(HC.get("superellipse", 2.2))
+        if HC.get("corner_tip_z") is not None:   # corner of the hood front edge moved back (top view arc ends at the corner)
+            ixm = [rows.index(r) for r in (TM["rows"] if TM and TM.get("on", 1) else ["roof_edge"]) if r in rows]
+            for j_ in ixm: S[-1, j_, 2] = HC["corner_tip_z"]; S[1, j_, 2] = S[0, j_, 2] + f_mid * (HC["corner_tip_z"] - S[0, j_, 2])
+        us = sorted([np.sin(0.5 * np.pi * k / (n_ + 1)) ** (2.0 / ns) for k in range(1, n_ + 1)], reverse=True)   # edge side first
+        zc_t = HC.get("tip_z_centre", float(S[-1, jc, 2])); S[-1, jc, 2] = zc_t; S[1, jc, 2] = S[0, jc, 2] + f_mid * (zc_t - S[0, jc, 2])
+        cols_ = []
+        for u in us:
+            pts_ = []
+            for i in range(S.shape[0]):
+                E_, Cn_ = S[i, je], S[i, jc]; x_ = u * E_[0]
+                yc_ = E_[1] + (Cn_[1] - E_[1]) * (1.0 - u ** ns) ** (1.0 / ns); yf_ = E_[1] + (Cn_[1] - E_[1]) * (1.0 - u)
+                if i == 0:
+                    nb_ = sl[np.abs(sl[:, 0] - x_) < HC.get("slab_dx_m", 0.03)]; y_ = float(nb_[:, 1].max()) if len(nb_) else yc_
+                    z_ = float(zcut(y_))
+                elif i == S.shape[0] - 1:
+                    y_ = yf_; z_ = Cn_[2] + (E_[2] - Cn_[2]) * u ** HC.get("arc_p", 2.0)
+                else:
+                    w_ = HC.get("mid_crown", 0.5); y_ = w_ * yc_ + (1 - w_) * yf_; z_ = Cn_[2] + (E_[2] - Cn_[2]) * u ** HC.get("arc_p", 2.0)
+                pts_.append([x_, y_, z_])
+            cols_.append(pts_)
+        if cols_:   # 26 October 2026: n 0 only moves the corner (corner_tip_z) and the centre tip
+            S = np.concatenate([S[:, :jc], np.array(cols_).transpose(1, 0, 2), S[:, jc:]], 1)
+            C["bands"] = C["bands"][:je] + ["hood"] * (n_ + 1) + C["bands"][je + 1:]
     allP, allQ, allN = [], [], []
     def add(poly, name):
         b = len(allP); allP.extend([list(map(float, p)) for p in poly]); allQ.append(list(range(b, b + len(poly)))); allN.append(name)

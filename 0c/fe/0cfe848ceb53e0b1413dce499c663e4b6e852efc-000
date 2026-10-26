@@ -200,6 +200,12 @@ def main(params, prefix, out):
             u = np.sin(0.5 * np.pi * k / (cn + 1)) ** (2.0 / cse) if cse else k / (cn + 1)
             u = ua + (ub - ua) * u
             out.append((ja, jb, u))
+        # 26 October 2026: CROWN EXTRA COLUMNS ; the rail joint (col u 0.91) sat between crown columns 12 cm apart (u 0.80
+        # and 0.98), its groove was a soft valley and the top view missed the rail inner edge (1.25 m) ; extra columns
+        # close to it make the V sharp, as side_edge does on the flank. FR : colonnes de bombement en plus près du joint.
+        for ue in C.get("crown_extra_u", []):
+            out.append((ja, jb, ua + (ub - ua) * ue))
+        out.sort(key=lambda o: o[2])
         return out
     if cse: cp = -float(cse)   # negative power = superellipse exponent (read in the column interpolation below)
     # 26 October 2026: SIDE SUBDIVISION ; a side band (sill to door_low, door_low to belt ...) was ONE quad tall (0.3 to 0.4 m),
@@ -317,6 +323,34 @@ def main(params, prefix, out):
             cx, sy = np.cos(th) ** (2.0 / nn), np.sin(th) ** (2.0 / nn)
             xs = np.sign(A_[:, 0]) * (np.abs(B_[:, 0]) + (np.abs(A_[:, 0]) - np.abs(B_[:, 0])) * cx); ys = A_[:, 1] + (B_[:, 1] - A_[:, 1]) * sy
             G2[:, k, 0] = (1 - wz) * G2[:, k, 0] + wz * xs; G2[:, k, 1] = (1 - wz) * G2[:, k, 1] + wz * ys
+    # 26 October 2026: BAND CREASE ; the top view draws the rear buttress edge as a line in the MIDDLE of the rear shoulder
+    # band (x 0.851 at z -0.9 down to 0.635 at -1.85) and the back view finds the model 3 cm low at x 0.7 to 0.8 : the band
+    # is two planes, not one. The inserted column nearest to the traced x is put ON it and lifted by lift_m, the other
+    # inserted columns slide onto the two planes (x kept, y re-interpolated). FR : arête au milieu d'une bande réglée.
+    for BK in C.get("band_crease", []):
+        if not BK.get("on", 1): continue
+        ra, rb = BK["rows"]; zq = G2[:, 0, 2]; rp_ = BK.get("ramp_m", 0.15); pz_, px_ = np.array(BK["pts_zx"], float).T; o_ = np.argsort(pz_); pz_, px_ = pz_[o_], px_[o_]
+        sstk = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        wz = np.where(zq > pz_[-1], sstk(1.0 - (zq - pz_[-1]) / rp_), np.where(zq < pz_[0], sstk(1.0 - (pz_[0] - zq) / rp_), 1.0))
+        xc_ = np.interp(zq, pz_, px_); lift_ = BK.get("lift_m", 0.03)
+        if BK.get("lift_zm"):   # 26 October 2026: lift by z ([z, m] points), 0 where the end views find the band already high
+            lz_, lv_ = np.array(BK["lift_zm"], float).T; o2_ = np.argsort(lz_); lift_ = np.interp(zq, lz_[o2_], lv_[o2_])
+        base_k3 = {cols[k][0]: k for k in range(len(cols)) if cols[k][0] == cols[k][1]}
+        for side_ in (1, -1):
+            ks = [k for k, (a, b, u, _, pw) in enumerate(cols) if a != b and {rname(a), rname(b)} == {ra, rb} and np.sign(np.median(G2[:, k, 0])) == side_]
+            if not ks: continue
+            a0, b0 = cols[ks[0]][0], cols[ks[0]][1]; ka, kb = (base_k3[a0], base_k3[b0]) if rname(a0) == ra else (base_k3[b0], base_k3[a0])
+            A_, B_ = G2[:, ka].copy(), G2[:, kb].copy(); ax_, bx_ = np.abs(A_[:, 0]), np.abs(B_[:, 0])
+            fc = np.clip((xc_ - ax_) / np.maximum(bx_ - ax_, 1e-6), 0.05, 0.95)          # crease fraction across the band
+            Cp = A_ + fc[:, None] * (B_ - A_); Cp[:, 1] += lift_ * wz                      # crease point, lifted
+            kc = min(ks, key=lambda k: float(np.median(np.abs(np.abs(G2[:, k, 0]) - xc_))))
+            for k in ks:
+                fk = np.clip((np.abs(G2[:, k, 0]) - ax_) / np.maximum(bx_ - ax_, 1e-6), 0.0, 1.0)
+                if k == kc: Pn = Cp
+                else:
+                    lo_ = fk <= fc; t1 = np.where(lo_, fk / np.maximum(fc, 1e-6), (fk - fc) / np.maximum(1 - fc, 1e-6))
+                    Pn = np.where(lo_[:, None], A_ + t1[:, None] * (Cp - A_), Cp + t1[:, None] * (B_ - Cp))
+                G2[:, k] = (1 - wz[:, None]) * G2[:, k] + wz[:, None] * Pn
     band = [c[3] for c in cols]; R2 = len(cols)
     # 26 October 2026: SLANTED DOOR CUT ; the sheet's rear door line is diagonal (side views), the cage split doors at a
     # station (vertical). Around the cut, each side column is sheared along z by a smooth bump (half cosine over window_m)
