@@ -1,0 +1,95 @@
+"""26 October 2026 : builds the END CARD of the ZenRay Meshes montage with ZenRay Motion Design and renders it silent with HyperFrames.
+It starts from the measured Apple MacBook Pro sequence s09 (template ap-title, "Personal. Private. Powerful."), changes only the text, the format, the fps and
+adds a hold (the reveal and the erase keep their measured colours and timing), writes the project `endTitle.project` (editable in the Motion Design app) and renders it.
+FR : carte de fin du montage, depuis la séquence Apple mesurée ; seuls le texte, le format, les images par seconde et une tenue changent.
+Usage: python3 Scripts/EndTitle.py [--params Params/montage.json] [--no-render] [--snapshots 0.3,0.9,1.6,2.4]
+"""
+import argparse
+import copy
+import json
+import shutil
+import sys
+import time
+from pathlib import Path
+
+ATELIER = Path(__file__).resolve().parents[1]
+MOTION = Path("/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayMotionDesign/motion")
+sys.path.insert(0, str(MOTION))
+import server  # noqa: E402  the same module the Motion Design app runs
+
+
+def shift_rows(rows, from_t, hold):
+    """Rows "item | time | colours" : every row at or after from_t moves later by hold, so a constant stretch opens between the reveal and the erase."""
+    out = []
+    for line in rows:
+        f = [s.strip() for s in str(line).split("|")]
+        if float(f[1]) >= from_t:
+            f[1] = f"{float(f[1]) + hold:.2f}"
+        out.append(" | ".join(f))
+    return out
+
+
+def build_project(cfg):
+    base = server.read_project(cfg["base"])
+    p = copy.deepcopy(base)
+    p["title"] = f"ZenRay Meshes : fin de montage, {cfg['text']}"
+    p["format"] = cfg["format"]
+    p["fps"] = int(cfg["fps"])
+    p["doc"] = "26 October 2026: end card of the ZenRay Meshes montage, built from " + cfg["base"] + " by Montage/Scripts/EndTitle.py (text, format, fps, hold only)."
+    sc = p["scenes"][0]
+    pr = sc["params"]
+    hold = float(cfg["hold"])
+    fields = [s.strip() for s in pr["items"][0].split("|")]
+    if len(fields) < 6:
+        raise SystemExit("items line without the end field: " + pr["items"][0])
+    fields[0] = cfg["text"]
+    fields[5] = f"{float(fields[5]) + hold:.2f}"   # the item ends later by the hold
+    pr["items"] = [" | ".join(fields)]
+    pr["keys"] = shift_rows(pr["keys"], float(cfg["holdFromItemTime"]), hold)
+    pr["gkeys"] = shift_rows(pr["gkeys"], float(cfg["holdFromItemTime"]), hold)
+    sc["duration"] = round(float(sc["duration"]) + hold, 3)
+    return p
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--params", default=str(ATELIER / "Params" / "montage.json"))
+    ap.add_argument("--no-render", action="store_true")
+    ap.add_argument("--snapshots", default="")
+    a = ap.parse_args()
+    cfg = json.load(open(a.params))["endTitle"]
+    pid = cfg["project"]
+    p = build_project(cfg)
+    server.write_project(pid, p)
+    (ATELIER / "Motion").mkdir(exist_ok=True)
+    (ATELIER / "Motion" / "end-title-project.json").write_text(json.dumps(server.read_project(pid), ensure_ascii=False, indent=1))
+    dur = p["scenes"][0]["duration"]
+    print(f"project {pid} : format {p['format']}, {p['fps']} fps, duration {dur} s, text {cfg['text']!r}")
+    if a.no_render and not a.snapshots:
+        return
+    work = ATELIER / "Motion" / "work"
+    work.mkdir(exist_ok=True)
+    page = server.cook(pid, work / "page")
+    if a.snapshots:
+        r = server.hyperframes(page, "snapshot", "--at", a.snapshots, "--no-end", "-o", str(work / "snaps"), timeout=300)
+        print("snapshots", r.returncode, str(work / "snaps"))
+    if a.no_render:
+        return
+    ex = server.CFG["export"]
+    out = (ATELIER / cfg["frames"]).resolve()
+    if ATELIER.resolve() not in out.parents or out.parent.name != "Motion":
+        raise SystemExit(f"frames folder must sit directly in Motion/ : {out}")   # the folder is emptied below, never anything else
+    if out.exists():
+        shutil.rmtree(out)
+    t0 = time.time()
+    # a lossless PNG sequence (one file per frame) : the montage encodes once, so the glow gradients get no extra lossy generation
+    r = server.hyperframes(page, "render", "-f", str(p["fps"]), "--format", "png-sequence", "-w", str(ex["workers"]), "-o", str(out), timeout=int(ex["timeoutS"]))
+    n = len(list(out.glob("frame_*.png"))) if out.exists() else 0
+    want = round(dur * p["fps"])
+    if r.returncode != 0 or n != want:
+        raise SystemExit(f"HyperFrames failed or wrong frame count ({n} instead of {want}): " + ((r.stderr or r.stdout) or "")[-800:])
+    print(f"rendered {n} frames in {out} in {time.time() - t0:.1f} s")
+
+
+if __name__ == "__main__":
+    main()

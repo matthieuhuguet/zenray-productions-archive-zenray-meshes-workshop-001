@@ -1,0 +1,419 @@
+"""26 October 2026 : ZenRay Edit montage builder. Reads Params/montage.json (the one place that holds every value), then :
+  plan     measures every clip and writes Out/plan.json (frames, start and end frame of each clip on the output timeline)
+  audio    music (leading silence cut, two pass linear loudnorm to its own target, fades) + the sound of clip 1 -> mix -> two pass linear master loudnorm -> Out/master.wav
+  video    ONE ffmpeg pass : every clip scaled to the square (never cropped), colour matrix brought to bt709, fps brought to the output fps, exact frame counts, concat, x264 + aac -> MP4
+  mov      the same streams copied into a QuickTime MOV container (no second encode)
+  verify   independent checks of the MP4 and the MOV (size, fps, frame count, tags, audio, loudness, fades, clip boundaries against the sources) ; `verify --selftest` proves the verifier goes red on a wrong file
+  index    writes Index.md, the index mapping of every file of the montage with sha256
+  build    plan, audio, video, mov, verify, index
+FR : montage ZenRay Edit en une passe, tout est lu dans Params/montage.json. Aucun recadrage : chaque clip est mis à l'échelle dans le carré.
+Usage: python3 Scripts/Montage.py <command> [--params Params/montage.json]
+"""
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ATELIER = Path(__file__).resolve().parents[1]
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
+
+
+def sh(cmd, **kw):
+    return subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kw)
+
+
+def must(cmd, **kw):
+    r = sh(cmd, **kw)
+    if r.returncode != 0:
+        raise SystemExit(f"command failed ({r.returncode}): {' '.join(str(c) for c in cmd)[:300]}\n{r.stderr[-1500:]}")
+    return r
+
+
+def load(params):
+    return json.load(open(params))
+
+
+def probe(path, count=False):
+    args = [FFPROBE, "-v", "error", "-show_streams", "-show_format", "-of", "json"]
+    if count:
+        args[1:1] = ["-count_packets"]
+    return json.loads(must(args + [path]).stdout)
+
+
+def rate(s):
+    a, b = s.split("/")
+    return float(a) / float(b) if float(b) else 0.0
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def abs_path(rel):
+    p = Path(rel)
+    return p if p.is_absolute() else ATELIER / p
+
+
+# ------------------------------------------------------------------ plan
+def plan(cfg):
+    out, fps = cfg["output"], int(cfg["output"]["fps"])
+    clips, cursor = [], 0
+    for c in cfg["sequence"]:
+        if c.get("kind") == "frames":
+            files = sorted(abs_path(c["src"]).parent.glob(Path(c["src"]).name.replace("%06d", "[0-9]*")))
+            n_src, src_fps, size = len(files), float(c["fps"]), None
+            if not files:
+                raise SystemExit(f"no frames for {c['id']} : {c['src']}")
+            size = None
+        else:
+            v = [s for s in probe(abs_path(c["src"]))["streams"] if s["codec_type"] == "video"][0]
+            n_src, src_fps, size = int(v["nb_frames"]), rate(v["avg_frame_rate"]), (v["width"], v["height"])
+        dur = n_src / src_fps
+        frames = int(round(dur * fps))   # Python rounds .5 to the even number : 3187.5 -> 3188 ; documented in Index.md
+        clips.append({**c, "srcFrames": n_src, "srcFps": src_fps, "srcSize": size, "seconds": dur, "frames": frames, "start": cursor, "end": cursor + frames})
+        cursor += frames
+    p = {"fps": fps, "size": int(out["size"]), "totalFrames": cursor, "totalSeconds": cursor / fps, "clips": clips}
+    (ATELIER / out["dir"]).mkdir(exist_ok=True)
+    json.dump(p, open(ATELIER / out["dir"] / "plan.json", "w"), indent=1, ensure_ascii=False)
+    for c in clips:
+        print(f"{c['id']:24s} {c['srcFrames']:5d} frames @ {c['srcFps']:g} -> {c['frames']:5d} @ {fps}  [{c['start']:5d}, {c['end']:5d})  {c['seconds']:.3f} s")
+    print(f"total {cursor} frames = {cursor / fps:.4f} s")
+    return p
+
+
+def load_plan(cfg):
+    f = ATELIER / cfg["output"]["dir"] / "plan.json"
+    return json.load(open(f)) if f.exists() else plan(cfg)
+
+
+# ------------------------------------------------------------------ audio
+def loudnorm_pass(src_args, target, tp, lra, pre_filter=""):
+    """First pass of loudnorm : the measured values, parsed from the JSON it prints."""
+    af = f"{pre_filter}loudnorm=I={target}:TP={tp}:LRA={lra}:print_format=json"
+    r = must([FFMPEG, "-hide_banner", "-nostats", *src_args, "-af", af, "-f", "null", "-"])
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
+    if not m:
+        raise SystemExit("loudnorm printed no measurement")
+    return json.loads(m.group(0))
+
+
+def linear_filter(meas, target, tp, lra):
+    return (f"loudnorm=I={target}:TP={tp}:LRA={lra}:measured_I={meas['input_i']}:measured_TP={meas['input_tp']}:measured_LRA={meas['input_lra']}"
+            f":measured_thresh={meas['input_thresh']}:offset={meas['target_offset']}:linear=true")
+
+
+def ebur(path):
+    """Integrated loudness (LUFS) and true peak (dBTP) of an audio file."""
+    r = must([FFMPEG, "-hide_banner", "-nostats", "-i", path, "-af", "ebur128=peak=true", "-f", "null", "-"])
+    tail = r.stderr[r.stderr.rfind("Summary"):]
+    return {"I": float(re.search(r"I:\s+(-?[0-9.]+) LUFS", tail).group(1)), "TP": float(re.search(r"Peak:\s+(-?[0-9.]+) dBFS", tail).group(1))}
+
+
+def audio(cfg):
+    pl = load_plan(cfg)
+    a = cfg["audio"]
+    out = ATELIER / cfg["output"]["dir"]
+    out.mkdir(exist_ok=True)
+    D, sr = pl["totalSeconds"], int(a["sampleRate"])
+    m = a["music"]
+    music = abs_path(m["src"])
+    head = m["trimHead"]
+    if head == "auto":
+        r = sh([FFMPEG, "-hide_banner", "-nostats", "-t", "8", "-i", music, "-af", "silencedetect=n=-50dB:d=0.05", "-f", "null", "-"])
+        mm = re.search(r"silence_start: 0\b[\s\S]*?silence_end: ([0-9.]+)", r.stderr)
+        head = float(mm.group(1)) if mm else 0.0
+    head = float(head)
+    print(f"music : leading silence cut {head:.3f} s, segment {D:.3f} s")
+    seg = ["-ss", f"{head:.4f}", "-t", f"{D:.4f}", "-i", music]
+    meas = loudnorm_pass(seg, m["targetLufs"], m["truePeak"], 11)
+    print("music measured", {k: meas[k] for k in ("input_i", "input_tp", "input_lra")})
+    fin, fout = float(m["fadeIn"]), float(m["fadeOut"])
+    music_wav = out / "music.wav"
+    must([FFMPEG, "-hide_banner", "-nostats", "-y", *seg, "-af",
+          f"aresample={sr},{linear_filter(meas, m['targetLufs'], m['truePeak'], 11)},aresample={sr},afade=t=in:st=0:d={fin},afade=t=out:st={D - fout:.4f}:d={fout},atrim=0:{D:.4f},apad=whole_dur={D:.4f}",
+          "-ac", "2", "-c:a", "pcm_f32le", music_wav])
+    # the sound of the clips that carry one (clip 1 : ZenRay SFX), placed at the start of its clip
+    ins, chains, labels = [], [], ["[0:a]"]
+    inputs = [str(music_wav)]
+    for c in pl["clips"]:
+        if c.get("audio"):
+            idx = len(inputs)
+            inputs.append(str(abs_path(c["src"])))
+            delay = int(round(c["start"] / pl["fps"] * 1000))
+            chains.append(f"[{idx}:a]aresample={sr},aformat=channel_layouts=stereo,volume={a['clipAudio']['gainDb']}dB,adelay={delay}|{delay},apad=whole_dur={D:.4f}[ca{idx}]")
+            labels.append(f"[ca{idx}]")
+    fc = ";".join(chains + [f"{''.join(labels)}amix=inputs={len(labels)}:normalize=0:duration=longest,atrim=0:{D:.4f}[mix]"])
+    mix_wav = out / "mix.wav"
+    cmd = [FFMPEG, "-hide_banner", "-nostats", "-y"]
+    for i in inputs:
+        cmd += ["-i", i]
+    must(cmd + ["-filter_complex", fc, "-map", "[mix]", "-c:a", "pcm_f32le", mix_wav])
+    # master : ONE constant gain brings the mix to the target loudness (so the level is right from the first sample, no ramp), then a fast limiter takes only the peaks of the
+    # clip sound (loudnorm in its dynamic fallback changed the music level by 1.5 dB for several seconds around the SFX hit). The gain is corrected until the measured loudness is on target.
+    ms = a["master"]
+    meas2 = ebur(mix_wav)
+    gain = ms["targetLufs"] - meas2["I"]
+    ceiling = 10 ** (ms["limiterCeilingDb"] / 20.0)
+    master = out / "master.wav"
+    for it in range(4):
+        must([FFMPEG, "-hide_banner", "-nostats", "-y", "-i", mix_wav, "-af", f"volume={gain:.4f}dB,alimiter=limit={ceiling:.5f}:attack={ms['limiterAttackMs']}:release={ms['limiterReleaseMs']}:level=0,atrim=0:{D:.4f}",
+              "-ac", "2", "-c:a", "pcm_s24le", master])
+        got = ebur(master)
+        err = ms["targetLufs"] - got["I"]
+        print(f"master pass {it}: gain {gain:+.3f} dB -> {got['I']} LUFS, true peak {got['TP']} dBTP")
+        if abs(err) < 0.05 and got["TP"] <= ms["truePeak"] + 0.05:
+            break
+        gain += err
+    else:
+        raise SystemExit("master loudness did not converge")
+    meas2 = {**meas2, "gainDb": round(gain, 3), "masterI": got["I"], "masterTP": got["TP"]}
+    json.dump({"musicHeadCut": head, "musicMeasured": meas, "mixMeasured": meas2}, open(out / "audio.json", "w"), indent=1)
+    print("master", master)
+
+
+# ------------------------------------------------------------------ video
+def clip_filter(i, c, size, fps):
+    s = int(size)
+    kind, mat = c.get("kind", "video"), c.get("inMatrix", "auto")
+    chain = []
+    if mat == "bt601":
+        # the car clips were encoded from RGB with the bt601 default of swscale and carry no tag : read them as bt601, write bt709 (grey is unchanged, colours are right)
+        chain.append("colorspace=space=bt709:trc=bt709:primaries=bt709:ispace=smpte170m:itrc=bt709:iprimaries=bt709:irange=tv:range=tv:fast=0:format=yuv420p")
+        chain.append(f"scale={s}:{s}:flags=lanczos+accurate_rnd:in_range=tv:out_range=tv")
+    elif kind == "frames" or mat == "rgb":
+        chain.append(f"scale={s}:{s}:flags=lanczos+accurate_rnd+full_chroma_int:out_color_matrix=bt709:out_range=tv:sws_dither=ed")
+    else:
+        chain.append(f"scale={s}:{s}:flags=lanczos+accurate_rnd:in_range=tv:out_range=tv")
+    chain += ["format=yuv420p", "setsar=1", f"fps={fps}:round=near", "tpad=stop_mode=clone:stop=4", f"trim=end_frame={c['frames']}", "setpts=PTS-STARTPTS"]
+    return f"[{i}:v]" + ",".join(chain) + f"[v{i}]"
+
+
+def video(cfg):
+    pl = load_plan(cfg)
+    o = cfg["output"]
+    out = ATELIER / o["dir"]
+    master = out / "master.wav"
+    if not master.exists():
+        raise SystemExit("run audio first : Out/master.wav is missing")
+    cmd = [FFMPEG, "-hide_banner", "-nostats", "-y"]
+    fcs = []
+    for i, c in enumerate(pl["clips"]):
+        if c.get("kind") == "frames":
+            cmd += ["-framerate", f"{c['fps']}", "-start_number", "1", "-i", abs_path(c["src"])]
+        else:
+            cmd += ["-i", abs_path(c["src"])]
+        fcs.append(clip_filter(i, c, pl["size"], pl["fps"]))
+    n = len(pl["clips"])
+    fcs.append("".join(f"[v{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=0[vout]")
+    script = out / "filtergraph.txt"
+    script.write_text(";\n".join(fcs) + "\n")
+    cmd += ["-i", master, "-filter_complex_script", script, "-map", "[vout]", "-map", f"{n}:a",
+            "-c:v", "libx264", "-preset", o["preset"], "-crf", str(o["crf"]), "-profile:v", "high", "-pix_fmt", "yuv420p", "-g", str(o["gop"]),
+            "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-fps_mode", "cfr", "-r", str(pl["fps"]),
+            "-c:a", "aac", "-b:a", o["audioBitrate"], "-ar", str(cfg["audio"]["sampleRate"]), "-ac", "2", "-movflags", "+faststart", out / (o["name"] + ".mp4")]
+    r = sh(cmd)
+    if r.returncode != 0:
+        raise SystemExit("ffmpeg failed:\n" + r.stderr[-2500:])
+    print("mp4", out / (o["name"] + ".mp4"))
+
+
+def mov(cfg):
+    o = cfg["output"]
+    out = ATELIER / o["dir"]
+    must([FFMPEG, "-hide_banner", "-nostats", "-y", "-i", out / (o["name"] + ".mp4"), "-map", "0", "-c", "copy", "-tag:v", "avc1", "-movflags", "+faststart", "-f", "mov", out / (o["name"] + ".mov")])
+    print("mov", out / (o["name"] + ".mov"))
+
+
+# ------------------------------------------------------------------ verify
+class Report:
+    def __init__(self):
+        self.rows = []
+
+    def check(self, name, ok, detail=""):
+        self.rows.append((name, bool(ok), detail))
+        print(("PASS " if ok else "FAIL ") + name + (f" : {detail}" if detail else ""))
+
+    @property
+    def ok(self):
+        return all(r[1] for r in self.rows)
+
+
+def frame_png(path, idx, dest, vf=""):
+    flt = f"select=eq(n\\,{idx})" + (f",{vf}" if vf else "")
+    must([FFMPEG, "-hide_banner", "-nostats", "-y", "-i", path, "-vf", flt, "-vsync", "0", "-frames:v", "1", dest])
+
+
+def psnr(a, b):
+    r = sh([FFMPEG, "-hide_banner", "-nostats", "-i", a, "-i", b, "-lavfi", "psnr", "-f", "null", "-"])
+    m = re.search(r"average:([0-9.inf]+)", r.stderr)
+    return float("inf") if m and m.group(1) == "inf" else float(m.group(1)) if m else -1.0
+
+
+def source_frame_index(c, local):
+    """The source frame shown by output frame `local` of clip c (frame repeat for the slower clips)."""
+    return min(c["srcFrames"] - 1, int(local * c["srcFps"] / 60.0 + 1e-9)) if c["srcFps"] < 60 else local
+
+
+def verify(cfg, target=None, selftest=False):
+    pl = load_plan(cfg)
+    o, v = cfg["output"], cfg["verify"]
+    out = ATELIER / o["dir"]
+    files = [Path(target)] if target else [out / (o["name"] + ".mp4"), out / (o["name"] + ".mov")]
+    rep = Report()
+    for f in files:
+        if not f.exists():
+            rep.check(f"{f.name} exists", False)
+            continue
+        info = probe(str(f), count=True)
+        vs = [s for s in info["streams"] if s["codec_type"] == "video"][0]
+        au = [s for s in info["streams"] if s["codec_type"] == "audio"][0]
+        S = pl["size"]
+        rep.check(f"{f.name} size {S}x{S} (1:1)", vs["width"] == S and vs["height"] == S, f"{vs['width']}x{vs['height']}")
+        rep.check(f"{f.name} square pixels", vs.get("sample_aspect_ratio", "1:1") in ("1:1", "0:1"), vs.get("sample_aspect_ratio", "n/a"))
+        rep.check(f"{f.name} {pl['fps']} fps constant", vs["r_frame_rate"] == f"{pl['fps']}/1" and vs["avg_frame_rate"] == f"{pl['fps']}/1", f"{vs['r_frame_rate']} {vs['avg_frame_rate']}")
+        rep.check(f"{f.name} frame count {pl['totalFrames']}", int(vs["nb_read_packets"]) == pl["totalFrames"], vs["nb_read_packets"])
+        rep.check(f"{f.name} h264 yuv420p", vs["codec_name"] == "h264" and vs["pix_fmt"] == "yuv420p", f"{vs['codec_name']} {vs['pix_fmt']}")
+        rep.check(f"{f.name} bt709 tv tags", (vs.get("color_space"), vs.get("color_transfer"), vs.get("color_primaries"), vs.get("color_range")) == ("bt709", "bt709", "bt709", "tv"),
+                  str((vs.get("color_space"), vs.get("color_transfer"), vs.get("color_primaries"), vs.get("color_range"))))
+        rep.check(f"{f.name} audio aac 48000 stereo", au["codec_name"] == "aac" and int(au["sample_rate"]) == 48000 and au["channels"] == 2, f"{au['codec_name']} {au['sample_rate']} {au['channels']}")
+        dv, da = float(vs["duration"]), float(au["duration"])
+        rep.check(f"{f.name} audio length matches the picture", abs(da - dv) <= v["audioDurationTolerance"] and abs(dv - pl["totalSeconds"]) < 0.02, f"video {dv:.3f} audio {da:.3f} plan {pl['totalSeconds']:.3f}")
+    if selftest:
+        return rep
+    mp4 = files[0]
+    # loudness and fades of the audio of the MP4
+    r = sh([FFMPEG, "-hide_banner", "-nostats", "-i", mp4, "-vn", "-af", "ebur128=peak=true", "-f", "null", "-"])
+    mi = re.search(r"I:\s+(-?[0-9.]+) LUFS", r.stderr[r.stderr.rfind("Summary"):])
+    mt = re.search(r"Peak:\s+(-?[0-9.]+) dBFS", r.stderr[r.stderr.rfind("Summary"):])
+    lufs, tp = float(mi.group(1)), float(mt.group(1))
+    rep.check("integrated loudness", abs(lufs - cfg["audio"]["master"]["targetLufs"]) <= v["lufsTolerance"], f"{lufs} LUFS (target {cfg['audio']['master']['targetLufs']})")
+    rep.check("true peak", tp <= v["truePeakMax"], f"{tp} dBTP")
+
+    def rms(start, dur):
+        rr = sh([FFMPEG, "-hide_banner", "-nostats", "-ss", f"{start}", "-t", f"{dur}", "-i", mp4, "-vn", "-af", "astats=measure_overall=RMS_level", "-f", "null", "-"])
+        mm = re.findall(r"RMS level dB:\s+(-?[0-9.inf]+)", rr.stderr)
+        return float(mm[-1]) if mm and mm[-1] != "-inf" else -120.0
+    D = pl["totalSeconds"]
+    fi, fo = cfg["audio"]["music"]["fadeIn"], cfg["audio"]["music"]["fadeOut"]
+    a0, a1, a2 = rms(0.0, 0.04), rms(fi + 0.05, 0.2), rms(D - 0.04, 0.04)
+    a3 = rms(D - fo - 0.25, 0.2)
+    rep.check("music fade in", a0 < a1 - 12, f"first 40 ms {a0} dB, after the fade {a1} dB")
+    rep.check("music fade out", a2 < a3 - 12, f"last 40 ms {a2} dB, before the fade {a3} dB")
+    # clip boundaries, against the sources scaled by a plain scale (so a crop, a pad or a wrong order shows)
+    tmp = Path(tempfile.mkdtemp(prefix="montage-verify-"))
+    S = pl["size"]
+    for c in pl["clips"]:
+        for tag, local in (("first", 0), ("middle", c["frames"] // 2), ("last", c["frames"] - 1)):
+            gi = c["start"] + local
+            got = tmp / f"{c['id']}-{tag}-got.png"
+            ref = tmp / f"{c['id']}-{tag}-ref.png"
+            frame_png(mp4, gi, got)
+            si = source_frame_index(c, local)
+            if c.get("kind") == "frames":
+                must([FFMPEG, "-hide_banner", "-nostats", "-y", "-start_number", "1", "-framerate", str(c["fps"]), "-i", abs_path(c["src"]), "-vf", f"select=eq(n\\,{si}),scale={S}:{S}:flags=lanczos", "-vsync", "0", "-frames:v", "1", ref])
+            else:
+                frame_png(abs_path(c["src"]), si, ref, f"scale={S}:{S}:flags=lanczos")
+            p = psnr(got, ref)
+            rep.check(f"{c['id']} {tag} frame (output frame {gi}, source frame {si}) matches its source", p >= v["psnrMin"], f"PSNR {p:.1f} dB")
+    return rep
+
+
+def run_verify(cfg):
+    rep = verify(cfg)
+    json.dump([{"check": n, "ok": ok, "detail": d} for n, ok, d in rep.rows], open(ATELIER / cfg["output"]["dir"] / "verify.json", "w"), indent=1)
+    print(f"{sum(1 for r in rep.rows if r[1])}/{len(rep.rows)} checks passed")
+    if not rep.ok:
+        raise SystemExit(1)
+
+
+def selftest(cfg):
+    """The verifier must go red on a file that is not the montage (the SFX clip alone : 2048 x 2048, 360 frames) and stay green on the real one."""
+    bad = verify(cfg, target=str(abs_path(cfg["sequence"][0]["src"])), selftest=True)
+    good = verify(cfg, selftest=True)
+    print(f"selftest : wrong file {'RED (expected)' if not bad.ok else 'GREEN (the verifier is blind)'} ; real files {'GREEN' if good.ok else 'RED'}")
+    if bad.ok or not good.ok:
+        raise SystemExit(1)
+
+
+# ------------------------------------------------------------------ index mapping
+def index(cfg):
+    pl = load_plan(cfg)
+    o = cfg["output"]
+    out = ATELIER / o["dir"]
+    ad = json.load(open(out / "audio.json")) if (out / "audio.json").exists() else {}
+    vr = json.load(open(out / "verify.json")) if (out / "verify.json").exists() else []
+    L = ["# ZenRay Meshes, montage final 1:1 : index mapping (26 October 2026)", "",
+         f"Project : `{cfg['project']}` (ZenRay Assets). Atelier : `{ATELIER}`. Every path below is relative to the atelier unless it starts with `/`. (26 October 2026)", "",
+         "## 1. Deliverables", "", "| ID | File | Format | Size | sha256 |", "|---|---|---|---|---|"]
+    for ext, fid in (("mp4", "OUT-MP4"), ("mov", "OUT-MOV")):
+        f = out / f"{o['name']}.{ext}"
+        if f.exists():
+            L.append(f"| {fid} | `{f.relative_to(ATELIER)}` | {pl['size']}x{pl['size']} 1:1, {pl['fps']} fps, {pl['totalSeconds']:.3f} s, H.264 + AAC | {f.stat().st_size / 1e6:.1f} MB | `{sha256(f)}` |")
+    L += ["", "## 2. Sequence (the order of the montage)", "", "| # | ID | Role | Source in the atelier | Original | Source frames | Output frames | Start (frame, s) | End (frame, s) |", "|---|---|---|---|---|---|---|---|---|"]
+    for i, c in enumerate(pl["clips"], 1):
+        L.append(f"| {i} | {c['id']} | {c['role']} | `{c['src']}` | `{c['origin']}` | {c['srcFrames']} @ {c['srcFps']:g} fps | {c['frames']} | {c['start']} ({c['start'] / pl['fps']:.3f}) | {c['end']} ({c['end'] / pl['fps']:.3f}) |")
+    L += ["", f"Total : {pl['totalFrames']} frames = {pl['totalSeconds']:.4f} s. Frame counts at {pl['fps']} fps are rounded to the nearest frame (3187.5 becomes 3188 for the 8 fps evolution clip). (26 October 2026)", "",
+          "## 3. Source files (sha256)", "", "| ID | File | Size | sha256 |", "|---|---|---|---|"]
+    for c in pl["clips"]:
+        p = abs_path(c["src"])
+        if c.get("kind") == "frames":
+            fr = sorted(p.parent.glob("frame_*.png"))
+            L.append(f"| {c['id']} | `{p.parent.relative_to(ATELIER)}/` ({len(fr)} PNG frames) | {sum(x.stat().st_size for x in fr) / 1e6:.1f} MB | `{sha256(fr[0])}` (first frame) |")
+        else:
+            L.append(f"| {c['id']} | `{c['src']}` | {p.stat().st_size / 1e6:.1f} MB | `{sha256(p)}` |")
+    m = abs_path(cfg["audio"]["music"]["src"])
+    L.append(f"| music | `{cfg['audio']['music']['src']}` | {m.stat().st_size / 1e6:.1f} MB | `{sha256(m)}` |")
+    mm, mx = ad.get("musicMeasured", {}), ad.get("mixMeasured", {})
+    au = cfg["audio"]
+    L += ["", "## 4. Audio chain", "",
+          f"- Music : leading silence cut {ad.get('musicHeadCut', 'n/a')} s, loudnorm two pass linear to {au['music']['targetLufs']} LUFS (measured before : {mm.get('input_i', 'n/a')} LUFS, true peak {mm.get('input_tp', 'n/a')} dBTP), fade in {au['music']['fadeIn']} s, fade out {au['music']['fadeOut']} s.",
+          f"- Clip 1 sound (ZenRay SFX) mixed in at {au['clipAudio']['gainDb']} dB, starting at frame 0.",
+          f"- Master : one constant gain of {mx.get('gainDb', 'n/a')} dB brings the mix ({mx.get('I', 'n/a')} LUFS) to {au['master']['targetLufs']} LUFS (measured {mx.get('masterI', 'n/a')} LUFS), then a limiter at {au['master']['limiterCeilingDb']} dBFS (measured true peak {mx.get('masterTP', 'n/a')} dBTP), AAC {o['audioBitrate']}, {au['sampleRate']} Hz. (26 October 2026)", "",
+          "## 5. Montage, scripts, parameters", "", "| ID | File | Role |", "|---|---|---|",
+          "| PARAMS | `Params/montage.json` | the montage and sequence file : every value of this montage |",
+          "| BUILD | `Scripts/Montage.py` | plan, audio, video, mov, verify, index |",
+          "| ENDTITLE | `Scripts/EndTitle.py` | builds the end card with ZenRay Motion Design and renders its PNG frames |",
+          "| MOTION-PROJECT | `Motion/end-title-project.json` | copy of the Motion Design project `" + cfg["endTitle"]["project"] + "` (editable in the app, text, hold, colours) |",
+          "| FRAMES | `Motion/end-title-frames/` | the end card, 165 lossless PNG frames at 60 fps |",
+          "| PLAN | `Out/plan.json` | the measured plan (frames of every clip) |", "| FILTERGRAPH | `Out/filtergraph.txt` | the exact ffmpeg filter graph of the video pass |",
+          "| AUDIO | `Out/audio.json`, `Out/music.wav`, `Out/mix.wav`, `Out/master.wav` | audio measurements and intermediates |",
+          "| VERIFY | `Out/verify.json` | result of every check |", ""]
+    if vr:
+        L += ["## 6. Verification", "", f"{sum(1 for r in vr if r['ok'])}/{len(vr)} checks passed.", "", "| Check | Result | Detail |", "|---|---|---|"]
+        L += [f"| {r['check']} | {'PASS' if r['ok'] else 'FAIL'} | {r['detail']} |" for r in vr]
+    (ATELIER / "Index.md").write_text("\n".join(L) + "\n")
+    print("index", ATELIER / "Index.md")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("command", choices=["plan", "audio", "video", "mov", "verify", "index", "build"])
+    ap.add_argument("--params", default=str(ATELIER / "Params" / "montage.json"))
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    cfg = load(a.params)
+    if a.command == "build":
+        plan(cfg)
+        audio(cfg)
+        video(cfg)
+        mov(cfg)
+        run_verify(cfg)
+        selftest(cfg)
+        index(cfg)
+    elif a.command == "verify":
+        selftest(cfg) if a.selftest else run_verify(cfg)
+    else:
+        {"plan": plan, "audio": audio, "video": video, "mov": mov, "index": index}[a.command](cfg)
+
+
+if __name__ == "__main__":
+    main()
