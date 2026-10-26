@@ -187,10 +187,19 @@ def _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up):
     return ((np.abs(tt - trunk_up / 2) < trunk_up / 2 + 0.2) & (rad < trunk_k * r_root)).reshape(E.shape)
 
 
-def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0):
+def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6):
     # multi view, SpeedTree order : stage 1 thick limbs (ridges of large scale) from the trunk top, stage 2 branches (medium scale) hung on the limbs ; twigs stay procedural. FR : limbes puis branches.
     R_, A_ = B.load_ridge(V.obj); E_thick, _ = B.evidence_volume(V, B.limb_map(R_, A_, 3), h=geo[3], y0=V.crown_base - 0.3); cyl = _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up)
-    N, par = _grow(E_thick, geo, root[None], np.array([-1]), cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = chains_smooth(N, par, geo[3]); N, par = prune_subtree(N, par, sub1)
+    # the trunk goes on above the crown base until the limbs part : a chain along the trunk axis, as long as the thick ridge supports it (at least ext_min, at most trunk_ext metres) ; without it the first
+    # limb segment turned sideways and the trunk tube ended in a visible step (v35 wood view). FR : prolongement du tronc jusqu'à la fourche.
+    Pt_ = np.array(V.ms["trunk"]["points"]); d_ = Pt_[-1] - Pt_[-6]; d_ = d_ / np.linalg.norm(d_); chain = [root.copy()]; low = 0
+    for i_ in range(1, int(trunk_ext / 0.2) + 1):
+        q_ = root + d_ * 0.2 * i_; side_ = np.cross(d_, [0, 0, 1.0]); side_ = side_ / (np.linalg.norm(side_) + 1e-9)
+        e_ = max(float(_sample_vol(E_thick, geo, (q_ + side_ * o_)[None])[0]) for o_ in (-0.3, 0.0, 0.3)); low = low + 1 if e_ < 0.12 else 0
+        if low >= 2 and i_ * 0.2 >= ext_min: break
+        chain.append(q_)
+    N0_ = np.array(chain); P0_ = np.array([-1] + list(range(len(chain) - 1)))
+    N, par = _grow(E_thick, geo, N0_, P0_, cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = chains_smooth(N, par, geo[3]); N, par = prune_subtree(N, par, sub1)
     N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = chains_smooth(N, par, geo[3]); return prune_subtree(N, par, sub2)
 
 
