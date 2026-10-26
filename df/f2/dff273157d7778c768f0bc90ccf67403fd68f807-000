@@ -1,0 +1,24 @@
+# 26 October 2026 : ZenRay Meshes, ARCH CLOSE UP : the delivery polygons around one wheel arch seen from the side (painter order, outer skin last), faulty faces in red, the arch ring drawn.
+# FR : gros plan du passage de roue, faces fautives en rouge. Usage: python ArchView.py <tag> <instance index 0..3> <out.png> [half_m=1.0] [px_per_m=1400]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw
+import TopoCheck as TC, AnimReview as AR
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+tag, idx, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]; half = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0; ppm = float(sys.argv[5]) if len(sys.argv) > 5 else 1400.0
+d = np.load(W + "work/car/delivery_%s.npz" % tag, allow_pickle=True); prm = AR.load_review_params(W + "work/car/topo_params.json"); tp = TC.load_params(W + "work/car/topo_params.json"); wheels = json.load(open(W + "work/car/wheel_params.json"))
+Q_ = [list(map(int, q)) for q in d["Q"]]; N, T = np.unique(d["names"], return_inverse=True); P = d["P"].astype(float); C = np.array([len(q) for q in Q_], np.int32); I = np.array([v for q in Q_ for v in q], np.int32)
+res, flags, err = TC.analyse(P, C, I, T, N, tp); inst = [i for i in wheels["instances"]][idx]; yc, zc, side = inst["y"], inst["z"], np.sign(inst["x"])
+st = np.concatenate([[0], np.cumsum(C.astype(np.int64))[:-1]]); sel = []
+for f in range(len(C)):
+    q = I[st[f]:st[f] + C[f]]; c = P[q].mean(0)
+    if side * c[0] > 0.3 and abs(c[2] - zc) < half and abs(c[1] - yc) < half: sel.append((side * c[0], f))
+sel.sort(); Wd = int(2 * half * ppm); Ht = int(2 * half * ppm); im = Image.new("RGB", (Wd, Ht), (60, 60, 60)); dr = ImageDraw.Draw(im)
+def pt(p): return ((p[2] - zc) * ppm * (-1 if True else 1) + Wd / 2 if False else (p[2] - zc) * ppm + Wd / 2, Ht / 2 - (p[1] - yc) * ppm)
+for _, f in sel:
+    q = I[st[f]:st[f] + C[f]]; poly = [pt(P[v]) for v in q]; dr.polygon(poly, fill=(235, 90, 90) if err[f] else (225, 225, 225), outline=(30, 30, 30))
+Rc = wheels["tyre_r"] * prm["arch"]["pad"]
+for R, col in ((Rc, (80, 160, 255)), (Rc + prm["arch"]["ring_m"], (80, 160, 255))):
+    dr.ellipse([Wd / 2 - R * ppm, Ht / 2 - R * ppm, Wd / 2 + R * ppm, Ht / 2 + R * ppm], outline=col, width=2)
+im.save(out); print("faces", len(sel), "faulty", int(sum(err[f] for _, f in sel)))
