@@ -344,6 +344,20 @@ def main(params, prefix, out):
                 if src.sum() < 4 or not len(tg): continue
                 Xf = LinearNDInterpolator(P_pre[src][:, 1:3], P_pre[src][:, 0])(P[tg][:, 1:3])
                 ok_ = np.isfinite(Xf); P[tg[ok_], 0] = Xf[ok_]
+        # 26 October 2026: FOLDED SLIVERS ; the radial snap can push a boundary vertex past its neighbour, leaving quads whose
+        # two triangles face opposite ways (171 to 180 deg, 1 to 5 cm2, dark specks at the front edge of the front arch) ;
+        # quads that touch the arch boundary and fold more than fold_max_deg are dropped. FR : éclats repliés retirés.
+        fmax = C.get("arch_fold_max_deg", 90.0)
+        if fmax:
+            Qa2 = np.array(Q); A_, B_, C_, D_ = (P[Qa2[:, k]] for k in range(4))
+            def cos_tri(T1, T2):   # 26 October 2026: both diagonals (a renderer may split the quad either way ; a bow tie looks fine along one)
+                l1_ = np.linalg.norm(T1, axis=1); l2_ = np.linalg.norm(T2, axis=1); okq = (l1_ > 1e-12) & (l2_ > 1e-12)
+                cv = np.ones(len(T1)); cv[okq] = (T1[okq] / l1_[okq, None] * T2[okq] / l2_[okq, None]).sum(1); return cv
+            cosv = np.minimum(cos_tri(np.cross(B_ - A_, C_ - A_), np.cross(C_ - A_, D_ - A_)), cos_tri(np.cross(C_ - B_, D_ - B_), np.cross(D_ - B_, A_ - B_)))
+            cq = (A_ + B_ + C_ + D_) / 4; dq = np.min([np.hypot(cq[:, 1] - yc, cq[:, 2] - zc) for yc, zc in cen], axis=0)
+            near = np.isin(Qa2, bnd).any(1) | ((np.abs(cq[:, 0]) > x0) & (dq < Rc + C.get("arch_fold_ring_m", 0.03)))   # 26 October 2026: the whole ring, not only the boundary
+            drop = near & (cosv < np.cos(np.radians(fmax)))
+            Q = [q for q, k_ in zip(Q, drop) if not k_]; N = [n for n, k_ in zip(N, drop) if not k_]
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
     for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):
