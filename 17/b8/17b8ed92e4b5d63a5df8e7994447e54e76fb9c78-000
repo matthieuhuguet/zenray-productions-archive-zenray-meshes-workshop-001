@@ -6,6 +6,7 @@
 import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
+from scipy import ndimage as ndi
 import trimesh
 from PIL import Image, ImageDraw, ImageFont
 import Raster
@@ -38,12 +39,17 @@ def main(fdir, vdir, mesh_path, board):
     mesh = trimesh.load(mesh_path, force="mesh", process=False)
     mr = Raster.Renderer(mesh.vertices, mesh.faces)
     font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 16)
-    tiles, scores = [], {}
+    tiles, scores, raw, holes = [], {}, {}, {}
     for v in meta["views"]:
         pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
         ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
         mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
         M, img = render_in_panel(mr, meta, v, mref.shape)
+        # 26 October 2026: the reference masks are hole filled (SheetSplit, binary_fill_holes) but the model render was not, so
+        # every panel gap seen edge on (door seams, glass inset) counted as missing ; the silhouette IoU now fills the model
+        # mask the same way, and the raw IoU and the hole area (see through gaps, a real defect) are reported beside it
+        M_raw = M; M = ndi.binary_fill_holes(M); holes[v["name"]] = int((M & ~M_raw).sum())
+        raw[v["name"]] = round(float((M_raw & mref).sum() / max((M_raw | mref).sum(), 1)), 4)
         iou = float((M & mref).sum() / max((M | mref).sum(), 1)); scores[v["name"]] = round(iou, 4)
         ov = np.stack([ref] * 3, -1).copy()
         ov[mref & ~M] = (220, 60, 60); ov[M & ~mref] = (60, 120, 230)
@@ -58,7 +64,8 @@ def main(fdir, vdir, mesh_path, board):
         out.paste(t, (0, y)); y += t.height
     out.save(board)
     kept = [scores[v["name"]] for v in meta["views"] if v["kept"]]
-    print(json.dumps({"silhouette_iou": scores, "mean_kept": round(float(np.mean(kept)), 4), "board": board}))
+    print(json.dumps({"silhouette_iou": scores, "mean_kept": round(float(np.mean(kept)), 4), "raw_iou": raw,
+                      "mean_raw": round(float(np.mean([raw[v["name"]] for v in meta["views"] if v["kept"]])), 4), "hole_px": holes, "board": board}))
 
 
 if __name__ == "__main__":
