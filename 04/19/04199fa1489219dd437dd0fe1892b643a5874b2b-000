@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 # learned defaults 25 October 2026 (TreeFit + sweeps v4 to v13, best v12: sheet 0.849, hull 0.874)
 P = {"ridge": 0, "base_cap": 1.15, "trunk_smooth": 1.5, "leaf_inset_m": 0.15, "crown_rule": 1, "crown_min_frac": 0.22, "trunk_clear_k": 1.6, "trunk_clear_m": 0.35, "max_seg_m": 1.0, "shell_clumps": 14000, "shell_depth_m": 0.6, "prune_out": 1, "root_flare": 1.0, "flare_h_m": 1.2, "attractors": 6000, "influence_m": 2.6, "kill_m": 0.45, "step_m": 0.28, "max_iter": 400, "tip_radius_m": 0.025,
      "pipe_exp": 2.0, "seed": 3, "trunk_tip_radius_scale": 1.0,
-     "wood_attr_frac": 0.0, "evidence": "work/tree/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1}
+     "wood_attr_frac": 0.0, "evidence": "work/tree/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1, "carve_tips": 0, "carve_tip_k": 3, "clump_src": "shell", "clump_evidence": "work/tree/evidence_foliage_strict.npz"}
 
 
 def main(hull, meas, out, **kw):
@@ -123,6 +123,12 @@ def main(hull, meas, out, **kw):
     else:
         shell = shell[shell[:, 1] > cb + 0.5]
     clumps = shell[rng.choice(len(shell), min(p["shell_clumps"], len(shell)), replace=False)]
+    if p["clump_src"] == "evidence":   # 26 October 2026: clumps only where every side view shows foliage (Evidence3D strict), none in front of a limb
+        Wk0 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); e = np.load(os.path.join(Wk0, p["clump_evidence"])); idf = np.argwhere(e["occ"])
+        pf = e["origin"] + idf * float(e["voxel"]) + float(e["voxel"]) * rng.random((len(idf), 3)); pf = pf[pf[:, 1] > p["crown_min_frac"] * pf[:, 1].max()]
+        okf = np.zeros(len(pf), bool)
+        for a in range(0, len(pf), 20000): okf[a:a + 20000] = trunk_clear(pf[a:a + 20000])
+        pf = pf[okf]; clumps = pf[rng.choice(len(pf), min(p["shell_clumps"], len(pf)), replace=False)] if len(pf) else clumps
     # 26 October 2026: CARVE ; a clump whose centre projects on a wood pixel in at least carve_k of the four side views would hide a limb the sheet shows,
     # it is dropped. FR : une touffe posée sur du bois visible cacherait un membre, elle est retirée.
     if p["carve_wood"]:
@@ -135,6 +141,15 @@ def main(hull, meas, out, **kw):
             if p["carve_dilate_px"]: wm = _nd.binary_dilation(wm, iterations=int(p["carve_dilate_px"]))
             ix, iy = np.floor(px).astype(int), np.floor(py).astype(int); ok = (ix >= 0) & (ix < wm.shape[1]) & (iy >= 0) & (iy < wm.shape[0]); h = np.zeros(len(clumps), bool); h[ok] = wm[iy[ok], ix[ok]]; cnt += h
         clumps = clumps[cnt < p["carve_k"]]
+        if p["carve_tips"]:   # the leaf cards at the tips hide limbs as well (1067 tips on v14) ; same test on the tip nodes
+            tp = N[np.array(tips, int)] if len(tips) else np.zeros((0, 3)); ct = np.zeros(len(tp), int)
+            for vn in ("front", "back", "right", "left"):
+                vv = [x for x in fm["views"] if x["name"] == vn][0]; a_, b_ = np.array(calj[vn][0]), np.array(calj[vn][1])
+                px = a_[0] * (tp @ np.array(vv["rx"], float)) + b_[0]; py = a_[1] * (tp @ np.array(vv["uy"], float)) + b_[1]
+                wm = np.asarray(_I.open(os.path.join(Wk, "work/tree/views/wood_%s.png" % vn))) > 127
+                if p["carve_dilate_px"]: wm = _nd.binary_dilation(wm, iterations=int(p["carve_dilate_px"]))
+                ix, iy = np.floor(px).astype(int), np.floor(py).astype(int); ok = (ix >= 0) & (ix < wm.shape[1]) & (iy >= 0) & (iy < wm.shape[0]); h = np.zeros(len(tp), bool); h[ok] = wm[iy[ok], ix[ok]]; ct += h
+            tips = [t for t, c_ in zip(tips, ct) if c_ < p["carve_tip_k"]]
     # trunk flare: the base radius grows toward the ground (roots)
     tr = dict(tr); ys_t = np.array(tr["points"])[:, 1]; rad = np.array(tr["radius"])
     # base guard (25 October 2026): the lowest rows touch the ground line (shadow, scale cube); the radius never exceeds
