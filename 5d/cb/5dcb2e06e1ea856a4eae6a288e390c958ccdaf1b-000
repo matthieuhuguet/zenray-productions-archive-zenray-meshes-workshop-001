@@ -52,6 +52,9 @@ def tri_render(dl):
     return P_, np.array(F, np.int32), np.array(TT), dl["names"]
 
 
+from OrganicClasses import wood_classes   # 26 October 2026: shared thickness classes (OrganicClasses.py)
+
+
 def row_map(meta, v, shape, ys=(3.0, 4.0, 12.0, 13.0)):
     """26 October 2026: pixel row of a world height in a sheet view, calibrated by rendering two vertical quads of known height (side views only) ;
     the mask rows of the quad give py = a y + b. FR : ligne de pixels d'une hauteur du monde, calibrée par deux quads de hauteur connue."""
@@ -69,6 +72,12 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
     the kept views, over a ceiling. FR : complétion des composants organiques par recouvrement de masques de classe dans une bande de hauteur."""
     prm = prm or json.load(open(W + "work/%s/component_params.json" % obj)); comps = prm["components"]; Pt = prm["paths"]
     meta = json.load(open(W + Pt["frame"] + "/frame.json")); sheet = json.load(open(W + Pt["views"] + "/sheet.json"))
+    cal = json.load(open(W + Pt["cal"].format(obj=obj))) if Pt.get("cal") else None
+    WC = prm.get("wood_classes"); trunk_r = None
+    if WC and Pt.get("measure"):
+        try: trunk_r = float(json.load(open(W + Pt["measure"].format(obj=obj)))["trunk"]["radius"][-1])
+        except Exception: trunk_r = None
+    r1_m = WC["thick_frac"] * trunk_r if WC and trunk_r else 0.2; r2_m = WC["med_frac"] * trunk_r if WC and trunk_r else 0.08   # radii relative to the trunk of THIS instance
     dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); Pv, Fv, Tv, Nv = tri_render(dl); part_comp = {}
     for j, nm in enumerate(Nv): part_comp[j] = [k for k, c in comps.items() if any(re.fullmatch(pt, str(nm)) for pt in c.get("parts", []))]
     r = Raster.Renderer(Pv, Fv); cap = {}; orig = r.render
@@ -82,7 +91,8 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
         M, shade = SheetScore.render_in_panel(r, meta, v, sh); Fi = cap["F"][: sh[0], : sh[1]]; vis = M & (Fi >= 0) & (Fi < len(Tv))
         wood = np.asarray(Image.open(W + Pt["views"] + "/wood_%s.png" % v["name"])) > 127; fol = np.asarray(Image.open(W + Pt["views"] + "/foliage_%s.png" % v["name"])) > 127
         rowf = row_map(meta, v, sh) if v["name"] in ("front", "back", "left", "right") else None
-        views[v["name"]] = {"M": M, "vis": vis, "fid": np.where(vis, Fi, 0), "wood": wood, "fol": fol, "shade": shade, "row": rowf, "ref": np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % (pan["index"], v["name"])).convert("L")), "mref": mref}
+        ppm = abs(cal[v["name"]][0][0]) if cal and v["name"] in cal else 30.0
+        views[v["name"]] = {"ppm": ppm, "wood_cls": wood_classes(wood, ppm, r1_m, r2_m), "M": M, "vis": vis, "fid": np.where(vis, Fi, 0), "wood": wood, "fol": fol, "shade": shade, "row": rowf, "ref": np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % (pan["index"], v["name"])).convert("L")), "mref": mref}
     r.release(); out = {}; ceil = prm["ceiling_iou"]
     # 26 October 2026: bands are RELATIVE to the instance : anchors ground, crown_base (read in the measure file of the object) and top, so the same
     # component list serves any tree ; a plain [lo, hi] in metres still works. FR : bandes relatives à l'instance, pas en mètres d'un arbre.
@@ -95,6 +105,9 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
         if isinstance(spec, dict):
             a, b = anchors[spec["from"]], anchors[spec["to"]]; f0, f1 = spec.get("frac", [0.0, 1.0]); return [a + (b - a) * f0, a + (b - a) * f1]
         return spec
+    for vn_, vw_ in views.items():   # model classes of the visible wood and leaves, for the board
+        wid = np.array([("branches" in str(n)) for n in Nv] + [False]); fid_ = np.array([("leaves" in str(n)) for n in Nv] + [False])
+        vw_["model_wood"] = vw_["vis"] & wid[Tv[vw_["fid"]]]; vw_["model_fol"] = vw_["vis"] & fid_[Tv[vw_["fid"]]]; vw_["model_cls"] = wood_classes(vw_["model_wood"], vw_["ppm"], r1_m, r2_m)
     for k, c in comps.items():
         c["y_band"] = band(c.get("y_band"))
         row = {"n": int(k), "name": c["name"], "tool": c.get("tool", ""), "class": c["ref"], "y_band": c.get("y_band"), "faces": int(sum((Tv == j).sum() for j, ks in part_comp.items() if k in ks))}
@@ -106,7 +119,12 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
                 a, b = vw["row"](c["y_band"][1]), vw["row"](c["y_band"][0]); rows[max(int(a), 0): min(int(b) + 1, len(rows))] = True
             else: rows[:] = True
             pid = np.array([k in part_comp[j] for j in range(len(Nv))] + [False]); mod = vw["vis"] & pid[Tv[vw["fid"]]] & rows[:, None]
-            ref = (vw["wood"] if c["ref"] == "wood" else vw["fol"]) & rows[:, None]; u = (ref | mod).sum()
+            if c["ref"] == "object": mod = vw["vis"] & rows[:, None]   # 26 October 2026: the trunk is the whole silhouette in its band (bark shading and moss must not shrink it)
+            if c["ref"] == "wood" and c.get("wclass"):   # thickness class : the same opening on the reference wood and on the model wood
+                mod = wood_classes(mod, vw["ppm"], r1_m, r2_m)[c["wclass"]]; ref = vw["wood_cls"][c["wclass"]] & rows[:, None]
+            elif c["ref"] == "object": ref = vw["mref"] & rows[:, None]
+            else: ref = (vw["wood"] if c["ref"] == "wood" else vw["fol"]) & rows[:, None]
+            u = (ref | mod).sum()
             if u: ious[vn] = round(float((ref & mod).sum() / u), 4)
             area_ref += int(ref.sum()); area_mod += int(mod.sum()); vw.setdefault("masks", {})[k] = (ref, mod)
         row["iou_views"] = ious; row["iou"] = round(float(np.mean(list(ious.values()))), 4) if ious else None
@@ -125,21 +143,48 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
          "| N | Component | % | IoU | area model / ref | next | tool |", "|---|---|---|---|---|---|---|"]
     for v in sorted(scored, key=lambda v: v["completion"]): L.append("| %d | %s | %.0f | %.3f | %.2f | %s | %s |" % (v["n"], v["name"], 100 * v["completion"], v["iou"], v["area_ratio"], v["next"], v["tool"]))
     open(base + ".md", "w").write("\n".join(L) + "\n")
-    if board: mask_board(views, base + "_board.png")
+    if board: mask_board(views, base + "_board.png", out, comps, tag, obj, tag)
     print(json.dumps(summary)); return result
 
 
-def mask_board(views, path):
-    """per view : reference classes | model classes | difference (red wood missing, blue wood extra, orange foliage missing, cyan foliage extra)."""
+def mask_board(views, path, out=None, comps=None, tag="", obj="", ver=""):
+    """26 October 2026: the COMPONENT SHEET of an organic object, as for the car : per view, the reference classes | the model classes, with the component numbers
+    placed by the algorithm on the centroid of each reference region (never by eye), coloured by completion on the model side, plus the ranked legend. The version
+    is written on the image. FR : planche des composants d'un objet organique, marqueurs au centroïde des régions de référence."""
+    from PIL import ImageFont
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 13); fl = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 15)
+    COL = {"thick": (150, 90, 50), "med": (230, 150, 60), "thin": (250, 220, 90), "fol": (60, 140, 70)}
     tiles = []
     for vn, vw in views.items():
-        ref = np.stack([vw["ref"] // 2] * 3, -1).astype(np.uint8); a = ref.copy(); a[vw["wood"]] = (230, 150, 60); a[vw["fol"]] = (60, 140, 70)
-        mw = np.zeros(vw["M"].shape, bool); mf = np.zeros(vw["M"].shape, bool)
-        for k, (rf, md) in vw.get("masks", {}).items():
+        sh = vw["M"].shape; base = np.stack([vw["ref"] // 3] * 3, -1).astype(np.uint8); a = base.copy()
+        for cl in ("thin", "med", "thick"): a[vw["wood_cls"][cl]] = COL[cl]
+        a[vw["fol"]] = COL["fol"]
+        wm = np.zeros(sh, bool); fm = np.zeros(sh, bool)
+        for k, c in (comps or {}).items():
             pass
-        b = np.stack([vw["shade"]] * 3, -1).astype(np.uint8)
-        tiles.append(np.hstack([a, b]))
-    Wd = max(t.shape[1] for t in tiles); Image.fromarray(np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0)).save(path)
+        m_ = np.stack([vw["shade"]] * 3, -1).astype(np.uint8).copy(); b_ = np.full(sh + (3,), 60, np.uint8)
+        # model classes : visible wood by thickness, visible leaves
+        modw = vw.get("model_wood"); modf = vw.get("model_fol")
+        if modw is not None:
+            cls_m = vw["model_cls"]
+            for cl in ("thin", "med", "thick"): b_[cls_m[cl]] = COL[cl]
+            b_[modf] = COL["fol"]
+        row = np.hstack([a, b_]); im = Image.fromarray(row); d = ImageDraw.Draw(im); d.text((6, 4), "%s %s : %s   reference | model" % (obj, ver, vn), font=fl, fill=(255, 255, 0))
+        for k, (rf, md) in vw.get("masks", {}).items():
+            if rf.sum() < 60 or (comps or {}).get(k, {}).get("stage", 1) == 0: continue
+            ys, xs = np.nonzero(rf); cx, cy = int(xs.mean()), int(ys.mean()); cp = (out or {}).get(k, {}).get("completion")
+            col = (70, 190, 90) if (cp or 0) >= 0.9 else (235, 170, 40) if (cp or 0) >= 0.75 else (225, 70, 60)
+            for xo, fill in ((0, (204, 124, 94)), (sh[1], col)):
+                d.ellipse((cx + xo - 10, cy - 10, cx + xo + 10, cy + 10), fill=fill, outline=(255, 255, 255)); d.text((cx + xo, cy), str(k), font=font, fill=(255, 255, 255) if xo == 0 else (20, 20, 20), anchor="mm")
+        tiles.append(np.asarray(im))
+    Wd = max(t.shape[1] for t in tiles); body = np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0); H = body.shape[0]
+    leg = Image.new("RGB", (330, H), (245, 244, 240)); d = ImageDraw.Draw(leg); d.text((12, 10), "completion, by stage (%s %s)" % (obj, ver), font=fl, fill=(40, 40, 40)); y = 40
+    for k, v in sorted((out or {}).items(), key=lambda kv: (comps[kv[0]].get("stage", 9) or 9, int(kv[0]))):
+        cp = v.get("completion")
+        if cp is None: continue
+        col = (70, 190, 90) if cp >= 0.9 else (235, 170, 40) if cp >= 0.75 else (225, 70, 60)
+        d.ellipse((12, y - 9, 30, y + 9), fill=col); d.text((38, y), "%s  st %s  %s  %.0f %%" % (k, comps[k].get("stage", "-"), v["name"][:24], 100 * cp), font=font, fill=(40, 40, 40), anchor="lm"); y += 26
+    Image.fromarray(np.hstack([body, np.asarray(leg)])).save(path)
 
 
 def main(tag, board=True, prm=None, write=True):

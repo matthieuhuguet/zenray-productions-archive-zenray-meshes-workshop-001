@@ -12,12 +12,12 @@ from scipy.spatial import cKDTree
 # learned defaults 25 October 2026 (TreeFit + sweeps v4 to v13, best v12: sheet 0.849, hull 0.874)
 P = {"ridge": 0, "base_cap": 1.15, "trunk_smooth": 1.5, "leaf_inset_m": 0.15, "crown_rule": 1, "crown_min_frac": 0.22, "trunk_clear_k": 1.6, "trunk_clear_m": 0.35, "max_seg_m": 1.0, "shell_clumps": 14000, "shell_depth_m": 0.6, "prune_out": 1, "root_flare": 1.0, "flare_h_m": 1.2, "attractors": 6000, "influence_m": 2.6, "kill_m": 0.45, "step_m": 0.28, "max_iter": 400, "tip_radius_m": 0.025,
      "pipe_exp": 2.0, "seed": 3, "trunk_tip_radius_scale": 1.0,
-     "wood_attr_frac": 0.0, "obj": "tree", "evidence": "work/{obj}/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1, "carve_tips": 0, "carve_tip_k": 3, "clump_src": "shell", "clump_shell_m": 0.0, "clump_evidence": "work/{obj}/evidence_foliage_strict.npz", "limb_src": "colonize", "skel_min_m3": 6.0, "foliage_gap_max": 0.8, "radius_src": "pipe", "radius_fit": 1.0, "trunk_radius_src": "measure", "trunk_radius_fit": 1.0, "spur_m": 0.8, "join_m": 1.2, "limb_close": 1, "skel_evidence": "work/{obj}/evidence_wood.npz"}
+     "wood_attr_frac": 0.0, "obj": "tree", "evidence": "work/{obj}/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1, "carve_tips": 0, "carve_tip_k": 3, "clump_src": "shell", "clump_shell_m": 0.0, "clump_evidence": "work/{obj}/evidence_foliage_strict.npz", "limb_src": "colonize", "thick_evidence": "work/{obj}/evidence10_wood_thick.npz", "med_evidence": "work/{obj}/evidence10_wood_med.npz", "thin_evidence": "work/{obj}/evidence10_wood_thin.npz", "med_attractors": 2500, "med_influence_m": 1.6, "med_kill_m": 0.25, "med_step_m": 0.2, "twig_attractors": 5000, "twig_influence_m": 0.9, "twig_kill_m": 0.15, "twig_step_m": 0.12, "twig_fill": 0.5, "tip_leaf_max": 2500, "floor_main_m": 0.18, "floor_branch_m": 0.10, "floor_twig_m": 0.03, "stage_iters": 200, "skel_min_m3": 6.0, "foliage_gap_max": 0.8, "radius_src": "pipe", "radius_fit": 1.0, "trunk_radius_src": "measure", "trunk_radius_fit": 1.0, "spur_m": 0.8, "join_m": 1.2, "limb_close": 1, "skel_evidence": "work/{obj}/evidence_wood.npz"}
 
 
 def main(hull, meas, out, **kw):
     p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P})
-    for k_ in ("evidence", "clump_evidence", "skel_evidence"): p[k_] = p[k_].replace("{obj}", p["obj"])   # 26 October 2026: the object (tree, tree_syn, ...) is a parameter
+    for k_ in ("evidence", "clump_evidence", "skel_evidence", "thick_evidence", "med_evidence", "thin_evidence"): p[k_] = p[k_].replace("{obj}", p["obj"])   # 26 October 2026: the object (tree, tree_syn, ...) is a parameter
     rng = np.random.default_rng(p["seed"])
     # 26 October 2026: AUTO chains ; the method is chosen from the evidence the sheet gives, not set by hand per instance : limbs from the wood evidence (skeleton then
     # colonisation) when it holds at least skel_min_m3 of wood, plain colonisation in the hull otherwise (a dense crown shows no limb) ; foliage on the evidence
@@ -63,12 +63,41 @@ def main(hull, meas, out, **kw):
         if len(ptw): att = np.concatenate([ptw[rng.choice(len(ptw), min(nw, len(ptw)), replace=False)], att[: max(p["attractors"] - nw, 0)]])
     trunk = np.array(tr["points"])
     nodes = [trunk[-1].copy()]; parent = [-1]
-    alive = np.ones(len(att), bool); it = -1
+    alive = np.ones(len(att), bool); it = -1; stage_of = []
     if p["limb_src"] in ("skeleton", "both"):   # 26 October 2026: the limbs start from the skeleton of the 3D wood evidence (WoodSkeleton.py) ; "both" then lets the space colonisation fill the rest
         Wk1 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); sys.path.insert(0, os.path.join(Wk1, "Scripts")); import WoodSkeleton as WS
         N0, par0, _r0, _t0 = WS.build(os.path.join(Wk1, p["skel_evidence"]), trunk[-1], cb - 0.3, close_it=int(p["limb_close"]), min_spur_m=p["spur_m"], join_m=p["join_m"])
         nodes = [np.array(x) for x in N0]; parent = [int(x) for x in par0]; alive[:] = (p["limb_src"] == "both")
-    for it in range(p["max_iter"] if p["limb_src"] != "skeleton" else 0):
+    if p["limb_src"] == "stages":   # 26 October 2026: SPEEDTREE ORDER ; stage 2 main limbs = skeleton of the THICK wood evidence, stage 3 branches = colonisation toward the MEDIUM wood evidence, twigs = fine colonisation toward the THIN evidence and a hull fill
+        Wk1 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); sys.path.insert(0, os.path.join(Wk1, "Scripts")); import WoodSkeleton as WS
+        N0, par0, _r0, _t0 = WS.build(os.path.join(Wk1, p["thick_evidence"]), trunk[-1], cb - 0.3, close_it=int(p["limb_close"]), min_spur_m=p["spur_m"], join_m=p["join_m"])
+        nodes = [np.array(x) for x in N0]; parent = [int(x) for x in par0]; stage_of = [2] * len(nodes)
+        def sample_ev(path, n):
+            try: e = np.load(os.path.join(Wk1, path))
+            except Exception: return np.zeros((0, 3))
+            ids = np.argwhere(e["occ"]); pts_ = e["origin"] + ids * float(e["voxel"]) + float(e["voxel"]) * rng.random((len(ids), 3)); pts_ = pts_[pts_[:, 1] > cb]
+            if len(pts_) == 0: return pts_
+            ok_ = np.zeros(len(pts_), bool)
+            for a in range(0, len(pts_), 20000): ok_[a:a + 20000] = trunk_clear(pts_[a:a + 20000])
+            pts_ = pts_[ok_]; return pts_[rng.choice(len(pts_), min(n, len(pts_)), replace=False)] if len(pts_) else pts_
+        cur_stage = [3]
+        def grow_stage(att_, infl, kill, step, iters):
+            alive_ = np.ones(len(att_), bool)
+            for _ in range(iters):
+                if not alive_.any(): break
+                N_ = np.array(nodes); t_ = cKDTree(N_); d_, nn_ = t_.query(att_[alive_], distance_upper_bound=infl); ok_ = np.isfinite(d_)
+                if not ok_.any(): break
+                A_ = att_[alive_][ok_]; nn_ = nn_[ok_]; gr = {}
+                for a_, n_ in zip(A_, nn_):
+                    v_ = a_ - N_[n_]; v_ /= np.linalg.norm(v_) + 1e-9; gr.setdefault(n_, []).append(v_)
+                for n_, vs_ in gr.items():
+                    dv_ = np.mean(vs_, 0); dv_ /= np.linalg.norm(dv_) + 1e-9; nodes.append(N_[n_] + dv_ * step); parent.append(int(n_)); stage_of.append(cur_stage[0])
+                N_ = np.array(nodes); d2_, _ = cKDTree(N_).query(att_); alive_ &= d2_ > kill
+        grow_stage(sample_ev(p["med_evidence"], p["med_attractors"]), p["med_influence_m"], p["med_kill_m"], p["med_step_m"], p["stage_iters"])
+        nt = int(p["twig_attractors"] * (1 - p["twig_fill"])); nf = int(p["twig_attractors"] * p["twig_fill"])
+        att_t = np.concatenate([sample_ev(p["thin_evidence"], nt), crown[rng.choice(len(crown), min(nf, len(crown)), replace=False)]]) if len(crown) else sample_ev(p["thin_evidence"], nt)
+        cur_stage[0] = 4; grow_stage(att_t, p["twig_influence_m"], p["twig_kill_m"], p["twig_step_m"], p["stage_iters"]); alive[:] = False
+    for it in range(p["max_iter"] if p["limb_src"] in ("colonize", "both") else 0):
         if not alive.any():
             break
         N = np.array(nodes); t = cKDTree(N)
@@ -87,7 +116,7 @@ def main(hull, meas, out, **kw):
         N = np.array(nodes); t = cKDTree(N)
         d2, _ = t.query(att)
         alive &= d2 > p["kill_m"]
-    N = np.array(nodes); par = np.array(parent)
+    N = np.array(nodes); par = np.array(parent); stg = np.array(stage_of + [0] * (len(nodes) - len(stage_of)), int)   # stage of every node (2 main limbs, 3 branches, 4 twigs, 0 unknown)
     # prune: nodes outside the crown volume (with a tolerance of one voxel) are removed with their subtree
     if p["prune_out"]:
         gi = np.floor((N - org) / vx).astype(int)
@@ -102,7 +131,7 @@ def main(hull, meas, out, **kw):
             keep[i] = ins_d[i] and (q < 0 or keep[q])
         keep[0] = True
         newi = -np.ones(len(N), int); newi[keep] = np.arange(keep.sum())
-        N = N[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
+        N = N[keep]; stg = stg[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
     # jump guard (25 October 2026): a child farther than max_seg_m from its parent makes a blade sweep, drop the subtree
     seg = np.array([np.linalg.norm(N[i] - N[q]) if q >= 0 else 0 for i, q in enumerate(par)])
     keep = np.ones(len(N), bool)
@@ -110,7 +139,7 @@ def main(hull, meas, out, **kw):
         q = par[i]; keep[i] = (seg[i] <= p["max_seg_m"]) and (q < 0 or keep[q])
     keep[0] = True
     newi = -np.ones(len(N), int); newi[keep] = np.arange(keep.sum())
-    N = N[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
+    N = N[keep]; stg = stg[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
     # pipe model radii from the tips down
     children = [[] for _ in N]
     for i, q in enumerate(par):
@@ -125,6 +154,10 @@ def main(hull, meas, out, **kw):
     # connect to the trunk: scale so the root radius equals the measured trunk top radius
     k = tr["radius"][-1] * p["trunk_tip_radius_scale"] / max(r[0], 1e-6)
     r = np.minimum(r * k, tr["radius"][-1])
+    if p["limb_src"] == "stages":   # 26 October 2026: radius floors by stage (the orders of SpeedTree) : a main limb is never thinner than floor_main_m, a branch than floor_branch_m, a twig than floor_twig_m
+        fl = np.where(stg == 2, p["floor_main_m"], np.where(stg == 3, p["floor_branch_m"], p["floor_twig_m"])); r = np.minimum(np.maximum(r, fl), tr["radius"][-1])
+        for i_ in np.argsort(np.array([d_ for d_ in _depths(par)])):
+            if par[i_] >= 0: r[i_] = min(r[i_], r[par[i_]])
     if p["radius_src"] == "mask":   # 26 October 2026: limb radii from the reference wood masks, pipe model where no view sees the wood
         sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "Scripts")); import WoodSkeleton as WS
         Wk2 = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); rm = WS.mask_radius(N, Wk2, obj=p["obj"]) * p["radius_fit"]
@@ -133,6 +166,7 @@ def main(hull, meas, out, **kw):
             if par[i_] >= 0: r2[i_] = min(r2[i_], r2[par[i_]])
         r = r2
     tips = [i for i in range(len(N)) if not children[i]]
+    if len(tips) > p["tip_leaf_max"]: tips = sorted(rng.choice(tips, p["tip_leaf_max"], replace=False).tolist())   # 26 October 2026: twigs make thousands of tips, leaves go to a random subset
     # foliage on the crown SHELL: hull voxels within shell_depth of the hull boundary (what the views actually see)
     from scipy import ndimage as ndi
     depth = ndi.distance_transform_edt(occ) * vx
