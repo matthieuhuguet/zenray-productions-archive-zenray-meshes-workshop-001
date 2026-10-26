@@ -12,10 +12,11 @@ import ComponentScore as C, Raster, SheetScore, OrganicClasses
 W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
 
 
-def main(obj="tree", tag="v17", cls="thick", quiet=False):
+def main(obj="tree", tag="v17", cls="thick", quiet=False, image=False):
     prm = json.load(open(W + "work/%s/component_params.json" % obj)); Pt = prm["paths"]; meta = json.load(open(W + Pt["frame"] + "/frame.json")); cal = json.load(open(W + Pt["cal"].format(obj=obj)))
     ms = json.load(open(W + Pt["measure"].format(obj=obj))); cb = ms["trunk"]["crown_base_y"]; tr_r = ms["trunk"]["radius"][-1]; r1, r2 = OrganicClasses.radii(tr_r, **{k: v for k, v in prm["wood_classes"].items() if k in ("thick_frac", "med_frac")})
-    dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); wid = [i for i, n in enumerate(N) if str(n) == "branches"]; r = Raster.Renderer(P, F[np.isin(T, wid)]); out = {}
+    dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); wid = [i for i, n in enumerate(N) if str(n) == "branches"]; r = Raster.Renderer(P, F[np.isin(T, wid)]); out = {}; tiles = []
+    from scipy import ndimage as ndi
     for v in meta["views"]:
         vn = v["name"]
         if vn in prm.get("skip_views", []): continue
@@ -25,13 +26,20 @@ def main(obj="tree", tag="v17", cls="thick", quiet=False):
             py = int(round(cal[vn][0][1] * cb + cal[vn][1][1])); rows[: py + 1] = True
         else: rows[:] = True
         rc, mc = OrganicClasses.wood_classes(wood, ppm, r1, r2), OrganicClasses.wood_classes(M, ppm, r1, r2); ref = rc[cls] & rows[:, None]; mod = M & rows[:, None]
+        if image:   # semi opaque overlay : reference relief dimmed, reference wood of the class in brown at half opacity, model wood X-ray contour in cyan, leak in red
+            idx = [p_ for p_ in json.load(open(W + Pt["views"] + "/sheet.json"))["panels"] if p_["name"] == vn][0]["index"]; g = np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % (idx, vn)).convert("L")).astype(float)
+            ov = np.stack([g * 0.7] * 3, -1); ov[ref] = 0.5 * ov[ref] + 0.5 * np.array([200, 120, 50]); edge = mod & ~ndi.binary_erosion(mod, iterations=1); ov[edge] = (80, 230, 240); ov[mod & ~mref] = (255, 40, 40); tiles.append(ov.astype(np.uint8))
         if ref.sum() == 0: continue
-        out[vn] = {"recall_cover": round(float((mod & ref).sum() / ref.sum()), 3), "recall_class": round(float((mc[cls] & ref).sum() / ref.sum()), 3), "leak": round(float((mod & ~mref).sum() / max(mod.sum(), 1)), 3)}
+        ref_all = wood & rows[:, None]; out[vn] = {"cover_all": round(float((mod & ref_all).sum() / max(ref_all.sum(), 1)), 3), "area_ratio": round(float(mod.sum() / max(ref_all.sum(), 1)), 3), "recall_cover": round(float((mod & ref).sum() / ref.sum()), 3), "recall_class": round(float((mc[cls] & ref).sum() / ref.sum()), 3), "leak": round(float((mod & ~mref).sum() / max(mod.sum(), 1)), 3)}
     r.release(); rc_ = np.mean([v["recall_class"] for v in out.values()]); cv_ = np.mean([v["recall_cover"] for v in out.values()]); lk_ = np.mean([v["leak"] for v in out.values()])
-    out["score"] = round(float(rc_ * (1 - lk_)), 3); out["cover"] = round(float(cv_), 3); out["leak"] = round(float(lk_), 3); out["class"] = cls
+    out["score"] = round(float(rc_ * (1 - lk_)), 3); out["cover"] = round(float(cv_), 3); out["leak"] = round(float(lk_), 3); out["class"] = cls; out["cover_all"] = round(float(np.mean([v["cover_all"] for v in out.values() if isinstance(v, dict)])), 3); out["area_ratio"] = round(float(np.mean([v["area_ratio"] for v in out.values() if isinstance(v, dict)])), 3)
+    if image and tiles:
+        from PIL import ImageDraw
+        Wd = max(t.shape[1] for t in tiles); H = max(t.shape[0] for t in tiles); im = Image.fromarray(np.concatenate([np.pad(t, ((0, H - t.shape[0]), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 1)); d = ImageDraw.Draw(im)
+        d.text((6, 4), "%s %s %s wood : reference class (brown, half opacity) | model X-ray contour (cyan) | leak (red)   score %s" % (obj, tag, cls, out["score"]), fill=(255, 255, 0)); im.save(W + "versions/Limb_%s_%s_%s.png" % (obj, tag, cls))
     if not quiet: print(json.dumps(out))
     return out
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:])
+    main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "thick", image=True)

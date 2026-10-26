@@ -1,0 +1,35 @@
+# 26 October 2026 : ZenRay Meshes, FIT of the procedural orders (TreeWP) on the reference by the X-ray wood score, order by order (main limbs, then branches, then twigs).
+# EN: coordinate search over the few numbers of each order ; objective of order 1 = thick wood class score ; of orders 2 and 3 = cover of all the reference wood, with an area
+# penalty (the model X-ray wood must not exceed 1.6 times the visible reference wood) so a fat tree cannot win. Each step is one TreeIter.sh call (about 8 s).
+# FR : réglage des quelques nombres de chaque ordre contre le score de bois en rayons X, avec pénalité de surface.
+# Usage: python WpFit.py <order 1|2|3> [rounds=2]   state in work/<obj>/wp_params.json
+import sys, os, json, subprocess, time
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"; OBJ = os.environ.get("OBJ", "tree"); RUN = time.strftime("%H%M%S"); n_eval = [0]
+SPACE = {1: {"n1": [3, 4, 5, 6], "phi0": [0, 30, 60, 90], "theta1": [20, 30, 40, 55], "len1": [3.0, 4.5, 6.0, 8.0], "bend1": [0.1, 0.3, 0.6], "start1": [0.2, 0.6, 1.0]},
+         2: {"n2": [2, 4, 6, 8], "theta2": [30, 45, 60, 75], "len2r": [0.35, 0.55, 0.8], "bend2": [0.1, 0.25, 0.5], "t2_lo": [0.1, 0.25, 0.4]},
+         3: {"n3": [3, 5, 8], "theta3": [35, 50, 70], "len3r": [0.3, 0.5, 0.8], "bend3": [0.0, 0.1, 0.3], "t3_lo": [0.2, 0.3, 0.5]}}
+DEF = {"n1": 4, "phi0": 0, "theta1": 35, "len1": 4.5, "bend1": 0.3, "start1": 0.6, "n2": 4, "theta2": 45, "len2r": 0.55, "bend2": 0.25, "t2_lo": 0.25, "n3": 5, "theta3": 50, "len3r": 0.5, "bend3": 0.1, "t3_lo": 0.3}
+
+
+def evaluate(cur, order):
+    n_eval[0] += 1; tag = "wf%s%03d" % (RUN, n_eval[0]); wp = ",".join("%s:%s" % kv for kv in cur.items())
+    r = subprocess.run(["zsh", W + "Scripts/TreeIter.sh", tag, "thick" if order == 1 else "med", "wp=" + wp], capture_output=True, text=True, cwd=W, env=dict(os.environ, OBJ=OBJ))
+    try:
+        d = json.loads(subprocess.run([sys.executable, "-I", W + "Scripts/LimbScore.py", OBJ, tag, "thick" if order == 1 else "med"], capture_output=True, text=True, cwd=W).stdout.strip().splitlines()[-1])
+        pen = min(1.0, 1.6 / max(d["area_ratio"], 1e-6)); return (d["score"] if order == 1 else d["cover_all"]) * pen
+    except Exception: return -1.0
+
+
+def main(order, rounds=2):
+    order = int(order); pf = W + "work/%s/wp_params.json" % OBJ; cur = dict(DEF); cur.update(json.load(open(pf)) if os.path.exists(pf) else {}); best = evaluate(cur, order); print("start", round(best, 4), flush=True)
+    for rd in range(int(rounds)):
+        for k, cands in SPACE[order].items():
+            for c in cands:
+                if c == cur[k]: continue
+                t = dict(cur); t[k] = c; sc = evaluate(t, order)
+                if sc > best + 1e-4: best, cur = sc, t; print("round", rd, k, c, "->", round(best, 4), flush=True)
+    json.dump(cur, open(pf, "w")); open(W + "work/%s/wp_args.txt" % OBJ, "w").write("wp=" + ",".join("%s:%s" % kv for kv in cur.items()) + "\n"); print("best", round(best, 4), cur, flush=True)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
