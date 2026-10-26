@@ -9,7 +9,7 @@ from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
 
 
-def build(path, root, y_min, close_it=1, min_spur_m=0.8, rmin=0.04, rscale=1.0, join_m=1.2, y_cut_top=None):
+def build(path, root, y_min, close_it=1, min_spur_m=0.8, rmin=0.04, rscale=1.0, join_m=1.2, y_cut_top=None, seg_max=0.35):
     e = np.load(path); occ = e["occ"].copy(); org = np.array(e["origin"], float); vx = float(e["voxel"]); root = np.asarray(root, float)
     iy = int(np.floor((y_min - org[1]) / vx)); occ[:, :max(iy, 0), :] = False
     if close_it: occ = ndi.binary_closing(occ, iterations=int(close_it)) | occ
@@ -53,8 +53,27 @@ def build(path, root, y_min, close_it=1, min_spur_m=0.8, rmin=0.04, rscale=1.0, 
     ch = [[] for _ in N]
     for i, q in enumerate(parent):
         if q >= 0: ch[q].append(i)
+    # 26 October 2026: DENSIFY ; a bridge between two far components is one long edge, cut into steps of seg_max so every later stage (jump guard, sweep) sees a limb
+    N, parent, rad = densify(N, parent, rad, seg_max)
+    ch = [[] for _ in N]
+    for i, q in enumerate(parent):
+        if q >= 0: ch[q].append(i)
     tips = [i for i in range(len(N)) if not ch[i]]
     return N, parent, rad, tips
+
+
+def densify(N, parent, rad, seg_max):
+    Nn, pn, rn = [np.array(x) for x in N], [int(q) for q in parent], [float(x) for x in rad]; n0 = len(Nn)
+    for i in range(n0):
+        q = pn[i]
+        if q < 0: continue
+        d = float(np.linalg.norm(Nn[i] - Nn[q]))
+        if d <= seg_max: continue
+        k = int(np.ceil(d / seg_max)); prev = q
+        for m in range(1, k):
+            f = m / k; Nn.append(Nn[q] * (1 - f) + Nn[i] * f); rn.append(rn[q] * (1 - f) + rn[i] * f); pn.append(prev); prev = len(Nn) - 1
+        pn[i] = prev
+    return np.array(Nn), np.array(pn), np.array(rn)
 
 
 def _depth(parent, i):

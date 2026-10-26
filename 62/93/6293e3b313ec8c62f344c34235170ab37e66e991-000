@@ -1,0 +1,30 @@
+# 26 October 2026 : ZenRay Meshes, 3D TRUTH SCORE on a synthetic instance : the views only constrain 2D projections, so a model can match every view and still be
+# wrong in 3D (ghost limbs). With a known truth, the symmetric chamfer distance and the recall within a tolerance of each class (wood, foliage) say how far the
+# reconstruction really is, and they are the metric that keeps the algorithm general. FR : score 3D contre la vérité d'une instance synthétique.
+# Usage: python TruthScore.py <truth_topo.npz> <model_topo.npz> [tol_m=0.3] [ymin=7.8]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy.spatial import cKDTree
+import ComponentScore as C
+
+
+def sample(topo, part, n=40000, ymin=0.0, seed=0):
+    dl = np.load(topo, allow_pickle=True); P, F, T, N = C.tri_render(dl); ids = [i for i, nm in enumerate(N) if str(nm) == part]
+    if not ids: return np.zeros((0, 3))
+    tri = P[F[np.isin(T, ids)]]; a = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); rng = np.random.default_rng(seed)
+    idx = rng.choice(len(tri), n, p=a / a.sum()); u = rng.random((n, 2)); u = np.where(u.sum(1, keepdims=True) > 1, 1 - u, u)
+    pts = tri[idx, 0] + u[:, :1] * (tri[idx, 1] - tri[idx, 0]) + u[:, 1:] * (tri[idx, 2] - tri[idx, 0]); return pts[pts[:, 1] > ymin]
+
+
+def main(truth, model, tol=0.3, ymin=7.8):
+    tol, ymin = float(tol), float(ymin); out = {}
+    for cls, part in (("wood", "branches"), ("foliage", "leaves")):
+        A, B = sample(truth, part, ymin=ymin), sample(model, part, ymin=ymin)
+        dA = cKDTree(B).query(A)[0]; dB = cKDTree(A).query(B)[0]
+        out[cls] = {"chamfer_m": round(float((dA.mean() + dB.mean()) / 2), 3), "recall": round(float((dA < tol).mean()), 3), "precision": round(float((dB < tol).mean()), 3)}
+    out["mean_f"] = round(float(np.mean([2 * v["recall"] * v["precision"] / max(v["recall"] + v["precision"], 1e-9) for v in out.values()])), 3); print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

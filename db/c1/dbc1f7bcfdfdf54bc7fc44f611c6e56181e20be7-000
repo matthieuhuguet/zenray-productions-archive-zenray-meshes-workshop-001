@@ -6,22 +6,30 @@
 import sys, os, json, subprocess, itertools
 W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
 SPACE = {   # name : (kind, candidate values) ; kind "grow" goes to TreeGrow k=v, "ctrl" to the Houdini CTRL
-    "shell_clumps": ("grow", [2500, 4500, 7000]), "leaf_size": ("ctrl", [0.35, 0.4, 0.45, 0.5]), "cards": ("ctrl", [2, 3, 4]), "carve_tip_k": ("grow", [1, 2, 3]),
-    "tip_radius_m": ("grow", [0.05, 0.08, 0.12, 0.2]), "spur_m": ("grow", [0.6, 1.2, 2.0]), "limb_close": ("grow", [0, 1, 2]),
-    "skel_evidence": ("grow", ["work/tree/evidence_wood.npz", "work/tree/evidence_wood_top.npz", "work/tree/evidence10_wood.npz", "work/tree/evidence10_wood_top.npz"]),
-    "clump_evidence": ("grow", ["work/tree/evidence_foliage_strict.npz", "work/tree/evidence10_foliage_strict.npz", "work/tree/evidence_foliage.npz"]), "wood_attr_frac": ("grow", [0.0]) }
+    "shell_clumps": ("grow", [4500, 7000, 10000]), "leaf_size": ("ctrl", [0.3, 0.35, 0.4, 0.5]), "cards": ("ctrl", [2, 3]), "carve_tip_k": ("grow", [1, 2, 3]),
+    "tip_radius_m": ("grow", [0.08, 0.12, 0.2, 0.3]), "pipe_exp": ("grow", [1.8, 2.0, 2.5, 3.0]), "trunk_tip_radius_scale": ("grow", [0.8, 1.0, 1.3]),
+    "spur_m": ("grow", [1.2, 2.0, 3.0]), "limb_close": ("grow", [0, 1, 2]), "join_m": ("grow", [1.2, 3.0]), "min_radius": ("ctrl", [0.01, 0.02, 0.04]),
+    "leaf_inset_m": ("grow", [0.05, 0.15, 0.3]), "skel_evidence": ("grow", ["work/{obj}/evidence10_wood_top.npz", "work/{obj}/evidence10_wood.npz", "work/{obj}/evidence10_wood_union.npz", "work/{obj}/evidence10_wood_k4.npz"]),
+    "clump_evidence": ("grow", ["work/{obj}/evidence10_foliage_strict.npz", "work/{obj}/evidence_foliage_strict.npz", "work/{obj}/evidence10_foliage.npz"])}
 FIXED = {"clump_src": "evidence", "carve_tips": 1, "limb_src": "skeleton"}   # structure choices, not searched
-BASE = {"shell_clumps": 4500, "leaf_size": 0.4, "cards": 3, "carve_tip_k": 2, "tip_radius_m": 0.12, "spur_m": 1.2, "limb_close": 1, "skel_evidence": "work/tree/evidence10_wood_top.npz",
-        "clump_evidence": "work/tree/evidence_foliage_strict.npz", "wood_attr_frac": 0.0}
+BASE = {"shell_clumps": 7000, "leaf_size": 0.35, "cards": 2, "carve_tip_k": 2, "tip_radius_m": 0.12, "pipe_exp": 2.0, "trunk_tip_radius_scale": 1.0, "spur_m": 2.0, "limb_close": 1, "join_m": 1.2, "min_radius": 0.02,
+        "leaf_inset_m": 0.15, "skel_evidence": "work/{obj}/evidence10_wood_top.npz", "clump_evidence": "work/{obj}/evidence10_foliage_strict.npz"}
+OBJ = os.environ.get("OBJ", "tree")
 n_eval = [0]
 
 
 def evaluate(v):
     n_eval[0] += 1; tag = "tf%03d" % n_eval[0]; grow = ["%s=%s" % (k, v[k]) for k, (kind, _) in SPACE.items() if kind == "grow"] + ["%s=%s" % kv for kv in FIXED.items()]
     ctrl = ",".join("%s=%s" % (k, v[k]) for k, (kind, _) in SPACE.items() if kind == "ctrl")
-    env = dict(os.environ, CTRL=ctrl); r = subprocess.run(["zsh", W + "Scripts/RunTreeScore.sh", tag] + grow, capture_output=True, text=True, env=env, cwd=W)
-    try: return json.loads(r.stdout.strip().splitlines()[-1])["mean_completion"]
+    env = dict(os.environ, CTRL=ctrl, OBJ=OBJ); r = subprocess.run(["zsh", W + "Scripts/RunTreeScore.sh", tag] + [g_.replace("{obj}", OBJ) for g_ in grow], capture_output=True, text=True, env=env, cwd=W)
+    try: comp = json.loads(r.stdout.strip().splitlines()[-1])["mean_completion"]
     except Exception: return -1.0
+    TR = os.environ.get("TRUTH")   # 26 October 2026: a synthetic instance has a known 3D truth ; the objective then mixes the 2D completion and the 3D chamfer F score
+    if TR:
+        r2 = subprocess.run([sys.executable, "-I", W + "Scripts/TruthScore.py", W + TR, W + "work/%s/topo_%s.npz" % (OBJ, tag)], capture_output=True, text=True, cwd=W)
+        try: f3 = json.loads(r2.stdout.strip().splitlines()[-1])["mean_f"]; wt = float(os.environ.get("TRUTH_W", "0.5")); return (1 - wt) * comp + wt * f3
+        except Exception: return -1.0
+    return comp
 
 
 def main(rounds=2):
@@ -32,7 +40,8 @@ def main(rounds=2):
                 if c == cur[k]: continue
                 t = dict(cur); t[k] = c; sc = evaluate(t); log.append({"values": t, "score": sc})
                 if sc > best + 1e-4: best, cur = sc, t; print("round", rd, k, c, "->", round(best, 4), flush=True)
-        json.dump({"_date": "26 October 2026", "best": best, "values": cur, "evaluations": n_eval[0], "log": log}, open(W + "work/tree/organic_fit.json", "w"), indent=1)
+        json.dump({"_date": "26 October 2026", "best": best, "values": cur, "evaluations": n_eval[0], "log": log}, open(W + "work/%s/organic_fit.json" % OBJ, "w"), indent=1)
+    open(W + "work/%s/organic_best_rules.txt" % OBJ, "w").write(" ".join("%s=%s" % (k, v) for k, v in cur.items() if SPACE[k][0] == "grow" and k not in FIXED) .replace("{obj}", OBJ) + " " + " ".join("%s=%s" % kv for kv in FIXED.items()) + "\n" + ",".join("%s=%s" % (k, v) for k, v in cur.items() if SPACE[k][0] == "ctrl") + "\n")
     print("best", best, cur, flush=True)
 
 
