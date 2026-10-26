@@ -85,9 +85,19 @@ def main(params, prefix, out):
                 face = inst["x"] + 0.5 * Wp["tyre_w"] + Wp.get("bulge", 0.0) + WC["cover_m"]
                 ex = rc.get("extra_rear_m" if inst["z"] < 0 else "extra_front_m", rc.get("extra_m", 0.0))
                 lo, hi = inst["z"] - Wp["tyre_r"] - (ex if inst["z"] < 0 else rc.get("extra_m", 0.0)), inst["z"] + Wp["tyre_r"] + (rc.get("extra_m", 0.0) if inst["z"] < 0 else ex)
-                w = sstep((zq - (lo - rp)) / rp) * sstep(((hi + rp) - zq) / rp)
                 for j in sorted({nh_ - 1 - E_.index(rn), nh_ - 1 + E_.index(rn)}):
                     if not 0 <= j < G.shape[1]: continue
+                    if WC.get("window") == "radial":
+                        # 26 October 2026: a FLARE ring around the arch (distance to the axle in y z), full push up to
+                        # arch radius + flare_m, ramp_m beyond ; the z window left fins at the arch edges (seen from above)
+                        d = np.hypot(G[:, j, 1] - inst["y"], zq - inst["z"]); R0 = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14) + WC.get("flare_m", 0.1)
+                        w = sstep((R0 + rp - d) / rp)
+                        zf = WC.get("front_fade_z")   # 26 October 2026: no flare at the nose cut (the nose read a bulged section)
+                        if zf and inst["z"] > 0: w = w * sstep((zf[1] - zq) / (zf[1] - zf[0]))
+                        zr = WC.get("rear_fade_z")    # 26 October 2026: nor at the tail cut (flat slab at the face corners)
+                        if zr and inst["z"] < 0: w = w * sstep((zq - zr[0]) / (zr[1] - zr[0]))
+                    else:
+                        w = sstep((zq - (lo - rp)) / rp) * sstep(((hi + rp) - zq) / rp)
                     ax = np.abs(G[:, j, 0]); u = face - ax
                     sp = k_ * np.logaddexp(0.0, u / k_)
                     G[:, j, 0] = np.sign(G[:, j, 0]) * (ax + sp * w)
@@ -142,12 +152,71 @@ def main(params, prefix, out):
         else:
             G2[:, k, 0] = G[:, a, 0] + u * (G[:, b, 0] - G[:, a, 0]); G2[:, k, 2] = G[:, a, 2] + u * (G[:, b, 2] - G[:, a, 2])
             G2[:, k, 1] = G[:, a, 1] + (G[:, b, 1] - G[:, a, 1]) * u ** pw
+    # 26 October 2026: HAUNCH ; the widest line of the rear haunch (back view 1.14 m at y 0.8) lies between door_low and
+    # belt, where the ruled band cut the corner ; the middle inserted column of that band (haunch.u) is pushed over each
+    # tyre like the wheel cover rows, and the inserted columns on either side are re-interpolated between their new
+    # neighbours (no groove). FR : colonne de hanche au milieu de la bande bas de porte / ceinture, poussée sur le pneu.
+    HC = C.get("haunch")
+    if HC and HC.get("on", 1) and ss > 1:
+        Wp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
+        ra_, rb_ = HC["between"]; zq = G2[:, 0, 2]; k_ = HC.get("soft_m", 0.006); rp = HC.get("ramp_m", 0.12)
+        sstep = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        for k, (a, b, u, _, pw) in enumerate(cols):
+            if a == b or {rname(a), rname(b)} != {ra_, rb_}: continue
+            uf = u if rname(a) == ra_ else 1.0 - u          # fraction measured from the first named row
+            if abs(uf - HC["u"]) > 1e-6: continue
+            ax = np.abs(G2[:, k, 0]); add = np.zeros(len(zq))
+            for inst in Wp["instances"]:
+                if inst["x"] <= 0: continue
+                face = inst["x"] + 0.5 * Wp["tyre_w"] + Wp.get("bulge", 0.0) + HC["cover_m"]
+                ex = HC.get("extra_rear_m" if inst["z"] < 0 else "extra_front_m", 0.0)
+                lo, hi = inst["z"] - Wp["tyre_r"] - (ex if inst["z"] < 0 else 0.0), inst["z"] + Wp["tyre_r"] + (0.0 if inst["z"] < 0 else ex)
+                if HC.get("window") == "radial":   # 26 October 2026: flare ring around the arch, as wheel_cover
+                    d = np.hypot(G2[:, k, 1] - inst["y"], zq - inst["z"]); R0 = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14) + HC.get("flare_m", 0.1)
+                    w = sstep((R0 + rp - d) / rp)
+                    zf = HC.get("front_fade_z")
+                    if zf and inst["z"] > 0: w = w * sstep((zf[1] - zq) / (zf[1] - zf[0]))
+                    zr = HC.get("rear_fade_z")
+                    if zr and inst["z"] < 0: w = w * sstep((zq - zr[0]) / (zr[1] - zr[0]))
+                else:
+                    w = sstep((zq - (lo - rp)) / rp) * sstep(((hi + rp) - zq) / rp)
+                add = np.maximum(add, k_ * np.logaddexp(0.0, (face - ax) / k_) * w)
+            G2[:, k, 0] = np.sign(G2[:, k, 0]) * (ax + add)
+            # re-interpolate the inserted columns between this column and the two ring columns of the band
+            ka = [i for i in range(len(cols)) if cols[i][0] == cols[i][1] == a][0]; kb = [i for i in range(len(cols)) if cols[i][0] == cols[i][1] == b][0]
+            for i2, (a2, b2, u2, _, _) in enumerate(cols):
+                if (a2, b2) != (a, b) or i2 == k: continue
+                if u2 < u: f = u2 / u; G2[:, i2] = G2[:, ka] + f * (G2[:, k] - G2[:, ka])
+                else: f = (u2 - u) / (1 - u); G2[:, i2] = G2[:, k] + f * (G2[:, kb] - G2[:, k])
     band = [c[3] for c in cols]; R2 = len(cols)
+    # 26 October 2026: SLANTED DOOR CUT ; the sheet's rear door line is diagonal (side views), the cage split doors at a
+    # station (vertical). Around the cut, each side column is sheared along z by a smooth bump (half cosine over window_m)
+    # so that ONE grid row (i0) lands exactly on the line, x and y re-read on the column's own curve (the surface does
+    # not move) ; quads of the door band then take door ahead of row i0 and quarter behind. FR : découpe de porte en biais.
+    DC = C.get("door_cut"); i0 = None; dc_cols = set()
+    if DC and DC.get("on", 1):
+        (zt_, yt_), (zb_, yb_) = DC["top"], DC["bottom"]; Wd = DC.get("window_m", 0.25); zmid = 0.5 * (zt_ + zb_)
+        zc_ = G2[:, 0, 2]; i0 = int(np.argmin(np.abs(zc_ - zmid)))
+        for k in range(R2):
+            yk = G2[i0, k, 1]
+            if abs(G2[i0, k, 0]) < DC.get("x_min", 0.5) or not (yb_ - 0.03 <= yk <= yt_ + 0.03): continue
+            tt_ = float(np.clip((yk - yb_) / (yt_ - yb_), 0, 1)); ztar = zb_ + tt_ * (zt_ - zb_); off = ztar - zc_[i0]
+            dzv = np.abs(zc_ - zc_[i0]); f = np.where(dzv < Wd, 0.5 * (1 + np.cos(np.pi * dzv / Wd)), 0.0)
+            znew = zc_ + off * f; o_ = np.argsort(zc_)
+            for a in (0, 1): G2[:, k, a] = np.interp(znew, zc_[o_], G2[o_, k, a])
+            G2[:, k, 2] = znew; dc_cols.add(k)
     P = G2.reshape(-1, 3); Q, N = [], []
     idx = lambda i, j: i * R2 + (j % R2)
     for i in range(len(t) - 1):
         for j in range(R2):
-            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(panels[seg[i] * R + band[j]])
+            nm_ = panels[seg[i] * R + band[j]]
+            if i0 is not None and j in dc_cols and (j + 1) % R2 in dc_cols:
+                for a_, b_ in ((DC.get("front", "door"), DC.get("back", "quarter")),):
+                    side_ = nm_.rsplit("_", 1)[-1]
+                    if nm_ in (a_ + "_" + side_, b_ + "_" + side_): nm_ = (a_ if i < i0 else b_) + "_" + side_
+            elif i0 is not None and DC.get("upper_split") and nm_.startswith(("shoulder_door", "shoulder_quarter")):
+                side_ = nm_.rsplit("_", 1)[-1]; nm_ = ("shoulder_door" if G2[i, 0, 2] > DC["top"][0] else "shoulder_quarter") + "_" + side_
+            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(nm_)
     R_orig, R = R, R2
     # 25 October 2026: WHEEL ARCHES CUT IN THE CONSTRUCTION (no boolean) ; quads whose centre lies inside an arch cylinder
     # (|x| > arch_x0, distance to the axle < tyre_r x arch_pad_cut) are removed, and the vertices on the new boundary are
@@ -169,6 +238,32 @@ def main(params, prefix, out):
                 elif abs(P[v, 1] - cen[k, 0]) < Rc:   # 25 October 2026: low points slide along z only, never below the floor
                     P[v, 2] = cen[k, 1] + np.sign(P[v, 2] - cen[k, 1]) * np.sqrt(Rc ** 2 - (P[v, 1] - cen[k, 0]) ** 2)
         Q = [q for q, k_ in zip(Q, inside) if not k_]; N = [n for n, k_ in zip(N, inside) if not k_]
+        # 26 October 2026: RING RELAX ; the snapped boundary vertices pulled fan shaped quads (shards around the arch top) ;
+        # the vertices of the ring around each arch (within arch_relax_m outside the circle) move toward the mean of their
+        # grid neighbours in y and z, the boundary staying on the circle. FR : anneau autour du passage lissé.
+        rr_ = C.get("arch_relax_m", 0.0); it_ = int(C.get("arch_relax_iter", 0))
+        if rr_ > 0 and it_ > 0:
+            used = np.zeros(len(P), bool); used[np.array(Q).ravel()] = True; fixed = np.zeros(len(P), bool); fixed[bnd] = True
+            d_all = np.min([np.hypot(P[:, 1] - yc, P[:, 2] - zc) for yc, zc in cen], axis=0)
+            ring = used & ~fixed & (np.abs(P[:, 0]) > x0) & (d_all < Rc + rr_)
+            idv = np.flatnonzero(ring); ii, kk = idv // R2, idv % R2; nT = len(t)
+            nbrs = []
+            for di, dk in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                i2, k2 = ii + di, (kk + dk) % R2; okn = (i2 >= 0) & (i2 < nT)
+                nb = np.where(okn, np.clip(i2, 0, nT - 1) * R2 + k2, -1); nb = np.where((nb >= 0) & used[np.maximum(nb, 0)], nb, -1); nbrs.append(nb)
+            nbrs = np.stack(nbrs, 1)
+            axes_ = (0, 1, 2) if C.get("arch_relax_x", 1) else (1, 2)   # 26 October 2026: x too, else ripples in the flare ring
+            # 26 October 2026: WEIGHTED ; an all or nothing ring relaxed some sections of the shoulder row (belt_top) and not
+            # their neighbours (8 cm jump in x over 8 cm, a vertical fold in front of the front arch) ; the blend now falls
+            # smoothly from 0.5 on the circle to 0 at the ring edge
+            u_ = np.clip((d_all[idv] - Rc) / rr_, 0.0, 1.0); wgt = 0.5 * (1.0 - u_ * u_ * (3.0 - 2.0 * u_))
+            for _ in range(it_):
+                Ms = []
+                for a in axes_:
+                    A = np.where(nbrs >= 0, P[np.maximum(nbrs, 0), a], np.nan)
+                    with np.errstate(all="ignore"): Ms.append(np.nanmean(A, 1))
+                okm = np.isfinite(Ms[0])
+                for a, M_ in zip(axes_, Ms): P[idv[okm], a] = (1 - wgt[okm]) * P[idv[okm], a] + wgt[okm] * M_[okm]
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
     for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):

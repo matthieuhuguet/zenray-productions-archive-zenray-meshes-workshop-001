@@ -14,7 +14,33 @@ def main(params, body, out):
     m = json.load(open(os.path.join(W, "arch_v1_measure.json"))); pr = m["profiles"]; ztip = m["keys"]["tail"]
     zs, hw = np.array(pr["z"]), np.array(pr["hw"]); ey = np.array(pr["ext_y"]); eb = np.array(pr["z_back"], float); ok = np.isfinite(eb)
     if C.get("tip_z_points"): tz = np.array(C["tip_z_points"]); o = np.argsort(tz[:, 0]); ey, eb, ok = tz[o, 0], tz[o, 1], np.ones(len(tz), bool)
-    P = np.load(body, allow_pickle=True)["P"]; sl = P[np.abs(P[:, 2] - zc) < C["slab_m"]]
+    BD = np.load(body, allow_pickle=True); P = BD["P"]; sl = P[np.abs(P[:, 2] - zc) < C["slab_m"]]
+    if C.get("true_section", 1) and "F" in BD.files:
+        # 26 October 2026: the body VERTICES near the cut are sparse in x (one per loft column), so a column between two
+        # rows read its top from a low row and the face top dipped at |x| 0.7 to 0.85 ; the section is now the real
+        # intersection of the body triangles with the plane z = cut_z, densified along each crossing edge.
+        # FR : la section est l'intersection réelle de la caisse avec le plan de coupe, pas les sommets voisins.
+        F_ = BD["F"]; A_, B_ = P[F_], np.roll(P[F_], -1, axis=1); A_, B_ = A_.reshape(-1, 3), B_.reshape(-1, 3)
+        da, db = A_[:, 2] - zc, B_[:, 2] - zc; cr = (da * db < 0)
+        tt = da[cr] / (da[cr] - db[cr]); X_ = A_[cr] + tt[:, None] * (B_[cr] - A_[cr])
+        segs = X_.reshape(-1, 3) if len(X_) else sl
+        dens = [segs]
+        # 26 October 2026: the exported body is often ALREADY clipped at cut_z (no triangle crosses the plane) ; the edges
+        # lying ON the plane then form the outline, densified every bin_m / 3
+        onp = (np.abs(A_[:, 2] - zc) < 1e-4) & (np.abs(B_[:, 2] - zc) < 1e-4)
+        if onp.any():
+            a0, b0 = A_[onp], B_[onp]; L_ = np.linalg.norm(b0 - a0, axis=1); nmax = int(np.clip((L_.max() / (C["bin_m"] / 3)), 1, 200))
+            for f in np.linspace(0, 1, nmax + 1): dens.append(a0 + f * (b0 - a0))
+        # densify : points every 1 cm between consecutive crossings of the same triangle (pairs of edges)
+        Fc = cr.reshape(-1, 3); ok3 = Fc.sum(1) == 2
+        if ok3.any():
+            AA, BB = A_.reshape(-1, 3, 3)[ok3], B_.reshape(-1, 3, 3)[ok3]; cc = Fc[ok3]
+            daa, dbb = AA[..., 2] - zc, BB[..., 2] - zc
+            with np.errstate(divide="ignore", invalid="ignore"): t3 = np.where(cc, daa / (daa - dbb), 0.0)
+            pts = AA + t3[..., None] * (BB - AA); idx = np.argsort(~cc, axis=1)[:, :2]
+            p0 = pts[np.arange(len(pts)), idx[:, 0]]; p1 = pts[np.arange(len(pts)), idx[:, 1]]
+            for f in np.linspace(0, 1, 6)[1:-1]: dens.append(p0 + f * (p1 - p0))
+        sl = np.concatenate(dens)
     xsec = float(np.abs(sl[:, 0]).max()) * 0.97; xmax = float(np.abs(sl[:, 0]).max()) * C.get("width_scale", 1.0); y_low = float(sl[:, 1].min()) + C.get("bottom_lift_m", 0.0)
     def yrange(x):
         s = sl[np.abs(np.abs(sl[:, 0]) - abs(x)) < C["bin_m"] + 0.02 * (abs(x) > xmax * 0.95)]
@@ -23,11 +49,45 @@ def main(params, body, out):
         if not len(s): return (None, None)
         return (y_low if C.get("full_height", 0) else float(s[:, 1].min()), float(s[:, 1].max()))
     rr = zs <= zc; zr, hr = zs[rr], hw[rr]; o_ = np.argsort(hr); zr, hr = zr[o_], np.maximum.accumulate(hr[o_])
+    SE = C.get("superellipse")   # 26 October 2026: clean parametric tail (plan superellipse, flat face), see below
     def z_plan(x):   # 25 October 2026: plan_interp 1 interpolates (the nearest sample makes 4 cm steps), 0 keeps v99 behaviour
+        if SE:
+            # 26 October 2026: the measured plan behind the cut is noisy (mask edge, 2 to 4 cm zigzag) ; the rear corner in
+            # plan is a superellipse (|x|/a)^n + ((zc - z)/b)^n = 1, a = section half width x a_scale, b = zc - end_z,
+            # n fitted on the corrected top view (1.6) : smooth by construction. FR : coin arrière en super-ellipse.
+            a = xmax * SE.get("a_scale", 1.0); b = zc - SE["end_z"]; u = min(abs(x) / a, 1.0)
+            return float(zc - b * (1.0 - u ** SE["n"]) ** (1.0 / SE["n"]))
         if C.get("plan_interp", 0): return float(np.interp(abs(x), hr, zr)) if abs(x) <= hr.max() else zc
         okp = (hw >= abs(x)) & (zs <= zc)
         return float(zs[okp].min()) if okp.any() else zc
-    nx, ny = C["nx"], C["ny"]; xs = np.linspace(-xmax, xmax, nx); G = np.zeros((nx, ny, 3))
+    FF = C.get("flat_face")
+    def z_side(y, lo, hi):
+        # 26 October 2026: the two side views disagree by 8 cm at the tail and each reads with 2 to 4 cm steps ; the face is
+        # flat at face_z between its bottom and top fillets (smootherstep over fillet_m to top_z and bottom_z)
+        if not FF: return float(np.interp(y, ey[ok], eb[ok]))
+        sm = lambda u: 0.0 if u <= 0 else 1.0 if u >= 1 else u ** 3 * (u * (6 * u - 15) + 10)
+        z = FF["face_z"]; ft, fb = FF.get("top_fillet_m", 0.08), FF.get("bottom_fillet_m", 0.06)
+        if FF.get("top_to_cut", 1):
+            # 26 October 2026: the top edge of the face lay 5 cm behind the clipped body edge (top_z -2.15 against the cut
+            # -2.10), a gap seen from above ; the top is now a convex quarter ellipse, vertical at y = hi - ft, reaching the
+            # cut plane at the column top, so the face meets the body edge exactly (watertight)
+            u = float(np.clip((y - (hi - ft)) / ft, 0.0, 1.0)); z += (zc - FF["face_z"]) * (1.0 - np.sqrt(max(1.0 - u * u, 0.0)))
+        else:
+            z += (FF["top_z"] - FF["face_z"]) * sm((y - (hi - ft)) / ft)
+        z += (FF["bottom_z"] - FF["face_z"]) * sm(((lo + fb) - y) / fb)
+        return float(z)
+    nx, ny = C["nx"], C["ny"]; xs = np.linspace(-xmax, xmax, nx)
+    # 26 October 2026: INSETS ; the dark rear panel and the light bar are cut INTO the face (a recess with a bevel), not
+    # stacked as slabs in front of it ; the grid gets columns and rows exactly on the inset edges so the recess is crisp.
+    # FR : panneau et bandeau creusés dans la face, grille alignée sur leurs bords.
+    INS = [i for i in C.get("insets", []) if i.get("on", 1)]
+    if INS:
+        ex_ = []
+        for i in INS:
+            for v in (i["x"], i["x"] - i["bevel_m"]) + ((i["x0"], i["x0"] + i["bevel_m"]) if "x0" in i else ()): ex_ += [v, -v]
+        xs = np.unique(np.round(np.concatenate([xs, [v for v in ex_ if abs(v) < xmax]]), 5))
+    if C.get("skirt"): xs = np.unique(np.round(np.concatenate([xs, [C["skirt"]["x"], -C["skirt"]["x"]]]), 5))
+    G = np.zeros((len(xs), ny + 4 * len(INS) + 1, 3)); nx = len(xs)
     # 25 October 2026: the per column top height is noisy (sawtooth top edge seen in Houdini) ; it is taken from a smoothed
     # profile of the section top over |x| (running max then moving average over top_smooth columns)
     his = []
@@ -36,18 +96,37 @@ def main(params, body, out):
     his = np.array(his); okh = np.isfinite(his); his[~okh] = np.interp(np.flatnonzero(~okh), np.flatnonzero(okh), his[okh])
     k_ = int(C.get("top_smooth", 5)); his_s = np.convolve(np.pad(his, k_ // 2, mode="edge"), np.ones(k_) / k_, mode="valid")
     lo_prev = hi_prev = None
+    lo_g, hi_g = y_low, float(np.nanmax(his_s))   # 26 October 2026: face fillets measured from the whole face, not per column
     for i, x in enumerate(xs):
         lo, hi = yrange(np.sign(x) * min(abs(x), xsec))   # 25 October 2026: columns wider than the section take its outer heights
         if hi is not None: hi = float(his_s[i])
         if lo is None: lo, hi = lo_prev, hi_prev
         lo_prev, hi_prev = lo, hi
-        for j, t in enumerate(np.linspace(0, 1, ny)):
-            y = lo + t * (hi - lo); zb = float(np.interp(y, ey[ok], eb[ok]))
-            z = max(z_plan(x), zb, ztip); G[i, j] = (x, y, min(z, zc))
-    PP, Q, N = G.reshape(-1, 3).tolist(), [], []
+        SK = C.get("skirt")   # 26 October 2026: the face goes down to the real rear bottom between the tyres (back view)
+        if SK and abs(x) < SK["x"]: lo = min(lo, SK["y"])
+        ys_ = np.linspace(lo, hi, ny)
+        if INS:   # global inset rows clamped to this column's range (degenerate quads are dropped below)
+            ys_ = np.sort(np.concatenate([ys_, np.clip([v for k in INS for v in (k["y0"], k["y0"] + k["bevel_m"], k["y1"] - k["bevel_m"], k["y1"])], lo, hi)]))
+        ys_ = np.sort(np.concatenate([ys_, [np.clip(C.get("skirt", {}).get("y", lo), lo, hi)]]))   # same row count in every column
+        for j, y in enumerate(ys_):
+            zb = z_side(y, lo_g, hi)   # 26 October 2026: the top fillet follows each column top (watertight with the body)
+            z = min(max(z_plan(x), zb, ztip), zc)
+            for k in INS:   # recess depth : full inside, linear over the bevel, zero outside ; x0 = inner edge (side pairs)
+                dxe = min(k["x"] - abs(x), abs(x) - k.get("x0", -1.0)) / k["bevel_m"]; dye = min(y - k["y0"], k["y1"] - y) / k["bevel_m"]
+                f = float(np.clip(min(dxe, dye), 0.0, 1.0)); z += k["depth_m"] * f
+            G[i, j] = (x, y, z)
+    nyy = G.shape[1]; PP, Q, N = G.reshape(-1, 3).tolist(), [], []
+    def name_at(c):   # 26 October 2026: a quad takes the name of the inset whose inner area holds its centre
+        for k in INS:
+            if k.get("x0", -1.0) + 1e-6 < abs(c[0]) < k["x"] - 1e-6 and k["y0"] + 1e-6 < c[1] < k["y1"] - 1e-6:
+                return k["name"] if "x0" not in k else k["name"].replace("_C", "_L" if c[0] > 0 else "_R")
+        return "CAR_body_tail_face_C"
     for i in range(nx - 1):
-        for j in range(ny - 1):
-            a, b = i * ny + j, (i + 1) * ny + j; Q.append([a, a + 1, b + 1, b]); N.append("CAR_body_tail_face_C")
+        for j in range(nyy - 1):
+            a, b = i * nyy + j, (i + 1) * nyy + j; q = [a, a + 1, b + 1, b]
+            P4 = G.reshape(-1, 3)[q]
+            if np.linalg.norm(np.cross(P4[2] - P4[0], P4[3] - P4[1])) < 1e-9: continue   # degenerate (clamped rows)
+            Q.append(q); N.append(name_at(P4.mean(0)))
     json.dump({"_date": "25 October 2026", "cut_z": zc, "cut_tilt": None}, open(out.replace(".npz", "_cut.json"), "w"))
     np.savez(out, P=np.array(PP, np.float32), Q=np.array(Q, dtype=object), names=np.array(N))
     print(json.dumps({"quads": len(Q), "xmax": round(xmax, 3), "z_range": [round(float(G[..., 2].min()), 3), round(float(G[..., 2].max()), 3)]}))

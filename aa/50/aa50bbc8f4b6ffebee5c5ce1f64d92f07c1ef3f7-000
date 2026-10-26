@@ -1,0 +1,37 @@
+# 26 October 2026 : ZenRay Meshes, SHEET BOARD for a human : each view of the sheet next to the model rendered in the SAME
+# panel camera as SheetScore, but shaded like CleanView (smooth normals, soft key light, sheet grey backdrop), so the two
+# read alike ; the score board stays the measuring tool, this one is the one to look at. FR : planche à regarder.
+# Usage: python SheetBoard.py <frame_dir> <views_dir> <car.npz> <out.png> [cusp_deg=10]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import Raster
+
+
+def main(fdir, vdir, npz, out, cusp=10):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    d = np.load(npz, allow_pickle=True); r = Raster.Renderer(d["P"], d["F"], smooth_deg=float(cusp))
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D; rows = []
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
+        rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+        if v["name"] == "top" and tz[1] < 0 or v["name"] == "bottom" and tz[1] > 0: tz = -tz
+        a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+        umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+        s = v["px_per_m"]; bb = v["bbox"]; R = int(max(ref.shape)); xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+        cu = umin + D[a] / 2 + (R / 2 - xc) / s; cv = vmax - D[b] / 2 + (yc - R / 2) / s
+        M, _, N, _ = r.render(cu * rx + cv * uy, s, (rx.tolist(), uy.tolist(), tz.tolist()), R)
+        M = M[: ref.shape[0], : ref.shape[1]]; N = N[: ref.shape[0], : ref.shape[1]]
+        L = np.array([0.30, 0.55, 0.78]); L /= np.linalg.norm(L)
+        sh = np.clip(0.22 + 0.70 * np.clip((N * L).sum(-1), 0, 1), 0, 1)
+        img = np.where(M, sh * 200, float(np.median(ref))).astype(np.uint8)
+        rows.append(np.concatenate([ref, img], 1))
+    r.release()
+    Wd = max(x.shape[1] for x in rows); B = np.concatenate([np.pad(x, ((0, 4), (0, Wd - x.shape[1])), constant_values=40) for x in rows], 0)
+    Image.fromarray(B).save(out); print(out)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
