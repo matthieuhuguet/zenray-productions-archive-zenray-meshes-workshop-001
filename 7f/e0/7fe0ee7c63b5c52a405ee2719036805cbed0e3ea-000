@@ -1,0 +1,245 @@
+# 26 October 2026, 19:10 : ZenRay Meshes, evolution video of the conifer (object tree_con) WITHOUT its leaves.
+# One square image per version, drawn with the smooth renderer of Raster.py (the one CleanView.py uses), with the same
+# views, light and greys. One camera for every version: CleanView.py refits its camera on each image, which would hide the
+# growth, so the centre and the size are read once, on the last version, and reused for all of them. The version label
+# sits at the bottom left. Then H.264 through ffmpeg, and an ffprobe check that fails loudly if the video is not the one asked.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I Scripts/ConiferEvolution.py --tags gen29,g33,g36,w43,w46 --out <mp4>
+# FR : vidéo d'évolution du conifère sans feuilles ; une seule caméra pour toutes les versions ; tous les réglages sont en tête.
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, os.path.join(ROOT, "Scripts"))
+import Raster  # the GPU smooth renderer that CleanView.py also uses
+
+# ---- defaults: the only place where a value lives (HDA style) ----
+DEFAULT_TAGS = "gen29,g33,g36,w43,w46"      # chronological order ; the last tag sets the camera
+DEFAULT_OBJ = "tree_con"                    # render files are work/<obj>/render_<tag>.npz
+DEFAULT_SIZE = 1024                         # square side in pixels, even (yuv420p)
+DEFAULT_FPS = 4                             # 0.25 s per version
+DEFAULT_HOLD_SECONDS = 1.5                  # the last version stays on screen this long
+DEFAULT_FOCUS_Y = "auto"                    # "auto": whole wood of the last version ; or "ymin,ymax" in metres
+DEFAULT_EXCLUDE = "leaves"                  # comma separated words ; a part whose name contains one is not drawn
+DEFAULT_VIEW = "three_quarter_front"
+DEFAULT_CUSP_DEG = 30.0                     # smooth shading cusp angle, as CleanView.py
+DEFAULT_LABEL_SHARE = 0.04                  # label height as a share of the image side
+DEFAULT_FRAMES_DIR = os.path.join(ROOT, "Evolution/Conifer/frames")
+DEFAULT_OUT = os.path.join(ROOT, "Evolution/Conifer/Conifer_evolution_wood_26-October-2026.mp4")
+DEFAULT_FONT = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"
+DEFAULT_FFMPEG = "/opt/homebrew/bin/ffmpeg"
+
+# View axes (right, up), copied from CleanView.py so that the same names give the same views.
+VIEWS = {
+    "three_quarter_front": ((0.70, 0.0, -0.71), (-0.25, 0.94, -0.25)),
+    "three_quarter_rear": ((-0.70, 0.0, 0.71), (0.25, 0.94, 0.25)),
+    "side": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+    "front": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    "back": ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+}
+KEY_LIGHT = np.array([0.30, 0.55, 0.78])   # the key light of CleanView.py
+BACKGROUND_GREY = 92                       # CleanView.py value of a pixel with no surface
+MESH_GREY_MAX = 235                        # CleanView.py value of a fully lit surface
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evolution video of a ZenRay Meshes object, without its leaves.")
+    parser.add_argument("--tags", default=DEFAULT_TAGS, help="versions in chronological order ; the last one sets the camera")
+    parser.add_argument("--obj", default=DEFAULT_OBJ, help="object folder under work/ that holds the render files")
+    parser.add_argument("--size", type=int, default=DEFAULT_SIZE, help="square image side in pixels, even")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="versions shown per second")
+    parser.add_argument("--hold-seconds", type=float, default=DEFAULT_HOLD_SECONDS, help="time the last version stays on screen")
+    parser.add_argument("--focus-y", default=DEFAULT_FOCUS_Y, help="'auto' or 'ymin,ymax': height band that sets the camera, read once")
+    parser.add_argument("--exclude", default=DEFAULT_EXCLUDE, help="comma separated words ; parts whose name contains one are dropped, '' keeps all")
+    parser.add_argument("--view", default=DEFAULT_VIEW, choices=sorted(VIEWS), help="view of every frame")
+    parser.add_argument("--cusp", type=float, default=DEFAULT_CUSP_DEG, help="smooth shading cusp angle in degrees")
+    parser.add_argument("--label-share", type=float, default=DEFAULT_LABEL_SHARE, help="label height as a share of the image side")
+    parser.add_argument("--frames-dir", default=DEFAULT_FRAMES_DIR, help="one PNG per version, named NN_tag.png")
+    parser.add_argument("--out", default=DEFAULT_OUT, help="output MP4 path")
+    parser.add_argument("--font", default=DEFAULT_FONT, help="font file of the version label")
+    parser.add_argument("--ffmpeg", default=DEFAULT_FFMPEG, help="ffmpeg binary ; ffprobe is looked up next to it")
+    args = parser.parse_args()
+    if args.size <= 0 or args.size % 2:
+        parser.error("--size must be a positive even number")
+    if args.fps <= 0:
+        parser.error("--fps must be a positive integer")
+    if args.hold_seconds < 0:
+        parser.error("--hold-seconds must be zero or more")
+    return args
+
+
+def load_faces(npz_path, drop_words):
+    """Vertices and faces left after the part filter, exactly as CleanView.py filters them."""
+    data = np.load(npz_path, allow_pickle=True)
+    points, faces = data["P"], data["F"]
+    if drop_words:
+        if "T" not in data.files or "names" not in data.files:
+            raise SystemExit("cannot drop parts %s: %s has no T or names array" % (drop_words, npz_path))
+        names = [str(name) for name in data["names"]]
+        keep_part = np.array([not any(word in name for word in drop_words) for name in names], dtype=bool)
+        faces = faces[keep_part[data["T"].astype(np.int64)]]
+    return points, faces
+
+
+def camera_from_reference(points, faces, focus_y):
+    """Centre and diagonal of the reference wood, read once and reused for every version."""
+    used = points[np.unique(faces)]
+    if focus_y != "auto":
+        try:
+            y_low, y_high = (float(value) for value in focus_y.split(","))
+        except ValueError:
+            raise SystemExit("--focus-y must be 'auto' or 'ymin,ymax', got %r" % focus_y)
+        used = used[(used[:, 1] >= y_low) & (used[:, 1] <= y_high)]
+    if len(used) == 0:
+        raise SystemExit("no vertex of the reference inside the focus band %r" % focus_y)
+    center = (used.max(axis=0) + used.min(axis=0)) / 2.0
+    extent = float(np.linalg.norm(used.max(axis=0) - used.min(axis=0)))
+    return center, extent
+
+
+def render_grey(points, faces, center, extent, view_name, size, cusp_deg):
+    """Smooth shaded image of one version, drawn as CleanView.py draws it (same axes, light and greys)."""
+    right, up = (np.array(axis, dtype=float) for axis in VIEWS[view_name])
+    right = right / np.linalg.norm(right)
+    up = up - right * (up @ right)
+    up = up / np.linalg.norm(up)
+    depth = np.cross(right, up)
+    renderer = Raster.Renderer(points, faces, smooth_deg=float(cusp_deg))
+    try:
+        mask, _, normals, _ = renderer.render(center, size / (extent * 1.05), (right.tolist(), up.tolist(), depth.tolist()), size)
+    finally:
+        renderer.release()
+    light = KEY_LIGHT / np.linalg.norm(KEY_LIGHT)
+    shade = np.clip(0.18 + 0.82 * np.clip((normals * light).sum(-1), 0, 1), 0, 1)
+    return np.where(mask, shade * MESH_GREY_MAX, BACKGROUND_GREY).astype(np.uint8)
+
+
+def labelled_image(grey, text, size, font_path, label_share):
+    """RGB frame with the version label at the bottom left, light text with a dark outline."""
+    image = Image.fromarray(grey).convert("RGB")
+    font_px = max(8, round(size * label_share))
+    try:
+        font = ImageFont.truetype(font_path, font_px)
+    except OSError:
+        print("warning: font not found, the Pillow default font is used: %s" % font_path, file=sys.stderr)
+        font = ImageFont.load_default(size=font_px)
+    stroke = max(1, size // 400)
+    margin = round(size * 0.03)
+    draw = ImageDraw.Draw(image)
+    left, _, _, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    draw.text((margin - left, size - margin - bottom), text, font=font, fill=(245, 245, 245),
+              stroke_width=stroke, stroke_fill=(30, 30, 30))
+    return image
+
+
+def write_frames(images, tags, frames_dir):
+    """One PNG per version, numbered NN_tag.png ; only files of this pattern are replaced."""
+    os.makedirs(frames_dir, exist_ok=True)
+    for name in os.listdir(frames_dir):
+        if re.fullmatch(r"\d{2}_.+\.png", name):
+            os.remove(os.path.join(frames_dir, name))
+    paths = []
+    for number, (tag, image) in enumerate(zip(tags, images), start=1):
+        path = os.path.join(frames_dir, "%02d_%s.png" % (number, tag))
+        image.save(path)
+        paths.append(path)
+    return paths
+
+
+def stage_sequence(frame_paths, fps, hold_seconds, sequence_dir):
+    """Ordered entries for ffmpeg: each version once, then the last one held hold_seconds in total."""
+    hold_frames = max(1, round(hold_seconds * fps))
+    order = frame_paths[:-1] + [frame_paths[-1]] * hold_frames
+    os.makedirs(sequence_dir, exist_ok=True)
+    for name in os.listdir(sequence_dir):
+        if re.fullmatch(r"\d{3}\.png", name):
+            os.remove(os.path.join(sequence_dir, name))
+    for index, source in enumerate(order, start=1):
+        target = os.path.join(sequence_dir, "%03d.png" % index)
+        try:
+            os.link(source, target)   # same disk: the pixels are not written twice
+        except OSError:
+            shutil.copyfile(source, target)
+    return len(order)
+
+
+def encode(ffmpeg, sequence_dir, frame_count, fps, out_path):
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-framerate", str(fps), "-start_number", "1", "-i", os.path.join(sequence_dir, "%03d.png"),
+               "-frames:v", str(frame_count), "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+               "-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart", out_path]
+    subprocess.run(command, check=True)
+
+
+def probe_video(ffmpeg, out_path):
+    """What ffprobe reads back from the file: codec, size, rate, pixel format, counted frames, duration."""
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    result = subprocess.run([ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                             "stream=codec_name,width,height,r_frame_rate,pix_fmt,nb_read_frames:format=duration",
+                             "-of", "json", out_path], check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return {"codec": stream["codec_name"], "width": int(stream["width"]), "height": int(stream["height"]),
+            "rate": stream["r_frame_rate"], "pix_fmt": stream["pix_fmt"],
+            "frames": int(stream["nb_read_frames"]), "duration_s": round(float(info["format"]["duration"]), 3)}
+
+
+def main():
+    args = parse_args()
+    tags = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+    if not tags:
+        raise SystemExit("--tags is empty")
+    if len(set(tags)) != len(tags):
+        raise SystemExit("--tags repeats a version")
+    work_dir = os.path.join(ROOT, "work", args.obj)
+    render_paths = {tag: os.path.join(work_dir, "render_%s.npz" % tag) for tag in tags}
+    absent = [path for path in render_paths.values() if not os.path.isfile(path)]
+    if absent:
+        raise SystemExit("missing render file(s): %s" % ", ".join(absent))
+    drop_words = [word for word in args.exclude.split(",") if word]
+
+    reference_points, reference_faces = load_faces(render_paths[tags[-1]], drop_words)
+    center, extent = camera_from_reference(reference_points, reference_faces, args.focus_y)
+
+    images, kept_faces = [], {}
+    for tag in tags:
+        points, faces = load_faces(render_paths[tag], drop_words)
+        kept_faces[tag] = int(len(faces))
+        grey = render_grey(points, faces, center, extent, args.view, args.size, args.cusp)
+        images.append(labelled_image(grey, tag, args.size, args.font, args.label_share))
+        print("rendered %s: %d faces kept" % (tag, kept_faces[tag]), file=sys.stderr)
+
+    frame_paths = write_frames(images, tags, args.frames_dir)
+    sequence_dir = os.path.join(args.frames_dir, "sequence")
+    frame_count = stage_sequence(frame_paths, args.fps, args.hold_seconds, sequence_dir)
+    encode(args.ffmpeg, sequence_dir, frame_count, args.fps, args.out)
+
+    probed = probe_video(args.ffmpeg, args.out)
+    problems = []
+    if (probed["width"], probed["height"]) != (args.size, args.size):
+        problems.append("size")
+    if probed["codec"] != "h264" or probed["pix_fmt"] != "yuv420p":
+        problems.append("codec or pixel format")
+    if probed["rate"] != "%d/1" % args.fps:
+        problems.append("frame rate")
+    if probed["frames"] != frame_count:
+        problems.append("frame count")
+    summary = {"tags": tags, "faces_kept": kept_faces, "exclude": drop_words, "view": args.view,
+               "camera_centre_m": np.round(center, 4).tolist(), "camera_diagonal_m": round(extent, 4),
+               "focus_y": args.focus_y, "frames": frame_paths, "frame_count": frame_count,
+               "expected_duration_s": round(frame_count / args.fps, 3), "out": args.out, "probe": probed}
+    print(json.dumps(summary, indent=2))
+    if problems:
+        raise SystemExit("video check failed: %s" % ", ".join(problems))
+
+
+if __name__ == "__main__":
+    main()

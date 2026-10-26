@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+# 26 October 2026 19:02: wireframe turnover of the ZenRay Meshes car, the same orbit as CarTurnover.py.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/CarTurnoverWire.py --help
+# Camera, framing, background and mesh loading are imported from CarTurnover.py, which is read and never edited here.
+"""Orbit the ZenRay Meshes car once in wireframe: the real polygon edges drawn over the shaded surface.
+
+The edges are the consecutive corners of each polygon of the export, so a quad shows its four sides and never
+the diagonal of the fan triangulation that the surface uses.
+Hidden edges are removed with the test of TopoCheck.board: a sample of an edge is visible when its depth is not
+behind the depth buffer of the surface by more than edge_eps (4 mm). The test runs on samples spaced along every
+edge, not on its midpoint only, so a long edge that is half behind the car shows only its front half.
+Frames are rendered at size * supersample and reduced with a Lanczos filter, so the thin lines stay sharp.
+Frame k (1 based) is taken at start_azimuth + 360 * (k - 1) / frames degrees, exactly as in CarTurnover.py.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from fractions import Fraction
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster        # headless OpenGL rasteriser: depth buffer and camera space normals of the surface
+import CarTurnover   # camera, framing, mesh loader and turnover values, imported and never modified here
+
+PROJECT_DIR = CarTurnover.PROJECT_DIR
+DATE_TAG = CarTurnover.DATE_TAG
+FFMPEG = CarTurnover.FFMPEG
+FRAME_RE = CarTurnover.FRAME_RE                       # numbered PNG names such as 0001.png
+DURATION_TOLERANCE = CarTurnover.DURATION_TOLERANCE
+WIRE_DIR = os.path.join(PROJECT_DIR, "Evolution/Turnover/wire")
+SOLID_TURNOVER_DIR = os.path.join(PROJECT_DIR, "Evolution/Turnover")   # written by CarTurnover.py, never by this script
+VERSIONS_DIR = os.path.join(PROJECT_DIR, "versions")                   # the versioned models, never written here
+EDGE_CHUNK = 60000             # edges sampled together, to bound the memory of the sampling
+SAMPLE_STEP_PX = 0.5           # spacing of the edge samples in render pixels: two samples per pixel
+KEY_LIGHT = (0.30, 0.55, 0.78)  # key light of TopoCheck.board, fixed in camera space
+AMBIENT = 0.25                  # TopoCheck.board: level = 0.25 + 0.75 * clip(normal . light, 0, 1)
+
+# Tunable values. A flag overrides a default. The turnover values come from CarTurnover.DEFAULTS, so the camera stays identical.
+DEFAULTS = {
+    "npz": CarTurnover.DEFAULTS["npz"],                      # polygon export of the delivered car v470
+    "frames": CarTurnover.DEFAULTS["frames"],                # 24 frames: 15 degrees between two frames
+    "seconds": "3,5",                                        # one MP4 per duration, all built from the same frames
+    "size": 1024,                                            # output side in pixels, must be even
+    "supersample": 2,                                        # frames are rendered at size * supersample, then reduced
+    "elevation": CarTurnover.DEFAULTS["elevation"],          # camera height in degrees
+    "start_azimuth": CarTurnover.DEFAULTS["start_azimuth"],  # azimuth of frame 1 in degrees
+    "margin": CarTurnover.DEFAULTS["margin"],                # free band around the bounding sphere
+    "bg": CarTurnover.DEFAULTS["bg"],                        # flat background, #606060 as in the solid turnover
+    "surface_color": "#f0f0f0",                              # light grey surface at full light
+    "shade_floor": 0.5,                                      # darkest surface level, as a share of surface_color
+    "line_color": "#19191e",                                 # dark edges, the colour of TopoCheck.board
+    "line_px": 1.0,                                          # edge width in output pixels
+    "edge_eps": 0.004,                                       # metres, the edge_eps_m of TopoCheck.board
+    "smooth_deg": 30.0,                                      # vertex normals shared between faces up to this angle, as TopoCheck.board
+    "crf": 16,                                               # libx264 quality, lower is better: thin lines need it
+    "suffix": "",                                            # appended to the MP4 and manifest names, for example _2048
+    "out_dir": WIRE_DIR,
+}
+
+
+def polygon_edges(counts, corners):
+    # Unique undirected edges of the polygon mesh: each polygon gives its consecutive corner pairs,
+    # the last corner closing on the first one. Returns an (E, 2) array of vertex indices.
+    counts = np.asarray(counts, np.int64)
+    corners = np.asarray(corners, np.int64)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    owner_start = np.repeat(starts, counts)
+    local = np.arange(corners.size) - owner_start
+    successor = owner_start + (local + 1) % np.repeat(counts, counts)
+    pairs = np.sort(np.stack([corners, corners[successor]], axis=1), axis=1)
+    pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+    return np.unique(pairs, axis=0)
+
+
+def shade_surface(normals, surface_rgb, floor):
+    # Same level as TopoCheck.board. With surface_rgb 240 and floor 0.5 the colour is 120 + 120 * level.
+    light = np.asarray(KEY_LIGHT, np.float64)
+    light /= np.linalg.norm(light)
+    lit = np.clip(np.nan_to_num(normals.astype(np.float64) @ light), 0.0, 1.0)
+    level = np.clip(AMBIENT + (1.0 - AMBIENT) * lit, 0.0, 1.0)
+    return (floor + (1.0 - floor) * level)[..., None] * surface_rgb
+
+
+def paint_visible_edges(canvas, surface_depth, screen_a, screen_b, depth_a, depth_b, stamp, eps, line_rgb):
+    # Sample each projected edge every SAMPLE_STEP_PX pixels. A sample is visible when its depth is not behind
+    # the surface depth buffer by more than eps (the TopoCheck.board test). Visible samples are stamped in line colour.
+    # Returns (visible samples, samples inside the frame).
+    side = canvas.shape[0]
+    span = np.abs(screen_b - screen_a).max(axis=1)
+    counts = np.maximum(np.ceil(span / SAMPLE_STEP_PX).astype(np.int64), 1) + 1
+    owner = np.repeat(np.arange(len(counts)), counts)
+    first = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    along = (np.arange(owner.size) - np.repeat(first, counts)) / np.repeat(counts - 1, counts)
+    xy = screen_a[owner] + (screen_b - screen_a)[owner] * along[:, None]
+    depth = depth_a[owner] + (depth_b - depth_a)[owner] * along
+    col = np.floor(xy[:, 0]).astype(np.int64)
+    row = np.floor(xy[:, 1]).astype(np.int64)
+    inside = (col >= 0) & (col < side) & (row >= 0) & (row < side)
+    col, row, depth = col[inside], row[inside], depth[inside]
+    visible = depth >= surface_depth[row, col] - eps
+    col, row = col[visible], row[visible]
+    for dy in stamp:
+        for dx in stamp:
+            rows, cols = row + dy, col + dx
+            ok = (rows >= 0) & (rows < side) & (cols >= 0) & (cols < side)
+            canvas[rows[ok], cols[ok]] = line_rgb
+    return int(visible.sum()), int(inside.sum())
+
+
+def render_frames(points, faces, edges, settings):
+    # Render every frame at render_size, reduce it to size and write it into the frames folder.
+    # Returns the framing numbers and one record per frame.
+    centre, radius, half_width = CarTurnover.frame_sphere(points, faces, settings["margin"])
+    render_size = settings["render_size"]
+    scale = render_size / (2.0 * half_width)      # pixels per metre at the render size, the mapping of CarTurnover.py
+    half = render_size / 2.0
+    relative = points - centre
+    background = np.asarray(settings["background"], np.uint8)
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    records = []
+    renderer = Raster.Renderer(points, faces, smooth_deg=settings["smooth_deg"])
+    try:
+        for index in range(settings["frames"]):
+            azimuth = settings["start_azimuth"] + 360.0 * index / settings["frames"]
+            right, up, viewer = CarTurnover.camera_axes(azimuth, settings["elevation"])
+            mask, depth_img, normals, _face_id = renderer.render(centre, scale, (right, up, viewer), render_size)
+            canvas = np.empty((render_size, render_size, 3), np.uint8)
+            canvas[:] = background
+            shaded = shade_surface(normals, settings["surface_rgb"], settings["shade_floor"])
+            canvas[mask] = np.clip(np.rint(shaded[mask]), 0, 255).astype(np.uint8)
+            surface_depth = np.where(np.isnan(depth_img), -np.inf, depth_img.astype(np.float64))
+            screen = np.stack([relative @ right * scale + half, half - relative @ up * scale], axis=1)
+            depth = relative @ viewer
+            visible = total = 0
+            for start in range(0, len(edges), EDGE_CHUNK):
+                pair = edges[start:start + EDGE_CHUNK]
+                a, b = pair[:, 0], pair[:, 1]
+                seen, sampled = paint_visible_edges(canvas, surface_depth, screen[a], screen[b], depth[a], depth[b],
+                                                    settings["stamp"], settings["edge_eps"], settings["line_rgb"])
+                visible += seen
+                total += sampled
+            image = Image.fromarray(canvas)
+            if render_size != settings["size"]:
+                image = image.resize((settings["size"], settings["size"]), resample)
+            image.save(os.path.join(settings["frames_dir"], "%04d.png" % (index + 1)))
+            records.append({"frame": index + 1, "azimuth": round(azimuth, 4), "visible_samples": visible,
+                            "samples": total, "visible_share": round(visible / max(total, 1), 4)})
+    finally:
+        renderer.release()
+    return centre, radius, half_width, records
+
+
+def encode_videos(settings):
+    # Start one ffmpeg per duration at the same time, wait for each one, then probe it and check size, count, rate and duration.
+    running = []
+    for seconds in settings["seconds"]:
+        rate = Fraction(settings["frames"]) / Fraction(str(seconds))   # 24 frames in 3 s = 8 fps, in 5 s = 24/5 fps
+        out_path = os.path.join(settings["out_dir"], "Car_turnover_wire_%gs_%s%s.mp4" % (seconds, DATE_TAG, settings["suffix"]))
+        command = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                   "-framerate", str(rate), "-i", os.path.join(settings["frames_dir"], "%04d.png"),
+                   "-c:v", "libx264", "-crf", str(settings["crf"]), "-pix_fmt", "yuv420p",
+                   "-r", str(rate), "-movflags", "+faststart", out_path]
+        running.append((seconds, rate, out_path, subprocess.Popen(command)))
+    videos = []
+    for seconds, rate, out_path, process in running:
+        if process.wait() != 0:
+            raise SystemExit("ffmpeg failed for %s" % out_path)
+        probe = CarTurnover.probe_video(out_path)
+        checks = {
+            "square": probe["width"] == settings["size"] and probe["height"] == settings["size"],
+            "frame_count": probe["frames"] == settings["frames"],
+            "frame_rate": Fraction(probe["r_frame_rate"]) == rate,
+            "duration": abs(probe["duration"] - seconds) <= DURATION_TOLERANCE,
+        }
+        videos.append({"path": out_path, "fps": str(rate), "requested_seconds": seconds, "probe": probe,
+                       "checks": checks, "ok": all(checks.values())})
+    return videos
+
+
+def parse_args(argv):
+    # Every flag mirrors a DEFAULTS entry, so the help text shows the value that will be used.
+    parser = argparse.ArgumentParser(description="Wireframe turnover of the ZenRay Meshes car: one orbit, one set of frames, one MP4 per duration.")
+    parser.add_argument("--npz", default=DEFAULTS["npz"], help="polygon export of the car, keys P, C, I, T and names")
+    parser.add_argument("--frames", type=int, default=DEFAULTS["frames"], help="frames in one full turn")
+    parser.add_argument("--seconds", default=DEFAULTS["seconds"], help="comma separated durations, one MP4 each")
+    parser.add_argument("--size", type=int, default=DEFAULTS["size"], help="output side in pixels, even")
+    parser.add_argument("--supersample", type=int, default=DEFAULTS["supersample"], help="render at size times this factor, then reduce with Lanczos")
+    parser.add_argument("--elevation", type=float, default=DEFAULTS["elevation"], help="camera height in degrees")
+    parser.add_argument("--start-azimuth", type=float, default=DEFAULTS["start_azimuth"], help="azimuth of frame 1 in degrees")
+    parser.add_argument("--margin", type=float, default=DEFAULTS["margin"], help="free band around the bounding sphere, ratio of its radius")
+    parser.add_argument("--bg", default=DEFAULTS["bg"], help="flat background as a hex colour such as #606060")
+    parser.add_argument("--surface-color", default=DEFAULTS["surface_color"], help="surface colour at full light, hex")
+    parser.add_argument("--shade-floor", type=float, default=DEFAULTS["shade_floor"], help="darkest surface level as a share of the surface colour, 0 to 1")
+    parser.add_argument("--line-color", default=DEFAULTS["line_color"], help="edge colour, hex")
+    parser.add_argument("--line-px", type=float, default=DEFAULTS["line_px"], help="edge width in output pixels")
+    parser.add_argument("--edge-eps", type=float, default=DEFAULTS["edge_eps"], help="depth tolerance in metres of the hidden edge test")
+    parser.add_argument("--smooth-deg", type=float, default=DEFAULTS["smooth_deg"], help="vertex normals are shared between faces up to this angle")
+    parser.add_argument("--crf", type=int, default=DEFAULTS["crf"], help="libx264 quality, lower is better")
+    parser.add_argument("--suffix", default=DEFAULTS["suffix"], help="text appended to the MP4 and manifest names, such as _2048")
+    parser.add_argument("--out-dir", default=DEFAULTS["out_dir"], help="folder receiving frames/ and the MP4 files")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.size < 64 or args.size % 2:
+        raise SystemExit("--size must be an even number of pixels, at least 64")
+    if args.supersample < 1:
+        raise SystemExit("--supersample must be an integer of 1 or more")
+    if args.frames < 2:
+        raise SystemExit("--frames must be at least 2")
+    if not -89.0 < args.elevation < 89.0:
+        raise SystemExit("--elevation must lie strictly between -89 and 89 degrees")
+    if args.margin < 0 or args.crf < 0 or args.edge_eps < 0:
+        raise SystemExit("--margin, --crf and --edge-eps must not be negative")
+    if args.line_px <= 0:
+        raise SystemExit("--line-px must be positive")
+    if not 0.0 <= args.shade_floor <= 1.0:
+        raise SystemExit("--shade-floor must lie between 0 and 1")
+    out_dir = os.path.abspath(args.out_dir)
+    if out_dir in (SOLID_TURNOVER_DIR, VERSIONS_DIR) or out_dir.startswith(VERSIONS_DIR + os.sep):
+        raise SystemExit("refusing to write into %s: that folder belongs to another output" % out_dir)
+    seconds = CarTurnover.parse_seconds(args.seconds)
+    background = CarTurnover.parse_hex(args.bg)
+    surface_rgb = np.asarray(CarTurnover.parse_hex(args.surface_color), np.float64)
+    line_rgb = np.asarray(CarTurnover.parse_hex(args.line_color), np.uint8)
+    stamp_width = max(1, int(round(args.line_px * args.supersample)))
+
+    data = np.load(args.npz, allow_pickle=True)
+    if "C" not in data.files or "I" not in data.files:
+        raise SystemExit("%s has no polygon keys C and I, so its edges cannot be drawn" % args.npz)
+    points, faces, _parts, _names = CarTurnover.load_mesh(args.npz)
+    edges = polygon_edges(data["C"], data["I"])
+
+    frames_dir = os.path.join(out_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    for name in os.listdir(frames_dir):   # only the numbered PNG frames of this folder are replaced
+        if FRAME_RE.match(name):
+            os.remove(os.path.join(frames_dir, name))
+
+    settings = {
+        "frames": args.frames, "seconds": seconds, "size": args.size, "render_size": args.size * args.supersample,
+        "elevation": args.elevation, "start_azimuth": args.start_azimuth, "margin": args.margin,
+        "background": background, "surface_rgb": surface_rgb, "shade_floor": args.shade_floor,
+        "line_rgb": line_rgb, "edge_eps": args.edge_eps, "smooth_deg": args.smooth_deg,
+        "stamp": range(-(stamp_width // 2), stamp_width - stamp_width // 2),
+        "crf": args.crf, "suffix": args.suffix, "out_dir": out_dir, "frames_dir": frames_dir,
+    }
+    centre, radius, half_width, records = render_frames(points, faces, edges, settings)
+    videos = encode_videos(settings)
+
+    manifest = {
+        "date": DATE_TAG, "script": os.path.abspath(__file__), "npz": os.path.abspath(args.npz),
+        "size": args.size, "render_size": settings["render_size"], "supersample": args.supersample,
+        "frames": args.frames, "turn_degrees": 360, "direction": "counter-clockwise seen from above",
+        "elevation": args.elevation, "start_azimuth": args.start_azimuth, "step_degrees": 360.0 / args.frames,
+        "centre": [float(value) for value in centre], "bounding_radius": radius, "half_width": half_width,
+        "margin": args.margin, "background": "#%02x%02x%02x" % background,
+        "surface_color": args.surface_color, "shade_floor": args.shade_floor, "line_color": args.line_color,
+        "line_px": args.line_px, "stamp_px": stamp_width, "edge_eps": args.edge_eps, "smooth_deg": args.smooth_deg,
+        "polygons": int(len(data["C"])), "edges": int(len(edges)), "frame_records": records, "videos": videos,
+    }
+    manifest_path = os.path.join(out_dir, "Car_turnover_wire_manifest_%s%s.json" % (DATE_TAG, args.suffix))
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    print("frames: %s (%d images of %dx%d, rendered at %d)" % (frames_dir, args.frames, args.size, args.size, settings["render_size"]))
+    print("bounding radius %.4f, half width %.4f, centre %s" % (radius, half_width, [round(float(v), 4) for v in centre]))
+    print("polygons %d, unique edges %d, edge stamp %d render pixels" % (len(data["C"]), len(edges), stamp_width))
+    for video in videos:
+        print("video: %s, %s fps, probe %s, checks %s" % (video["path"], video["fps"], json.dumps(video["probe"]), json.dumps(video["checks"])))
+    print("manifest: %s" % manifest_path)
+    failed = [video["path"] for video in videos if not video["ok"]]
+    if failed:
+        raise SystemExit("verification failed for: %s" % ", ".join(failed))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
