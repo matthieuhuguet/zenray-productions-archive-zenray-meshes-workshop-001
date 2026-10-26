@@ -1,0 +1,48 @@
+# 26 October 2026 : ZenRay Meshes, RADIUS PROBE : the width of every strong limb measured DIRECTLY on the reference photograph, independent of the ridge scale and of the pipe model. For each node of a limb file seen
+# in a side view with a strong ridge, the grey profile is sampled across the limb (normal to its projected tangent), the width is the full width at half prominence of the bright peak, radius = width / 2 / px per metre.
+# The report is the ratio measured / model radius per class and the median radius per class. FR : sonde de rayon, largeur mesurée sur la photo contre le rayon du modèle. Usage: python RadiusProbe.py <limbs.npz> [obj=tree]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy.ndimage import map_coordinates, gaussian_filter
+import BranchLab as B
+
+
+def probe(path, obj="tree", radius=None, ret_nodes=False, min_y=None):
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, 1); d = np.load(path); N = d["nodes"]; par = d["parent"]; r = d["radius"] if radius is None else radius; out = []
+    G = {vn: gaussian_filter(V.gray[vn], 1.0) for vn in ("front", "back", "right", "left")}
+    for i in range(1, len(N)):
+        if N[i][1] < (V.crown_base + 0.5 if min_y is None else min_y): continue
+        j = par[i]; seg = N[i] - N[j]
+        if np.linalg.norm(seg) < 1e-6: continue
+        est = []
+        for vn in ("front", "back", "right", "left"):
+            p0x, p0y = V.project(vn, N[j][None]); p1x, p1y = V.project(vn, N[i][None]); t = np.array([p1x[0] - p0x[0], p1y[0] - p0y[0]]); L = np.linalg.norm(t)
+            if L < 2.0: continue
+            t = t / L; nrm = np.array([-t[1], t[0]]); cx, cy = p1x[0], p1y[0]; ii = np.arange(-30, 31, 0.5); xs = cx + nrm[0] * ii; ys = cy + nrm[1] * ii
+            if (xs < 1).any() or (ys < 1).any() or (xs > G[vn].shape[1] - 2).any() or (ys > G[vn].shape[0] - 2).any(): continue
+            prof = map_coordinates(G[vn], [ys, xs], order=1); k0 = int(np.argmax(prof[50:71])) + 50; pk = prof[k0]
+            # bright peak minus the two nearest local minima : half prominence width
+            l = k0
+            while l > 0 and prof[l - 1] <= prof[l] + 1e-4: l -= 1
+            rr = k0
+            while rr < len(prof) - 1 and prof[rr + 1] <= prof[rr] + 1e-4: rr += 1
+            base = max(prof[l], prof[rr]); prom = pk - base
+            if prom < 0.04: continue
+            half = base + prom / 2; a = k0
+            while a > l and prof[a] > half: a -= 1
+            b = k0
+            while b < rr and prof[b] > half: b += 1
+            w = (b - a) * 0.5; est.append(w / 2.0 / V.ppm[vn])
+        if len(est) >= 2: out.append((i, float(np.median(est)), float(r[i])))
+    if ret_nodes: return out
+    a = np.array(out); cls = lambda rr: "limb" if rr >= 0.12 else "branch"
+    res = {"n_probed": int(len(a))}
+    for c in ("limb", "branch"):
+        m = np.array([cls(x) == c for x in a[:, 2]]); 
+        if m.sum() >= 5: res[c] = {"n": int(m.sum()), "measured_radius_m_median": round(float(np.median(a[m, 1])), 3), "model_radius_m_median": round(float(np.median(a[m, 2])), 3), "ratio_measured_over_model_median": round(float(np.median(a[m, 1] / a[m, 2])), 2), "ratio_p10_p90": [round(float(np.percentile(a[m, 1] / a[m, 2], q)), 2) for q in (10, 90)]}
+    return res
+
+
+if __name__ == "__main__":
+    print(json.dumps(probe(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "tree")))
