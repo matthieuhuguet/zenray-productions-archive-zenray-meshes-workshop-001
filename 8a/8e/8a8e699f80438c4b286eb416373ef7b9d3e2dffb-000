@@ -1,0 +1,363 @@
+# 26 October 2026 : ZenRay Meshes, the METHODS of the branch tournament (shared by every organic object). Each method returns a tree graph (nodes, parent), the bench
+# (BranchLab) gives radii by the pipe model and the score. No Houdini, no render. FR : les méthodes du tournoi des branches, un graphe d'arbre chacune.
+# Usage : python BranchMethods.py <method id> [k=v ...] [obj=tree]   e.g.  python BranchMethods.py m10 tau=0.4
+import sys, os, json, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import BranchLab as B
+W = B.W
+
+
+def truth_curves(obj, nodes, parent, tol=0.3, ymin=7.8):
+    # 3D truth on a synthetic instance : precision = share of the curve samples lying on the truth wood surface, recall = share of the truth wood samples within tol of the curve. FR : vérité 3D des courbes.
+    from scipy.spatial import cKDTree
+    import TruthScore as T
+    tw = T.sample(W + "work/%s/topo_w_truth.npz" % obj, "branches", n=60000, ymin=ymin); cp = B.densify(nodes, parent, 0.1); cp = cp[cp[:, 1] > ymin]
+    dc = cKDTree(tw).query(cp)[0]; dt = cKDTree(cp).query(tw)[0]; return {"truth_precision": round(float((dc < tol).mean()), 3), "truth_recall": round(float((dt < tol).mean()), 3), "truth_chamfer": round(float((dc.mean() + dt.mean()) / 2), 3)}
+
+
+def setup(obj="tree", h=0.1, kmin=1, pair="max", comb="min"):
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, kmin); root = np.array(V.ms["trunk"]["points"][-1], float); r_root = float(V.ms["trunk"]["radius"][-1])
+    E, geo = B.evidence_volume(V, RL, h=h, y0=V.crown_base - 0.3, pair=pair, comb=comb); return V, RL, E, geo, root, r_root
+
+
+def _vox(P, geo):
+    x0, y0, z0, h = geo; return np.round((np.asarray(P, float) - np.array([x0, y0, z0])) / h).astype(int)
+
+
+def _world(I, geo):
+    x0, y0, z0, h = geo; return np.array([x0, y0, z0]) + np.asarray(I, float) * h
+
+
+def chains_smooth(nodes, parent, h, step=0.35, s_fac=0.8):
+    # one smoothing spline per chain between branch points and tips (car lesson : few control points, smooth by construction). FR : une spline lissée par tronçon.
+    from scipy.interpolate import splprep, splev
+    N = len(parent); kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    key = [i for i in range(N) if parent[i] < 0 or len(kids[i]) != 1]; out_n = []; out_p = []; ids = {}
+    for k in key:
+        if parent[k] < 0: ids[k] = len(out_n); out_n.append(nodes[k].copy()); out_p.append(-1)
+    for k in key:                                     # walk the chain up from every key node (order : key nodes are processed parent first)
+        pass
+    order = []; st = [i for i in range(N) if parent[i] < 0]
+    while st:
+        i = st.pop(); order.append(i); st.extend(kids[i])
+    keyset = set(key)
+    for k in order:
+        if parent[k] < 0: continue
+        chain = [k]; c = parent[k]
+        while c not in keyset: chain.append(c); c = parent[c]
+        chain.append(c); chain = chain[::-1]; P = nodes[chain]; top = ids[c]
+        if len(P) >= 5:
+            try:
+                tck, u = splprep(P.T, s=len(P) * (s_fac * h) ** 2, k=min(3, len(P) - 1)); L = float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1))); n = max(int(L / step), 1)
+                Q = np.array(splev(np.linspace(0, 1, n + 1), tck)).T; Q[0] = P[0]; Q[-1] = P[-1]
+            except Exception: Q = P
+        else: Q = P
+        prev = top
+        for j in range(1, len(Q)):
+            out_n.append(Q[j].copy()); out_p.append(prev); prev = len(out_n) - 1
+        ids[k] = prev
+    return np.array(out_n), np.array(out_p)
+
+
+def prune_spurs(nodes, parent, min_len=0.6):
+    # delete leaf chains shorter than min_len (iterated once from the shortest). FR : élaguer les chicots.
+    N = len(parent); kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    alive = np.ones(N, bool)
+    for i in range(N):
+        if kids[i] or parent[i] < 0: continue
+        chain = [i]; c = parent[i]; L = 0.0
+        while c >= 0 and len(kids[c]) == 1 and parent[c] >= 0: chain.append(c); c = parent[c]
+        L = sum(np.linalg.norm(nodes[a] - nodes[parent[a]]) for a in chain if parent[a] >= 0)
+        if L < min_len and c >= 0 and len(kids[c]) > 1: alive[chain] = False
+    idx = -np.ones(N, int); idx[alive] = np.arange(alive.sum()); par = np.array([idx[parent[i]] if parent[i] >= 0 else -1 for i in range(N) if alive[i]]); return nodes[alive], par
+
+
+def prune_subtree(nodes, parent, lmin):
+    # keep a node only if the wood carried by its subtree (itself and all descendants) is at least lmin metres : monotone, no collapse. FR : garder ce qui porte au moins lmin de bois.
+    N = len(parent); kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    order = []; st = [i for i in range(N) if parent[i] < 0]
+    while st:
+        i = st.pop(); order.append(i); st.extend(kids[i])
+    sub = np.zeros(N)
+    for i in reversed(order):
+        sub[i] = sum(sub[k] + np.linalg.norm(nodes[k] - nodes[i]) for k in kids[i])
+    alive = sub >= lmin; alive[[i for i in range(N) if parent[i] < 0]] = True; idx = -np.ones(N, int); idx[alive] = np.arange(alive.sum())
+    return nodes[alive], np.array([idx[parent[i]] if parent[i] >= 0 else -1 for i in range(N) if alive[i]])
+
+
+def m01_wp(V, RL, E, geo, root, r_root, args=None):
+    # grammar : the v21 procedural orders (TreeWP) with the visible fit numbers. FR : baseline v21.
+    import TreeWP
+    a = open(W + "work/tree/wp_args_visible.txt").read().strip().split("=", 1)[1]; p = {kv.split(":")[0]: float(kv.split(":")[1]) for kv in a.split(",")}
+    d = np.array(V.ms["trunk"]["points"][-1]) - np.array(V.ms["trunk"]["points"][-6]); d = d / np.linalg.norm(d); N, par, order = TreeWP.build(root, d, p); return N, par
+
+
+def m10_geodesic(V, RL, E, geo, root, r_root, tau=0.5, cover=4, eps=0.05, gamma=2.0, avg_min=0.40, min_new=8, smooth=1, trunk_k=1.5, trunk_up=3.0, spur=1.5):
+    # multi view : greedy growth by minimal paths from the trunk top in the cost volume 1 / (eps + E)^gamma, farthest evidence first, paths merge into a tree. FR : chemins minimaux.
+    from skimage.graph import MCP_Geometric
+    cost = 1.0 / (eps + E) ** gamma; m = MCP_Geometric(cost, fully_connected=True); r0 = tuple(_vox(root, geo)); cum, _ = m.find_costs([r0]); cum = np.where(np.isfinite(cum), cum, 0)
+    cand = np.argwhere(E >= tau); cand = cand[np.argsort(-cum[tuple(cand.T)])]; covered = np.zeros(E.shape, bool); node_id = {}; nodes = []; parent = []
+    # the trunk top is a thick cylinder : no target inside it, or the paths fill it with parallel lines. FR : cylindre du tronc exclu des cibles.
+    Pt = np.array(V.ms["trunk"]["points"]); d_ = Pt[-1] - Pt[-6]; d_ = d_ / np.linalg.norm(d_); I = np.indices(E.shape).reshape(3, -1).T; Wd = _world(I, geo) - root; tt = Wd @ d_; rad = np.linalg.norm(Wd - tt[:, None] * d_[None], axis=1)
+    covered[(np.abs(tt - trunk_up / 2) < trunk_up / 2 + 0.2).reshape(E.shape) & (rad < trunk_k * r_root).reshape(E.shape)] = True
+    def add(v, par_):
+        node_id[v] = len(nodes); nodes.append(_world(v, geo)); parent.append(par_); return node_id[v]
+    add(r0, -1); sh = np.array(E.shape)
+    for t in cand:
+        t = tuple(t)
+        if covered[t]: continue
+        path = [tuple(p_) for p_ in m.traceback(t)]; new = [p_ for p_ in path if p_ not in node_id]
+        if len(new) < min_new: covered[t] = True; continue
+        if float(np.mean([E[p_] for p_ in new])) < avg_min:
+            covered[t] = True; continue
+        prev = None
+        for p_ in path:
+            if p_ not in node_id: add(p_, node_id[prev] if prev is not None else -1)
+            prev = p_
+            lo = np.maximum(np.array(p_) - cover, 0); hi = np.minimum(np.array(p_) + cover + 1, sh); covered[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
+    N = np.array(nodes); par = np.array(parent)
+    if smooth: N, par = chains_smooth(N, par, geo[3])
+    return prune_subtree(N, par, spur)
+
+
+def m07_skeleton(V, RL, E, geo, root, r_root, tau=0.45, min_spur=0.6):
+    # multi view : threshold the soft evidence volume, keep the part reaching the trunk top, thin to a 3D skeleton, shortest path tree from the root. FR : squelette 3D de l'évidence douce.
+    from skimage.morphology import skeletonize
+    from scipy import ndimage as ndi
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+    bi = E >= tau; r0 = _vox(root, geo); lab, n = ndi.label(bi, structure=np.ones((3, 3, 3)))
+    near = lab[max(r0[0] - 3, 0): r0[0] + 4, max(r0[1] - 3, 0): r0[1] + 4, max(r0[2] - 3, 0): r0[2] + 4]; ids = np.unique(near[near > 0])
+    keep = np.isin(lab, ids) if len(ids) else bi; sk = skeletonize(keep); P = np.argwhere(sk); idx = -np.ones(E.shape, int); idx[tuple(P.T)] = np.arange(len(P)); rows = []; cols = []; w = []
+    for d in np.array([[a, b, c] for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1) if (a, b, c) > (0, 0, 0)]):
+        Q = P + d; ok = (Q >= 0).all(1) & (Q < np.array(E.shape)).all(1); Q = Q[ok]; j = idx[tuple(Q.T)]; sel = j >= 0
+        rows.append(np.arange(len(P))[ok][sel]); cols.append(j[sel]); w.append(np.full(sel.sum(), np.linalg.norm(d)))
+    rows, cols, w = map(np.concatenate, (rows, cols, w)); G = coo_matrix((w, (rows, cols)), shape=(len(P), len(P))); G = G + G.T
+    src = int(np.argmin(np.linalg.norm(P - r0, axis=1))); dist, pred = dijkstra(G, indices=src, return_predecessors=True); ok = np.isfinite(dist)
+    mp = -np.ones(len(P), int); mp[ok] = np.arange(ok.sum()); par = np.array([mp[pred[i]] if pred[i] >= 0 else -1 for i in np.nonzero(ok)[0]]); N = _world(P[ok], geo)
+    N, par = chains_smooth(N, par, geo[3]); return prune_spurs(N, par, min_spur)
+
+
+def subdivide(nodes, parent, step):
+    # insert nodes so that no edge is longer than step : sources and cover marks of a later stage need voxel spacing. FR : sous-diviser les arêtes.
+    out_n = list(nodes); out_p = list(parent)
+    for i, p_ in enumerate(parent):
+        if p_ < 0: continue
+        L = np.linalg.norm(nodes[i] - nodes[p_]); n = int(L / step)
+        if n < 1: continue
+        prev = p_
+        for j in range(1, n + 1):
+            out_n.append(nodes[p_] + (nodes[i] - nodes[p_]) * (j / (n + 1))); out_p.append(prev); prev = len(out_n) - 1
+        out_p[i] = prev
+    return np.array(out_n), np.array(out_p)
+
+
+def _grow(E, geo, nodes0, parent0, cyl_mask, tau, cover, eps, gamma, avg_min, min_new):
+    # greedy minimal-path growth from every node of an existing tree : farthest strong evidence first, new paths merge into the tree. FR : croissance par chemins minimaux depuis un arbre existant.
+    from skimage.graph import MCP_Geometric
+    cost = 1.0 / (eps + E) ** gamma; m = MCP_Geometric(cost, fully_connected=True); sh = np.array(E.shape); V0 = _vox(nodes0, geo); node_id = {}; nodes = [n.copy() for n in nodes0]; parent = [int(p_) for p_ in parent0]
+    for i, v in enumerate(V0):
+        v = tuple(np.clip(v, 0, sh - 1)); node_id.setdefault(v, i)
+    cum, _ = m.find_costs(list(node_id.keys())); cum = np.where(np.isfinite(cum), cum, 0); covered = cyl_mask.copy()
+    for v in node_id:
+        lo = np.maximum(np.array(v) - cover, 0); hi = np.minimum(np.array(v) + cover + 1, sh); covered[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
+    cand = np.argwhere(E >= tau); cand = cand[np.argsort(-cum[tuple(cand.T)])]
+    for t in cand:
+        t = tuple(t)
+        if covered[t]: continue
+        path = [tuple(p_) for p_ in m.traceback(t)]; new = [p_ for p_ in path if p_ not in node_id]
+        if len(new) < min_new or float(np.mean([E[p_] for p_ in new])) < avg_min: covered[t] = True; continue
+        prev = None
+        for p_ in path:
+            if p_ not in node_id: node_id[p_] = len(nodes); nodes.append(_world(p_, geo)); parent.append(node_id[prev] if prev is not None else -1)
+            prev = p_
+            lo = np.maximum(np.array(p_) - cover, 0); hi = np.minimum(np.array(p_) + cover + 1, sh); covered[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
+    return np.array(nodes), np.array(parent)
+
+
+def _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up):
+    Pt = np.array(V.ms["trunk"]["points"]); d_ = Pt[-1] - Pt[-6]; d_ = d_ / np.linalg.norm(d_); I = np.indices(E.shape).reshape(3, -1).T; Wd = _world(I, geo) - root; tt = Wd @ d_; rad = np.linalg.norm(Wd - tt[:, None] * d_[None], axis=1)
+    return ((np.abs(tt - trunk_up / 2) < trunk_up / 2 + 0.2) & (rad < trunk_k * r_root)).reshape(E.shape)
+
+
+def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6, s_fac=0.8, step=0.35):
+    # multi view, SpeedTree order : stage 1 thick limbs (ridges of large scale) from the trunk top, stage 2 branches (medium scale) hung on the limbs ; twigs stay procedural. FR : limbes puis branches.
+    R_, A_ = B.load_ridge(V.obj); E_thick, _ = B.evidence_volume(V, B.limb_map(R_, A_, 3), h=geo[3], y0=V.crown_base - 0.3); cyl = _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up)
+    # the trunk goes on above the crown base until the limbs part : a chain along the trunk axis, as long as the thick ridge supports it (at least ext_min, at most trunk_ext metres) ; without it the first
+    # limb segment turned sideways and the trunk tube ended in a visible step (v35 wood view). FR : prolongement du tronc jusqu'à la fourche.
+    Pt_ = np.array(V.ms["trunk"]["points"]); d_ = Pt_[-1] - Pt_[-6]; d_ = d_ / np.linalg.norm(d_); chain = [root.copy()]; low = 0
+    for i_ in range(1, int(trunk_ext / 0.2) + 1):
+        q_ = root + d_ * 0.2 * i_; side_ = np.cross(d_, [0, 0, 1.0]); side_ = side_ / (np.linalg.norm(side_) + 1e-9)
+        e_ = max(float(_sample_vol(E_thick, geo, (q_ + side_ * o_)[None])[0]) for o_ in (-0.3, 0.0, 0.3)); low = low + 1 if e_ < 0.12 else 0
+        if low >= 2 and i_ * 0.2 >= ext_min: break
+        chain.append(q_)
+    N0_ = np.array(chain); P0_ = np.array([-1] + list(range(len(chain) - 1)))
+    N, par = _grow(E_thick, geo, N0_, P0_, cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = chains_smooth(N, par, geo[3], step=step, s_fac=s_fac); N, par = prune_subtree(N, par, sub1)
+    N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = chains_smooth(N, par, geo[3], step=step, s_fac=s_fac); return prune_subtree(N, par, sub2)
+
+
+def _sample_vol(Ev, geo, P):
+    from scipy.ndimage import map_coordinates
+    x0, y0, z0, h = geo; I = (np.asarray(P, float) - np.array([x0, y0, z0])) / h; return map_coordinates(Ev, I.T, order=1, mode="constant", cval=0.0)
+
+
+def m02_colonize(V, RL, E, geo, root, r_root, tau=0.45, n_att=5000, infl=1.4, kill=0.45, step=0.3, iters=90, sub=2.5, seed=3):
+    # grammar free growth : space colonisation toward attractors drawn from the soft evidence volume. FR : colonisation d'espace vers des attracteurs d'évidence.
+    from scipy.spatial import cKDTree
+    rng = np.random.default_rng(seed); idx = np.argwhere(E >= tau); att = _world(idx[rng.choice(len(idx), min(n_att, len(idx)), replace=False)], geo); alive = np.ones(len(att), bool); nodes = [root.copy()]; parent = [-1]
+    for _ in range(iters):
+        if not alive.any(): break
+        Nn = np.array(nodes); t = cKDTree(Nn); d, nn = t.query(att[alive], distance_upper_bound=infl); ok = np.isfinite(d)
+        if not ok.any(): break
+        grow = {}
+        for a, n in zip(att[alive][ok], nn[ok]):
+            v = a - Nn[n]; grow.setdefault(n, []).append(v / (np.linalg.norm(v) + 1e-9))
+        for n, vs in grow.items():
+            dv = np.mean(vs, 0); dv /= np.linalg.norm(dv) + 1e-9; nodes.append(Nn[n] + dv * step); parent.append(int(n))
+        t = cKDTree(np.array(nodes)); d2, _ = t.query(att); alive &= d2 > kill
+    N, par = chains_smooth(np.array(nodes), np.array(parent), geo[3]); return prune_subtree(N, par, sub)
+
+
+def m04_gram_fit(V, RL, E, geo, root, r_root, rounds=2):
+    # grammar fitted on the ridge bench : the TreeWP numbers by coordinate search on the tournament score G itself (not the X-ray wood). FR : grammaire réglée sur le score de crêtes.
+    import TreeWP, WpFit
+    d = np.array(V.ms["trunk"]["points"][-1]) - np.array(V.ms["trunk"]["points"][-6]); d = d / np.linalg.norm(d); cur = dict(WpFit.DEF); cur.update({k: float(v) for k, v in [kv.split(":") for kv in open(W + "work/tree/wp_args_visible.txt").read().strip().split("=", 1)[1].split(",")]})
+    def G(q):
+        N, par, _ = TreeWP.build(root, d, q); rad = B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6); return B.score(V, RL, N, par, rad)["G"]
+    best = G(cur)
+    for _ in range(int(rounds)):
+        for order in (1, 2, 3):
+            for k, cands in WpFit.SPACE[order].items():
+                for c in cands:
+                    if c == cur[k]: continue
+                    t = dict(cur); t[k] = c; g = G(t)
+                    if g > best + 1e-4: best, cur = g, t
+    N, par, _ = TreeWP.build(root, d, cur); return N, par
+
+
+def m06_hull_lift(V, RL, E, geo, root, r_root, thr=0.5, sub=2.0):
+    # image based : the 2D skeleton of the front limb ridges lifted to depth by the middle of the visual hull along the view axis. FR : squelette 2D de la face relevé par la coque.
+    from skimage.morphology import skeletonize
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+    hull = np.load(W + "work/tree/hull_B.npz"); occ = hull["occ"]; org = hull["origin"]; vx = float(hull["voxel"]); M = RL["front"] >= thr; rows = np.zeros(M.shape[0], bool); rows[: int(round(V.cal["front"][0][1] * (V.crown_base - 0.3) + V.cal["front"][1][1])) + 1] = True; M &= rows[:, None]
+    sk = skeletonize(M); ys, xs = np.nonzero(sk); a, b = np.array(V.cal["front"][0]), np.array(V.cal["front"][1]); X = (xs - b[0]) / a[0]; Y = (ys - b[1]) / a[1]; pts = []
+    for x, y in zip(X, Y):
+        gi = int((x - org[0]) / vx); gj = int((y - org[1]) / vx)
+        if not (0 <= gi < occ.shape[0] and 0 <= gj < occ.shape[1]): pts.append(None); continue
+        zz = np.nonzero(occ[gi, gj, :])[0]; pts.append(None if len(zz) == 0 else [x, y, org[2] + zz.mean() * vx])
+    keep = [i for i, p_ in enumerate(pts) if p_ is not None]; P = np.array([pts[i] for i in keep]); from scipy.spatial import cKDTree
+    t = cKDTree(P); pairs = t.query_pairs(0.18); r_ = np.array([i for i, j in pairs] + [j for i, j in pairs]); c_ = np.array([j for i, j in pairs] + [i for i, j in pairs]); w = np.linalg.norm(P[r_] - P[c_], axis=1) + 1e-6
+    G_ = coo_matrix((w, (r_, c_)), shape=(len(P), len(P))); src = int(np.argmin(np.linalg.norm(P - root, axis=1))); dist, pred = dijkstra(G_, indices=src, return_predecessors=True); ok = np.isfinite(dist)
+    mp = -np.ones(len(P), int); mp[ok] = np.arange(ok.sum()); par = np.array([mp[pred[i]] if pred[i] >= 0 else -1 for i in np.nonzero(ok)[0]]); N = P[ok]; N, par = chains_smooth(N, par, geo[3], step=step, s_fac=s_fac); return prune_subtree(N, par, sub)
+
+
+def m11_track(V, RL, E, geo, root, r_root, step=0.25, e_min=0.3, patience=6, spawn_e=0.5, spawn_every=0.8, max_walkers=400, sub=3.0, seed=5):
+    # tracking : walkers climb the evidence volume with momentum from the trunk top and spawn side walkers where a second ridge lies off axis. FR : suivi de crête avec élan.
+    from scipy.ndimage import gaussian_filter
+    Es = gaussian_filter(E, 0.8); rng = np.random.default_rng(seed); nodes = [root.copy()]; parent = [-1]; d0 = np.array(V.ms["trunk"]["points"][-1]) - np.array(V.ms["trunk"]["points"][-6]); d0 = d0 / np.linalg.norm(d0)
+    cone = rng.normal(0, 1, (60, 3)); cone /= np.linalg.norm(cone, axis=1)[:, None]; walkers = [(0, d0, 0.0)]; n_w = 0; done = np.zeros(E.shape, bool)
+    while walkers and n_w < max_walkers:
+        i0, d, _ = walkers.pop(0); n_w += 1; cur = i0; bad = 0; since = 0.0
+        for _ in range(240):
+            c = d[None] * 0.0 + cone; ok = (c @ d) > np.cos(np.radians(45)); cand = c[ok]; pos = nodes[cur]; sc = _sample_vol(Es, geo, pos[None] + cand * step * 1.5)
+            j = int(np.argmax(sc)); e = float(sc[j]); nd = 0.6 * d + 0.4 * cand[j]; nd /= np.linalg.norm(nd) + 1e-9
+            if e < e_min: bad += 1
+            else: bad = 0
+            if bad >= patience: break
+            q = pos + nd * step; vi = np.round((q - np.array(geo[:3])) / geo[3]).astype(int)
+            if (vi < 0).any() or (vi >= np.array(E.shape)).any(): break
+            if done[tuple(vi)]: break
+            done[max(vi[0] - 1, 0): vi[0] + 2, max(vi[1] - 1, 0): vi[1] + 2, max(vi[2] - 1, 0): vi[2] + 2] = True
+            nodes.append(q); parent.append(cur); cur = len(nodes) - 1; d = nd; since += step
+            if since >= spawn_every:
+                since = 0.0; side = np.nonzero((cand @ d) < np.cos(np.radians(70)))[0]
+                allc = cone; sc2 = _sample_vol(Es, geo, nodes[cur][None] + allc * step * 2.0); off = (allc @ d) < np.cos(np.radians(60)); sc2 = np.where(off, sc2, 0); k = int(np.argmax(sc2))
+                if sc2[k] >= spawn_e: walkers.append((cur, allc[k], 0.0))
+    N, par = chains_smooth(np.array(nodes), np.array(parent), geo[3]); return prune_subtree(N, par, sub)
+
+
+def m13_snake(V, RL, E, geo, root, r_root, base="m20", iters=25, a=0.5, b=0.4):
+    # optimisation : the curves of the staged method are pulled up the evidence gradient while a smoothing term keeps them smooth (active curve). FR : courbe active sur le volume d'évidence.
+    from scipy.ndimage import gaussian_filter
+    N, par = METHODS[base](V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, sub2=2.5); N = N.copy(); Es = gaussian_filter(E, 1.0); h = geo[3]; kids = [[] for _ in N]
+    for i, p_ in enumerate(par):
+        if p_ >= 0: kids[p_].append(i)
+    for _ in range(int(iters)):
+        g = np.zeros_like(N)
+        for ax in range(3):
+            e = np.zeros(3); e[ax] = h; g[:, ax] = (_sample_vol(Es, geo, N + e) - _sample_vol(Es, geo, N - e)) / (2 * h)
+        gn = np.linalg.norm(g, axis=1)[:, None] + 1e-9; M = N.copy()
+        for i in range(1, len(N)):
+            nb = [par[i]] + kids[i]; M[i] = N[nb].mean(0)
+        N2 = N + a * h * 0.5 * g / gn + b * (M - N); N2[0] = N[0]; N = N2
+    return N, par
+
+
+def m14_fusion(V, RL, E, geo, root, r_root):
+    # fusion : minimal paths (m20) refined by the active curve (m13). FR : fusion m20 puis m13.
+    return m13_snake(V, RL, E, geo, root, r_root, base="m20", iters=25)
+
+
+def m15_snake2d(V, RL, E, geo, root, r_root, base="m20", iters=20, eta=0.04, smooth=0.5, max_move=0.3, views=("front", "back", "right", "left", "top", "bottom")):
+    # optimisation : every node is pulled by the 2D gradient of the soft limb ridge in each view that sees it (chain rule to world axes), a smoothing term keeps the curve, the move is capped. FR : courbe active sur les crêtes 2D de chaque vue.
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    N0, par = METHODS[base](V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, tau2=0.25, sub2=4.5, avg2=0.3); N = N0.copy(); kids = [[] for _ in N]
+    for i, p_ in enumerate(par):
+        if p_ >= 0: kids[p_].append(i)
+    Rs = {vn: gaussian_filter(RL[vn], 1.5) for vn in views}; G = {}
+    for vn in views: gy, gx = np.gradient(Rs[vn]); G[vn] = (gx, gy)
+    for _ in range(int(iters)):
+        F = np.zeros_like(N)
+        for vn in views:
+            v = V.vm[vn]; px, py = V.project(vn, N); gx = map_coordinates(G[vn][0], [py, px], order=1, mode="constant"); gy = map_coordinates(G[vn][1], [py, px], order=1, mode="constant")
+            a = np.array(V.cal[vn][0]); f = gx[:, None] * a[0] * np.array(v["rx"])[None] + gy[:, None] * a[1] * np.array(v["uy"])[None]; F += f
+        nrm = np.linalg.norm(F, axis=1)[:, None]; F = F / np.maximum(nrm, 1e-9) * np.minimum(nrm, 1.0)
+        M = N.copy()
+        for i in range(1, len(N)): M[i] = N[[par[i]] + kids[i]].mean(0)
+        N2 = N + eta * F + smooth * 0.25 * (M - N); N2[0] = N[0]; d = N2 - N0; dn = np.linalg.norm(d, axis=1)[:, None]; N = N0 + d * np.minimum(1.0, max_move / np.maximum(dn, 1e-9))
+    return N, par
+
+
+METHODS = {"m15": m15_snake2d, "m02": m02_colonize, "m04": m04_gram_fit, "m06": m06_hull_lift, "m11": m11_track, "m13": m13_snake, "m14": m14_fusion, "m20": m20_staged, "m01": m01_wp, "m07": m07_skeleton, "m10": m10_geodesic}
+
+
+def trunk_continuity(N, par, rad, r_root, length=3.0):
+    # the first limb path above the trunk top starts with the trunk radius and eases down to its own : no step between the trunk tube and the limb tube. FR : continuité de rayon du tronc au premier limbe.
+    kids = [[] for _ in N]
+    for i, p_ in enumerate(par):
+        if p_ >= 0: kids[p_].append(i)
+    path = [0]; L = 0.0
+    while kids[path[-1]] and L < length:
+        c = max(kids[path[-1]], key=lambda x: rad[x])
+        if len(kids[path[-1]]) >= 2 and sorted([rad[x] for x in kids[path[-1]]])[-2] > 0.6 * rad[c]: break   # a real fork : the path ends
+        L += float(np.linalg.norm(N[c] - N[path[-1]])); path.append(c)
+    end = rad[path[-1]]; Ls = np.concatenate([[0.0], np.cumsum([np.linalg.norm(N[path[k + 1]] - N[path[k]]) for k in range(len(path) - 1)])])
+    for k, i in enumerate(path): rad[i] = max(rad[i], r_root + (end - r_root) * (Ls[k] / max(Ls[-1], 1e-9)))
+    for i in range(1, len(N)): rad[i] = min(rad[i], rad[par[i]])   # taper stays monotone
+    return rad
+
+
+def run(mid, obj="tree", **kw):
+    t0 = time.time(); ev = {k: kw.pop(k) for k in ("kmin", "pair", "comb") if k in kw}; V, RL, E, geo, root, r_root = setup(obj, **ev); N, par = METHODS[mid](V, RL, E, geo, root, r_root, **kw); rad = np.sqrt(B.radius_from_ridge(V, RL, N, par, r_root) * B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6)); rad[par < 0] = r_root   # geometric mean : the ridge scale alone is too fat at forks, the pipe model alone too thin
+    rad = trunk_continuity(N, par, rad, r_root)
+    s = B.score(V, RL, N, par, rad); s["method"] = mid; s["ev"] = ev; s["seconds"] = round(time.time() - t0, 1); s["args"] = kw
+    if os.path.exists(W + "work/%s/topo_w_truth.npz" % obj): s.update(truth_curves(obj, N, par))
+    np.savez(W + "work/%s/branches_%s.npz" % (obj, mid), nodes=N, parent=par, radius=rad); B.board(V, N, par, rad, W + "versions/Branches_%s_%s.png" % (obj, mid), "%s %s F %s P %s Rthick %s Rmed %s nodes %d" % (obj, mid, s["F"], s["precision"], s["recall_thick"], s["recall_med"], len(N)))
+    return s
+
+
+if __name__ == "__main__":
+    mid = sys.argv[1]; kw = {}; obj = "tree"
+    for a in sys.argv[2:]:
+        k, v = a.split("=");
+        if k == "obj": obj = v
+        else: kw[k] = float(v) if "." in v or v.lstrip("-").isdigit() else v
+    kw = {k: (int(v) if isinstance(v, float) and v.is_integer() and k in ("cover", "min_new", "smooth", "cover1", "cover2", "min_new1", "min_new2") else v) for k, v in kw.items()}; r = run(mid, obj, **kw); print(json.dumps({k: r[k] for k in ('method', 'G', 'F', 'precision', 'recall_thick', 'recall_med', 'n_nodes', 'length_m', 'truth_precision', 'truth_recall', 'truth_chamfer', 'ev', 'args') if k in r}))

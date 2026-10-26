@@ -187,7 +187,43 @@ def _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up):
     return ((np.abs(tt - trunk_up / 2) < trunk_up / 2 + 0.2) & (rad < trunk_k * r_root)).reshape(E.shape)
 
 
-def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6):
+def smooth_curves(nodes, parent, tol=0.08, step=0.35):
+    # the branch curves as the tube builder sees them (the thickest child continues the parent, the other children start new curves) : each curve is one smoothing spline of the whole path, resampled every `step` metres,
+    # the child curves are attached to the nearest resampled point of their parent. Chopping at every fork left 2 and 3 point chains unsmoothed (a third of the limb steps turned by more than 25 degrees). FR : une spline par courbe de branche.
+    from scipy.interpolate import splprep, splev
+    N = len(parent); kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    size = np.ones(N)
+    order = []; st = [i for i in range(N) if parent[i] < 0]
+    while st:
+        i = st.pop(); order.append(i); st.extend(kids[i])
+    for i in reversed(order):
+        size[i] += sum(size[k] for k in kids[i])
+    out_n = [nodes[order[0]].copy()]; out_p = [-1]; stack = [(order[0], None)]; curve_pts = {}
+    while stack:
+        start, frm = stack.pop(); chain = ([frm] if frm is not None else []) + [start]; n = start
+        while kids[n]:
+            ks = sorted(kids[n], key=lambda c: -size[c]); n2 = ks[0]
+            for k in ks[1:]: stack.append((k, n))
+            chain.append(n2); n = n2
+        P = nodes[chain].copy(); attach = 0
+        if frm is not None:   # the attachment point : the nearest resampled node of the parent's curve (a node of out_n)
+            d = np.linalg.norm(np.array(out_n) - nodes[frm], axis=1); attach = int(np.argmin(d)); P[0] = out_n[attach]
+        if len(P) >= 4:
+            L = float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1))); w = np.ones(len(P)); w[0] = 1e3   # the start stays on the parent
+            try:
+                tck, _ = splprep(P.T, w=w, s=len(P) * tol ** 2, k=min(3, len(P) - 1)); m = max(int(L / step), 2); Q = np.array(splev(np.linspace(0, 1, m + 1), tck)).T; Q[0] = P[0]; Q[-1] = P[-1]
+            except Exception: Q = P
+        else: Q = P
+        prev = attach if frm is not None else 0
+        for j in range(1 if frm is None else 1, len(Q)):
+            if frm is None and j == 0: continue
+            out_n.append(Q[j].copy()); out_p.append(prev); prev = len(out_n) - 1
+    return np.array(out_n), np.array(out_p)
+
+
+def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2=2.5, cover1=5, cover2=4, eps=0.05, gamma=2.0, avg1=0.4, avg2=0.35, min_new1=8, min_new2=6, trunk_k=1.5, trunk_up=3.0, trunk_ext=3.0, ext_min=0.6, s_fac=0.8, step=0.35, tol=0.08):
     # multi view, SpeedTree order : stage 1 thick limbs (ridges of large scale) from the trunk top, stage 2 branches (medium scale) hung on the limbs ; twigs stay procedural. FR : limbes puis branches.
     R_, A_ = B.load_ridge(V.obj); E_thick, _ = B.evidence_volume(V, B.limb_map(R_, A_, 3), h=geo[3], y0=V.crown_base - 0.3); cyl = _trunk_cyl(V, E, geo, root, r_root, trunk_k, trunk_up)
     # the trunk goes on above the crown base until the limbs part : a chain along the trunk axis, as long as the thick ridge supports it (at least ext_min, at most trunk_ext metres) ; without it the first
@@ -199,8 +235,8 @@ def m20_staged(V, RL, E, geo, root, r_root, tau1=0.35, sub1=6.0, tau2=0.35, sub2
         if low >= 2 and i_ * 0.2 >= ext_min: break
         chain.append(q_)
     N0_ = np.array(chain); P0_ = np.array([-1] + list(range(len(chain) - 1)))
-    N, par = _grow(E_thick, geo, N0_, P0_, cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = chains_smooth(N, par, geo[3]); N, par = prune_subtree(N, par, sub1)
-    N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = chains_smooth(N, par, geo[3]); return prune_subtree(N, par, sub2)
+    N, par = _grow(E_thick, geo, N0_, P0_, cyl, tau1, cover1, eps, gamma, avg1, min_new1); N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); N, par = prune_subtree(N, par, sub1)
+    N, par = subdivide(N, par, geo[3]); N, par = _grow(E, geo, N, par, cyl, tau2, cover2, eps, gamma, avg2, min_new2); N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); return prune_subtree(N, par, sub2)
 
 
 def _sample_vol(Ev, geo, P):
@@ -256,7 +292,7 @@ def m06_hull_lift(V, RL, E, geo, root, r_root, thr=0.5, sub=2.0):
     keep = [i for i, p_ in enumerate(pts) if p_ is not None]; P = np.array([pts[i] for i in keep]); from scipy.spatial import cKDTree
     t = cKDTree(P); pairs = t.query_pairs(0.18); r_ = np.array([i for i, j in pairs] + [j for i, j in pairs]); c_ = np.array([j for i, j in pairs] + [i for i, j in pairs]); w = np.linalg.norm(P[r_] - P[c_], axis=1) + 1e-6
     G_ = coo_matrix((w, (r_, c_)), shape=(len(P), len(P))); src = int(np.argmin(np.linalg.norm(P - root, axis=1))); dist, pred = dijkstra(G_, indices=src, return_predecessors=True); ok = np.isfinite(dist)
-    mp = -np.ones(len(P), int); mp[ok] = np.arange(ok.sum()); par = np.array([mp[pred[i]] if pred[i] >= 0 else -1 for i in np.nonzero(ok)[0]]); N = P[ok]; N, par = chains_smooth(N, par, geo[3]); return prune_subtree(N, par, sub)
+    mp = -np.ones(len(P), int); mp[ok] = np.arange(ok.sum()); par = np.array([mp[pred[i]] if pred[i] >= 0 else -1 for i in np.nonzero(ok)[0]]); N = P[ok]; N, par = (smooth_curves(N, par, tol=tol, step=step) if tol > 0 else chains_smooth(N, par, geo[3], step=step, s_fac=s_fac)); return prune_subtree(N, par, sub)
 
 
 def m11_track(V, RL, E, geo, root, r_root, step=0.25, e_min=0.3, patience=6, spawn_e=0.5, spawn_every=0.8, max_walkers=400, sub=3.0, seed=5):

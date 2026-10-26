@@ -1,0 +1,67 @@
+# 26 October 2026 : ZenRay Meshes, CURVE STATS : the measured guides of a tree (the car's ShapeCheck for limbs). A limb file (nodes, parent, radius) is cut into chains (root, fork or tip to the next fork or tip) ; per chain and per class
+# (limb r >= 0.12 m, branch 0.04 to 0.12 m, twig below) : length, straightness, mean radius, taper, turning rate, kinks (turn above 25 degrees between two steps), fork angle, radius ratio ; per fork : the pipe exponent e that
+# solves sum(r_child^e) = r_parent^e (Leonardo da Vinci : e = 2) and the child/parent radius ratio ; plus the Strahler order. FR : mesures des guides 3D de l'arbre, propreté des courbes.
+# Usage: python CurveStats.py <limbs.npz> [label] [--json out.json]
+import sys, os, json
+import numpy as np
+from scipy.optimize import brentq
+
+
+def chains_of(N, par):
+    kids = [[] for _ in N]
+    for i, p in enumerate(par):
+        if p >= 0: kids[p].append(i)
+    key = {i for i in range(len(N)) if par[i] < 0 or len(kids[i]) != 1}; out = []
+    for k in key:
+        for c in kids[k]:
+            ch = [k, c]
+            while c not in key: c = kids[c][0]; ch.append(c)
+            out.append(ch)
+    return out, kids
+
+
+def strahler(kids, root=0):
+    o = {}
+    def f(i):
+        if not kids[i]: o[i] = 1; return 1
+        v = sorted((f(c) for c in kids[i]), reverse=True); o[i] = v[0] + 1 if len(v) > 1 and v[0] == v[1] else v[0]; return o[i]
+    sys.setrecursionlimit(100000); f(root); return o
+
+
+def stats(path, label=""):
+    d = np.load(path); N = d["nodes"]; par = d["parent"]; r = d["radius"]; chains, kids = chains_of(N, par); so = strahler(kids)
+    cls = lambda rr: "limb" if rr >= 0.12 else ("branch" if rr >= 0.04 else "twig"); rows = []
+    for ch in chains:
+        P = N[ch]; R = r[ch]; seg = np.diff(P, axis=0); sl = np.linalg.norm(seg, axis=1); L = float(sl.sum())
+        if L < 1e-6 or len(ch) < 2: continue
+        u = seg / np.maximum(sl[:, None], 1e-9); turn = np.degrees(np.arccos(np.clip((u[1:] * u[:-1]).sum(1), -1, 1))) if len(u) > 1 else np.zeros(0)
+        pr = ch[0]; fa = None
+        if par[pr] >= 0: din = N[pr] - N[par[pr]]; din = din / (np.linalg.norm(din) + 1e-9); fa = float(np.degrees(np.arccos(np.clip(float(u[0] @ din), -1, 1))))
+        rows.append({"class": cls(float(R.mean())), "length": L, "straight": float(np.linalg.norm(P[-1] - P[0]) / L), "r_mean": float(R.mean()), "taper_per_m": float((R[0] - R[-1]) / L), "turn_deg_per_m": float(turn.sum() / L) if len(turn) else 0.0,
+                     "kinks": int((turn > 25).sum()), "steps": int(len(sl)), "fork_angle": fa, "strahler": so[ch[-1]]})
+    forks = []
+    for i, k in enumerate(kids):
+        if len(k) >= 2 and r[i] > 0.02:
+            rc = np.sort(r[k])[::-1]; f = lambda e: float((rc ** e).sum() - r[i] ** e)
+            try: e = brentq(f, 0.5, 8.0) if f(0.5) * f(8.0) < 0 else None
+            except Exception: e = None
+            forks.append({"parent_r": float(r[i]), "n_children": len(k), "ratio_main": float(rc[0] / r[i]), "ratio_second": float(rc[1] / r[i]), "exponent": e})
+    out = {"label": label or os.path.basename(path), "n_nodes": int(len(N)), "n_chains": len(rows), "n_forks": len(forks), "length_total_m": round(float(sum(x["length"] for x in rows)), 1), "classes": {}}
+    for c in ("limb", "branch", "twig"):
+        R_ = [x for x in rows if x["class"] == c]
+        if not R_: continue
+        fa = [x["fork_angle"] for x in R_ if x["fork_angle"] is not None]
+        out["classes"][c] = {"chains": len(R_), "length_m_median": round(float(np.median([x["length"] for x in R_])), 2), "straightness_median": round(float(np.median([x["straight"] for x in R_])), 3), "radius_m_median": round(float(np.median([x["r_mean"] for x in R_])), 3),
+                             "taper_per_m_median": round(float(np.median([x["taper_per_m"] for x in R_])), 3), "turn_deg_per_m_median": round(float(np.median([x["turn_deg_per_m"] for x in R_])), 1), "kinks_total": int(sum(x["kinks"] for x in R_)), "steps_total": int(sum(x["steps"] for x in R_)),
+                             "clean_chain_share": round(float(np.mean([x["kinks"] == 0 for x in R_])), 3), "fork_angle_deg_p10_p50_p90": [round(float(np.percentile(fa, q)), 1) for q in (10, 50, 90)] if fa else None}
+    ex = [x["exponent"] for x in forks if x["exponent"] is not None]
+    out["pipe_exponent_median"] = round(float(np.median(ex)), 2) if ex else None; out["pipe_exponent_p10_p90"] = [round(float(np.percentile(ex, q)), 2) for q in (10, 90)] if ex else None
+    out["radius_ratio_main_child_median"] = round(float(np.median([x["ratio_main"] for x in forks])), 3) if forks else None; out["radius_ratio_second_child_median"] = round(float(np.median([x["ratio_second"] for x in forks])), 3) if forks else None
+    out["strahler_max"] = int(max(so.values())); out["strahler_counts"] = {str(k): int(v) for k, v in zip(*np.unique(list(so.values()), return_counts=True))}
+    return out
+
+
+if __name__ == "__main__":
+    o = stats(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "")
+    if "--json" in sys.argv: json.dump(o, open(sys.argv[sys.argv.index("--json") + 1], "w"), indent=1)
+    print(json.dumps(o))
