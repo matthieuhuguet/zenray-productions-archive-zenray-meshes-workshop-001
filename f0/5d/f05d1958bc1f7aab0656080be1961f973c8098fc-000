@@ -297,7 +297,27 @@ def m14_fusion(V, RL, E, geo, root, r_root):
     return m13_snake(V, RL, E, geo, root, r_root, base="m20", iters=25)
 
 
-METHODS = {"m02": m02_colonize, "m04": m04_gram_fit, "m06": m06_hull_lift, "m11": m11_track, "m13": m13_snake, "m14": m14_fusion, "m20": m20_staged, "m01": m01_wp, "m07": m07_skeleton, "m10": m10_geodesic}
+def m15_snake2d(V, RL, E, geo, root, r_root, base="m20", iters=20, eta=0.04, smooth=0.5, max_move=0.3, views=("front", "back", "right", "left", "top", "bottom")):
+    # optimisation : every node is pulled by the 2D gradient of the soft limb ridge in each view that sees it (chain rule to world axes), a smoothing term keeps the curve, the move is capped. FR : courbe active sur les crêtes 2D de chaque vue.
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    N0, par = METHODS[base](V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, tau2=0.25, sub2=4.5, avg2=0.3); N = N0.copy(); kids = [[] for _ in N]
+    for i, p_ in enumerate(par):
+        if p_ >= 0: kids[p_].append(i)
+    Rs = {vn: gaussian_filter(RL[vn], 1.5) for vn in views}; G = {}
+    for vn in views: gy, gx = np.gradient(Rs[vn]); G[vn] = (gx, gy)
+    for _ in range(int(iters)):
+        F = np.zeros_like(N)
+        for vn in views:
+            v = V.vm[vn]; px, py = V.project(vn, N); gx = map_coordinates(G[vn][0], [py, px], order=1, mode="constant"); gy = map_coordinates(G[vn][1], [py, px], order=1, mode="constant")
+            a = np.array(V.cal[vn][0]); f = gx[:, None] * a[0] * np.array(v["rx"])[None] + gy[:, None] * a[1] * np.array(v["uy"])[None]; F += f
+        nrm = np.linalg.norm(F, axis=1)[:, None]; F = F / np.maximum(nrm, 1e-9) * np.minimum(nrm, 1.0)
+        M = N.copy()
+        for i in range(1, len(N)): M[i] = N[[par[i]] + kids[i]].mean(0)
+        N2 = N + eta * F + smooth * 0.25 * (M - N); N2[0] = N[0]; d = N2 - N0; dn = np.linalg.norm(d, axis=1)[:, None]; N = N0 + d * np.minimum(1.0, max_move / np.maximum(dn, 1e-9))
+    return N, par
+
+
+METHODS = {"m15": m15_snake2d, "m02": m02_colonize, "m04": m04_gram_fit, "m06": m06_hull_lift, "m11": m11_track, "m13": m13_snake, "m14": m14_fusion, "m20": m20_staged, "m01": m01_wp, "m07": m07_skeleton, "m10": m10_geodesic}
 
 
 def run(mid, obj="tree", **kw):

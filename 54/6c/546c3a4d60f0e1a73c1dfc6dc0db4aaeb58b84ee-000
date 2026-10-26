@@ -1,0 +1,71 @@
+# 26 October 2026 : ZenRay Meshes, RING RELAX, a retopology step on the DELIVERY file : the vertices of the quads around each wheel arch are relaxed (uniform Laplacian, tangential, projected back on the
+# original surface sampled every 2 mm) so the wedge cells cut by the arc become regular quads ; rim, part boundaries and sharp creases stay fixed. The shape cannot move more than the sample spacing.
+# FR : relaxation des quads de l'anneau d'arche, projetée sur la surface d'origine ; l'arc, les bords de pièce et les plis vifs restent fixes.
+# Usage: python RingRelax.py <delivery_in.npz> <delivery_out.npz> [iters=20] [step=0.6] [ring_out_m=0.14] [crease_deg=25]
+import sys, os, json, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy.spatial import cKDTree
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+
+
+def main(src, dst, iters=20, step=0.6, ring_out=0.14, crease=25.0):
+    iters = int(iters); step = float(step); ring_out = float(ring_out); crease = float(crease)
+    d = np.load(src, allow_pickle=True); P0 = d["P"].astype(float); Q = [list(map(int, q)) for q in d["Q"]]; names = d["names"]; wheels = json.load(open(W + "work/car/wheel_params.json")); Rc = wheels["tyre_r"] * 1.14
+    cen = [(i["y"], i["z"]) for i in wheels["instances"] if i["x"] > 0]
+    cent = np.array([P0[q].mean(0) for q in Q]); body = np.array([str(n).startswith("CAR_body_") for n in names]); ring = np.zeros(len(Q), bool)
+    for yc, zc in cen:
+        r = np.hypot(cent[:, 1] - yc, cent[:, 2] - zc); ring |= (np.abs(cent[:, 0]) > 0.4) & (r > Rc - 0.01) & (r < Rc + ring_out) & body
+    # edges : use counts per part for the boundary, face normals for creases
+    ec = collections.Counter(); ef = collections.defaultdict(list)
+    for fi, q in enumerate(Q):
+        for k in range(len(q)):
+            e = (min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)])); ec[e] += 1; ef[e].append(fi)
+    def fn(q):
+        n = np.cross(P0[q[2]] - P0[q[0]], P0[q[3 % len(q)]] - P0[q[1]]); return n / (np.linalg.norm(n) + 1e-12)
+    normals = np.array([fn(q) for q in Q]); fixed = np.zeros(len(P0), bool); cosc = np.cos(np.radians(crease))
+    for e, c in ec.items():
+        if c == 1: fixed[list(e)] = True
+        else:
+            f1, f2 = ef[e][:2]
+            if float(normals[f1] @ normals[f2]) < cosc: fixed[list(e)] = True
+    rimr = np.full(len(P0), 9.0)
+    for yc, zc in cen: rimr = np.minimum(rimr, np.abs(np.hypot(P0[:, 1] - yc, P0[:, 2] - zc) - Rc / 1.14 * 1.14))
+    used = np.zeros(len(P0), bool)
+    for fi in np.nonzero(ring)[0]: used[Q[fi]] = True
+    nb = [set() for _ in P0]
+    for q in Q:
+        for k in range(len(q)): a, b = q[k], q[(k + 1) % len(q)]; nb[a].add(b); nb[b].add(a)
+    # arch rim : the vertices of the ring faces nearest the arc (radius within 3 mm of the smallest radius of the ring) stay fixed
+    rr = np.full(len(P0), 9.0)
+    for yc, zc in cen: rr = np.minimum(rr, np.hypot(P0[:, 1] - yc, P0[:, 2] - zc))
+    rim = used & (rr < (Rc - 0.01) + 0.004 + 0.0)
+    free = used & ~fixed & ~rim
+    for i in np.nonzero(free)[0]:   # a vertex joined to a far neighbour belongs to a big plate (floor, liner) : the Laplacian would drag it, keep it
+        if max(np.linalg.norm(P0[j] - P0[i]) for j in nb[i]) > 0.08: free[i] = False
+    # surface samples of the original faces, ONE TREE PER PART (a vertex may only be projected on the surface of its own part, never on a neighbouring layer) ; every 2 mm
+    vpart = np.empty(len(P0), object)
+    for fi, q in enumerate(Q): vpart[q] = str(names[fi])
+    rr_f = np.full(len(Q), 9.0)
+    for yc, zc in cen: rr_f = np.minimum(rr_f, np.hypot(cent[:, 1] - yc, cent[:, 2] - zc))
+    near = (rr_f < Rc + ring_out + 0.06) & (np.abs(cent[:, 0]) > 0.35) & body; rng = np.random.default_rng(0); samp = collections.defaultdict(list)
+    for fi in np.nonzero(near)[0]:
+        q = Q[fi]; nm = str(names[fi])
+        for j in range(1, len(q) - 1):
+            a, b, c = P0[q[0]], P0[q[j]], P0[q[j + 1]]; A = 0.5 * np.linalg.norm(np.cross(b - a, c - a)); n = max(int(A / 4e-6), 1)
+            u = rng.random((n, 2)); u = np.where(u.sum(1, keepdims=True) > 1, 1 - u, u); samp[nm].append(a + u[:, :1] * (b - a) + u[:, 1:] * (c - a))
+        for v in q: samp[nm].append(P0[v][None])
+    trees = {k: (cKDTree(np.concatenate(v, 0)), np.concatenate(v, 0)) for k, v in samp.items()}; P = P0.copy(); idx = np.nonzero(free)[0]; groups = collections.defaultdict(list)
+    for i in idx: groups[vpart[i]].append(i)
+    for _ in range(iters):
+        tgt = np.array([P[list(nb[i])].mean(0) for i in idx]); Pn = P.copy(); Pn[idx] = P[idx] + step * (tgt - P[idx])
+        for nm, ii in groups.items():
+            if nm not in trees: continue
+            ii = np.array(ii); t, S = trees[nm]; dd, j = t.query(Pn[ii]); ok = dd < 0.03; P[ii[ok]] = S[j[ok]]
+        dv = P[idx] - P0[idx]; nrm = np.linalg.norm(dv, axis=1); sc = np.minimum(1.0, 0.04 / np.maximum(nrm, 1e-9)); P[idx] = P0[idx] + dv * sc[:, None]   # at most 4 cm from the original place   # a jump of more than 3 cm means the vertex left its surface : keep it where it was
+    mv = np.linalg.norm(P - P0, axis=1); print(json.dumps({"ring_faces": int(ring.sum()), "ring_vertices": int(used.sum()), "free": int(free.sum()), "fixed_boundary_or_crease": int((used & fixed).sum()), "rim": int(rim.sum()), "max_move_mm": round(float(mv.max() * 1000), 2), "mean_move_mm": round(float(mv[free].mean() * 1000), 2) if free.any() else 0}))
+    np.savez(dst, P=P, Q=np.array(Q, dtype=object), names=names)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
