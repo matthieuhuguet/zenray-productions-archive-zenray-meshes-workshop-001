@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+# 26 October 2026 18:15: evolution video of ZenRay Meshes, one square frame per version.
+# Every visual value lives in DEFAULTS or OBJECTS below, or behind a flag: one edit changes every frame.
+# Usage: python3 EvolutionVideo.py --obj car  |  python3 EvolutionVideo.py --obj tree --size 2048
+"""Build a square evolution MP4 of the ZenRay Meshes car or tree.
+
+Each source version becomes one square PNG frame, then the frames are encoded
+with libx264 at --fps (default 4, so one version lasts 0.25 second). The source
+files are only read: they are never modified, moved or deleted.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+PROJECT_DIR = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+VERSIONS_DIR = os.path.join(PROJECT_DIR, "versions")
+EVOLUTION_DIR = os.path.join(PROJECT_DIR, "Evolution")
+DATE_TAG = "26-October-2026"
+RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+
+FONT_CANDIDATES = [
+    "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf",  # GT Ultra Regular, first choice
+    "/System/Library/Fonts/Helvetica.ttc",                        # sans-serif fallback
+]
+FFMPEG_CANDIDATES = ["/opt/homebrew/bin/ffmpeg", "ffmpeg"]
+FFPROBE_CANDIDATES = ["/opt/homebrew/bin/ffprobe", "ffprobe"]
+
+# Tunable values. A flag overrides a default; the defaults rebuild the delivered MP4 files.
+DEFAULTS = {
+    "size": 1024,         # frame side in pixels, must be even
+    "fps": 4,             # frames per second: one version per frame, 0.25 second each
+    "label": 1,           # 1 draws the version label bottom left, 0 draws nothing
+    "hold_seconds": 1.5,  # the last version stays on screen this long
+    "crf": 18,            # libx264 quality, lower is better
+    "margin": 0.03,       # outer margin, ratio of the frame side
+    "label_band": 0.075,  # bottom band kept free for the label, ratio of the frame side
+    "label_font": 0.04,   # label font size, ratio of the frame side
+    "jobs": 16,           # parallel workers for the image stages
+    "max_version": 0,     # car only: 0 keeps every version, N keeps the versions up to N
+    "bg": "auto",         # "auto" measures the corner of each source, or a hex colour such as #606060
+}
+
+# Measured geometry of each source family, in source pixels.
+OBJECTS = {
+    "car": {
+        "source_size": (2130, 1800),     # every Car_v<N>_materials.png file
+        "crop": (0, 0, 1800, 1800),      # the four views; the material legend starts at x = 1800
+        "caption_box": None,             # nothing to hide
+    },
+    "tree": {
+        "source_size": (1236, 3726),     # every Tree_tree_<tag>_board.png file
+        "crop": (412, 0, 824, 620),      # row 1 (front), reproduction column: 412 x 620 pixels
+        "caption_box": (0, 0, 100, 26),  # yellow IoU caption inside the cell, crop coordinates
+    },
+}
+
+TREE_MAIN_LINE = ["v%d" % number for number in range(15, 43)] + ["w43", "f44"]
+CAR_MATERIALS_RE = re.compile(r"^Car_v(\d+)([a-z]?)_materials\.png$")
+CAR_FALLBACK_RE = re.compile(r"^Car_v(\d+)([a-z]?)_vs_ref\.png$")
+FRAME_RE = re.compile(r"^\d{4}\.png$")
+
+
+def parse_args(argv):
+    # Every flag mirrors a DEFAULTS entry, so the help text shows the value that will be used.
+    parser = argparse.ArgumentParser(description="Evolution video of ZenRay Meshes: one square frame per version.")
+    parser.add_argument("--obj", required=True, choices=sorted(OBJECTS), help="car or tree")
+    parser.add_argument("--size", type=int, default=DEFAULTS["size"], help="frame side in pixels, even")
+    parser.add_argument("--fps", type=int, default=DEFAULTS["fps"], help="frames per second, one version per frame")
+    parser.add_argument("--label", type=int, choices=[0, 1], default=DEFAULTS["label"], help="1 draws the version label, 0 none")
+    parser.add_argument("--out", default=None, help="output MP4 path")
+    parser.add_argument("--frames-dir", default=None, help="folder receiving the PNG frames")
+    parser.add_argument("--hold-seconds", type=float, default=DEFAULTS["hold_seconds"], help="time the last version stays on screen")
+    parser.add_argument("--crf", type=int, default=DEFAULTS["crf"], help="libx264 quality")
+    parser.add_argument("--jobs", type=int, default=DEFAULTS["jobs"], help="parallel workers")
+    parser.add_argument("--max-version", type=int, default=DEFAULTS["max_version"], help="car only: last version to keep, 0 keeps all")
+    parser.add_argument("--bg", default=DEFAULTS["bg"], help="auto, or a hex colour such as #606060")
+    parser.add_argument("--listing", default=None, help="text file with one source name per line (default: live listing)")
+    return parser.parse_args(argv)
+
+
+def first_existing(candidates):
+    # Return the first tool or file that exists, so a missing tool fails with a clear message.
+    for candidate in candidates:
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate):
+                return candidate
+        else:
+            found = shutil.which(candidate)
+            if found:
+                return found
+    raise SystemExit("none of these exists: %s" % ", ".join(candidates))
+
+
+def read_names(listing_path):
+    # Work on a frozen listing when one is given, otherwise on the live folder.
+    if listing_path:
+        with open(listing_path, encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    return os.listdir(VERSIONS_DIR)
+
+
+def select_car(names, max_version):
+    # One source per car version: materials first, vs_ref only as a hole filler.
+    materials, fallback = {}, {}
+    for name in names:
+        match = CAR_MATERIALS_RE.match(name)
+        if match:
+            materials[(int(match.group(1)), match.group(2))] = name
+            continue
+        match = CAR_FALLBACK_RE.match(name)
+        if match:
+            fallback[(int(match.group(1)), match.group(2))] = name
+    keys = sorted(set(materials) | set(fallback))
+    if max_version:
+        keys = [key for key in keys if key[0] <= max_version]
+    sources = []
+    for key in keys:
+        if key in materials:
+            file_name, kind = materials[key], "materials"
+        else:
+            file_name, kind = fallback[key], "vs_ref"
+        sources.append({"label": "v%d%s" % key, "file": file_name, "kind": kind})
+    present = {key[0] for key in keys}
+    last = max(present) if present else 0
+    absent = ["v%d" % number for number in range(1, last + 1) if number not in present]
+    return sources, absent
+
+
+def select_tree(names):
+    # One source per tree tag of the main line; a missing board is reported, never replaced.
+    available = set(names)
+    sources, absent = [], []
+    for tag in TREE_MAIN_LINE:
+        file_name = "Tree_tree_%s_board.png" % tag
+        if file_name in available:
+            sources.append({"label": tag, "file": file_name, "kind": "board"})
+        else:
+            absent.append(tag)
+    return sources, absent
+
+
+def verify_sizes(sources, expected):
+    # Read only the headers: a source with another size would be cropped at the wrong place.
+    wrong = []
+    for source in sources:
+        with Image.open(os.path.join(VERSIONS_DIR, source["file"])) as image:
+            if image.size != expected:
+                wrong.append((source["file"], image.size))
+    if wrong:
+        raise SystemExit("source size differs from the measured geometry: %s" % wrong[:5])
+
+
+def sample_corner(job):
+    # Worker: average the bottom left 12 x 12 pixels of the crop, the flat background of each source.
+    file_name, crop = job
+    with Image.open(os.path.join(VERSIONS_DIR, file_name)) as image:
+        region = image.convert("RGB").crop(crop)
+    width, height = region.size
+    pixels = list(region.crop((0, height - 12, 12, height)).getdata())
+    return tuple(int(round(sum(pixel[channel] for pixel in pixels) / float(len(pixels)))) for channel in range(3))
+
+
+def resolve_background(setting, samples):
+    # Median of the measured corners, or the colour given on the command line.
+    if setting != "auto":
+        match = re.match(r"^#?([0-9a-fA-F]{6})$", setting)
+        if not match:
+            raise SystemExit("--bg expects auto or a hex colour such as #606060")
+        value = match.group(1)
+        return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+    medians = []
+    for channel in range(3):
+        values = sorted(sample[channel] for sample in samples)
+        medians.append(values[len(values) // 2])
+    return tuple(medians)
+
+
+def label_colour(background):
+    # Pick black or near white by WCAG relative luminance, whichever contrasts more.
+    def linear(channel):
+        value = channel / 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+    red, green, blue = (linear(channel) for channel in background)
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    threshold = math.sqrt(1.05 * 0.05) - 0.05
+    return (20, 20, 20) if luminance > threshold else (245, 244, 240)
+
+
+def mask_caption(picture, box, background):
+    # Replace the yellow IoU caption of the comparison board by the flat background colour.
+    pixels = picture.load()
+    x0, y0, x1, y1 = box
+    for y in range(y0, min(y1, picture.size[1])):
+        for x in range(x0, min(x1, picture.size[0])):
+            red, green, blue = pixels[x, y][:3]
+            if red - blue > 20 and green - blue > 20 and abs(red - green) < 60:
+                pixels[x, y] = background
+
+
+def render_frame(job):
+    # Worker: crop one source, fit it without distortion, draw the label, save one square PNG.
+    file_name, out_path, crop, caption_box, label_text, settings = job
+    with Image.open(os.path.join(VERSIONS_DIR, file_name)) as image:
+        picture = image.convert("RGB").crop(crop)
+    background = settings["background"]
+    if caption_box:
+        mask_caption(picture, caption_box, background)
+    size = settings["size"]
+    margin = int(round(size * settings["margin"]))
+    band = int(round(size * settings["label_band"])) if settings["label"] else 0
+    box_w = size - 2 * margin
+    box_h = size - 2 * margin - band
+    src_w, src_h = picture.size
+    scale = min(box_w / float(src_w), box_h / float(src_h))
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    if abs(new_w / float(new_h) - src_w / float(src_h)) > 0.01:
+        raise ValueError("the aspect ratio would change for %s" % file_name)
+    canvas = Image.new("RGB", (size, size), background)
+    offset = (margin + (box_w - new_w) // 2, margin + (box_h - new_h) // 2)
+    canvas.paste(picture.resize((new_w, new_h), RESAMPLE), offset)
+    if settings["label"]:
+        font = ImageFont.truetype(settings["font_path"], settings["font_px"])
+        ImageDraw.Draw(canvas).text((margin, size - margin), label_text, font=font,
+                                    fill=label_colour(background), anchor="lb")
+    canvas.save(out_path, format="PNG")
+    return out_path
+
+
+def probe_video(ffprobe, path):
+    # Read the first video stream, counting the frames that ffmpeg actually decodes.
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate,nb_read_frames,codec_name,pix_fmt",
+         "-show_entries", "format=duration,size", "-of", "json", path],
+        check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return {
+        "width": int(stream["width"]),
+        "height": int(stream["height"]),
+        "r_frame_rate": stream["r_frame_rate"],
+        "frames": int(stream["nb_read_frames"]),
+        "codec": stream["codec_name"],
+        "pix_fmt": stream["pix_fmt"],
+        "duration": float(info["format"]["duration"]),
+        "bytes": int(info["format"]["size"]),
+    }
+
+
+def check_video(probe, size, frames, fps):
+    # Named checks; the video is accepted only when every one of them is True.
+    return {
+        "square": probe["width"] == size and probe["height"] == size,
+        "frame_count": probe["frames"] == frames,
+        "frame_rate": probe["r_frame_rate"] == "%d/1" % fps,
+    }
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.size < 64 or args.size % 2:
+        raise SystemExit("--size must be an even number of pixels, at least 64")
+    if args.fps < 1 or args.jobs < 1:
+        raise SystemExit("--fps and --jobs must be at least 1")
+    if args.max_version and args.obj != "car":
+        raise SystemExit("--max-version applies to the car only")
+
+    geometry = OBJECTS[args.obj]
+    suffix = "" if args.size == DEFAULTS["size"] else "_%d" % args.size
+    stem = "Car" if args.obj == "car" else "Tree"
+    out_path = os.path.abspath(args.out or os.path.join(EVOLUTION_DIR, "%s_evolution_%s%s.mp4" % (stem, DATE_TAG, suffix)))
+    frames_dir = os.path.abspath(args.frames_dir or os.path.join(EVOLUTION_DIR, "frames_%s%s" % (args.obj, suffix)))
+    manifest_path = os.path.join(EVOLUTION_DIR, "manifest_%s%s.json" % (args.obj, suffix))
+
+    names = read_names(args.listing)
+    if args.obj == "car":
+        sources, absent = select_car(names, args.max_version)
+    else:
+        sources, absent = select_tree(names)
+    if not sources:
+        raise SystemExit("no source file found for %s" % args.obj)
+    verify_sizes(sources, geometry["source_size"])
+
+    workers = min(args.jobs, os.cpu_count() or 1)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        samples = list(pool.map(sample_corner, [(source["file"], geometry["crop"]) for source in sources], chunksize=8))
+    background = resolve_background(args.bg, samples)
+    spread = max(max(sample[channel] for sample in samples) - min(sample[channel] for sample in samples) for channel in range(3))
+    if spread > 3:
+        print("warning: the source backgrounds differ by up to %d levels" % spread)
+
+    font_path = first_existing(FONT_CANDIDATES)
+    settings = {
+        "size": args.size,
+        "margin": DEFAULTS["margin"],
+        "label_band": DEFAULTS["label_band"],
+        "label": args.label,
+        "font_px": int(round(args.size * DEFAULTS["label_font"])),
+        "font_path": font_path,
+        "background": background,
+    }
+
+    os.makedirs(frames_dir, exist_ok=True)
+    for name in os.listdir(frames_dir):
+        if FRAME_RE.match(name):
+            os.remove(os.path.join(frames_dir, name))
+    frame_jobs = [
+        (source["file"], os.path.join(frames_dir, "%04d.png" % index), geometry["crop"],
+         geometry["caption_box"], source["label"], settings)
+        for index, source in enumerate(sources, start=1)
+    ]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(render_frame, frame_jobs, chunksize=4))
+
+    # The last version is held by copying its frame, so it stays on screen for hold_seconds.
+    hold_frames = max(1, int(round(args.hold_seconds * args.fps)))
+    total = len(sources)
+    last_frame = os.path.join(frames_dir, "%04d.png" % total)
+    for _ in range(hold_frames - 1):
+        total += 1
+        shutil.copyfile(last_frame, os.path.join(frames_dir, "%04d.png" % total))
+
+    ffmpeg = first_existing(FFMPEG_CANDIDATES)
+    ffprobe = first_existing(FFPROBE_CANDIDATES)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    subprocess.run(
+        [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+         "-framerate", str(args.fps), "-i", os.path.join(frames_dir, "%04d.png"),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
+         "-r", str(args.fps), "-movflags", "+faststart", out_path],
+        check=True)
+
+    probe = probe_video(ffprobe, out_path)
+    checks = check_video(probe, args.size, total, args.fps)
+    if not all(checks.values()):
+        raise SystemExit("verification failed: %s" % json.dumps(checks))
+
+    manifest = {
+        "object": args.obj,
+        "date": DATE_TAG,
+        "size": args.size,
+        "fps": args.fps,
+        "label": args.label,
+        "hold_frames": hold_frames,
+        "background": "#%02x%02x%02x" % background,
+        "background_spread": spread,
+        "font": font_path,
+        "source_crop": geometry["crop"],
+        "listing": args.listing or "live listing of the versions folder",
+        "frames_dir": frames_dir,
+        "video": out_path,
+        "total_frames": total,
+        "duration_seconds": total / float(args.fps),
+        "absent_versions": absent,
+        "sources": [dict(frame=index, **source) for index, source in enumerate(sources, start=1)],
+    }
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    print("video: %s" % out_path)
+    print("frames: %d, duration: %.2f s, size: %dx%d, probe: %s" % (total, total / float(args.fps), args.size, args.size, json.dumps(probe)))
+    print("first: %s, last: %s, last version held for %d frames" % (sources[0]["label"], sources[-1]["label"], hold_frames))
+    print("background: #%02x%02x%02x, spread across sources: %d levels" % (background[0], background[1], background[2], spread))
+    print("absent versions: %s" % (", ".join(absent) if absent else "none"))
+    print("checks: %s" % json.dumps(checks))
+    print("manifest: %s" % manifest_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
