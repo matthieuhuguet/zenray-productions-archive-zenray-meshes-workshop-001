@@ -1,0 +1,191 @@
+# 26 October 2026, 19:40 : ZenRay Meshes, independent check of the eucalyptus evolution video (object "tree", no leaves).
+# It reads the MP4 back with ffprobe and compares its size, codec, pixel format, rate, frame count and duration with what
+# was asked. For each pair of consecutive versions it cross-checks three signals: the geometry fingerprint of the kept
+# triangles, the digest of the rendered wood image taken before the label is drawn, and the PNG pixels. Two versions with
+# the same wood must give the same wood digest, and their PNG frames may differ only inside the label corner. Two versions
+# with different wood must give different wood digests. The first, middle and last frames of the video are decoded and
+# compared with their PNG source, and a contact sheet of the version frames is drawn.
+# Exit code 0 when every check passes, 1 otherwise.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I -B /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/TreeWoodCheck.py
+import argparse
+import json
+import os
+import re
+import subprocess
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+
+# ---- defaults: the only place where a value lives (HDA style) ----
+DEFAULT_VIDEO = os.path.join(ROOT, "Evolution/TreeWood/Tree_evolution_wood_26-October-2026.mp4")
+DEFAULT_SUMMARY = os.path.join(ROOT, "Evolution/TreeWood/Tree_evolution_wood_26-October-2026.json")
+DEFAULT_FRAMES_DIR = os.path.join(ROOT, "Evolution/TreeWood/frames")
+DEFAULT_VERIFY_DIR = os.path.join(ROOT, "Evolution/TreeWood/verify")
+DEFAULT_FONT = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"
+DEFAULT_FFPROBE = "/opt/homebrew/bin/ffprobe"
+DEFAULT_FFMPEG = "/opt/homebrew/bin/ffmpeg"
+DEFAULT_SIZE = 1024                 # expected square side in pixels
+DEFAULT_FPS = 4                     # expected frames per second
+DEFAULT_HOLD_SECONDS = 1.5          # expected hold time of the last version
+DEFAULT_MAX_MEAN_DIFF = 3.0         # largest mean grey difference between a decoded frame and its PNG source
+DEFAULT_LABEL_ROW_SHARE = 0.85      # label pixels lie below this share of the image side (rows) ...
+DEFAULT_LABEL_COL_SHARE = 0.50      # ... and left of this share of the image side (columns)
+DEFAULT_TILE = 200                  # side of one thumbnail of the contact sheet
+DEFAULT_COLUMNS = 8                 # thumbnails per row of the contact sheet
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Independent check of the eucalyptus evolution video.")
+    parser.add_argument("--video", default=DEFAULT_VIDEO, help="MP4 to read back")
+    parser.add_argument("--summary", default=DEFAULT_SUMMARY, help="JSON summary written by TreeWoodEvolution.py")
+    parser.add_argument("--frames-dir", default=DEFAULT_FRAMES_DIR, help="PNG frames, one per version")
+    parser.add_argument("--verify-dir", default=DEFAULT_VERIFY_DIR,
+                        help="extracted frames, contact sheet and result JSON go here")
+    parser.add_argument("--font", default=DEFAULT_FONT, help="font of the contact sheet labels")
+    parser.add_argument("--ffprobe", default=DEFAULT_FFPROBE, help="ffprobe binary")
+    parser.add_argument("--ffmpeg", default=DEFAULT_FFMPEG, help="ffmpeg binary")
+    parser.add_argument("--size", type=int, default=DEFAULT_SIZE, help="expected square side in pixels")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="expected frames per second")
+    parser.add_argument("--hold-seconds", type=float, default=DEFAULT_HOLD_SECONDS,
+                        help="expected hold time of the last version")
+    parser.add_argument("--expected-frames", type=int, default=None,
+                        help="frame count to expect ; by default versions + hold frames - 1 ; a wrong value tests the check")
+    parser.add_argument("--max-mean-diff", type=float, default=DEFAULT_MAX_MEAN_DIFF,
+                        help="largest mean grey difference between a decoded frame and its PNG source")
+    return parser.parse_args()
+
+
+def probe(ffprobe, video):
+    """Fields that ffprobe reads back from the first video stream, with the frames counted."""
+    result = subprocess.run([ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                             "stream=codec_name,width,height,r_frame_rate,pix_fmt,nb_read_frames:format=duration",
+                             "-of", "json", video], check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return {"codec": stream["codec_name"], "width": int(stream["width"]), "height": int(stream["height"]),
+            "rate": stream["r_frame_rate"], "pix_fmt": stream["pix_fmt"],
+            "frames": int(stream["nb_read_frames"]), "duration_s": round(float(info["format"]["duration"]), 3)}
+
+
+def extract_frame(ffmpeg, video, index, out_path):
+    """Decode the frame at the given index with ffmpeg and return the PNG path written."""
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", video,
+                    "-vf", "select=eq(n\\,%d)" % index, "-frames:v", "1", "-fps_mode", "passthrough", out_path],
+                   check=True)
+    if not os.path.isfile(out_path):
+        raise SystemExit("ffmpeg wrote no frame %d from %s" % (index, video))
+    return out_path
+
+
+def contact_sheet(frames_dir, names, out_path, font_path):
+    """Thumbnails of the version frames, numbered, in a grid of DEFAULT_COLUMNS per row."""
+    font = ImageFont.truetype(font_path, 16)
+    rows = -(-len(names) // DEFAULT_COLUMNS)
+    gap = 6
+    width = DEFAULT_COLUMNS * (DEFAULT_TILE + gap) + gap
+    height = rows * (DEFAULT_TILE + gap) + gap
+    sheet = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(sheet)
+    for index, name in enumerate(names):
+        x = gap + (index % DEFAULT_COLUMNS) * (DEFAULT_TILE + gap)
+        y = gap + (index // DEFAULT_COLUMNS) * (DEFAULT_TILE + gap)
+        with Image.open(os.path.join(frames_dir, name)) as image:
+            thumb = image.convert("RGB").resize((DEFAULT_TILE, DEFAULT_TILE), Image.Resampling.LANCZOS)
+        sheet.paste(thumb, (x, y))
+        draw.text((x + 4, y + 4), name[:-4], font=font, fill=(255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0))
+    sheet.save(out_path)
+    return out_path
+
+
+def main():
+    args = parse_args()
+    errors = []
+    if not os.path.isfile(args.video):
+        raise SystemExit("video missing: %s" % args.video)
+    with open(args.summary, encoding="utf-8") as handle:
+        summary = json.load(handle)
+    names = sorted(name for name in os.listdir(args.frames_dir) if re.fullmatch(r"\d{2}_.+\.png", name))
+    if not names:
+        raise SystemExit("no version frame in %s" % args.frames_dir)
+    if len(names) != len(summary["tags_rendered"]):
+        errors.append("%d frames on disk, %d versions in the summary" % (len(names), len(summary["tags_rendered"])))
+
+    hold_frames = max(1, round(args.hold_seconds * args.fps))
+    expected = len(names) - 1 + hold_frames if args.expected_frames is None else args.expected_frames
+    probed = probe(args.ffprobe, args.video)
+    if (probed["width"], probed["height"]) != (args.size, args.size):
+        errors.append("video is %dx%d, expected %dx%d" % (probed["width"], probed["height"], args.size, args.size))
+    if probed["codec"] != "h264" or probed["pix_fmt"] != "yuv420p":
+        errors.append("codec %s and pixel format %s, expected h264 and yuv420p" % (probed["codec"], probed["pix_fmt"]))
+    if probed["rate"] != "%d/1" % args.fps:
+        errors.append("frame rate %s, expected %d/1" % (probed["rate"], args.fps))
+    if probed["frames"] != expected:
+        errors.append("video has %d frames, expected %d" % (probed["frames"], expected))
+    if abs(probed["duration_s"] - expected / args.fps) > 0.02:
+        errors.append("duration %.3f s, expected %.3f s" % (probed["duration_s"], expected / args.fps))
+
+    frames, wrong_size = {}, []
+    for name in names:
+        with Image.open(os.path.join(args.frames_dir, name)) as image:
+            if image.size != (args.size, args.size):
+                wrong_size.append(name)
+            frames[name] = np.asarray(image.convert("RGB"))
+    if wrong_size:
+        errors.append("frames not %dx%d: %s" % (args.size, args.size, ", ".join(wrong_size)))
+
+    fingerprints, wood_digests = summary["geometry_fingerprint"], summary["wood_digest"]
+    row_limit = args.size * DEFAULT_LABEL_ROW_SHARE
+    col_limit = args.size * DEFAULT_LABEL_COL_SHARE
+    same_wood_pairs = []
+    for previous, current in zip(names, names[1:]):
+        tag_a, tag_b = previous[3:-4], current[3:-4]
+        if not all(tag in fingerprints and tag in wood_digests for tag in (tag_a, tag_b)):
+            errors.append("%s or %s has no entry in the summary" % (previous, current))
+            continue
+        same_geometry = fingerprints[tag_a] == fingerprints[tag_b]
+        same_wood = wood_digests[tag_a] == wood_digests[tag_b]
+        if same_geometry != same_wood:
+            errors.append("%s and %s: geometry and rendered wood disagree" % (previous, current))
+        changed = np.argwhere(np.any(frames[previous] != frames[current], axis=2))
+        if same_wood:
+            outside = changed[(changed[:, 0] <= row_limit) | (changed[:, 1] >= col_limit)]
+            if len(outside):
+                errors.append("%s and %s: same wood but %d pixels differ outside the label corner"
+                              % (previous, current, len(outside)))
+            same_wood_pairs.append({"pair": [previous, current], "pixels_differing_in_label_corner": int(len(changed))})
+        elif len(changed) == 0:
+            errors.append("%s and %s: different wood but identical frames" % (previous, current))
+
+    os.makedirs(args.verify_dir, exist_ok=True)
+    extraction = []
+    for label, index in (("first", 0), ("middle", probed["frames"] // 2), ("last", probed["frames"] - 1)):
+        source = names[min(index, len(names) - 1)]   # the hold frames repeat the last version
+        target = extract_frame(args.ffmpeg, args.video, index,
+                               os.path.join(args.verify_dir, "video_%s_frame%02d.png" % (label, index)))
+        with Image.open(target) as decoded, Image.open(os.path.join(args.frames_dir, source)) as reference:
+            if decoded.size != reference.size:
+                errors.append("video frame %d is %s, %s is %s" % (index, decoded.size, source, reference.size))
+                difference = None
+            else:
+                difference = float(np.abs(np.asarray(decoded.convert("L"), dtype=float)
+                                          - np.asarray(reference.convert("L"), dtype=float)).mean())
+        if difference is not None and difference > args.max_mean_diff:
+            errors.append("video frame %d differs from %s by %.2f grey levels" % (index, source, difference))
+        extraction.append({"label": label, "video_frame": index, "compared_with": source,
+                           "mean_grey_difference": None if difference is None else round(difference, 3)})
+
+    sheet = contact_sheet(args.frames_dir, names, os.path.join(args.verify_dir, "contact_sheet.png"), args.font)
+    result = {"video": args.video, "expected_frames": expected, "frames_on_disk": len(names), "probe": probed,
+              "consecutive_pairs_with_same_wood": same_wood_pairs, "extraction": extraction,
+              "contact_sheet": sheet, "errors": errors}
+    with open(os.path.join(args.verify_dir, "check_result.json"), "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2)
+    print(json.dumps(result, indent=2))
+    if errors:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,339 @@
+# 26 October 2026, 19:30 : ZenRay Meshes, evolution video of the eucalyptus object "tree" WITHOUT its leaves.
+# One square image per version, drawn with the smooth renderer of Raster.py (the one CleanView.py uses), with the same
+# view, light and greys as CleanView.py. One camera for every version: the centre is the centre of the last version and
+# the scale is the largest diagonal of all versions, so the tree keeps the same size from one frame to the next. The scale
+# grows again only if some version would still leave the frame. Every frame is also checked for clipping at its border.
+# The version label sits at the bottom left. H.264 comes from ffmpeg, then ffprobe must read back the video that was asked.
+# A version with no render file is reported as absent, never invented. A JSON summary with the same stem as the video
+# records the versions, the camera, the fit ratios and one geometry fingerprint per version (checked by TreeWoodCheck.py).
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I -B /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/TreeWoodEvolution.py
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, os.path.join(ROOT, "Scripts"))
+import Raster  # the GPU smooth renderer that CleanView.py also uses
+
+# ---- defaults: the only place where a value lives (HDA style) ----
+# Main line of the eucalyptus in chronological order. A version with no render file is reported as absent.
+MAIN_LINE_TAGS = ["v%d" % number for number in range(15, 43)] + ["w43", "f44", "w45", "w46", "f46"]
+DEFAULT_TAGS = ",".join(MAIN_LINE_TAGS)                  # the last version present sets the camera centre
+# Searched in order: the original renders first, then the renders converted from topologies by TopoToRender.py.
+DEFAULT_RENDER_DIRS = ",".join([os.path.join(ROOT, "work/tree"), os.path.join(ROOT, "Evolution/TreeWood/render")])
+DEFAULT_SIZE = 1024                                      # square side in pixels, even (yuv420p)
+DEFAULT_FPS = 4                                          # 0.25 s per version
+DEFAULT_HOLD_SECONDS = 1.5                               # the last version stays on screen this long
+DEFAULT_EXCLUDE = "leaves"                               # comma separated words ; a part whose name contains one is not drawn
+DEFAULT_VIEW = "three_quarter_front"
+DEFAULT_CUSP_DEG = 30.0                                  # smooth shading cusp angle, as CleanView.py
+DEFAULT_LABEL_SHARE = 0.04                               # label height as a share of the image side
+DEFAULT_CRF = 18                                         # H.264 quality, lower is better
+DEFAULT_FRAMES_DIR = os.path.join(ROOT, "Evolution/TreeWood/frames")
+DEFAULT_OUT = os.path.join(ROOT, "Evolution/TreeWood/Tree_evolution_wood_26-October-2026.mp4")
+DEFAULT_FONT = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"
+DEFAULT_FFMPEG = "/opt/homebrew/bin/ffmpeg"              # ffprobe is looked up next to it
+
+# View axes (right, up), copied from CleanView.py so that the same names give the same views.
+VIEWS = {
+    "three_quarter_front": ((0.70, 0.0, -0.71), (-0.25, 0.94, -0.25)),
+    "three_quarter_rear": ((-0.70, 0.0, 0.71), (0.25, 0.94, 0.25)),
+    "side": ((0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+    "front": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    "back": ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+}
+KEY_LIGHT = np.array([0.30, 0.55, 0.78])                 # the key light of CleanView.py
+BACKGROUND_GREY = 92                                     # CleanView.py value of a pixel with no surface
+MESH_GREY_MAX = 235                                      # CleanView.py value of a fully lit surface
+FRAME_MARGIN = 1.05                                      # CleanView.py: the frame spans extent * 1.05 metres across
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evolution video of the eucalyptus object, without its leaves.")
+    parser.add_argument("--tags", default=DEFAULT_TAGS,
+                        help="versions in chronological order ; the last one present sets the camera centre")
+    parser.add_argument("--render-dirs", default=DEFAULT_RENDER_DIRS,
+                        help="comma separated folders searched in order for render_<tag>.npz")
+    parser.add_argument("--size", type=int, default=DEFAULT_SIZE, help="square image side in pixels, even")
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="versions shown per second")
+    parser.add_argument("--hold-seconds", type=float, default=DEFAULT_HOLD_SECONDS,
+                        help="time the last version stays on screen")
+    parser.add_argument("--exclude", default=DEFAULT_EXCLUDE,
+                        help="comma separated words ; parts whose name contains one are dropped, empty keeps all")
+    parser.add_argument("--view", default=DEFAULT_VIEW, choices=sorted(VIEWS), help="view of every frame")
+    parser.add_argument("--cusp", type=float, default=DEFAULT_CUSP_DEG, help="smooth shading cusp angle in degrees")
+    parser.add_argument("--label-share", type=float, default=DEFAULT_LABEL_SHARE,
+                        help="label height as a share of the image side")
+    parser.add_argument("--crf", type=int, default=DEFAULT_CRF, help="H.264 quality, 0 to 51, lower is better")
+    parser.add_argument("--frames-dir", default=DEFAULT_FRAMES_DIR, help="one PNG per version, named NN_tag.png")
+    parser.add_argument("--out", default=DEFAULT_OUT, help="output MP4 path ; the JSON summary takes the same stem")
+    parser.add_argument("--font", default=DEFAULT_FONT, help="font file of the version label")
+    parser.add_argument("--ffmpeg", default=DEFAULT_FFMPEG, help="ffmpeg binary ; ffprobe is looked up next to it")
+    args = parser.parse_args()
+    if args.size <= 0 or args.size % 2:
+        parser.error("--size must be a positive even number")
+    if args.fps <= 0:
+        parser.error("--fps must be a positive integer")
+    if args.hold_seconds < 0:
+        parser.error("--hold-seconds must be zero or more")
+    if not 0 <= args.crf <= 51:
+        parser.error("--crf must be between 0 and 51")
+    return args
+
+
+def find_render(tag, render_dirs):
+    """Path of render_<tag>.npz in the first folder that holds it, or None when the version has no render."""
+    for folder in render_dirs:
+        candidate = os.path.join(folder, "render_%s.npz" % tag)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def load_mesh(npz_path, drop_words):
+    """Vertices and faces left after the part filter, filtered exactly as CleanView.py filters them."""
+    data = np.load(npz_path, allow_pickle=True)
+    points, faces = data["P"], data["F"]
+    total_faces = int(len(faces))
+    if drop_words:
+        if "T" not in data.files or "names" not in data.files:
+            raise SystemExit("cannot drop parts %s: %s has no T or names array" % (drop_words, npz_path))
+        names = [str(name) for name in data["names"]]
+        keep_part = np.array([not any(word in name for word in drop_words) for name in names], dtype=bool)
+        faces = faces[keep_part[data["T"].astype(np.int64)]]
+    return points, faces, total_faces
+
+
+def used_vertices(points, faces):
+    """Vertices referenced by at least one kept face."""
+    return points[np.unique(faces)]
+
+
+def centre_and_diagonal(used):
+    """Centre and diagonal of the box around the used vertices."""
+    centre = (used.max(axis=0) + used.min(axis=0)) / 2.0
+    diagonal = float(np.linalg.norm(used.max(axis=0) - used.min(axis=0)))
+    return centre, diagonal
+
+
+def geometry_fingerprint(points, faces):
+    """Digest of the kept triangles, sorted, so two versions with the same wood get the same digest."""
+    triangles = points[faces].reshape(len(faces), 9).astype(np.float32)
+    order = np.lexsort(triangles.T[::-1])
+    return hashlib.sha256(np.ascontiguousarray(triangles[order]).tobytes()).hexdigest()[:16]
+
+
+def view_axes(view_name):
+    """Orthonormal right, up and depth axes of a view, built the way CleanView.py builds them."""
+    right, up = (np.array(axis, dtype=float) for axis in VIEWS[view_name])
+    right = right / np.linalg.norm(right)
+    up = up - right * (up @ right)
+    up = up / np.linalg.norm(up)
+    return right, up, np.cross(right, up)
+
+
+def fit_extent(used_of, centre, right, up, base_extent):
+    """Scale of the shared camera: the base extent, grown only if a version would leave the frame.
+    The renderer spans extent * FRAME_MARGIN metres across the image, so a vertex stays inside when its offset
+    from the shared centre, read along the view axes, is below extent * FRAME_MARGIN / 2."""
+    reach = {}
+    for tag, used in used_of.items():
+        if len(used) == 0:
+            reach[tag] = 0.0
+            continue
+        offset = used - centre
+        reach[tag] = float(np.max(np.maximum(np.abs(offset @ right), np.abs(offset @ up))))
+    extent = max(base_extent, 2.0 * max(reach.values()) / FRAME_MARGIN)
+    return extent, reach
+
+
+def render_grey(points, faces, centre, extent, axes, size, cusp_deg):
+    """Smooth shaded image of one version, drawn as CleanView.py draws it (same axes, light and greys).
+    Returns the grey levels and the coverage mask of the wood."""
+    right, up, depth = axes
+    renderer = Raster.Renderer(points, faces, smooth_deg=float(cusp_deg))
+    try:
+        mask, _, normals, _ = renderer.render(centre, size / (extent * FRAME_MARGIN),
+                                              (right.tolist(), up.tolist(), depth.tolist()), size)
+    finally:
+        renderer.release()
+    light = KEY_LIGHT / np.linalg.norm(KEY_LIGHT)
+    shade = np.clip(0.18 + 0.82 * np.clip((normals * light).sum(-1), 0, 1), 0, 1)
+    return np.where(mask, shade * MESH_GREY_MAX, BACKGROUND_GREY).astype(np.uint8), mask
+
+
+def labelled_image(grey, text, size, font_path, label_share):
+    """RGB frame with the version label at the bottom left, light text with a dark outline."""
+    if not os.path.isfile(font_path):
+        raise SystemExit("font not found: %s" % font_path)
+    image = Image.fromarray(grey).convert("RGB")
+    font = ImageFont.truetype(font_path, max(8, round(size * label_share)))
+    stroke = max(1, size // 400)
+    margin = round(size * 0.03)
+    draw = ImageDraw.Draw(image)
+    left, _, _, bottom = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
+    draw.text((margin - left, size - margin - bottom), text, font=font, fill=(245, 245, 245),
+              stroke_width=stroke, stroke_fill=(30, 30, 30))
+    return image
+
+
+def write_frames(images, tags, frames_dir):
+    """One PNG per version, numbered NN_tag.png ; only files of this pattern are replaced."""
+    os.makedirs(frames_dir, exist_ok=True)
+    for name in os.listdir(frames_dir):
+        if re.fullmatch(r"\d{2}_.+\.png", name):
+            os.remove(os.path.join(frames_dir, name))
+    paths = []
+    for number, (tag, image) in enumerate(zip(tags, images), start=1):
+        path = os.path.join(frames_dir, "%02d_%s.png" % (number, tag))
+        image.save(path)
+        paths.append(path)
+    return paths
+
+
+def stage_sequence(frame_paths, fps, hold_seconds, sequence_dir):
+    """Ordered entries for ffmpeg: each version once, then the last one held hold_seconds in total."""
+    hold_frames = max(1, round(hold_seconds * fps))
+    order = frame_paths[:-1] + [frame_paths[-1]] * hold_frames
+    os.makedirs(sequence_dir, exist_ok=True)
+    for name in os.listdir(sequence_dir):
+        if re.fullmatch(r"\d{3}\.png", name):
+            os.remove(os.path.join(sequence_dir, name))
+    for index, source in enumerate(order, start=1):
+        target = os.path.join(sequence_dir, "%03d.png" % index)
+        try:
+            os.link(source, target)   # same disk: the pixels are not written twice
+        except OSError:
+            shutil.copyfile(source, target)
+    return len(order)
+
+
+def encode(ffmpeg, sequence_dir, frame_count, fps, crf, out_path):
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+               "-framerate", str(fps), "-start_number", "1", "-i", os.path.join(sequence_dir, "%03d.png"),
+               "-frames:v", str(frame_count), "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+               "-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart", out_path]
+    subprocess.run(command, check=True)
+
+
+def probe_video(ffmpeg, out_path):
+    """What ffprobe reads back from the file: codec, size, rate, pixel format, counted frames, duration."""
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe")
+    result = subprocess.run([ffprobe, "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                             "stream=codec_name,width,height,r_frame_rate,pix_fmt,nb_read_frames:format=duration",
+                             "-of", "json", out_path], check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return {"codec": stream["codec_name"], "width": int(stream["width"]), "height": int(stream["height"]),
+            "rate": stream["r_frame_rate"], "pix_fmt": stream["pix_fmt"],
+            "frames": int(stream["nb_read_frames"]), "duration_s": round(float(info["format"]["duration"]), 3)}
+
+
+def check_video(probed, args, frame_count):
+    """Mismatches between what ffprobe reads back and what was asked ; an empty list means the video is right."""
+    problems = []
+    if (probed["width"], probed["height"]) != (args.size, args.size):
+        problems.append("size")
+    if probed["codec"] != "h264" or probed["pix_fmt"] != "yuv420p":
+        problems.append("codec or pixel format")
+    if probed["rate"] != "%d/1" % args.fps:
+        problems.append("frame rate")
+    if probed["frames"] != frame_count:
+        problems.append("frame count")
+    if abs(probed["duration_s"] - frame_count / args.fps) > 0.02:
+        problems.append("duration")
+    return problems
+
+
+def main():
+    args = parse_args()
+    tags = [tag.strip() for tag in args.tags.split(",") if tag.strip()]
+    if not tags:
+        raise SystemExit("--tags is empty")
+    if len(set(tags)) != len(tags):
+        raise SystemExit("--tags repeats a version")
+    render_dirs = [folder.strip() for folder in args.render_dirs.split(",") if folder.strip()]
+    drop_words = [word for word in args.exclude.split(",") if word]
+
+    found, absent = {}, []
+    for tag in tags:
+        path = find_render(tag, render_dirs)
+        if path is None:
+            absent.append(tag)
+        else:
+            found[tag] = path
+    present = [tag for tag in tags if tag in found]
+    if not present:
+        raise SystemExit("no render file found for any requested version")
+
+    meshes, total_faces, kept_faces, used_of, fingerprints = {}, {}, {}, {}, {}
+    for tag in present:
+        points, faces, total = load_mesh(found[tag], drop_words)
+        meshes[tag] = (points, faces)
+        total_faces[tag] = total
+        kept_faces[tag] = int(len(faces))
+        used_of[tag] = used_vertices(points, faces)
+        fingerprints[tag] = geometry_fingerprint(points, faces)
+
+    centre, _ = centre_and_diagonal(used_of[present[-1]])                    # centre of the last version, read once
+    largest = max(centre_and_diagonal(used_of[tag])[1] for tag in present)   # largest diagonal of all versions
+    axes = view_axes(args.view)
+    extent, reach = fit_extent(used_of, centre, axes[0], axes[1], largest)
+    fill = {tag: reach[tag] / (extent * FRAME_MARGIN / 2.0) for tag in present}
+
+    images, clipped, mask_pixels, wood_digests = [], {}, {}, {}
+    for tag in present:
+        points, faces = meshes[tag]
+        grey, mask = render_grey(points, faces, centre, extent, axes, args.size, args.cusp)
+        clipped[tag] = bool(mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any())
+        mask_pixels[tag] = int(mask.sum())
+        wood_digests[tag] = hashlib.sha256(grey.tobytes()).hexdigest()[:16]   # wood image before the label is drawn
+        images.append(labelled_image(grey, tag, args.size, args.font, args.label_share))
+        print("rendered %s: %d of %d faces kept, fill %.3f" % (tag, kept_faces[tag], total_faces[tag], fill[tag]),
+              file=sys.stderr)
+
+    frame_paths = write_frames(images, present, args.frames_dir)
+    sequence_dir = os.path.join(args.frames_dir, "sequence")
+    frame_count = stage_sequence(frame_paths, args.fps, args.hold_seconds, sequence_dir)
+    encode(args.ffmpeg, sequence_dir, frame_count, args.fps, args.crf, args.out)
+
+    probed = probe_video(args.ffmpeg, args.out)
+    problems = check_video(probed, args, frame_count)
+    touching = [tag for tag in present if clipped[tag]]
+    if touching:
+        problems.append("frames touch the border: %s" % ", ".join(touching))
+    summary = {
+        "tags_requested": tags, "tags_rendered": present, "tags_absent": absent,
+        "render_file": {tag: found[tag] for tag in present},
+        "exclude": drop_words, "view": args.view,
+        "faces_total": total_faces, "faces_kept": kept_faces,
+        "geometry_fingerprint": fingerprints,
+        "wood_digest": wood_digests,
+        "camera_centre_m": [round(float(value), 4) for value in centre],
+        "camera_largest_diagonal_m": round(largest, 4), "camera_extent_m": round(extent, 4),
+        "camera_grown_for_fit": extent > largest + 1e-9,
+        "fill_ratio": {tag: round(fill[tag], 4) for tag in present},
+        "touches_border": clipped, "mask_pixels": mask_pixels,
+        "frames": frame_paths, "frame_count": frame_count,
+        "expected_duration_s": round(frame_count / args.fps, 3),
+        "out": args.out, "probe": probed, "problems": problems,
+    }
+    summary_path = os.path.splitext(args.out)[0] + ".json"
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    print(json.dumps(summary, indent=2))
+    if problems:
+        raise SystemExit("video check failed: %s" % ", ".join(problems))
+
+
+if __name__ == "__main__":
+    main()
