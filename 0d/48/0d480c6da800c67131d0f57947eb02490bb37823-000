@@ -85,21 +85,25 @@ def build_rows(S, z0, z1, cell, tol, max_rows=400):
     n = max(2, int(round((z1 - z0) / cell)) + 1)
     zs = list(np.linspace(z0, z1, n))
 
+    xs_probe = np.linspace(-0.85, 0.85, 18)
+
     def sag(za, zb):
-        mid = (za + zb) / 2.0
+        """Largest gap between the surface and the chord of the interval, at five stations and 18 probe columns (points outside the footprint are skipped)."""
+        zz = np.linspace(za, zb, 5)
         worst = 0.0
-        for x in (-0.6, -0.3, 0.0, 0.3, 0.6, 0.8):
-            h = S.height(np.array([x, x, x]), np.array([za, mid, zb]))
+        for x in xs_probe:
+            h = S.lowest(np.full(5, x), zz)
             if np.isnan(h).any():
                 continue
-            worst = max(worst, abs(h[1] - (h[0] + h[2]) / 2.0))
+            chord = h[0] + (h[4] - h[0]) * (zz - za) / max(zb - za, 1e-9)
+            worst = max(worst, float(np.abs(h - chord).max()))
         return worst
     changed = True
     while changed and len(zs) < max_rows:
         changed = False
         new = [zs[0]]
         for a, b in zip(zs[:-1], zs[1:]):
-            if (b - a) > cell / 4.0 and sag(a + 1e-6 if a == z0 else a, b - 1e-6 if b == z1 else b) > tol:
+            if (b - a) > cell / 6.0 and sag(a + 1e-6 if a == z0 else a, b - 1e-6 if b == z1 else b) > tol:
                 new.append((a + b) / 2.0)
                 changed = True
             new.append(b)
@@ -147,12 +151,16 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
     rows = []
     for z in zs:
         wide = edge(z, True)
+        low = edge(z, False)
+        if wide is not None and low is not None and low < wide:
+            wide = low   # at a step row the wider side wins
         if wide is None:
             raise SystemExit(f"the floor has no footprint at z = {z:.3f}")
         in_mid = bool(steps) and steps[0] - 1e-6 <= z <= steps[-1] + 1e-6 and wide < -(narrow + jump / 2.0)
         w = narrow if in_mid else abs(wide)
         rows.append((float(z), float(w), float(abs(wide)) if in_mid else 0.0))
     widest = max(r[1] for r in rows)
+    ns_all = max(1, int(round(max([r[2] - r[1] for r in rows] + [0.0]) / cell)))   # side strip columns, the same on every row
     ncol = int(cols or max(2, int(round(2.0 * widest / cell))))
     pts, quads, idx = [], [], {}
 
@@ -168,7 +176,7 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
         for j in range(ncol + 1):
             add(xs[j], h[j], z, ("m", i, j))
         if outer > 0:
-            ns = max(1, int(round((outer - w) / cell)))
+            ns = ns_all
             for side in (-1, 1):
                 for k in range(ns):
                     x = side * (outer - (outer - w) * k / ns)
@@ -180,7 +188,7 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
         a, b = rows[i], rows[i + 1]
         if a[2] > 0 and b[2] > 0:
             for side in (-1, 1):
-                ns = max(1, int(round((a[2] - a[1]) / cell)))
+                ns = ns_all
                 chain_a = [idx[("s", side, i, k)] for k in range(ns)] + [idx[("m", i, 0 if side < 0 else ncol)]]
                 chain_b = [idx[("s", side, i + 1, k)] for k in range(ns)] + [idx[("m", i + 1, 0 if side < 0 else ncol)]]
                 for k in range(ns):
