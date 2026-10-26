@@ -61,7 +61,7 @@ def main(params, body, out):
         okp = (hw >= abs(x)) & (zs <= zc)
         return float(zs[okp].min()) if okp.any() else zc
     FF = C.get("flat_face")
-    def z_side(y, lo, hi):
+    def z_side(y, lo, hi, x=None):
         # 26 October 2026: the two side views disagree by 8 cm at the tail and each reads with 2 to 4 cm steps ; the face is
         # flat at face_z between its bottom and top fillets (smootherstep over fillet_m to top_z and bottom_z)
         if not FF: return float(np.interp(y, ey[ok], eb[ok]))
@@ -72,9 +72,13 @@ def main(params, body, out):
             # 26 October 2026: TOP CHAMFER ; the sheet ends the deck on a crisp edge (top view z -2.19, back view y 0.94 to
             # 1.0) then a chamfer down to the face ; the deck runs from the cut (zc, hi) to the crease (crease_z, hi - eps),
             # the chamfer from there to (face_z, hi - drop). FR : pont, arête vive, chanfrein jusqu'à la face.
-            eps, drop, zcr = TC.get("eps_m", 0.006), TC["drop_m"], TC["crease_z"]
+            eps, drop, zcr = TC.get("eps_m", 0.006), TC["drop_m"], TC["crease_z"]; zf_ = FF["face_z"]
+            if TC.get("follow_plan") and x is not None:
+                # 26 October 2026: the crease follows the plan corner : offset_xm [[|x|, m], ...] ahead of this column's face
+                # (top view : 7 cm at the centre, 4.5 cm at |x| 0.75), the chamfer foot on the face. FR : arête qui suit le plan.
+                zf_ = max(z_plan(x), FF["face_z"]); ox_, om_ = np.array(TC["offset_xm"], float).T; zcr = zf_ + float(np.interp(abs(x), ox_, om_))
             if y >= hi - eps: z = zcr + (zc - zcr) * (y - (hi - eps)) / eps
-            elif y >= hi - drop: z = FF["face_z"] + (zcr - FF["face_z"]) * (y - (hi - drop)) / (drop - eps)
+            elif y >= hi - drop: z = zf_ + (zcr - zf_) * (y - (hi - drop)) / (drop - eps)
             z += (FF["bottom_z"] - FF["face_z"]) * sm(((lo + fb) - y) / fb)
             return float(z)
         if FF.get("top_to_cut", 1):
@@ -123,7 +127,7 @@ def main(params, body, out):
         if TC_ and TC_.get("on", 1):   # 26 October 2026: rows exactly on the crease and the chamfer foot (crisp edges)
             ys_ = np.sort(np.concatenate([ys_, [hi - TC_.get("eps_m", 0.006), hi - TC_["drop_m"]]]))
         for j, y in enumerate(ys_):
-            zb = z_side(y, lo_g, hi)   # 26 October 2026: the top fillet follows each column top (watertight with the body)
+            zb = z_side(y, lo_g, hi, x)   # 26 October 2026: the top fillet follows each column top (watertight with the body)
             z = min(max(z_plan(x), zb, ztip), zc)
             for k in INS:   # recess depth : full inside, linear over the bevel, zero outside ; x0 = inner edge (side pairs)
                 dxe = min(k["x"] - abs(x), abs(x) - k.get("x0", -1.0)) / k["bevel_m"]; dye = min(y - k["y0"], k["y1"] - y) / k["bevel_m"]
