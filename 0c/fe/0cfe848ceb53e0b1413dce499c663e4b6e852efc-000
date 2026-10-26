@@ -217,6 +217,7 @@ def main(params, prefix, out):
     # corners beside it ; side_subdiv n inserts n - 1 straight columns in every band between two rows of side_rows (the
     # band is ruled, the shape does not change), and the cut then follows the circle. FR : bandes de flanc subdivisées.
     E_s = cj["exp_rows"]; nh_s = len(E_s); ss = int(C.get("side_subdiv", 1)); srow = set(C.get("side_rows", []))
+    vent_k = []   # 26 October 2026: columns moved onto the vent's lower edge
     rname = lambda j: E_s[nh_s - 1 - j] if j < nh_s else E_s[j - (nh_s - 1)]
     for j in range(R):
         cols.append((j, j, 0.0, j, 1.0))
@@ -235,6 +236,20 @@ def main(params, prefix, out):
                 if rname(j) in SE_["rows"]: us_.append(ue_)
                 if rname(j + 1) in SE_["rows"]: us_.append(1.0 - ue_)
                 us_.sort(key=lambda v_: float(np.mean(v_)))
+            # 26 October 2026: VENT ; the front fender vent of the sheet (a slot under the shoulder line, tip at z 0.95, open
+            # to the door joint) : the inserted column of the band nearest to the vent's lower edge is moved onto it (per
+            # station fraction, smootherstep in and out of the z window) and pushed in later by depth_pts. FR : ouïe d'aile.
+            VT_ = C.get("vent")
+            if VT_ and VT_.get("on", 1) and {rname(j), rname(j + 1)} == set(VT_["band"]):
+                zr_ = G[:, j, 2]; yp_ = np.array(VT_["y_pts"], float); o_ = np.argsort(yp_[:, 0]); yp_ = yp_[o_]
+                yv_ = np.interp(zr_, yp_[:, 0], yp_[:, 1]); ya_, yb_ = G[:, j, 1], G[:, j + 1, 1]
+                ut_ = np.clip((yv_ - ya_) / np.where(np.abs(yb_ - ya_) < 1e-6, 1e-6, yb_ - ya_), 0.05, 0.95)
+                rpv = VT_.get("ramp_m", 0.05); zv0, zv1 = yp_[0, 0], yp_[-1, 0]
+                sstv = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+                wv_ = sstv((zr_ - (zv0 - rpv)) / rpv) * sstv(((zv1 + rpv) - zr_) / rpv)
+                iu = int(np.argmin([abs(float(np.mean(v_)) - float(np.mean(ut_[wv_ > 0.5]) if (wv_ > 0.5).any() else 0.5)) for v_ in us_]))
+                ub_ = np.full_like(zr_, float(np.mean(us_[iu]))) if np.ndim(us_[iu]) == 0 else us_[iu]
+                us_[iu] = ub_ + wv_ * (ut_ - ub_); vent_k.append(len(cols) + iu)
             cols += [(j, j + 1, u_, j, 1.0) for u_ in us_]
     G2 = np.zeros((len(t), len(cols), 3))
     for k, (a, b, u, _, pw) in enumerate(cols):
@@ -361,6 +376,12 @@ def main(params, prefix, out):
                 t1 = np.where(lo_, fk / np.maximum(f_kc, 1e-6), (fk - f_kc) / np.maximum(1 - f_kc, 1e-6))
                 Pn = np.where(lo_[:, None], A_ + t1[:, None] * (Cp - A_), Cp + t1[:, None] * (B_ - Cp))
                 G2[:, k] = (1 - wz[:, None]) * G2[:, k] + wz[:, None] * Pn
+    VT2 = C.get("vent")
+    if VT2 and VT2.get("on", 1) and vent_k:   # 26 October 2026: push the vent column in (depth_pts [z, m]), a V : light lip above, dark face below
+        dp_ = np.array(VT2["depth_pts"], float); o_ = np.argsort(dp_[:, 0]); dp_ = dp_[o_]
+        for k in vent_k:
+            dz_ = np.interp(G2[:, k, 2], dp_[:, 0], dp_[:, 1], left=0.0, right=0.0)
+            G2[:, k, 0] = np.sign(G2[:, k, 0]) * (np.abs(G2[:, k, 0]) - dz_)
     band = [c[3] for c in cols]; R2 = len(cols)
     # 26 October 2026: SLANTED DOOR CUT ; the sheet's rear door line is diagonal (side views), the cage split doors at a
     # station (vertical). Around the cut, each side column is sheared along z by a smooth bump (half cosine over window_m)
