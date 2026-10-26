@@ -247,9 +247,28 @@ def main(params, prefix, out):
                 rpv = VT_.get("ramp_m", 0.05); zv0, zv1 = yp_[0, 0], yp_[-1, 0]
                 sstv = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
                 wv_ = sstv((zr_ - (zv0 - rpv)) / rpv) * sstv(((zv1 + rpv) - zr_) / rpv)
-                iu = int(np.argmin([abs(float(np.mean(v_)) - float(np.mean(ut_[wv_ > 0.5]) if (wv_ > 0.5).any() else 0.5)) for v_ in us_]))
-                ub_ = np.full_like(zr_, float(np.mean(us_[iu]))) if np.ndim(us_[iu]) == 0 else us_[iu]
-                us_[iu] = ub_ + wv_ * (ut_ - ub_); vent_k.append(len(cols) + iu)
+                um_ = float(np.mean(ut_[wv_ > 0.5])) if (wv_ > 0.5).any() else 0.5
+                iu = int(np.argmin([abs(float(np.mean(v_)) - um_) for v_ in us_]))
+                if VT_.get("slot_m"):
+                    # 26 October 2026: SLOT ; four columns (outer wall, floor, floor, outer wall) slot_m tall, the two floor
+                    # columns pushed in later ; outside the window they sit evenly between the neighbouring columns (no
+                    # degenerate strip), the replaced uniform column included. FR : fente à quatre colonnes.
+                    mu_ = sorted(float(np.mean(v_)) for v_ in us_); lo_u = max([m for m in mu_ if m < float(np.mean(us_[iu])) - 1e-6] + [0.0]); hi_u = min([m for m in mu_ if m > float(np.mean(us_[iu])) + 1e-6] + [1.0])
+                    sm_, wl_ = VT_["slot_m"], VT_.get("wall_m", 0.003); offs = [0.0, wl_, sm_ - wl_, sm_]
+                    uo_ = np.linspace(lo_u, hi_u, 6)[1:-1]
+                    newc = []
+                    for o_, uo in zip(offs, uo_):
+                        ui_ = np.clip((yv_ + o_ - ya_) / np.where(np.abs(yb_ - ya_) < 1e-6, 1e-6, yb_ - ya_), 0.02, 0.98)
+                        newc.append(uo + wv_ * (ui_ - uo))
+                    if np.mean(ya_) > np.mean(yb_): newc = newc[::-1]   # u measured from the upper row : keep increasing u
+                    del us_[iu]; base_ = len(cols) + len([v_ for v_ in us_ if float(np.mean(v_)) < lo_u + 1e-6])
+                    us_ = [v_ for v_ in us_ if float(np.mean(v_)) <= lo_u + 1e-6] + newc + [v_ for v_ in us_ if float(np.mean(v_)) >= hi_u - 1e-6]
+                    pos_ = [i_ for i_, v_ in enumerate(us_) if any(v_ is c_ for c_ in newc)]
+                    floor_ = [newc[1], newc[2]]
+                    vent_k.extend([len(cols) + i_ for i_, v_ in enumerate(us_) if any(v_ is c_ for c_ in floor_)])
+                else:
+                    ub_ = np.full_like(zr_, float(np.mean(us_[iu]))) if np.ndim(us_[iu]) == 0 else us_[iu]
+                    us_[iu] = ub_ + wv_ * (ut_ - ub_); vent_k.append(len(cols) + iu)
             cols += [(j, j + 1, u_, j, 1.0) for u_ in us_]
     G2 = np.zeros((len(t), len(cols), 3))
     for k, (a, b, u, _, pw) in enumerate(cols):
