@@ -5,13 +5,14 @@
 # read by a Python SOP in Houdini that builds curves for Sweep (clean quad rings) and leaf cards (quads) at the tips.
 # FR : les branches poussent vers des points tirés dans le volume mesuré de la couronne ; rayons par le modèle des tuyaux.
 # Usage: python TreeGrow.py <hull.npz> <measure.json> <out.json> [k=v]
-import sys, json
+import sys, os, json
 import numpy as np
 from scipy.spatial import cKDTree
 
 # learned defaults 25 October 2026 (TreeFit + sweeps v4 to v13, best v12: sheet 0.849, hull 0.874)
 P = {"ridge": 0, "base_cap": 1.15, "trunk_smooth": 1.5, "leaf_inset_m": 0.15, "crown_rule": 1, "crown_min_frac": 0.22, "trunk_clear_k": 1.6, "trunk_clear_m": 0.35, "max_seg_m": 1.0, "shell_clumps": 14000, "shell_depth_m": 0.6, "prune_out": 1, "root_flare": 1.0, "flare_h_m": 1.2, "attractors": 6000, "influence_m": 2.6, "kill_m": 0.45, "step_m": 0.28, "max_iter": 400, "tip_radius_m": 0.025,
-     "pipe_exp": 2.0, "seed": 3, "trunk_tip_radius_scale": 1.0}
+     "pipe_exp": 2.0, "seed": 3, "trunk_tip_radius_scale": 1.0,
+     "wood_attr_frac": 0.0, "evidence": "work/tree/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1}
 
 
 def main(hull, meas, out, **kw):
@@ -37,6 +38,15 @@ def main(hull, meas, out, **kw):
     else:
         crown = pts[pts[:, 1] > cb]
     att = crown[rng.choice(len(crown), min(p["attractors"], len(crown)), replace=False)]
+    # 26 October 2026: WOOD EVIDENCE ; a share of the attractors comes from the voxels the sheet shows as wood in the front or back AND the right or left view
+    # (Evidence3D.py), so the limbs grow where the reference shows limbs. FR : une part des attracteurs vient des voxels de bois vus sur la planche.
+    if p["wood_attr_frac"] > 0:
+        e = np.load(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), p["evidence"]) if not os.path.isabs(p["evidence"]) else p["evidence"])
+        idw = np.argwhere(e["occ"]); ptw = e["origin"] + idw * float(e["voxel"]) + float(e["voxel"]) / 2 * rng.random((len(idw), 3)); ptw = ptw[ptw[:, 1] > cb]
+        okw = np.zeros(len(ptw), bool)
+        for a in range(0, len(ptw), 20000): okw[a:a + 20000] = trunk_clear(ptw[a:a + 20000])
+        ptw = ptw[okw]; nw = int(p["attractors"] * p["wood_attr_frac"])
+        if len(ptw): att = np.concatenate([ptw[rng.choice(len(ptw), min(nw, len(ptw)), replace=False)], att[: max(p["attractors"] - nw, 0)]])
     trunk = np.array(tr["points"])
     nodes = [trunk[-1].copy()]; parent = [-1]
     alive = np.ones(len(att), bool)
@@ -113,6 +123,18 @@ def main(hull, meas, out, **kw):
     else:
         shell = shell[shell[:, 1] > cb + 0.5]
     clumps = shell[rng.choice(len(shell), min(p["shell_clumps"], len(shell)), replace=False)]
+    # 26 October 2026: CARVE ; a clump whose centre projects on a wood pixel in at least carve_k of the four side views would hide a limb the sheet shows,
+    # it is dropped. FR : une touffe posée sur du bois visible cacherait un membre, elle est retirée.
+    if p["carve_wood"]:
+        Wk = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from PIL import Image as _I; from scipy import ndimage as _nd
+        calj = json.load(open(os.path.join(Wk, "work/tree/view_cal.json"))); fm = json.load(open(os.path.join(Wk, "work/tree/frame_B/frame.json"))); cnt = np.zeros(len(clumps), int)
+        for vn in ("front", "back", "right", "left"):
+            vv = [x for x in fm["views"] if x["name"] == vn][0]; a_, b_ = np.array(calj[vn][0]), np.array(calj[vn][1])
+            px = a_[0] * (clumps @ np.array(vv["rx"], float)) + b_[0]; py = a_[1] * (clumps @ np.array(vv["uy"], float)) + b_[1]
+            wm = np.asarray(_I.open(os.path.join(Wk, "work/tree/views/wood_%s.png" % vn))) > 127
+            if p["carve_dilate_px"]: wm = _nd.binary_dilation(wm, iterations=int(p["carve_dilate_px"]))
+            ix, iy = np.floor(px).astype(int), np.floor(py).astype(int); ok = (ix >= 0) & (ix < wm.shape[1]) & (iy >= 0) & (iy < wm.shape[0]); h = np.zeros(len(clumps), bool); h[ok] = wm[iy[ok], ix[ok]]; cnt += h
+        clumps = clumps[cnt < p["carve_k"]]
     # trunk flare: the base radius grows toward the ground (roots)
     tr = dict(tr); ys_t = np.array(tr["points"])[:, 1]; rad = np.array(tr["radius"])
     # base guard (25 October 2026): the lowest rows touch the ground line (shadow, scale cube); the radius never exceeds

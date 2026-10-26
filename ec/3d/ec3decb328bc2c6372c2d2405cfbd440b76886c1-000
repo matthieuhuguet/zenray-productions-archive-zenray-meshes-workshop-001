@@ -1,0 +1,164 @@
+# 25 October 2026 : ZenRay Meshes tree archetype, LIMBS by space colonization (Runions et al. 2007), no AI.
+# EN: attraction points are sampled in the crown volume measured on the sheet (visual hull above the crown base);
+# branches grow from the trunk top toward them (influence radius, kill radius, step), radii follow the pipe model
+# (r_parent^2 = sum r_child^2), the trunk is the measured sweep. Output JSON skeleton (nodes, parents, radii, tips)
+# read by a Python SOP in Houdini that builds curves for Sweep (clean quad rings) and leaf cards (quads) at the tips.
+# FR : les branches poussent vers des points tirés dans le volume mesuré de la couronne ; rayons par le modèle des tuyaux.
+# Usage: python TreeGrow.py <hull.npz> <measure.json> <out.json> [k=v]
+import sys, os, json
+import numpy as np
+from scipy.spatial import cKDTree
+
+# learned defaults 25 October 2026 (TreeFit + sweeps v4 to v13, best v12: sheet 0.849, hull 0.874)
+P = {"ridge": 0, "base_cap": 1.15, "trunk_smooth": 1.5, "leaf_inset_m": 0.15, "crown_rule": 1, "crown_min_frac": 0.22, "trunk_clear_k": 1.6, "trunk_clear_m": 0.35, "max_seg_m": 1.0, "shell_clumps": 14000, "shell_depth_m": 0.6, "prune_out": 1, "root_flare": 1.0, "flare_h_m": 1.2, "attractors": 6000, "influence_m": 2.6, "kill_m": 0.45, "step_m": 0.28, "max_iter": 400, "tip_radius_m": 0.025,
+     "pipe_exp": 2.0, "seed": 3, "trunk_tip_radius_scale": 1.0,
+     "wood_attr_frac": 0.0, "evidence": "work/tree/evidence_wood.npz", "carve_wood": 0, "carve_k": 3, "carve_dilate_px": 1}
+
+
+def main(hull, meas, out, **kw):
+    p = dict(P); p.update({k: type(P[k])(v) for k, v in kw.items() if k in P})
+    rng = np.random.default_rng(p["seed"])
+    h = np.load(hull); occ, org, vx = h["occ"], h["origin"], float(h["voxel"])
+    M = json.load(open(meas)); tr = M["trunk"]; cb = tr["crown_base_y"]
+    idx = np.argwhere(occ); pts = org + idx * vx + vx / 2 * rng.random((len(idx), 3))
+    trunk = np.array(tr["points"]); trad = np.array(tr["radius"])
+    def trunk_clear(Q):
+        # distance of each point to the trunk line, compared with the local trunk radius (25 October 2026)
+        d = np.min(np.linalg.norm(Q[:, None, :] - trunk[None, :, :], axis=2), axis=1) if len(Q) < 200000 else None
+        r = np.interp(Q[:, 1], trunk[:, 1], trad)
+        return d > p["trunk_clear_k"] * r + p["trunk_clear_m"]
+    if p["crown_rule"]:
+        # CROWN = hull minus the trunk tube, at any height above crown_min_frac of the tree (foliage hangs below the
+        # trunk width jump), generic rule 7 (25 October 2026)
+        hy = pts[:, 1].max()
+        cand = pts[pts[:, 1] > p["crown_min_frac"] * hy]
+        keep = np.zeros(len(cand), bool)
+        for a in range(0, len(cand), 20000): keep[a:a + 20000] = trunk_clear(cand[a:a + 20000])
+        crown = cand[keep] if keep.sum() > 100 else pts[pts[:, 1] > cb]
+    else:
+        crown = pts[pts[:, 1] > cb]
+    att = crown[rng.choice(len(crown), min(p["attractors"], len(crown)), replace=False)]
+    # 26 October 2026: WOOD EVIDENCE ; a share of the attractors comes from the voxels the sheet shows as wood in the front or back AND the right or left view
+    # (Evidence3D.py), so the limbs grow where the reference shows limbs. FR : une part des attracteurs vient des voxels de bois vus sur la planche.
+    if p["wood_attr_frac"] > 0:
+        e = np.load(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), p["evidence"]) if not os.path.isabs(p["evidence"]) else p["evidence"])
+        idw = np.argwhere(e["occ"]); ptw = e["origin"] + idw * float(e["voxel"]) + float(e["voxel"]) / 2 * rng.random((len(idw), 3)); ptw = ptw[ptw[:, 1] > cb]
+        okw = np.zeros(len(ptw), bool)
+        for a in range(0, len(ptw), 20000): okw[a:a + 20000] = trunk_clear(ptw[a:a + 20000])
+        ptw = ptw[okw]; nw = int(p["attractors"] * p["wood_attr_frac"])
+        if len(ptw): att = np.concatenate([ptw[rng.choice(len(ptw), min(nw, len(ptw)), replace=False)], att[: max(p["attractors"] - nw, 0)]])
+    trunk = np.array(tr["points"])
+    nodes = [trunk[-1].copy()]; parent = [-1]
+    alive = np.ones(len(att), bool)
+    for it in range(p["max_iter"]):
+        if not alive.any():
+            break
+        N = np.array(nodes); t = cKDTree(N)
+        d, nn = t.query(att[alive], distance_upper_bound=p["influence_m"])
+        ok = np.isfinite(d)
+        if not ok.any():
+            break
+        A = att[alive][ok]; nn = nn[ok]
+        grow = {}
+        for a, n in zip(A, nn):
+            v = a - N[n]; v /= np.linalg.norm(v) + 1e-9
+            grow.setdefault(n, []).append(v)
+        for n, vs in grow.items():
+            dvec = np.mean(vs, 0); dvec /= np.linalg.norm(dvec) + 1e-9
+            nodes.append(N[n] + dvec * p["step_m"]); parent.append(int(n))
+        N = np.array(nodes); t = cKDTree(N)
+        d2, _ = t.query(att)
+        alive &= d2 > p["kill_m"]
+    N = np.array(nodes); par = np.array(parent)
+    # prune: nodes outside the crown volume (with a tolerance of one voxel) are removed with their subtree
+    if p["prune_out"]:
+        gi = np.floor((N - org) / vx).astype(int)
+        inside = np.all((gi >= 0) & (gi < np.array(occ.shape)), 1)
+        inside[inside] = occ[tuple(gi[inside].T)]
+        from scipy import ndimage as ndi
+        occ_d = ndi.binary_dilation(occ, iterations=1)
+        ins_d = np.all((gi >= 0) & (gi < np.array(occ.shape)), 1); ins_d[ins_d] = occ_d[tuple(gi[ins_d].T)]
+        keep = np.ones(len(N), bool)
+        for i in range(len(N)):
+            q = par[i]
+            keep[i] = ins_d[i] and (q < 0 or keep[q])
+        keep[0] = True
+        newi = -np.ones(len(N), int); newi[keep] = np.arange(keep.sum())
+        N = N[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
+    # jump guard (25 October 2026): a child farther than max_seg_m from its parent makes a blade sweep, drop the subtree
+    seg = np.array([np.linalg.norm(N[i] - N[q]) if q >= 0 else 0 for i, q in enumerate(par)])
+    keep = np.ones(len(N), bool)
+    for i in range(len(N)):
+        q = par[i]; keep[i] = (seg[i] <= p["max_seg_m"]) and (q < 0 or keep[q])
+    keep[0] = True
+    newi = -np.ones(len(N), int); newi[keep] = np.arange(keep.sum())
+    N = N[keep]; par = np.array([newi[q] if q >= 0 else -1 for q in par[keep]])
+    # pipe model radii from the tips down
+    children = [[] for _ in N]
+    for i, q in enumerate(par):
+        if q >= 0: children[q].append(i)
+    r = np.zeros(len(N))
+    order = np.argsort(-np.array([depth for depth in _depths(par)]))
+    for i in order:
+        if not children[i]:
+            r[i] = p["tip_radius_m"]
+        else:
+            r[i] = (sum(r[c] ** p["pipe_exp"] for c in children[i])) ** (1 / p["pipe_exp"])
+    # connect to the trunk: scale so the root radius equals the measured trunk top radius
+    k = tr["radius"][-1] * p["trunk_tip_radius_scale"] / max(r[0], 1e-6)
+    r = np.minimum(r * k, tr["radius"][-1])
+    tips = [i for i in range(len(N)) if not children[i]]
+    # foliage on the crown SHELL: hull voxels within shell_depth of the hull boundary (what the views actually see)
+    from scipy import ndimage as ndi
+    depth = ndi.distance_transform_edt(occ) * vx
+    # cards reach leaf_size/2 around their centre: centres stay leaf_inset_m inside the hull (25 October 2026)
+    ridge = occ & (depth >= ndi.maximum_filter(depth, 3) - 1e-6)            # thin parts: their medial voxels qualify too
+    shell = np.argwhere(occ & (((depth >= p["leaf_inset_m"]) & (depth <= p["leaf_inset_m"] + p["shell_depth_m"])) | (ridge & (depth < p["leaf_inset_m"]) & bool(p["ridge"]))))
+    shell = org + shell * vx + vx / 2
+    if p["crown_rule"]:
+        shell = shell[shell[:, 1] > p["crown_min_frac"] * shell[:, 1].max()]
+        ok = np.zeros(len(shell), bool)
+        for a in range(0, len(shell), 20000): ok[a:a + 20000] = trunk_clear(shell[a:a + 20000])
+        shell = shell[ok]
+    else:
+        shell = shell[shell[:, 1] > cb + 0.5]
+    clumps = shell[rng.choice(len(shell), min(p["shell_clumps"], len(shell)), replace=False)]
+    # 26 October 2026: CARVE ; a clump whose centre projects on a wood pixel in at least carve_k of the four side views would hide a limb the sheet shows,
+    # it is dropped. FR : une touffe posée sur du bois visible cacherait un membre, elle est retirée.
+    if p["carve_wood"]:
+        Wk = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from PIL import Image as _I; from scipy import ndimage as _nd
+        calj = json.load(open(os.path.join(Wk, "work/tree/view_cal.json"))); fm = json.load(open(os.path.join(Wk, "work/tree/frame_B/frame.json"))); cnt = np.zeros(len(clumps), int)
+        for vn in ("front", "back", "right", "left"):
+            vv = [x for x in fm["views"] if x["name"] == vn][0]; a_, b_ = np.array(calj[vn][0]), np.array(calj[vn][1])
+            px = a_[0] * (clumps @ np.array(vv["rx"], float)) + b_[0]; py = a_[1] * (clumps @ np.array(vv["uy"], float)) + b_[1]
+            wm = np.asarray(_I.open(os.path.join(Wk, "work/tree/views/wood_%s.png" % vn))) > 127
+            if p["carve_dilate_px"]: wm = _nd.binary_dilation(wm, iterations=int(p["carve_dilate_px"]))
+            ix, iy = np.floor(px).astype(int), np.floor(py).astype(int); ok = (ix >= 0) & (ix < wm.shape[1]) & (iy >= 0) & (iy < wm.shape[0]); h = np.zeros(len(clumps), bool); h[ok] = wm[iy[ok], ix[ok]]; cnt += h
+        clumps = clumps[cnt < p["carve_k"]]
+    # trunk flare: the base radius grows toward the ground (roots)
+    tr = dict(tr); ys_t = np.array(tr["points"])[:, 1]; rad = np.array(tr["radius"])
+    # base guard (25 October 2026): the lowest rows touch the ground line (shadow, scale cube); the radius never exceeds
+    # base_cap times the median radius between 1 and 3 m, then it is smoothed (no ring steps)
+    mid = rad[(ys_t > 1.0) & (ys_t < 3.0)]
+    if len(mid): rad = np.minimum(rad, p["base_cap"] * float(np.median(mid)))
+    rad = ndi.gaussian_filter1d(rad, p["trunk_smooth"])
+    flare = 1 + (p["root_flare"] - 1) * np.clip(1 - (ys_t - ys_t.min()) / p["flare_h_m"], 0, 1) ** 2
+    tr["radius"] = (rad * flare).round(4).tolist()
+    json.dump({"_date": "25 October 2026", "params": p, "trunk": tr, "nodes": N.round(4).tolist(), "parent": par.tolist(),
+               "radius": r.round(4).tolist(), "tips": tips, "clumps": clumps.round(4).tolist()}, open(out, "w"))
+    print(json.dumps({"nodes": len(N), "tips": len(tips), "root_r": round(float(r[0]), 3), "iters": it + 1}))
+
+
+def _depths(par):
+    d = np.zeros(len(par), int)
+    for i in range(len(par)):
+        q, n = par[i], 0
+        while q >= 0:
+            n += 1; q = par[q]
+        d[i] = n
+    return d
+
+
+if __name__ == "__main__":
+    a = sys.argv
+    main(a[1], a[2], a[3], **dict(x.split("=") for x in a[4:]))

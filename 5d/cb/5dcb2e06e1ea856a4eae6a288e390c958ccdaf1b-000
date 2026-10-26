@@ -43,6 +43,93 @@ def colour(p):
     return (70, 190, 90) if p >= 0.90 else (235, 170, 40) if p >= 0.75 else (225, 70, 60)
 
 
+def tri_render(dl):
+    """26 October 2026: a topology file (P, C, I, T, names) as a triangle mesh with the part id of every triangle ; FR : fichier de topologie en triangles."""
+    C_, I_, T_, P_ = dl["C"].astype(int), dl["I"].astype(int), dl["T"], dl["P"].astype(np.float32); st = np.concatenate([[0], np.cumsum(C_)[:-1]]); F, TT = [], []
+    for s0, c, t in zip(st, C_, T_):
+        v = I_[s0:s0 + c]
+        for k in range(1, c - 1): F.append((v[0], v[k], v[k + 1])); TT.append(t)
+    return P_, np.array(F, np.int32), np.array(TT), dl["names"]
+
+
+def row_map(meta, v, shape, ys=(3.0, 4.0, 12.0, 13.0)):
+    """26 October 2026: pixel row of a world height in a sheet view, calibrated by rendering two vertical quads of known height (side views only) ;
+    the mask rows of the quad give py = a y + b. FR : ligne de pixels d'une hauteur du monde, calibrée par deux quads de hauteur connue."""
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); c0 = lo + D / 2; rx = np.array(v["rx"]); got = []
+    for y0 in (ys[0], ys[2]):
+        P_ = np.array([c0 + rx * 2 + np.array([0, y0 - c0[1], 0]), c0 - rx * 2 + np.array([0, y0 - c0[1], 0]), c0 - rx * 2 + np.array([0, y0 + 1 - c0[1], 0]), c0 + rx * 2 + np.array([0, y0 + 1 - c0[1], 0])], np.float32)
+        r = Raster.Renderer(P_, np.array([[0, 1, 2], [0, 2, 3]], np.int32)); M, _ = SheetScore.render_in_panel(r, meta, v, shape); r.release(); rows = np.flatnonzero(M.any(1)); got.append((y0, rows.min(), rows.max()))
+    (ya, ta, ba), (yb, tb, bb) = got; sl = ((ta + ba) / 2 - (tb + bb) / 2) / (ya - yb); b = (ta + ba) / 2 - sl * (ya + 0.5)
+    return lambda y: sl * y + b
+
+
+def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
+    """26 October 2026: ORGANIC component completion. A grey generated tree has no edge to compare, so each component is a region : the reference mask
+    of its class (wood or foliage, WoodMask.py) in a height band, against the visible faces of its parts in the same band ; IoU per view, mean over
+    the kept views, over a ceiling. FR : complétion des composants organiques par recouvrement de masques de classe dans une bande de hauteur."""
+    prm = prm or json.load(open(W + "work/%s/component_params.json" % obj)); comps = prm["components"]; Pt = prm["paths"]
+    meta = json.load(open(W + Pt["frame"] + "/frame.json")); sheet = json.load(open(W + Pt["views"] + "/sheet.json"))
+    dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); Pv, Fv, Tv, Nv = tri_render(dl); part_comp = {}
+    for j, nm in enumerate(Nv): part_comp[j] = [k for k, c in comps.items() if any(re.fullmatch(pt, str(nm)) for pt in c.get("parts", []))]
+    r = Raster.Renderer(Pv, Fv); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["F"] = out[3]; return out
+    r.render = rr; views = {}
+    for v in meta["views"]:
+        if v["name"] in prm.get("skip_views", []): continue
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        mref = np.asarray(Image.open(W + Pt["frame"] + "/mask_%s.png" % v["name"])) > 127; sh = mref.shape
+        M, shade = SheetScore.render_in_panel(r, meta, v, sh); Fi = cap["F"][: sh[0], : sh[1]]; vis = M & (Fi >= 0) & (Fi < len(Tv))
+        wood = np.asarray(Image.open(W + Pt["views"] + "/wood_%s.png" % v["name"])) > 127; fol = np.asarray(Image.open(W + Pt["views"] + "/foliage_%s.png" % v["name"])) > 127
+        rowf = row_map(meta, v, sh) if v["name"] in ("front", "back", "left", "right") else None
+        views[v["name"]] = {"M": M, "vis": vis, "fid": np.where(vis, Fi, 0), "wood": wood, "fol": fol, "shade": shade, "row": rowf, "ref": np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % (pan["index"], v["name"])).convert("L")), "mref": mref}
+    r.release(); out = {}; ceil = prm["ceiling_iou"]
+    for k, c in comps.items():
+        row = {"n": int(k), "name": c["name"], "tool": c.get("tool", ""), "class": c["ref"], "y_band": c.get("y_band"), "faces": int(sum((Tv == j).sum() for j, ks in part_comp.items() if k in ks))}
+        ious = {}; area_ref = area_mod = 0
+        for vn, vw in views.items():
+            if c.get("y_band") and vw["row"] is None: continue
+            rows = np.zeros(vw["M"].shape[0], bool)
+            if c.get("y_band"):
+                a, b = vw["row"](c["y_band"][1]), vw["row"](c["y_band"][0]); rows[max(int(a), 0): min(int(b) + 1, len(rows))] = True
+            else: rows[:] = True
+            pid = np.array([k in part_comp[j] for j in range(len(Nv))] + [False]); mod = vw["vis"] & pid[Tv[vw["fid"]]] & rows[:, None]
+            ref = (vw["wood"] if c["ref"] == "wood" else vw["fol"]) & rows[:, None]; u = (ref | mod).sum()
+            if u: ious[vn] = round(float((ref & mod).sum() / u), 4)
+            area_ref += int(ref.sum()); area_mod += int(mod.sum()); vw.setdefault("masks", {})[k] = (ref, mod)
+        row["iou_views"] = ious; row["iou"] = round(float(np.mean(list(ious.values()))), 4) if ious else None
+        row["ref_px"], row["model_px"] = area_ref, area_mod; row["area_ratio"] = round(area_mod / max(area_ref, 1), 3)
+        row["completion"] = round(min(1.0, row["iou"] / ceil), 3) if row["iou"] is not None else None
+        out[k] = row
+    scored = [v for v in out.values() if v["completion"] is not None]; th = prm["thresholds"]
+    for v in scored:
+        v["next"] = "keep" if v["completion"] >= th["exact"] else ("model has too much %s (area ratio %.2f) : thin it in %s" % (v["class"], v["area_ratio"], v["tool"]) if v["area_ratio"] > 1.0 else "model misses %s (area ratio %.2f) : grow it in %s" % (v["class"], v["area_ratio"], v["tool"]))
+    summary = {"_date": "26 October 2026", "object": obj, "tag": tag, "components_scored": len(scored), "mean_completion": round(float(np.mean([v["completion"] for v in scored])), 3),
+               "exact": [v["n"] for v in scored if v["completion"] >= th["exact"]], "close": [v["n"] for v in scored if th["close"] <= v["completion"] < th["exact"]], "not_exact": [v["n"] for v in scored if v["completion"] < th["close"]]}
+    result = {"summary": summary, "components": out}; main_mask.last = {"views": views, "comps": comps}
+    if not write: return result
+    base = W + "versions/Components_%s_%s" % (obj, tag); json.dump(result, open(base + ".json", "w"), indent=1, ensure_ascii=False)
+    L = ["# Component completion %s %s (%s)" % (obj, tag, summary["_date"]), "", "Mean %.1f %%, %d components : exact %d, close %d, not exact %d." % (100 * summary["mean_completion"], len(scored), len(summary["exact"]), len(summary["close"]), len(summary["not_exact"])), "",
+         "| N | Component | % | IoU | area model / ref | next | tool |", "|---|---|---|---|---|---|---|"]
+    for v in sorted(scored, key=lambda v: v["completion"]): L.append("| %d | %s | %.0f | %.3f | %.2f | %s | %s |" % (v["n"], v["name"], 100 * v["completion"], v["iou"], v["area_ratio"], v["next"], v["tool"]))
+    open(base + ".md", "w").write("\n".join(L) + "\n")
+    if board: mask_board(views, base + "_board.png")
+    print(json.dumps(summary)); return result
+
+
+def mask_board(views, path):
+    """per view : reference classes | model classes | difference (red wood missing, blue wood extra, orange foliage missing, cyan foliage extra)."""
+    tiles = []
+    for vn, vw in views.items():
+        ref = np.stack([vw["ref"] // 2] * 3, -1).astype(np.uint8); a = ref.copy(); a[vw["wood"]] = (230, 150, 60); a[vw["fol"]] = (60, 140, 70)
+        mw = np.zeros(vw["M"].shape, bool); mf = np.zeros(vw["M"].shape, bool)
+        for k, (rf, md) in vw.get("masks", {}).items():
+            pass
+        b = np.stack([vw["shade"]] * 3, -1).astype(np.uint8)
+        tiles.append(np.hstack([a, b]))
+    Wd = max(t.shape[1] for t in tiles); Image.fromarray(np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0)).save(path)
+
+
 def main(tag, board=True, prm=None, write=True):
     prm = prm or json.load(open(W + "work/car/component_params.json")); comps = prm["components"]; wt = prm["weights"]; L = prm["line"]
     LineScore.P["tol_px"] = L["tol_px"]
@@ -244,4 +331,5 @@ def selftest(tag):
 if __name__ == "__main__":
     if "--selftest" in sys.argv: sys.exit(selftest(sys.argv[1]))
     if "--crop" in sys.argv: crop(sys.argv[1], sys.argv[sys.argv.index("--crop") + 1]); sys.exit(0)
+    if "--obj" in sys.argv and sys.argv[sys.argv.index("--obj") + 1] != "car": main_mask(sys.argv[1], "--no-board" not in sys.argv, None, True, sys.argv[sys.argv.index("--obj") + 1]); sys.exit(0)
     main(sys.argv[1], "--no-board" not in sys.argv)

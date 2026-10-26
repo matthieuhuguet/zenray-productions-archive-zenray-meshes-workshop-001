@@ -1,0 +1,31 @@
+# 26 October 2026 : ZenRay Meshes, 3D EVIDENCE of a class (wood, foliage) from the sheet views (shared organic tool).
+# EN: every voxel is projected into the four side views and the top (ViewCal) ; a voxel is HULL if it lies inside the object mask of every view,
+# WOOD if besides it hits a wood pixel in the front or the back view AND in the right or the left view, FOLIAGE the same with the foliage masks.
+# A limb hidden behind leaves in every view stays out (nothing measures it either). Output npz with occ, origin, voxel (the format of hull.npz).
+# FR : évidence 3D du bois et du feuillage : un voxel est du bois s'il tombe sur du bois en face OU dos ET en droite OU gauche, dans le volume des masques.
+# Usage: python Evidence3D.py <frame_dir> <views_dir> <out_prefix> [voxel_m=0.15]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import ViewCal
+
+
+def main(fdir, vdir, outp, voxel=0.15):
+    voxel = float(voxel); meta = json.load(open(os.path.join(fdir, "frame.json"))); lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); n = np.ceil(D / voxel).astype(int)
+    shape = np.asarray(Image.open(os.path.join(fdir, "mask_front.png"))).shape; cal = ViewCal.calibrate(meta, shape)
+    g = np.stack(np.meshgrid(*[np.arange(k) for k in n], indexing="ij"), -1).reshape(-1, 3); C = lo + (g + 0.5) * voxel
+    def hit(view, imgp):
+        v = [x for x in meta["views"] if x["name"] == view][0]; px, py = ViewCal.project(cal[view], v, C); ix, iy = np.floor(px).astype(int), np.floor(py).astype(int)
+        ok = (ix >= 0) & (ix < shape[1]) & (iy >= 0) & (iy < shape[0]); im = np.asarray(Image.open(imgp)) > 127; r = np.zeros(len(C), bool); r[ok] = im[iy[ok], ix[ok]]; return r
+    mask = {v: hit(v, os.path.join(fdir, "mask_%s.png" % v)) for v in ("front", "back", "right", "left", "top")}
+    hull = mask["front"] & mask["back"] & mask["right"] & mask["left"] & mask["top"]
+    W_ = {v: hit(v, os.path.join(vdir, "wood_%s.png" % v)) for v in ("front", "back", "right", "left")}; F_ = {v: hit(v, os.path.join(vdir, "foliage_%s.png" % v)) for v in ("front", "back", "right", "left")}
+    wood = hull & (W_["front"] | W_["back"]) & (W_["right"] | W_["left"]); fol = hull & (F_["front"] | F_["back"]) & (F_["right"] | F_["left"])
+    for nm, m in (("hull", hull), ("wood", wood), ("foliage", fol)):
+        np.savez(outp + "_%s.npz" % nm, occ=m.reshape(n), origin=lo, voxel=voxel)
+    print(json.dumps({"voxels": int(len(C)), "hull": int(hull.sum()), "wood": int(wood.sum()), "foliage": int(fol.sum()), "voxel_m": voxel}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

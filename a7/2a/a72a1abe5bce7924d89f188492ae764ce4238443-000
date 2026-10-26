@@ -1,0 +1,35 @@
+# 26 October 2026 : ZenRay Meshes, WORLD to PIXEL calibration of every sheet view (shared by all objects).
+# EN: SheetScore.render_in_panel hides its camera ; a known square of 1 m rendered at two positions along each image axis gives the
+# affine map px = a_u u + b_u, py = a_v v + b_v with u = p . rx and v = p . uy of the view. Measured on the car bottom view :
+# px = 305.8 - 117.2 z, py = 198.5 + 115.5 x (skill section 79). FR : calibrage monde vers pixel de chaque vue de la planche.
+# Both windings of the square are rendered : the rasteriser culls back faces. FR : les deux sens de rotation du carré.
+# Usage : cal = ViewCal.calibrate(meta, shape) -> {view: (A, b)} ; px, py = ViewCal.project(cal[view], meta_view, points)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import Raster, SheetScore
+
+
+def _square(c0, ru, rv, cu, cv, size=1.0):
+    h = size / 2; return np.array([c0 + ru * (cu - h) + rv * (cv - h), c0 + ru * (cu + h) + rv * (cv - h), c0 + ru * (cu + h) + rv * (cv + h), c0 + ru * (cu - h) + rv * (cv + h)], np.float32)
+
+
+def calibrate(meta, shape):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); c0 = lo + D / 2; out = {}
+    for v in meta["views"]:
+        ru, rv = np.array(v["rx"], float), np.array(v["uy"], float); cu0, cv0 = float(c0 @ ru), float(c0 @ rv); res = {}
+        spread = 0.3 * min(D[np.argmax(np.abs(ru))], D[np.argmax(np.abs(rv))])
+        pts = []
+        for du, dv in ((-spread, 0), (spread, 0), (0, -spread), (0, spread)):
+            P_ = _square(c0 - ru * cu0 - rv * cv0, ru, rv, cu0 + du, cv0 + dv, size=spread)
+            r = Raster.Renderer(P_, np.array([[0, 1, 2], [0, 2, 3], [0, 2, 1], [0, 3, 2]], np.int32)); M, _ = SheetScore.render_in_panel(r, meta, v, shape); r.release()
+            ys, xs = np.nonzero(M); pts.append((cu0 + du, cv0 + dv, xs.min() + xs.max() + 1, ys.min() + ys.max() + 1))
+        a_u = (pts[1][2] / 2 - pts[0][2] / 2) / (pts[1][0] - pts[0][0]); b_u = pts[0][2] / 2 - a_u * pts[0][0]
+        a_v = (pts[3][3] / 2 - pts[2][3] / 2) / (pts[3][1] - pts[2][1]); b_v = pts[2][3] / 2 - a_v * pts[2][1]
+        out[v["name"]] = (np.array([a_u, a_v]), np.array([b_u, b_v]))
+    return out
+
+
+def project(cal_v, view, P):
+    P = np.asarray(P, float); u, w = P @ np.array(view["rx"], float), P @ np.array(view["uy"], float); a, b = cal_v
+    return a[0] * u + b[0], a[1] * w + b[1]

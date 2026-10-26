@@ -1,0 +1,40 @@
+# 26 October 2026 : ZenRay Meshes, WOOD versus FOLIAGE masks of a grey rendered tree, one per sheet view (shared organic tool).
+# EN: a generated tree sheet is grey, so colour cannot split wood from leaves. Two features do : the smoothed luminance (limbs
+# and trunk are lit, smooth ramps ; leaves are dark and speckled) and the local texture (std of the luminance in a window).
+# A two class k-means (numpy, no sklearn) on (L, std) inside the object mask gives the foliage / wood split, then a small
+# morphological clean up. Writes work/<obj>/views/wood_<view>.png and foliage_<view>.png and an overlay board.
+# FR : masques bois et feuillage d'un arbre gris : luminance lissée et texture locale, deux classes, sans sklearn.
+# Usage: python WoodMask.py <views_dir> [win=9]
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+
+def split(ref, m, win=9):
+    ref = ref.astype(float); L = ndi.gaussian_filter(ref, 2.0); mu = ndi.uniform_filter(ref, win); sd = np.sqrt(np.maximum(ndi.uniform_filter(ref ** 2, win) - mu ** 2, 0))
+    gm = np.hypot(ndi.sobel(ref, 0), ndi.sobel(ref, 1)); ge = ndi.uniform_filter(gm, win)
+    F = np.stack([L[m], sd[m], ge[m]], 1); F = (F - F.mean(0)) / (F.std(0) + 1e-9)
+    c = np.stack([F[F[:, 0] > np.percentile(F[:, 0], 75)].mean(0), F[F[:, 0] < np.percentile(F[:, 0], 25)].mean(0)])   # bright class first, dark class second
+    for _ in range(30):
+        d = ((F[:, None, :] - c[None]) ** 2).sum(2); lab = d.argmin(1)
+        c = np.stack([F[lab == k].mean(0) if (lab == k).any() else c[k] for k in (0, 1)])
+    wood = np.zeros(m.shape, bool); wood[m] = lab == 0
+    wood = ndi.binary_opening(wood, iterations=1); wood = ndi.binary_closing(wood, iterations=2) & m
+    return wood
+
+
+def main(vdir, win=9):
+    sheet = json.load(open(os.path.join(vdir, "sheet.json"))); tiles = []; stats = {}
+    for p in sheet["panels"]:
+        nm = p["name"]; ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (p["index"], nm))).convert("L"))
+        m = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_mask.png" % (p["index"], nm)))) > 127
+        w = split(ref, m, int(win)); f = m & ~w
+        Image.fromarray((w * 255).astype(np.uint8)).save(os.path.join(vdir, "wood_%s.png" % nm)); Image.fromarray((f * 255).astype(np.uint8)).save(os.path.join(vdir, "foliage_%s.png" % nm))
+        ov = np.stack([ref // 2] * 3, -1).astype(np.uint8); ov[w] = (230, 150, 60); ov[f] = (60, 140, 70); tiles.append(ov); stats[nm] = {"wood_px": int(w.sum()), "foliage_px": int(f.sum()), "wood_share": round(float(w.sum() / max(m.sum(), 1)), 3)}
+    Wd = max(t.shape[1] for t in tiles); out = np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0); Image.fromarray(out).save(os.path.join(vdir, "wood_board.png"))
+    print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

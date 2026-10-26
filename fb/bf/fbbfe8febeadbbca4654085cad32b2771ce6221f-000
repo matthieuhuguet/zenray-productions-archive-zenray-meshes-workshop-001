@@ -3,7 +3,7 @@
 # drop polygons that collapse, ORIENT every connected piece consistently (breadth first over shared edges, the majority
 # winding of the piece is kept), and a closed piece outward (positive signed volume). Parts stay separate shells.
 # FR : réparation de topologie par pièce : soudure, faces effondrées, orientation cohérente (vers l'extérieur si fermé).
-# Usage: python TopoFix.py <in.npz> <out.npz> [weld_tol_m=1e-7] [--across] [--nofix] [--cap=part1,part2] [--split5] [--obj=<out.obj>]
+# Usage: python TopoFix.py <in.npz> <out.npz> [weld_tol_m=1e-7] [--across] [--nofix] [--cap=part1,part2] [--split5] [--twist=20] [--obj=<out.obj>]
 #        --nofix keeps the polygons as they are (a topology export), --cap closes clipped thick panels (cap_ladder), --obj writes a grouped polygon OBJ
 #        python TopoFix.py --selftest
 import sys, json
@@ -130,6 +130,23 @@ def split_pentagons(P, Q, N):
     return out_q, out_n, done, left
 
 
+def split_twisted(P, Q, N, deg=20.0):
+    """26 October 2026 : a quad whose four corners are not coplanar (ruled facets of the nose, curved grid cells) is flagged as a FOLD by TopoCheck
+    when even its better diagonal breaks it by more than deg degrees. It is cut into two triangles along the diagonal that breaks it least, so
+    each half is planar and the shape is untouched. FR : un quad gauchi devient deux triangles plans, selon la diagonale la moins brisée."""
+    out_q, out_n, done = [], [], 0
+    def ang(a, b, c, d):   # angle between the normals of triangles (a, b, c) and (a, c, d)
+        n1 = np.cross(P[b] - P[a], P[c] - P[a]); n2 = np.cross(P[c] - P[a], P[d] - P[a])
+        return float(np.degrees(np.arccos(np.clip(n1 @ n2 / (np.linalg.norm(n1) * np.linalg.norm(n2) + 1e-30), -1, 1))))
+    for q, n in zip(Q, N):
+        if len(q) != 4: out_q.append(q); out_n.append(n); continue
+        a, b, c, d = q; fA, fB = ang(a, b, c, d), ang(b, c, d, a)
+        if min(fA, fB) <= deg: out_q.append(q); out_n.append(n); continue
+        t = [[a, b, c], [a, c, d]] if fA <= fB else [[b, c, d], [b, d, a]]
+        out_q += t; out_n += [n, n]; done += 1
+    return out_q, out_n, done
+
+
 def fix(P, Q, N, tol=1e-7, across=False):
     P2, Q2, N2 = weld(np.asarray(P, float), [list(map(int, q)) for q in Q], list(N), tol, across)
     Q3, flips = orient(P2, Q2, N2)
@@ -192,6 +209,9 @@ if __name__ == "__main__":
     else: P2, Q2, N2, st = fix(Pin, Qin, Nin, tol, "--across" in sys.argv)
     if "--split5" in sys.argv:
         Q2, N2, n5, left = split_pentagons(P2, Q2, N2); st["pentagons_split"] = n5; st["polygons_over_5_left"] = left
+    tw_arg = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--twist=")]
+    if tw_arg:
+        Q2, N2, ntw = split_twisted(P2, Q2, N2, float(tw_arg[0])); st["twisted_split"] = ntw
     if cap_arg:
         Q2, N2, nadd, rep = cap_ladder(P2, Q2, N2, cap_arg[0].split(",")); st["cap_quads"] = nadd; st["cap"] = rep
         if nadd: Q2, fl = orient(P2, Q2, N2); st["flipped_after_cap"] = fl
