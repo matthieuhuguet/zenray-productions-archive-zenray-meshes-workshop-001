@@ -218,6 +218,7 @@ def main(params, prefix, out):
     # band is ruled, the shape does not change), and the cut then follows the circle. FR : bandes de flanc subdivisées.
     E_s = cj["exp_rows"]; nh_s = len(E_s); ss = int(C.get("side_subdiv", 1)); srow = set(C.get("side_rows", []))
     vent_k = []   # 26 October 2026: columns moved onto the vent's lower edge
+    vent_slot = []   # 26 October 2026: slot columns to put back on their segment outside the vent window
     rname = lambda j: E_s[nh_s - 1 - j] if j < nh_s else E_s[j - (nh_s - 1)]
     for j in range(R):
         cols.append((j, j, 0.0, j, 1.0))
@@ -249,7 +250,25 @@ def main(params, prefix, out):
                 wv_ = sstv((zr_ - (zv0 - rpv)) / rpv) * sstv(((zv1 + rpv) - zr_) / rpv)
                 um_ = float(np.mean(ut_[wv_ > 0.5])) if (wv_ > 0.5).any() else 0.5
                 iu = int(np.argmin([abs(float(np.mean(v_)) - um_) for v_ in us_]))
-                if VT_.get("slot_m"):
+                if VT_.get("slot_m") and VT_.get("keep_band", 1):
+                    # 26 October 2026: SLOT, KEEP BAND ; the nearest existing column becomes the lower wall inside the window
+                    # (unchanged outside) and three added columns (floor, floor, upper wall) take the slot inside the window ;
+                    # outside it they are put back, after the bulge, ON the straight segment between that column and the far
+                    # row (the shoulder line), so the surface away from the vent is exactly the old one. FR : fente sans
+                    # toucher la bande ailleurs.
+                    ub_ = np.full_like(zr_, float(np.mean(us_[iu]))) if np.ndim(us_[iu]) == 0 else us_[iu]
+                    lo_col = ub_ + wv_ * (ut_ - ub_); us_[iu] = lo_col
+                    far_name = VT_.get("far_row", VT_["band"][1]); u_far = 1.0 if rname(j + 1) == far_name else 0.0
+                    sm_, wl_ = VT_["slot_m"], VT_.get("wall_m", 0.003); fr_ = [0.25, 0.5, 0.75]; extras = []
+                    for o_, f_ in zip([wl_, sm_ - wl_, sm_], fr_):
+                        ui_ = np.clip((yv_ + o_ - ya_) / np.where(np.abs(yb_ - ya_) < 1e-6, 1e-6, yb_ - ya_), 0.01, 0.99)
+                        uo_ = ub_ + f_ * (u_far - ub_); extras.append(uo_ + wv_ * (ui_ - uo_))
+                    us_ = us_ + extras; us_.sort(key=lambda v_: float(np.mean(v_)))
+                    base_ = len(cols); idx_ = lambda arr: base_ + [i_ for i_, v_ in enumerate(us_) if v_ is arr][0]
+                    k_far = base_ - 1 if rname(j) == far_name else base_ + len(us_)
+                    vent_slot.append({"k_lo": idx_(lo_col), "k_extra": [idx_(e_) for e_ in extras], "fr": fr_, "k_far": k_far, "wv": wv_})
+                    vent_k.extend([idx_(extras[0]), idx_(extras[1])])
+                elif VT_.get("slot_m"):
                     # 26 October 2026: SLOT ; four columns (outer wall, floor, floor, outer wall) slot_m tall, the two floor
                     # columns pushed in later ; outside the window they sit evenly between the neighbouring columns (no
                     # degenerate strip), the replaced uniform column included. FR : fente à quatre colonnes.
@@ -396,6 +415,10 @@ def main(params, prefix, out):
                 Pn = np.where(lo_[:, None], A_ + t1[:, None] * (Cp - A_), Cp + t1[:, None] * (B_ - Cp))
                 G2[:, k] = (1 - wz[:, None]) * G2[:, k] + wz[:, None] * Pn
     VT2 = C.get("vent")
+    for vs_ in vent_slot:   # 26 October 2026: outside the window the added columns lie on the old straight segment (lower wall to far row)
+        Plo_, Pfar_ = G2[:, vs_["k_lo"]].copy(), G2[:, vs_["k_far"]].copy(); w_ = vs_["wv"][:, None]
+        for k_, f_ in zip(vs_["k_extra"], vs_["fr"]):
+            G2[:, k_] = w_ * G2[:, k_] + (1.0 - w_) * (Plo_ + f_ * (Pfar_ - Plo_))
     if VT2 and VT2.get("on", 1) and vent_k:   # 26 October 2026: push the vent column in (depth_pts [z, m]), a V : light lip above, dark face below
         dp_ = np.array(VT2["depth_pts"], float); o_ = np.argsort(dp_[:, 0]); dp_ = dp_[o_]
         for k in vent_k:
