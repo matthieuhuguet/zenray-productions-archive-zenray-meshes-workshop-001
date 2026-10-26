@@ -16,7 +16,7 @@ DEFAULTS = {   # 26 October 2026: interface ; the params file overrides any of t
     "faces": {"ngon_is_error": 1, "tri_is_error": 0},
     "quality": {"aspect_max": 8.0, "angle_dev_max_deg": 55.0, "fold_max_deg": 20.0, "density_ratio_max": 3.0,
                 "min_edge_m": 1e-5, "min_area_m2": 1e-10},
-    "poles": {"sharp_deg": 30.0, "valence_min": 3, "valence_max": 5, "pole_on_sharp_is_error": 1},
+    "poles": {"sharp_deg": 30.0, "valence_min": 3, "valence_max": 5, "pole_on_sharp_is_error": 1, "support_deg": 20.0},
     "weld": {"crack_tol_m": 1e-5},
     "symmetry": {"suffix_l": "_L", "suffix_r": "_R", "mirror_tol_m": 0.002},
     "board": {"res": 1000, "views": ["three_quarter_front", "three_quarter_rear", "side", "front", "back", "top"], "edge_eps_m": 0.004},
@@ -69,7 +69,19 @@ def analyse(P, C, I, T, names, prm):
         n_ = np.cross(V[:, b] - V[:, a], V[:, c] - V[:, a]); return n_ / (np.linalg.norm(n_, axis=1, keepdims=True) + 1e-30)
     fA = np.degrees(np.arccos(np.clip((tn(0, 1, 2) * tn(0, 2, 3)).sum(1), -1, 1))); fB = np.degrees(np.arccos(np.clip((tn(1, 2, 3) * tn(1, 3, 0)).sum(1), -1, 1)))
     fold = np.minimum(fA, fB)
-    flags["aspect"][qs[aspect > q["aspect_max"]]] = True; flags["angle"][qs[adev > q["angle_dev_max_deg"]]] = True; flags["fold"][qs[fold > q["fold_max_deg"]]] = True
+    # 26 October 2026: SUPPORT STRIPS ; a holding loop along a hard edge is long and thin by design (ZenRayMeshes1.md 6.2,
+    # support loops) : a quad whose long edge carries a break of support_deg or more is exempt from aspect and density.
+    # FR : bande de maintien le long d'une arête vive, longue et fine par construction, exemptée d'allongement et de densité.
+    edih = np.zeros(len(uE)); edih[man] = dih
+    def edge_id(a_, b_):
+        k_ = np.stack([np.minimum(a_, b_), np.maximum(a_, b_)], 1); key_ = k_[:, 0] * (nP + 1) + k_[:, 1]
+        ukey = uE[:, 0] * (nP + 1) + uE[:, 1]; o_ = np.argsort(ukey); return o_[np.searchsorted(ukey[o_], key_)]
+    lng = np.argmax(L, 1); a0 = Q4[np.arange(len(qs)), lng]; a1 = Q4[np.arange(len(qs)), (lng + 1) % 4]
+    b0 = Q4[np.arange(len(qs)), (lng + 2) % 4]; b1 = Q4[np.arange(len(qs)), (lng + 3) % 4]
+    sup_q = np.maximum(edih[edge_id(a0, a1)], edih[edge_id(b0, b1)]) >= po.get("support_deg", 20.0)
+    support = np.zeros(nF, bool); support[qs[sup_q]] = True
+    flags["aspect"][qs[(aspect > q["aspect_max"]) & ~sup_q]] = True; flags["angle"][qs[adev > q["angle_dev_max_deg"]]] = True; flags["fold"][qs[fold > q["fold_max_deg"]]] = True
+    flags["density"] &= ~support
     # poles ; FR : pôles (valence différente de 4) hors bord, et pôles posés sur une arête vive
     used = np.zeros(nP, bool); used[I] = True
     deg = np.bincount(uE.ravel(), minlength=nP); bnd = np.zeros(nP, bool); bnd[uE[cnt == 1].ravel()] = True
@@ -135,9 +147,14 @@ def board(P, C, I, T, flags, err, prm, out_png):
     F = np.concatenate(tri); tpoly = np.concatenate(tp)
     fi = np.repeat(np.arange(len(C64)), C64); loc = np.arange(len(I)) - np.repeat(st, C64); nx_ = I[np.repeat(st, C64) + (loc + 1) % np.repeat(C64, C64)]
     E = np.unique(np.sort(np.stack([I, nx_], 1), 1), axis=0)
-    used = np.unique(F); c = (P[used].max(0) + P[used].min(0)) / 2; ext = np.linalg.norm(P[used].max(0) - P[used].min(0))
+    used = np.unique(F); Vf = P[used]
+    fz_ = os.environ.get("TC_FOCUS")   # 26 October 2026: zoom "z0,z1[,y0,y1]" ; TC_VIEWS picks the views (comma list)
+    if fz_:
+        lim = [float(x) for x in fz_.split(",")]; Vf = Vf[(Vf[:, 2] >= lim[0]) & (Vf[:, 2] <= lim[1])]
+        if len(lim) == 4: Vf = Vf[(Vf[:, 1] >= lim[2]) & (Vf[:, 1] <= lim[3])]
+    c = (Vf.max(0) + Vf.min(0)) / 2; ext = np.linalg.norm(Vf.max(0) - Vf.min(0))
     r = Raster.Renderer(P, F, smooth_deg=30.0); tiles = []; s = res / (ext * 1.05)
-    for name in b["views"]:
+    for name in (os.environ.get("TC_VIEWS", "").split(",") if os.environ.get("TC_VIEWS") else b["views"]):
         rx, uy = VIEWS[name]; rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
         M, D, N_, fid = r.render(c, s, (rx.tolist(), uy.tolist(), tz.tolist()), res)
         Lc = np.array([0.30, 0.55, 0.78]); Lc /= np.linalg.norm(Lc); sh = np.clip(0.25 + 0.75 * np.clip((N_ * Lc).sum(-1), 0, 1), 0, 1)
@@ -155,7 +172,8 @@ def board(P, C, I, T, flags, err, prm, out_png):
         for x0, y0, x1, y1 in zip(ax, ay, bx, by): dr.line((x0, y0, x1, y1), fill=(25, 25, 30))
         dr.text((8, 6), name, fill=(255, 255, 255)); tiles.append(np.asarray(im))
     r.release()
-    rows = [np.concatenate(tiles[i:i + 3], 1) for i in range(0, len(tiles), 3)]
+    nc_ = min(3, len(tiles)); tiles += [np.full_like(tiles[0], 70)] * ((-len(tiles)) % nc_)
+    rows = [np.concatenate(tiles[i:i + nc_], 1) for i in range(0, len(tiles), nc_)]
     Image.fromarray(np.concatenate(rows, 0)).save(out_png)
 
 
@@ -204,6 +222,10 @@ def selftest():
     Q6 = [f for f in Q if not (set(f) <= set(ring))] + [[ring[k], ring[(k + 1) % 6], c0] for k in range(6)]
     checks["bad_pole"] = run(P6, Q6)["bad_poles"] >= 1
     Q7 = [list(f) for f in Q]; Q7[7] = Q7[7][::-1]; checks["flipped"] = run(P, Q7)["flipped_edges"] >= 1
+    # aspect on a FLAT grid (no support edge) : 1 x 20 quads must be caught
+    xs_, zs_ = np.linspace(0, 1, 3), np.linspace(0, 1, 41); Pf = np.array([[x_, 0, z_] for x_ in xs_ for z_ in zs_])
+    Qf = [[i * 41 + j, i * 41 + j + 1, (i + 1) * 41 + j + 1, (i + 1) * 41 + j] for i in range(2) for j in range(40)]
+    checks["aspect_flat"] = run(Pf, Qf)["categories"]["aspect"]["faces"] >= 40
     out = {"green_clean_torus": ok_green, "green_score": g["score_clean"], "red_caught": checks, "ok": ok_green and all(checks.values())}
     print(json.dumps(out)); return 0 if out["ok"] else 1
 
