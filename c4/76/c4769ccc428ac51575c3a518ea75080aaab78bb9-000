@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# 26 October 2026 18:35: turnover of the ZenRay Meshes car, one full orbit of 24 frames, one MP4 per duration.
+# Every visual value lives in DEFAULTS or MATERIAL_COLOURS below, or behind a flag: one edit changes every frame and every video.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/CarTurnover.py
+"""Orbit the ZenRay Meshes car once around its vertical axis and encode the frames as turnover MP4 files.
+
+The camera turns counter-clockwise seen from above, at a constant height and a constant distance.
+It frames the bounding sphere of the car once, so the car keeps the same apparent size on every frame.
+Frame k (1 based) is taken at start_azimuth + 360 * (k - 1) / frames degrees: frame 1 is the three quarter
+front view, and the last frame lies one step (15 degrees for 24 frames) before it, so the loop has no seam.
+Every MP4 is encoded from the same frames; only the frame rate changes.
+The source file is only read. Only the numbered PNG frames of the output folder are replaced.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from fractions import Fraction
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster  # headless OpenGL rasteriser, shared with CleanView.py and ColorViews.py
+
+PROJECT_DIR = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+DATE_TAG = "26-October-2026"
+FFMPEG = "/opt/homebrew/bin/ffmpeg"
+FFPROBE = "/opt/homebrew/bin/ffprobe"
+FRAME_RE = re.compile(r"^\d{4}\.png$")
+DURATION_TOLERANCE = 0.05   # seconds allowed between the probed duration and the requested one
+
+# Tunable values. A flag overrides a default; the defaults rebuild the delivered files.
+DEFAULTS = {
+    "npz": os.path.join(PROJECT_DIR, "work/car/topo_v470.npz"),  # polygon export of the delivered car v470
+    "frames": 24,                       # frames in one full turn: 360 / 24 = 15 degrees between two frames
+    "seconds": "3,5",                   # one MP4 per duration, all built from the same frames
+    "size": 1024,                       # square frame side in pixels, must be even
+    "elevation": 20.6,                  # camera height above the horizontal plane, degrees (CleanView three_quarter_front)
+    "start_azimuth": 45.4,              # azimuth of frame 1, degrees (CleanView three_quarter_front)
+    "margin": 0.08,                     # free band between the bounding sphere and the frame edge, ratio of the sphere radius
+    "bg": "#606060",                    # flat background, the grey of the evolution videos
+    "crf": 18,                          # libx264 quality, lower is better
+    "out_dir": os.path.join(PROJECT_DIR, "Evolution/Turnover"),
+    "key_light": (-0.45, 0.6, 0.65),    # key light fixed in camera space, the same vector as ShadedViews.py
+    "ambient": 0.35,                    # shading = ambient + diffuse * max(0, normal . key), clipped to 1
+    "diffuse": 0.65,
+}
+
+# Component family to colour, copied from the ZRM_MATERIALS table of ColorViews.py.
+# The first keyword found in a part name wins, so the order matters. The empty keyword is the default colour.
+MATERIAL_COLOURS = [
+    ("CAR_line_", (150, 150, 152)), ("rocker_trim", (85, 85, 90)), ("joint_", (150, 150, 152)),
+    ("roof_molding", (170, 170, 172)), ("under_plate", (95, 95, 98)), ("under_arrow", (80, 80, 84)),
+    ("pillar", (40, 40, 44)), ("arch_", (205, 205, 200)), ("wheelwell", (30, 30, 32)),
+    ("brake_disc", (120, 120, 124)), ("caliper", (150, 40, 40)), ("susp", (50, 50, 52)),
+    ("bolt", (90, 90, 92)), ("tunnel", (60, 60, 62)), ("glass", (60, 72, 88)), ("tyre", (38, 38, 40)),
+    ("rim", (190, 192, 196)), ("light", (150, 40, 40)), ("grille", (55, 55, 58)),
+    ("diffuser", (55, 55, 58)), ("vent", (45, 45, 48)), ("splitter", (60, 60, 62)),
+    ("under", (70, 70, 72)), ("fascia_rear_panel", (70, 70, 74)), ("", (215, 215, 212)),
+]
+
+
+def colour_of(part_name):
+    # The first keyword found in the part name gives its colour; the empty keyword always matches.
+    for keyword, colour in MATERIAL_COLOURS:
+        if keyword in part_name:
+            return colour
+    raise SystemExit("no colour for part %s" % part_name)
+
+
+def load_mesh(path):
+    # Return vertices, triangles, the part index of every triangle and the part names.
+    # A file with an F key is already triangulated. A polygon file (C corner counts, I corners, one T per polygon)
+    # is fan triangulated: a polygon with n corners gives n - 2 triangles sharing its first corner, and each
+    # triangle inherits the part of its polygon.
+    data = np.load(path, allow_pickle=True)
+    points = np.asarray(data["P"], dtype=np.float64)
+    names = [str(name) for name in data["names"]]
+    if "F" in data.files:
+        return points, np.asarray(data["F"], dtype=np.int64), np.asarray(data["T"], dtype=np.int64), names
+    counts = np.asarray(data["C"], dtype=np.int64)
+    corners = np.asarray(data["I"], dtype=np.int64)
+    polygon_parts = np.asarray(data["T"], dtype=np.int64)
+    if len(polygon_parts) != len(counts) or counts.min() < 3 or corners.size != counts.sum():
+        raise SystemExit("polygon file %s is inconsistent: C, I and T disagree" % path)
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    triangles_per_polygon = counts - 2
+    owner = np.repeat(np.arange(len(counts)), triangles_per_polygon)
+    first_triangle = np.concatenate([[0], np.cumsum(triangles_per_polygon)[:-1]])
+    fan = np.arange(triangles_per_polygon.sum()) - np.repeat(first_triangle, triangles_per_polygon)
+    base = starts[owner]
+    faces = np.stack([corners[base], corners[base + fan + 1], corners[base + fan + 2]], axis=1)
+    return points, faces, polygon_parts[owner], names
+
+
+def frame_sphere(points, faces, margin):
+    # Bounding sphere of the vertices the faces really use. Any orientation of the car fits inside it.
+    used = points[np.unique(faces)]
+    centre = (used.max(axis=0) + used.min(axis=0)) / 2.0
+    radius = float(np.linalg.norm(used - centre, axis=1).max())
+    return centre, radius, radius * (1.0 + margin)
+
+
+def camera_axes(azimuth_deg, elevation_deg):
+    # Image right, image up and the direction from the car to the viewer, for a camera orbiting the vertical axis.
+    # The viewer direction is (cos e sin a, sin e, cos e cos a). Right = world up x viewer, then up closes the
+    # right handed frame, viewer = right x up, which is the convention of Raster.py.
+    azimuth = math.radians(azimuth_deg)
+    elevation = math.radians(elevation_deg)
+    viewer = np.array([math.cos(elevation) * math.sin(azimuth), math.sin(elevation), math.cos(elevation) * math.cos(azimuth)])
+    right = np.cross(np.array([0.0, 1.0, 0.0]), viewer)
+    right /= np.linalg.norm(right)
+    up = np.cross(viewer, right)
+    return right, up, viewer
+
+
+def shade(normals, key_light):
+    # Same formula as ColorViews.py. The key light is fixed in camera space, so the lit side always faces the viewer.
+    # A pixel without a usable normal (degenerate face) gets the ambient level instead of NaN.
+    lit = np.clip(np.nan_to_num((normals * key_light).sum(axis=-1)), 0.0, 1.0)
+    return np.clip(DEFAULTS["ambient"] + DEFAULTS["diffuse"] * lit, 0.0, 1.0)
+
+
+def render_frames(points, faces, parts, names, settings):
+    # Render every frame into the frames folder. Return the azimuth of each frame and the framing numbers.
+    centre, radius, half_width = frame_sphere(points, faces, settings["margin"])
+    px_per_m = settings["size"] / (2.0 * half_width)   # the renderer maps half_width to half of the frame side
+    palette = np.array([colour_of(name) for name in names], dtype=np.float64)
+    key = np.array(DEFAULTS["key_light"], dtype=np.float64)
+    key /= np.linalg.norm(key)
+    background = np.array(settings["background"], dtype=np.float64)
+    azimuths = []
+    renderer = Raster.Renderer(points, faces)
+    try:
+        for index in range(settings["frames"]):
+            azimuth = settings["start_azimuth"] + 360.0 * index / settings["frames"]
+            right, up, viewer = camera_axes(azimuth, settings["elevation"])
+            mask, _, normals, face_id = renderer.render(centre, px_per_m, (right, up, viewer), settings["size"])
+            face_part = parts[np.clip(face_id, 0, len(faces) - 1)]
+            picture = np.where(mask[..., None], palette[face_part] * shade(normals, key)[..., None], background)
+            Image.fromarray(picture.astype(np.uint8)).save(os.path.join(settings["frames_dir"], "%04d.png" % (index + 1)))
+            azimuths.append(azimuth)
+    finally:
+        renderer.release()
+    return azimuths, centre, radius, half_width
+
+
+def probe_video(path):
+    # Count the frames ffmpeg really decodes, then read size, rate and duration of the first video stream.
+    result = subprocess.run(
+        [FFPROBE, "-v", "error", "-count_frames", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,nb_read_frames,r_frame_rate,codec_name,pix_fmt",
+         "-show_entries", "format=duration", "-of", "json", path],
+        check=True, capture_output=True, text=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return {"width": int(stream["width"]), "height": int(stream["height"]), "frames": int(stream["nb_read_frames"]),
+            "r_frame_rate": stream["r_frame_rate"], "codec": stream["codec_name"], "pix_fmt": stream["pix_fmt"],
+            "duration": float(info["format"]["duration"])}
+
+
+def encode_videos(settings):
+    # Start one ffmpeg per duration at the same time, then wait for each and verify its probe.
+    running = []
+    for seconds in settings["seconds"]:
+        rate = Fraction(settings["frames"]) / Fraction(str(seconds))   # 24 frames in 3 s = 8 fps, in 5 s = 24/5 fps
+        out_path = os.path.join(settings["out_dir"], "Car_turnover_%gs_%s.mp4" % (seconds, DATE_TAG))
+        command = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                   "-framerate", str(rate), "-i", os.path.join(settings["frames_dir"], "%04d.png"),
+                   "-c:v", "libx264", "-crf", str(settings["crf"]), "-pix_fmt", "yuv420p",
+                   "-r", str(rate), "-movflags", "+faststart", out_path]
+        running.append((seconds, rate, out_path, subprocess.Popen(command)))
+    videos = []
+    for seconds, rate, out_path, process in running:
+        if process.wait() != 0:
+            raise SystemExit("ffmpeg failed for %s" % out_path)
+        probe = probe_video(out_path)
+        checks = {
+            "square": probe["width"] == settings["size"] and probe["height"] == settings["size"],
+            "frame_count": probe["frames"] == settings["frames"],
+            "frame_rate": Fraction(probe["r_frame_rate"]) == rate,
+            "duration": abs(probe["duration"] - seconds) <= DURATION_TOLERANCE,
+        }
+        videos.append({"path": out_path, "fps": str(rate), "requested_seconds": seconds, "probe": probe,
+                       "checks": checks, "ok": all(checks.values())})
+    return videos
+
+
+def parse_args(argv):
+    # Every flag mirrors a DEFAULTS entry, so the help text shows the value that will be used.
+    parser = argparse.ArgumentParser(description="Turnover videos of the ZenRay Meshes car: one orbit, one set of frames, one MP4 per duration.")
+    parser.add_argument("--npz", default=DEFAULTS["npz"], help="polygon or triangle export of the car")
+    parser.add_argument("--frames", type=int, default=DEFAULTS["frames"], help="frames in one full turn")
+    parser.add_argument("--seconds", default=DEFAULTS["seconds"], help="comma separated durations, one MP4 each")
+    parser.add_argument("--size", type=int, default=DEFAULTS["size"], help="square frame side in pixels, even")
+    parser.add_argument("--elevation", type=float, default=DEFAULTS["elevation"], help="camera height in degrees, strictly between -89 and 89")
+    parser.add_argument("--start-azimuth", type=float, default=DEFAULTS["start_azimuth"], help="azimuth of frame 1 in degrees")
+    parser.add_argument("--margin", type=float, default=DEFAULTS["margin"], help="free band around the bounding sphere, ratio of its radius")
+    parser.add_argument("--bg", default=DEFAULTS["bg"], help="flat background as a hex colour such as #606060")
+    parser.add_argument("--crf", type=int, default=DEFAULTS["crf"], help="libx264 quality")
+    parser.add_argument("--out-dir", default=DEFAULTS["out_dir"], help="folder receiving frames/ and the MP4 files")
+    return parser.parse_args(argv)
+
+
+def parse_seconds(text):
+    values = [float(item) for item in text.split(",") if item.strip()]
+    if not values or any(value <= 0 for value in values):
+        raise SystemExit("--seconds expects one or more positive durations, such as 3,5")
+    return values
+
+
+def parse_hex(text):
+    match = re.match(r"^#?([0-9a-fA-F]{6})$", text)
+    if not match:
+        raise SystemExit("--bg expects a hex colour such as #606060")
+    digits = match.group(1)
+    return tuple(int(digits[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.size < 64 or args.size % 2:
+        raise SystemExit("--size must be an even number of pixels, at least 64")
+    if args.frames < 2:
+        raise SystemExit("--frames must be at least 2")
+    if not -89.0 < args.elevation < 89.0:
+        raise SystemExit("--elevation must lie strictly between -89 and 89 degrees")
+    if args.margin < 0 or args.crf < 0:
+        raise SystemExit("--margin and --crf must not be negative")
+    seconds = parse_seconds(args.seconds)
+    background = parse_hex(args.bg)
+
+    points, faces, parts, names = load_mesh(args.npz)
+    out_dir = os.path.abspath(args.out_dir)
+    frames_dir = os.path.join(out_dir, "frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    for name in os.listdir(frames_dir):   # only the numbered PNG frames of this folder are replaced
+        if FRAME_RE.match(name):
+            os.remove(os.path.join(frames_dir, name))
+
+    settings = {"frames": args.frames, "seconds": seconds, "size": args.size, "elevation": args.elevation,
+                "start_azimuth": args.start_azimuth, "margin": args.margin, "background": background,
+                "crf": args.crf, "out_dir": out_dir, "frames_dir": frames_dir}
+    azimuths, centre, radius, half_width = render_frames(points, faces, parts, names, settings)
+    videos = encode_videos(settings)
+
+    manifest = {
+        "date": DATE_TAG, "npz": os.path.abspath(args.npz), "size": args.size, "frames": args.frames,
+        "turn_degrees": 360, "direction": "counter-clockwise seen from above", "elevation": args.elevation,
+        "start_azimuth": args.start_azimuth, "step_degrees": 360.0 / args.frames,
+        "centre": [float(value) for value in centre], "bounding_radius": radius, "half_width": half_width,
+        "margin": args.margin, "background": "#%02x%02x%02x" % background,
+        "frame_azimuths": [round(value, 4) for value in azimuths], "videos": videos,
+    }
+    manifest_path = os.path.join(out_dir, "Car_turnover_manifest_%s.json" % DATE_TAG)
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    print("frames: %s (%d images of %dx%d)" % (frames_dir, args.frames, args.size, args.size))
+    print("bounding radius %.4f, half width %.4f, centre %s" % (radius, half_width, [round(float(v), 4) for v in centre]))
+    for video in videos:
+        print("video: %s, %s fps, probe %s, checks %s" % (video["path"], video["fps"], json.dumps(video["probe"]), json.dumps(video["checks"])))
+    print("manifest: %s" % manifest_path)
+    failed = [video["path"] for video in videos if not video["ok"]]
+    if failed:
+        raise SystemExit("verification failed for: %s" % ", ".join(failed))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
