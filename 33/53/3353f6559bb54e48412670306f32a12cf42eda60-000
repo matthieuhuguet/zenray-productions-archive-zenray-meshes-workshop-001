@@ -1,0 +1,372 @@
+# 25 October 2026 : ZenRay Meshes car, BODY BY ROW LOFT (method change). The creased Catmull-Clark of the cage rounded
+# every band BETWEEN two character lines and carried the noise of each measured station along the car (lumpy, wavy sides),
+# while the sheet is made of clean bands split by crisp lines. Here every named row of the cage is a smooth curve along
+# the car (monotone cubic through the stations, no overshoot), sampled densely in z, and the surface between two rows is
+# straight across : crisp character lines across, smooth bands along, like the sheet. Panel names follow the cage faces.
+# FR : chaque rangée nommée devient une courbe lisse le long de la voiture, la surface est droite entre deux rangées.
+# Usage: python RowLoft.py <loft_params.json> <cage_prefix> <out.npz>
+import sys, os, json
+import numpy as np
+from scipy.interpolate import PchipInterpolator
+
+
+def main(params, prefix, out):
+    C = json.load(open(params)); cj = json.load(open(prefix + "_cage.json"))
+    st = np.array(cj["stations"]); R = cj["ring"]; S = len(st); panels = cj["panels"]
+    V = np.array([list(map(float, l.split()[1:])) for l in open(prefix + "_cage.obj") if l.startswith("v ")]).reshape(S, R, 3)
+    # dense samples per station interval : n_per_m along the length, at least 1 per interval
+    zs, seg = [], []
+    for i in range(S - 1):
+        n = max(1, int(abs(st[i] - st[i + 1]) * C["n_per_m"]))
+        for k in range(n): zs.append(i + k / n); seg.append(i)
+    zs.append(S - 1); seg.append(S - 2)
+    t = np.array(zs)                                     # station parameter (fractional index), monotone
+    G = np.zeros((len(t), R, 3))
+    for j in range(R):
+        for a in range(3):
+            G[:, j, a] = PchipInterpolator(np.arange(S), V[:, j, a])(t)
+    if C.get("fair", 1):
+        # 25 October 2026: FAIR ROWS. Each row (x and y along z) is a penalised cubic B-spline (P-spline : knots every knot_m,
+        # second difference penalty lam), ends held by a large weight ; the arch rows ignore the stations inside the wheel
+        # arches (the arches are cut afterwards), so the side runs clean from bumper to bumper.
+        from scipy.interpolate import BSpline
+        m = json.load(open(prefix + "_measure.json")) if os.path.exists(prefix + "_measure.json") else None
+        Wh = m["wheels"] if m else None; E = cj["exp_rows"]; nh = len(E)
+        row_of = lambda j: E[nh - 1 - j] if j < nh else E[j - (nh - 1)]
+        zt = np.interp(t, np.arange(S), V[:, 0, 2] * 0 + st)   # sample z along the car
+        zlo, zhi = st.min(), st.max(); kn = np.arange(zlo, zhi + 1e-9, C["knot_m"])
+        if kn[-1] < zhi: kn = np.append(kn, zhi)
+        T = np.concatenate([[zlo] * 3, kn, [zhi] * 3])
+        # 25 October 2026: CLEAN CURVES ; each character line is a cubic B-spline with one knot every knot_m (few control
+        # points, smooth by construction, like a designer's curve) and deliberate C0 corners (knot repeated 3 times) only at
+        # the design breaks listed per row in "breaks" (windshield base, rear glass base) ; FR : courbes propres, peu de points.
+        def knots_for(bz):
+            pts = [zlo] + sorted(b for b in bz if zlo + 0.05 < b < zhi - 0.05) + [zhi]; inner = []
+            for a_, b_ in zip(pts[:-1], pts[1:]):
+                n_ = max(1, int(round((b_ - a_) / C["knot_m"]))); inner += list(np.linspace(a_, b_, n_ + 1)[1:-1])
+                if b_ < zhi: inner += [b_] * 3
+            return np.concatenate([[zlo] * 4, sorted(inner), [zhi] * 4])
+        def fit(z, v, w, zq):
+            T_ = T; B = BSpline.design_matrix(np.clip(z, zlo, zhi), T_, 3).toarray(); nb = B.shape[1]
+            D = np.diff(np.eye(nb), 2, axis=0); A = B.T @ (w[:, None] * B) + C["lam"] * D.T @ D
+            c = np.linalg.solve(A, B.T @ (w * v)); return BSpline.design_matrix(np.clip(zq, zlo, zhi), T, 3).toarray() @ c
+        ra = Wh["tyre_r"] * C["arch_pad"] if Wh else 0
+        for j in range(R):
+            r = row_of(j); z = V[:, j, 2]; keep0 = np.ones(S, bool)
+            if C.get("fit_skip_ends", 1): keep0[0] = keep0[-1] = False   # 25 October 2026: end faces (tips, ground shadow) pulled the floor down
+            T = knots_for(C.get("breaks", {}).get(r, []))
+            for a in (0, 1):
+                keep = keep0.copy()
+                # 25 October 2026: only the HEIGHT (y) of the arch rows is perturbed over the wheels (arch top) ; their width
+                # (x) there is the real haunch bulge, so x is fitted on every station (skipping it lost the rear haunch)
+                if Wh and r in C["arch_rows"] and (a == 1 or not C.get("arch_skip_x_keep", 1)):
+                    keep &= np.minimum(np.abs(z - Wh["front_z"]), np.abs(z - Wh["rear_z"])) > ra * C["arch_skip"]
+                w = np.where(np.arange(S)[keep] % (S - 1) == 0, C["end_weight"], 1.0)
+                G[:, j, a] = fit(z[keep], V[keep, j, a], w, zt)
+            G[:, j, 2] = zt
+    # 26 October 2026: SHOULDER OVERHANG LIMIT ; belt_top (plan shoulder line) stood up to 3.5 cm outside the belt in the
+    # middle of the doors, an undercut that rendered as a black band where the sheet shades the shoulder band softly ; the
+    # belt is held at most shoulder_overhang_max inside belt_top. FR : débord de l'épaule sur la ceinture limité.
+    om = C.get("shoulder_overhang_max")
+    if om is not None:
+        E_o = cj["exp_rows"]; nh_o = len(E_o)
+        for jb, jt in ((nh_o - 1 - E_o.index("belt"), nh_o - 1 - E_o.index("belt_top")), (nh_o - 1 + E_o.index("belt"), nh_o - 1 + E_o.index("belt_top"))):
+            if 0 <= jb < R and 0 <= jt < R:
+                G[:, jb, 0] = np.sign(G[:, jb, 0]) * np.maximum(np.abs(G[:, jb, 0]), np.abs(G[:, jt, 0]) - om)
+    # 26 October 2026: WHEEL COVER ; a car body covers its tyres in plan (the sheet's top view never shows them), so the rows
+    # that frame the arches (wheel_cover.rows) are pushed out over each tyre to tyre face + cover_m by a smooth bump (a
+    # max filter then a Gaussian of sigma_m along z : no kink, the curve stays clean). The top view rounds the rear corners
+    # over the tyres (0.23 m off the side views at z -2.0) ; the side views and the back view win.
+    # FR : la caisse couvre ses pneus vue de dessus, bosse lisse sur les rangées qui encadrent les passages.
+    WC = C.get("wheel_cover")
+    if WC and WC.get("on", 1):
+        # 26 October 2026: the first bump (max filter of the deficit, then Gaussian) added the largest nearby deficit to points
+        # that needed less (sill 1.29 m at z -1.8 for a 1.13 target) ; now new = |x| + softplus(face - |x|) * w(z), w a C2
+        # plateau window over the tyre (plus extra_m per row, smootherstep ramps of ramp_m) : |x| where w = 0, max(|x|, face)
+        # inside, a smooth blend between
+        Wp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
+        E_ = cj["exp_rows"]; nh_ = len(E_); zq = G[:, 0, 2]; k_ = WC.get("soft_m", 0.006); rp = WC.get("ramp_m", 0.12)
+        sstep = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        for rn, rc in WC["rows"].items():
+            if rn not in E_: continue
+            for inst in Wp["instances"]:
+                if inst["x"] <= 0: continue
+                if rc.get("rear_only") and inst["z"] > 0: continue   # 26 October 2026: per row, rear wheels only
+                face = inst["x"] + 0.5 * Wp["tyre_w"] + Wp.get("bulge", 0.0) + WC["cover_m"] + rc.get("face_dx", 0.0)   # 26 October 2026: per row face offset
+                ex = rc.get("extra_rear_m" if inst["z"] < 0 else "extra_front_m", rc.get("extra_m", 0.0))
+                lo, hi = inst["z"] - Wp["tyre_r"] - (ex if inst["z"] < 0 else rc.get("extra_m", 0.0)), inst["z"] + Wp["tyre_r"] + (rc.get("extra_m", 0.0) if inst["z"] < 0 else ex)
+                for j in sorted({nh_ - 1 - E_.index(rn), nh_ - 1 + E_.index(rn)}):
+                    if not 0 <= j < G.shape[1]: continue
+                    if rc.get("window", WC.get("window")) == "radial":   # 26 October 2026: a row can override the window (belt : z window)
+                        # 26 October 2026: a FLARE ring around the arch (distance to the axle in y z), full push up to
+                        # arch radius + flare_m, ramp_m beyond ; the z window left fins at the arch edges (seen from above)
+                        d = np.hypot(G[:, j, 1] - inst["y"], zq - inst["z"]); R0 = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14) + WC.get("flare_m", 0.1)
+                        w = sstep((R0 + rp - d) / rp)
+                        zf = WC.get("front_fade_z")   # 26 October 2026: no flare at the nose cut (the nose read a bulged section)
+                        if zf and inst["z"] > 0: w = w * sstep((zf[1] - zq) / (zf[1] - zf[0]))
+                        zr = WC.get("rear_fade_z")    # 26 October 2026: nor at the tail cut (flat slab at the face corners)
+                        if zr and inst["z"] < 0: w = w * sstep((zq - zr[0]) / (zr[1] - zr[0]))
+                    else:
+                        rp_ = rc.get("ramp_m", rp)   # 26 October 2026: per row ramp (the rear belt push turned in 0.15 m, a kink in the shoulder)
+                        w = sstep((zq - (lo - rp_)) / rp_) * sstep(((hi + rp_) - zq) / rp_)
+                    ax = np.abs(G[:, j, 0]); u = face - ax
+                    sp = k_ * np.logaddexp(0.0, u / k_)
+                    G[:, j, 0] = np.sign(G[:, j, 0]) * (ax + sp * w)
+    # 25 October 2026: CHARACTER LINE GROOVES ; a named row sinks inward by d (x toward the axis), so the two bands that meet
+    # there break their normals enough to draw the line the sheet shows (belt crease, sill crease)
+    if C.get("groove_rows"):
+        E_ = cj["exp_rows"]; nh_ = len(E_)
+        for rn, d in C["groove_rows"].items():
+            if rn not in E_: continue
+            for j in (nh_ - 1 - E_.index(rn), nh_ - 1 + E_.index(rn)):
+                if 0 <= j < R: G[:, j, 0] -= np.sign(G[:, j, 0]) * d
+    if C.get("min_y") is not None: G[:, :, 1] = np.maximum(G[:, :, 1], C["min_y"])   # 25 October 2026: no row below the floor plane
+    # 26 October 2026: SKIRT BELOW THE FLOOR ; the back view puts the underside between the tyres at y 0.17 while the side
+    # views see a bottom line at 0.126 : the side skirt (sill) hangs lower than the floor. row_y_min raises the floor rows,
+    # row_dy lowers a row between the wheels with smootherstep ramps (z window, ramp_m). FR : jupe plus basse que le plancher.
+    E_y = cj["exp_rows"]; nh_y = len(E_y); zq_y = G[:, 0, 2]
+    sst_ = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+    for rn, ym in C.get("row_y_min", {}).items():
+        if rn in E_y:
+            for j in sorted({nh_y - 1 - E_y.index(rn), nh_y - 1 + E_y.index(rn)}): G[:, j, 1] = np.maximum(G[:, j, 1], ym)
+    for rn, sp_ in C.get("row_dy", {}).items():
+        if rn not in E_y: continue
+        z0_, z1_ = sp_["z"]; rp_ = sp_.get("ramp_m", 0.2)
+        w_ = sst_((zq_y - (z0_ - rp_)) / rp_) * sst_(((z1_ + rp_) - zq_y) / rp_)
+        for j in sorted({nh_y - 1 - E_y.index(rn), nh_y - 1 + E_y.index(rn)}): G[:, j, 1] += sp_["dy"] * w_
+    # 26 October 2026: row_dx moves a row's |x| by dx (negative = inward) in a z window with smootherstep ramps ; the sheet's
+    # band under the lower door crease is darker (it tucks in toward the sill), the model's was vertical. FR : retrait en x.
+    for rn, sp_ in C.get("row_dx", {}).items():
+        if rn not in E_y: continue
+        z0_, z1_ = sp_["z"]; rp_ = sp_.get("ramp_m", 0.2)
+        w_ = sst_((zq_y - (z0_ - rp_)) / rp_) * sst_(((z1_ + rp_) - zq_y) / rp_)
+        for j in sorted({nh_y - 1 - E_y.index(rn), nh_y - 1 + E_y.index(rn)}): G[:, j, 0] = np.sign(G[:, j, 0]) * (np.abs(G[:, j, 0]) + sp_["dx"] * w_)
+    # 25 October 2026: ROW ORDER ; from the sill up, each row stays above the row below (row_gap_m) and, from the glass
+    # base up, inside it in x : rows never cross, so no fold in any section (ShapeCheck "folds")
+    if C.get("order_rows", 1):
+        E_ = cj["exp_rows"]; nh_ = len(E_)
+        for side in (1, -1):
+            prev = None
+            for k in range(E_.index("sill"), nh_):
+                j = ((nh_ - 1 + k) if side > 0 else (nh_ - 1 - k)) % R
+                if prev is not None:
+                    G[:, j, 1] = np.maximum(G[:, j, 1], G[:, prev, 1] + C.get("row_gap_m", 0.003))
+                    if E_[k] in C.get("inward_rows", ["glass_base", "roof_edge"]):
+                        G[:, j, 0] = np.sign(G[:, j, 0]) * np.minimum(np.abs(G[:, j, 0]), np.abs(G[:, prev, 0]))
+                prev = j
+    # 25 October 2026: CROWN ; the top band (roof_centre -> roof_edge, roof and hood) was a straight ruled strip, a tent
+    # with a ridge in the front view ; crown_n columns are inserted, x linear and y = yc + (ye - yc) * u**crown_p, flat top
+    # that drops near its edges, as the sheet. Panels of the inserted strips follow their band.
+    cols = []
+    cn, cp = C.get("crown_n", 0), C.get("crown_p", 3.0)
+    # 26 October 2026: SUPERELLIPSE CROWN ; the end views of the sheet show a flat roof with a tight corner (front view top
+    # 1.334 m out to x 0.5, 1.315 at 0.6, then down), the power law u**3 made a dome (model 1.5 to 3 cm high in the middle,
+    # 3 to 6 cm low at x 0.5 to 0.65). crown_superellipse n : y = ye + (yc - ye) * (1 - u**n)**(1/n), a quarter superellipse
+    # (vertical tangent at the roof edge row), columns spread by the superellipse angle so the corner gets them
+    cse = C.get("crown_superellipse")
+    def crown(ja, jb, ua, ub):   # ja centre column, jb edge column
+        out = []
+        for k in range(1, cn + 1):
+            u = np.sin(0.5 * np.pi * k / (cn + 1)) ** (2.0 / cse) if cse else k / (cn + 1)
+            u = ua + (ub - ua) * u
+            out.append((ja, jb, u))
+        return out
+    if cse: cp = -float(cse)   # negative power = superellipse exponent (read in the column interpolation below)
+    # 26 October 2026: SIDE SUBDIVISION ; a side band (sill to door_low, door_low to belt ...) was ONE quad tall (0.3 to 0.4 m),
+    # so the arch cut, which removes quads by their centre, left a tongue hanging in the middle of the rear arch and square
+    # corners beside it ; side_subdiv n inserts n - 1 straight columns in every band between two rows of side_rows (the
+    # band is ruled, the shape does not change), and the cut then follows the circle. FR : bandes de flanc subdivisées.
+    E_s = cj["exp_rows"]; nh_s = len(E_s); ss = int(C.get("side_subdiv", 1)); srow = set(C.get("side_rows", []))
+    rname = lambda j: E_s[nh_s - 1 - j] if j < nh_s else E_s[j - (nh_s - 1)]
+    for j in range(R):
+        cols.append((j, j, 0.0, j, 1.0))
+        if cn and j == 0: cols += [(0, 1, u, 0, cp) for (_, _, u) in crown(0, 1, 0, 1)]
+        if cn and j == R - 1: cols += [(0, R - 1, u, R - 1, cp) for (_, _, u) in crown(0, R - 1, 0, 1)[::-1]]
+        if ss > 1 and j < R - 1 and rname(j) in srow and rname(j + 1) in srow:
+            cols += [(j, j + 1, k / ss, j, 1.0) for k in range(1, ss)]
+    G2 = np.zeros((len(t), len(cols), 3))
+    for k, (a, b, u, _, pw) in enumerate(cols):
+        if a == b: G2[:, k] = G[:, a]
+        else:
+            G2[:, k, 0] = G[:, a, 0] + u * (G[:, b, 0] - G[:, a, 0]); G2[:, k, 2] = G[:, a, 2] + u * (G[:, b, 2] - G[:, a, 2])
+            f_ = (1.0 - (1.0 - u ** -pw) ** (1.0 / -pw)) if pw < 0 else u ** pw   # 26 October 2026: superellipse crown when pw < 0
+            G2[:, k, 1] = G[:, a, 1] + (G[:, b, 1] - G[:, a, 1]) * f_
+    # 26 October 2026: HAUNCH ; the widest line of the rear haunch (back view 1.14 m at y 0.8) lies between door_low and
+    # belt, where the ruled band cut the corner ; the middle inserted column of that band (haunch.u) is pushed over each
+    # tyre like the wheel cover rows, and the inserted columns on either side are re-interpolated between their new
+    # neighbours (no groove). FR : colonne de hanche au milieu de la bande bas de porte / ceinture, poussée sur le pneu.
+    HC = C.get("haunch")
+    if HC and HC.get("on", 1) and ss > 1:
+        Wp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
+        ra_, rb_ = HC["between"]; zq = G2[:, 0, 2]; k_ = HC.get("soft_m", 0.006); rp = HC.get("ramp_m", 0.12)
+        sstep = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        for k, (a, b, u, _, pw) in enumerate(cols):
+            if a == b or {rname(a), rname(b)} != {ra_, rb_}: continue
+            uf = u if rname(a) == ra_ else 1.0 - u          # fraction measured from the first named row
+            if abs(uf - HC["u"]) > 1e-6: continue
+            ax = np.abs(G2[:, k, 0]); add = np.zeros(len(zq))
+            for inst in Wp["instances"]:
+                if inst["x"] <= 0: continue
+                face = inst["x"] + 0.5 * Wp["tyre_w"] + Wp.get("bulge", 0.0) + HC["cover_m"]
+                ex = HC.get("extra_rear_m" if inst["z"] < 0 else "extra_front_m", 0.0)
+                lo, hi = inst["z"] - Wp["tyre_r"] - (ex if inst["z"] < 0 else 0.0), inst["z"] + Wp["tyre_r"] + (0.0 if inst["z"] < 0 else ex)
+                if HC.get("window") == "radial":   # 26 October 2026: flare ring around the arch, as wheel_cover
+                    d = np.hypot(G2[:, k, 1] - inst["y"], zq - inst["z"]); R0 = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14) + HC.get("flare_m", 0.1)
+                    w = sstep((R0 + rp - d) / rp)
+                    zf = HC.get("front_fade_z")
+                    if zf and inst["z"] > 0: w = w * sstep((zf[1] - zq) / (zf[1] - zf[0]))
+                    zr = HC.get("rear_fade_z")
+                    if zr and inst["z"] < 0: w = w * sstep((zq - zr[0]) / (zr[1] - zr[0]))
+                else:
+                    w = sstep((zq - (lo - rp)) / rp) * sstep(((hi + rp) - zq) / rp)
+                add = np.maximum(add, k_ * np.logaddexp(0.0, (face - ax) / k_) * w)
+            G2[:, k, 0] = np.sign(G2[:, k, 0]) * (ax + add)
+            # re-interpolate the inserted columns between this column and the two ring columns of the band
+            ka = [i for i in range(len(cols)) if cols[i][0] == cols[i][1] == a][0]; kb = [i for i in range(len(cols)) if cols[i][0] == cols[i][1] == b][0]
+            for i2, (a2, b2, u2, _, _) in enumerate(cols):
+                if (a2, b2) != (a, b) or i2 == k: continue
+                if u2 < u: f = u2 / u; G2[:, i2] = G2[:, ka] + f * (G2[:, k] - G2[:, ka])
+                else: f = (u2 - u) / (1 - u); G2[:, i2] = G2[:, k] + f * (G2[:, kb] - G2[:, k])
+    # 26 October 2026: BULGE FIELD ; the haunches were made by pushing single rows (wheel cover rows, haunch column, belt)
+    # while the columns between them stayed ruled : streaks and a crumpled band above each arch. One smooth field now moves
+    # EVERY side column (rows in bulge.rows and the columns inserted between them) : x_new = |x| + softplus(H(y) - |x|) w(z),
+    # H the section profile of the haunch read on the end views (half width against height), w a plateau window along z
+    # per wheel. Smooth in y (H) and in z (w), so the side stays clean. FR : un seul champ de bombement lisse pour tout le flanc.
+    BG = C.get("bulge")
+    if BG and BG.get("on", 1):
+        sst2 = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        rows_ok = set(BG.get("rows", ["sill", "door_low", "belt", "belt_top"])); zq = G2[:, 0, 2]; k_ = BG.get("soft_m", 0.006)
+        sel = [k for k, (a, b, u, _, pw) in enumerate(cols) if rname(a) in rows_ok and rname(b) in rows_ok]
+        for wh in BG["wheels"]:
+            rp_ = wh.get("ramp_m", 0.3); w = sst2((zq - (wh["z0"] - rp_)) / rp_) * sst2(((wh["z1"] + rp_) - zq) / rp_)
+            Hy = np.array(wh["profile"], float)
+            for k in sel:
+                ax = np.abs(G2[:, k, 0]); H = np.interp(G2[:, k, 1], Hy[:, 0], Hy[:, 1])
+                G2[:, k, 0] = np.sign(G2[:, k, 0]) * (ax + k_ * np.logaddexp(0.0, (H - ax) / k_) * w)
+        # 26 October 2026: a band with ONE moved edge (belt_top / glass_base, sill / fender_inner) kept its inserted columns
+        # where they were, so its first strip twisted (TwistCheck p95 8.7 deg, max 57 on the front fender shoulder) ; those
+        # columns are re-interpolated between their two edges after the bulge (straight strips again)
+        base_k = {cols[k][0]: k for k in range(len(cols)) if cols[k][0] == cols[k][1]}
+        for k, (a, b, u, _, pw) in enumerate(cols):
+            if a == b or (rname(a) in rows_ok) == (rname(b) in rows_ok) or pw != 1.0: continue
+            ka, kb = base_k[a], base_k[b]
+            G2[:, k] = G2[:, ka] + u * (G2[:, kb] - G2[:, ka])
+    band = [c[3] for c in cols]; R2 = len(cols)
+    # 26 October 2026: SLANTED DOOR CUT ; the sheet's rear door line is diagonal (side views), the cage split doors at a
+    # station (vertical). Around the cut, each side column is sheared along z by a smooth bump (half cosine over window_m)
+    # so that ONE grid row (i0) lands exactly on the line, x and y re-read on the column's own curve (the surface does
+    # not move) ; quads of the door band then take door ahead of row i0 and quarter behind. FR : découpe de porte en biais.
+    DC = C.get("door_cut"); i0 = None; dc_cols = set()
+    if DC and DC.get("on", 1):
+        (zt_, yt_), (zb_, yb_) = DC["top"], DC["bottom"]; Wd = DC.get("window_m", 0.25); zmid = 0.5 * (zt_ + zb_)
+        zc_ = G2[:, 0, 2]; i0 = int(np.argmin(np.abs(zc_ - zmid)))
+        for k in range(R2):
+            yk = G2[i0, k, 1]
+            if abs(G2[i0, k, 0]) < DC.get("x_min", 0.5) or not (yb_ - 0.03 <= yk <= yt_ + 0.03): continue
+            tt_ = float(np.clip((yk - yb_) / (yt_ - yb_), 0, 1)); ztar = zb_ + tt_ * (zt_ - zb_); off = ztar - zc_[i0]
+            dzv = np.abs(zc_ - zc_[i0]); f = np.where(dzv < Wd, 0.5 * (1 + np.cos(np.pi * dzv / Wd)), 0.0)
+            znew = zc_ + off * f; o_ = np.argsort(zc_)
+            for a in (0, 1): G2[:, k, a] = np.interp(znew, zc_[o_], G2[o_, k, a])
+            G2[:, k, 2] = znew; dc_cols.add(k)
+    P = G2.reshape(-1, 3); Q, N = [], []
+    idx = lambda i, j: i * R2 + (j % R2)
+    for i in range(len(t) - 1):
+        for j in range(R2):
+            nm_ = panels[seg[i] * R + band[j]]
+            if i0 is not None and j in dc_cols and (j + 1) % R2 in dc_cols:
+                for a_, b_ in ((DC.get("front", "door"), DC.get("back", "quarter")),):
+                    side_ = nm_.rsplit("_", 1)[-1]
+                    if nm_ in (a_ + "_" + side_, b_ + "_" + side_): nm_ = (a_ if i < i0 else b_) + "_" + side_
+            elif i0 is not None and DC.get("upper_split") and nm_.startswith(("shoulder_door", "shoulder_quarter")):
+                side_ = nm_.rsplit("_", 1)[-1]; nm_ = ("shoulder_door" if G2[i, 0, 2] > DC["top"][0] else "shoulder_quarter") + "_" + side_
+            Q.append((idx(i, j), idx(i, j + 1), idx(i + 1, j + 1), idx(i + 1, j))); N.append(nm_)
+    R_orig, R = R, R2
+    # 25 October 2026: WHEEL ARCHES CUT IN THE CONSTRUCTION (no boolean) ; quads whose centre lies inside an arch cylinder
+    # (|x| > arch_x0, distance to the axle < tyre_r x arch_pad_cut) are removed, and the vertices on the new boundary are
+    # moved radially onto the arc : a clean circular opening. FR : passages découpés à la construction, bord ramené sur l'arc.
+    if C.get("arch_cut", 0):
+        Wp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
+        Rc = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14); x0 = C.get("arch_x0", 0.40)
+        cen = np.array([(i["y"], i["z"]) for i in Wp["instances"] if i["x"] > 0])
+        P_pre = P.copy()   # 26 October 2026: the surface before the cut, read back below (x on the arch ring)
+        Qa = np.array(Q); ce = P[Qa].mean(1); inside = np.zeros(len(Qa), bool)
+        for yc, zc in cen: inside |= (np.abs(ce[:, 0]) > x0) & (np.hypot(ce[:, 1] - yc, ce[:, 2] - zc) < Rc)
+        bnd = np.intersect1d(np.unique(Qa[inside].ravel()), np.unique(Qa[~inside].ravel()))
+        for v in bnd:
+            if abs(P[v, 0]) <= x0: continue
+            dd = np.hypot(P[v, 1] - cen[:, 0], P[v, 2] - cen[:, 1]); k = int(np.argmin(dd))
+            if dd[k] < Rc * 1.4 and dd[k] > 1e-6:
+                ny_ = cen[k, 0] + (P[v, 1] - cen[k, 0]) * Rc / dd[k]
+                if ny_ >= C.get("min_y", 0.10):
+                    P[v, 1] = ny_; P[v, 2] = cen[k, 1] + (P[v, 2] - cen[k, 1]) * Rc / dd[k]
+                elif abs(P[v, 1] - cen[k, 0]) < Rc:   # 25 October 2026: low points slide along z only, never below the floor
+                    P[v, 2] = cen[k, 1] + np.sign(P[v, 2] - cen[k, 1]) * np.sqrt(Rc ** 2 - (P[v, 1] - cen[k, 0]) ** 2)
+        Q = [q for q, k_ in zip(Q, inside) if not k_]; N = [n for n, k_ in zip(N, inside) if not k_]
+        # 26 October 2026: RING RELAX ; the snapped boundary vertices pulled fan shaped quads (shards around the arch top) ;
+        # the vertices of the ring around each arch (within arch_relax_m outside the circle) move toward the mean of their
+        # grid neighbours in y and z, the boundary staying on the circle. FR : anneau autour du passage lissé.
+        rr_ = C.get("arch_relax_m", 0.0); it_ = int(C.get("arch_relax_iter", 0))
+        if rr_ > 0 and it_ > 0:
+            used = np.zeros(len(P), bool); used[np.array(Q).ravel()] = True; fixed = np.zeros(len(P), bool); fixed[bnd] = True
+            d_all = np.min([np.hypot(P[:, 1] - yc, P[:, 2] - zc) for yc, zc in cen], axis=0)
+            ring = used & ~fixed & (np.abs(P[:, 0]) > x0) & (d_all < Rc + rr_)
+            idv = np.flatnonzero(ring); ii, kk = idv // R2, idv % R2; nT = len(t)
+            nbrs = []
+            for di, dk in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                i2, k2 = ii + di, (kk + dk) % R2; okn = (i2 >= 0) & (i2 < nT)
+                nb = np.where(okn, np.clip(i2, 0, nT - 1) * R2 + k2, -1); nb = np.where((nb >= 0) & used[np.maximum(nb, 0)], nb, -1); nbrs.append(nb)
+            nbrs = np.stack(nbrs, 1)
+            axes_ = (0, 1, 2) if C.get("arch_relax_x", 1) else (1, 2)   # 26 October 2026: x too, else ripples in the flare ring
+            # 26 October 2026: WEIGHTED ; an all or nothing ring relaxed some sections of the shoulder row (belt_top) and not
+            # their neighbours (8 cm jump in x over 8 cm, a vertical fold in front of the front arch) ; the blend now falls
+            # smoothly from 0.5 on the circle to 0 at the ring edge
+            u_ = np.clip((d_all[idv] - Rc) / rr_, 0.0, 1.0); wgt = 0.5 * (1.0 - u_ * u_ * (3.0 - 2.0 * u_))
+            for _ in range(it_):
+                Ms = []
+                for a in axes_:
+                    A = np.where(nbrs >= 0, P[np.maximum(nbrs, 0), a], np.nan)
+                    with np.errstate(all="ignore"): Ms.append(np.nanmean(A, 1))
+                okm = np.isfinite(Ms[0])
+                for a, M_ in zip(axes_, Ms): P[idv[okm], a] = (1 - wgt[okm]) * P[idv[okm], a] + wgt[okm] * M_[okm]
+        # 26 October 2026: ARCH RING BACK ON THE SURFACE ; the radial snap and the relax move the ring vertices in y and z but
+        # keep their old x, so the ring left the surface (crumpled band above each arch) ; x is read back on the surface
+        # before the cut, x = X(y, z) per side, linear interpolation over the outer side points. FR : l'anneau reprojeté.
+        AR = C.get("arch_ring_reproject", {"on": 1, "x_min": 0.9, "y_min": 0.14, "reach_m": 0.35})
+        if AR and AR.get("on", 1):
+            from scipy.interpolate import LinearNDInterpolator
+            used2 = np.zeros(len(P), bool); used2[np.array(Q).ravel()] = True
+            d_pre = np.min([np.hypot(P_pre[:, 1] - yc, P_pre[:, 2] - zc) for yc, zc in cen], axis=0)
+            d_now = np.min([np.hypot(P[:, 1] - yc, P[:, 2] - zc) for yc, zc in cen], axis=0)
+            mv = used2 & (np.abs(P[:, 0]) > AR["x_min"]) & (d_now < Rc + max(rr_, 0.0) + 0.02)
+            for sg in (1, -1):
+                src = (np.sign(P_pre[:, 0]) == sg) & (np.abs(P_pre[:, 0]) > AR["x_min"]) & (P_pre[:, 1] > AR["y_min"]) & (d_pre < Rc + AR["reach_m"])
+                tg = np.flatnonzero(mv & (np.sign(P[:, 0]) == sg))
+                if src.sum() < 4 or not len(tg): continue
+                Xf = LinearNDInterpolator(P_pre[src][:, 1:3], P_pre[src][:, 0])(P[tg][:, 1:3])
+                ok_ = np.isfinite(Xf); P[tg[ok_], 0] = Xf[ok_]
+        # 26 October 2026: FOLDED SLIVERS ; the radial snap can push a boundary vertex past its neighbour, leaving quads whose
+        # two triangles face opposite ways (171 to 180 deg, 1 to 5 cm2, dark specks at the front edge of the front arch) ;
+        # quads that touch the arch boundary and fold more than fold_max_deg are dropped. FR : éclats repliés retirés.
+        fmax = C.get("arch_fold_max_deg", 90.0)
+        if fmax:
+            Qa2 = np.array(Q); A_, B_, C_, D_ = (P[Qa2[:, k]] for k in range(4))
+            def cos_tri(T1, T2):   # 26 October 2026: both diagonals (a renderer may split the quad either way ; a bow tie looks fine along one)
+                l1_ = np.linalg.norm(T1, axis=1); l2_ = np.linalg.norm(T2, axis=1); okq = (l1_ > 1e-12) & (l2_ > 1e-12)
+                cv = np.ones(len(T1)); cv[okq] = (T1[okq] / l1_[okq, None] * T2[okq] / l2_[okq, None]).sum(1); return cv
+            # 26 October 2026: dropped only when folded along BOTH diagonals ; the boundary quads distorted by the snap are bow
+            # ties folded along one diagonal only, and dropping them (v229) cut a row of teeth all around each arch
+            cosv = np.maximum(cos_tri(np.cross(B_ - A_, C_ - A_), np.cross(C_ - A_, D_ - A_)), cos_tri(np.cross(C_ - B_, D_ - B_), np.cross(D_ - B_, A_ - B_)))
+            cq = (A_ + B_ + C_ + D_) / 4; dq = np.min([np.hypot(cq[:, 1] - yc, cq[:, 2] - zc) for yc, zc in cen], axis=0)
+            near = np.isin(Qa2, bnd).any(1) | ((np.abs(cq[:, 0]) > x0) & (dq < Rc + C.get("arch_fold_ring_m", 0.03)))   # 26 October 2026: the whole ring, not only the boundary
+            drop = near & (cosv < np.cos(np.radians(fmax)))
+            Q = [q for q, k_ in zip(Q, drop) if not k_]; N = [n for n, k_ in zip(N, drop) if not k_]
+    h = R // 2                                           # end caps between symmetric ring pairs, as the cage
+    for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
+        for j in range(h - 1):
+            q = (idx(i, j), idx(i, j + 1), idx(i, R - 2 - j), idx(i, R - 1 - j)); Q.append(q[::-1] if flip else q); N.append(cap)
+    np.savez(out, grid_shape=np.array([len(t), R]), grid_cols=np.array([c[3] for c in cols]), P=P.astype(np.float32), Q=np.array(Q, np.int32)[:, ::-1], names=np.array(["CAR_body_" + n for n in N]), panel=np.array(N))
+    print(json.dumps({"points": len(P), "quads": len(Q), "samples_z": len(t)}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
