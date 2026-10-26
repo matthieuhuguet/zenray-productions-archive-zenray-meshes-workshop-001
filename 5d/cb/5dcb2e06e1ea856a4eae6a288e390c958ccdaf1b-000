@@ -84,7 +84,19 @@ def main_mask(tag, board=True, prm=None, write=True, obj="tree"):
         rowf = row_map(meta, v, sh) if v["name"] in ("front", "back", "left", "right") else None
         views[v["name"]] = {"M": M, "vis": vis, "fid": np.where(vis, Fi, 0), "wood": wood, "fol": fol, "shade": shade, "row": rowf, "ref": np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % (pan["index"], v["name"])).convert("L")), "mref": mref}
     r.release(); out = {}; ceil = prm["ceiling_iou"]
+    # 26 October 2026: bands are RELATIVE to the instance : anchors ground, crown_base (read in the measure file of the object) and top, so the same
+    # component list serves any tree ; a plain [lo, hi] in metres still works. FR : bandes relatives à l'instance, pas en mètres d'un arbre.
+    anchors = {"ground": float(meta["lo"][1]), "top": float(meta["lo"][1] + meta["dims_m"][1])}
+    if Pt.get("measure"):
+        try: anchors["crown_base"] = float(json.load(open(W + Pt["measure"].format(obj=obj)))["trunk"]["crown_base_y"])
+        except Exception: pass
+    def band(spec):
+        if not spec: return None
+        if isinstance(spec, dict):
+            a, b = anchors[spec["from"]], anchors[spec["to"]]; f0, f1 = spec.get("frac", [0.0, 1.0]); return [a + (b - a) * f0, a + (b - a) * f1]
+        return spec
     for k, c in comps.items():
+        c["y_band"] = band(c.get("y_band"))
         row = {"n": int(k), "name": c["name"], "tool": c.get("tool", ""), "class": c["ref"], "y_band": c.get("y_band"), "faces": int(sum((Tv == j).sum() for j, ks in part_comp.items() if k in ks))}
         ious = {}; area_ref = area_mod = 0
         for vn, vw in views.items():
@@ -330,6 +342,6 @@ def selftest(tag):
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv: sys.exit(selftest(sys.argv[1]))
-    if "--crop" in sys.argv: crop(sys.argv[1], sys.argv[sys.argv.index("--crop") + 1]); sys.exit(0)
+    if "--crop" in sys.argv: crop(sys.argv[1], sys.argv[sys.argv.index("--crop") + 1], int(sys.argv[sys.argv.index("--pad") + 1]) if "--pad" in sys.argv else 14); sys.exit(0)
     if "--obj" in sys.argv and sys.argv[sys.argv.index("--obj") + 1] != "car": main_mask(sys.argv[1], "--no-board" not in sys.argv, None, True, sys.argv[sys.argv.index("--obj") + 1]); sys.exit(0)
     main(sys.argv[1], "--no-board" not in sys.argv)

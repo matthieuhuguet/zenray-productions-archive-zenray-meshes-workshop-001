@@ -61,3 +61,18 @@ def _depth(parent, i):
     d = 0
     while parent[i] >= 0: i = parent[i]; d += 1
     return d
+
+
+def mask_radius(points, work, views=("front", "back", "right", "left"), win=3, min_views=1, obj="tree"):
+    """26 October 2026: radius of the wood at 3D points, read from the reference wood masks : the euclidean distance transform of each wood mask at the
+    projected point (largest value in a win px window, the centre line of a limb) over the pixels per metre of that view ; median over the views where the
+    point lands on wood, NaN where no view sees wood there (a limb hidden behind leaves). FR : rayon du bois lu sur les masques de référence."""
+    import json, os
+    from PIL import Image
+    meta = json.load(open(os.path.join(work, "work/%s/frame_B/frame.json" % obj))); cal = json.load(open(os.path.join(work, "work/%s/view_cal.json" % obj))); pts = np.asarray(points, float); acc = []
+    for vn in views:
+        v = [x for x in meta["views"] if x["name"] == vn][0]; a, b = np.array(cal[vn][0]), np.array(cal[vn][1]); wm = np.asarray(Image.open(os.path.join(work, "work/%s/views/wood_%s.png" % (obj, vn)))) > 127
+        dt = ndi.distance_transform_edt(wm); mx = ndi.maximum_filter(dt, size=win); px = a[0] * (pts @ np.array(v["rx"], float)) + b[0]; py = a[1] * (pts @ np.array(v["uy"], float)) + b[1]
+        ix, iy = np.floor(px).astype(int), np.floor(py).astype(int); ok = (ix >= 0) & (ix < wm.shape[1]) & (iy >= 0) & (iy < wm.shape[0]); r = np.full(len(pts), np.nan)
+        on = np.zeros(len(pts), bool); on[ok] = wm[iy[ok], ix[ok]]; r[on] = mx[iy[on], ix[on]] / abs(a[0]); acc.append(r)
+    A = np.array(acc); cnt = np.isfinite(A).sum(0); out = np.full(len(pts), np.nan); good = cnt >= min_views; out[good] = np.nanmedian(A[:, good], axis=0); return out

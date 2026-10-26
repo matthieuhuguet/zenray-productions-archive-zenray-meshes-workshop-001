@@ -1,0 +1,39 @@
+# 26 October 2026 : ZenRay Meshes, SYNTHETIC SHEET of a known model : the second instance that proves the algorithm is general (shared by every family).
+# EN: a model whose parts and classes are known (a tree from TreeGrow with other rules, a car with other parameters) is rendered in the six panel cameras of an
+# existing sheet frame ; the visible masks per class (wood, foliage, ...) are written exactly as the real sheet ones (mask_<view>.png, wood_<view>.png,
+# foliage_<view>.png, <NN>_<view>_rgb.png, sheet.json, frame.json, view_cal.json). The pipeline (Evidence3D, WoodSkeleton, TreeGrow, ComponentScore) then runs
+# on it with a known truth. FR : planche synthétique d'un modèle connu, pour essayer l'algorithme sur une seconde instance avec sa vérité.
+# Usage: python SynthSheet.py <topo.npz> <src_obj=tree> <dst_obj=tree_syn>
+import sys, os, json, shutil
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import ComponentScore as C, Raster, SheetScore
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+CLASSES = {"wood": ["branches"], "foliage": ["leaves"]}
+
+
+def main(topo, src="tree", dst="tree_syn"):
+    meta = json.load(open(W + "work/%s/frame_B/frame.json" % src)); sheet = json.load(open(W + "work/%s/views/sheet.json" % src))
+    os.makedirs(W + "work/%s/frame_B" % dst, exist_ok=True); os.makedirs(W + "work/%s/views" % dst, exist_ok=True)
+    shutil.copy(W + "work/%s/frame_B/frame.json" % src, W + "work/%s/frame_B/frame.json" % dst); shutil.copy(W + "work/%s/views/sheet.json" % src, W + "work/%s/views/sheet.json" % dst)
+    for f in ("view_cal.json", "tree_v1_measure.json"):
+        if os.path.exists(W + "work/%s/%s" % (src, f)): shutil.copy(W + "work/%s/%s" % (src, f), W + "work/%s/%s" % (dst, f))
+    dl = np.load(topo, allow_pickle=True); P, F, T, N = C.tri_render(dl); r = Raster.Renderer(P, F); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["F"] = out[3]; return out
+    r.render = rr; names = [str(n) for n in N]; stats = {}
+    import re
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]; sh = np.asarray(Image.open(W + "work/%s/frame_B/mask_%s.png" % (src, v["name"]))).shape
+        M, shade = SheetScore.render_in_panel(r, meta, v, sh); Fi = cap["F"][: sh[0], : sh[1]]; vis = M & (Fi >= 0) & (Fi < len(T)); part = np.where(vis, T[np.clip(Fi, 0, len(T) - 1)], -1)
+        Image.fromarray((M * 255).astype(np.uint8)).save(W + "work/%s/frame_B/mask_%s.png" % (dst, v["name"])); Image.fromarray(shade.astype(np.uint8)).save(W + "work/%s/views/%02d_%s_rgb.png" % (dst, pan["index"], v["name"]))
+        Image.fromarray((M * 255).astype(np.uint8)).save(W + "work/%s/views/%02d_%s_mask.png" % (dst, pan["index"], v["name"]))
+        for cls, pats in CLASSES.items():
+            ids = [j for j, n in enumerate(names) if any(re.fullmatch(p_, n) for p_ in pats)]; m = np.isin(part, ids)
+            Image.fromarray((m * 255).astype(np.uint8)).save(W + "work/%s/views/%s_%s.png" % (dst, cls, v["name"])); stats.setdefault(v["name"], {})[cls] = int(m.sum())
+    r.release(); print(json.dumps(stats))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
