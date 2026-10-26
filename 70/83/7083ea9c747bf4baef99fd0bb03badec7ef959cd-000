@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+# 26 October 2026 21:05: first build of the ZenRay Meshes thumbnail, one square of 2048 x 2048 pixels.
+# Every visual value lives in Params/thumbnail.json, read at each run. The defaults rebuild the delivered files.
+"""Build the ZenRay Meshes thumbnail: the V470 car, a radial vignette and the glowing title "Modeling Car".
+
+1. The car: the composition function of EvolutionVideo.py places the four views on their flat background at the
+   output size. The module is imported, not copied, so the thumbnail and the evolution video share one code path.
+2. The title: a ZenRay Motion Design project copied from the end title is rendered by HyperFrames at one instant.
+   Its size and centre are calibrated over a few passes until the ink width and the mass centre match the parameters.
+3. The vignette and the final composite are computed in float and quantised with a small dither, so no band shows.
+4. The outputs go to Out/, Index.md is rewritten, then Scripts/CheckThumbnail.py verifies the result.
+
+Run it with the zenray-uv interpreter, from any folder:
+  /Users/zenray/.venvs/zenray-uv/bin/python -I /Users/zenray/.claude/tmp/tmp-zenray-meshes/Montage/Thumbnail/Scripts/Thumbnail.py --help
+"""
+
+import argparse
+import copy
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.dont_write_bytecode = True  # no cache next to the shared Scripts folder, nor inside the Motion repository
+
+THUMB_DIR = Path(__file__).resolve().parents[1]
+PARAMS_DEFAULT = THUMB_DIR / "Params" / "thumbnail.json"
+OUT_DIR = THUMB_DIR / "Out"
+WORK_DIR = THUMB_DIR / "Work"
+MOTION_TREE = Path("/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayMotionDesign/motion")
+CHECK_SCRIPT = THUMB_DIR / "Scripts" / "CheckThumbnail.py"
+PYTHON = "/Users/zenray/.venvs/zenray-uv/bin/python"
+FINAL_PNG = "thumbnail-1x1-2048.png"
+FINAL_JPG = "thumbnail-1x1-2048.jpg"
+FRAME_PX = 1080           # the 1x1 format of ZenRay Motion Design, server.FORMATS["1x1"]
+DESIGN_WIDTH_PX = 1920    # the ap-title plane is a 1920 x 1080 design, scaled to a square frame
+RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+TITLE_KEYS = ["text", "width_ratio", "size_start", "centre_x", "centre_y", "instant_seconds", "render_scale",
+              "start_seconds", "end_seconds", "reveal_seconds", "erase_seconds", "erase_lead_seconds",
+              "duration_seconds", "fps", "format", "tall_zoom", "base_project_id", "project_id", "project_title",
+              "calibration_passes", "width_tolerance", "centre_tolerance_px"]
+INDEX_ROWS = [
+    ("params", "Params/thumbnail.json", "every parameter of the thumbnail, one JSON file"),
+    ("script-thumbnail", "Scripts/Thumbnail.py", "builds every output from the parameters, then runs the check"),
+    ("script-check", "Scripts/CheckThumbnail.py", "checks the outputs, exit code 1 on any failure"),
+    ("motion-copy", "Motion/project.json", "copy of the title project of ZenRay Motion Design"),
+    ("out-thumbnail-png", "Out/thumbnail-1x1-2048.png", "final thumbnail, RGB, 2048 x 2048, lossless"),
+    ("out-thumbnail-jpg", "Out/thumbnail-1x1-2048.jpg", "final thumbnail for networks, quality 95, chroma 4:4:4"),
+    ("out-background", "Out/background-2048.png", "V470 car on its flat #606060 background, before the vignette"),
+    ("out-background-vignette", "Out/background-vignette-2048.png", "background after the radial vignette"),
+    ("out-title", "Out/text-2048.png", "title layer, RGBA, 2048 x 2048, transparent outside the glyphs and the glow"),
+    ("out-title-render", "Out/text-2160.png", "title layer as rendered by HyperFrames, RGBA, 2160 x 2160"),
+    ("out-calibration", "Out/calibration.json", "every calibration pass: size, centre, measured ink width"),
+    ("index", "Index.md", "this index, rewritten by Scripts/Thumbnail.py at each run"),
+]
+PARAMS_FILE = PARAMS_DEFAULT  # replaced by --params in main()
+
+
+def need(params, *keys):
+    """Return the parameter at this path, or stop with a message that names it."""
+    node = params
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            raise SystemExit("missing parameter %s in %s" % (".".join(keys), PARAMS_FILE))
+        node = node[key]
+    return node
+
+
+def load_params(path):
+    """Read the one parameter file of the thumbnail."""
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def hex_to_rgb(text):
+    """Turn a colour such as #606060 into three integers, or stop."""
+    value = str(text).lstrip("#")
+    if len(value) != 6:
+        raise SystemExit("a colour must look like #606060, got %r" % (text,))
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def file_sha256(path):
+    """Hash a file block by block, so a large PNG never has to fit in memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_evolution(path):
+    """Import the composition function of EvolutionVideo.py without writing a cache beside it."""
+    spec = importlib.util.spec_from_file_location("EvolutionVideo", str(path))
+    if spec is None or spec.loader is None:
+        raise SystemExit("cannot import the composition function from %s" % path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_server():
+    """Import server.py of ZenRay Motion Design, the module the application runs, on the real projects root."""
+    os.environ.pop("ZRMD_MOTION_PROJECTS", None)
+    sys.path.insert(0, str(MOTION_TREE))
+    import server  # noqa: E402  the same module as the Motion Design app
+    return server
+
+
+def build_background(params, out_dir):
+    """Compose the V470 car on its flat background at the output size, then check the four corners."""
+    source = Path(need(params, "background", "source"))
+    crop = tuple(int(value) for value in need(params, "background", "crop"))
+    size = int(need(params, "output", "size"))
+    expected = hex_to_rgb(need(params, "background", "expected_hex"))
+    margin = float(need(params, "background", "margin"))
+    evolution = load_evolution(need(params, "background", "evolution_script"))
+    if not source.is_file():
+        raise SystemExit("source picture not found: %s" % source)
+    with Image.open(source) as picture:
+        if picture.size[0] < crop[2] or picture.size[1] < crop[3]:
+            raise SystemExit("source %s is smaller than the crop %s" % (source, crop))
+    measured = tuple(int(value) for value in evolution.sample_corner((str(source), crop)))
+    if measured != expected:
+        raise SystemExit("the source background is %s, expected %s: stop, the corners must match before the vignette"
+                         % (measured, expected))
+    # Only these keys are read by render_frame when no label is drawn.
+    settings = {"size": size, "margin": margin, "label": 0, "background": measured}
+    target = out_dir / "background-2048.png"
+    evolution.render_frame((str(source), str(target), crop, None, "v470", settings))
+    rendered = np.asarray(Image.open(target).convert("RGB"))
+    corners = [tuple(int(value) for value in rendered[row, column])
+               for row, column in ((0, 0), (0, size - 1), (size - 1, 0), (size - 1, size - 1))]
+    if any(corner != expected for corner in corners):
+        raise SystemExit("background corners are %s, expected %s" % (corners, expected))
+    print("background: %s, corners %s, source %s" % (target, expected, source))
+
+
+def item_line(title, size, centre_x, centre_y):
+    """The one line of the title item: text | centre x | centre y | size | start | end | reveal | erase | erase lead."""
+    if "|" in str(title["text"]):
+        raise SystemExit("title.text must not contain the character |")
+    fields = [str(title["text"]), "%.2f" % centre_x, "%.2f" % centre_y, "%.2f" % size,
+              "%.2f" % title["start_seconds"], "%.2f" % title["end_seconds"], "%.2f" % title["reveal_seconds"],
+              "%.2f" % title["erase_seconds"], "%.2f" % title["erase_lead_seconds"]]
+    return " | ".join(fields)
+
+
+def build_project(base, title, size, centre_x, centre_y):
+    """Copy the end-title project. Only the text, size, centre, duration, format, fps and background change."""
+    project = copy.deepcopy(base)
+    project["title"] = title["project_title"]
+    project["format"] = title["format"]
+    project["fps"] = int(title["fps"])
+    project["doc"] = ("26 October 2026: title layer of the ZenRay Meshes thumbnail, copied from %s by Scripts/Thumbnail.py. "
+                      "Only the text, the size, the centre, the duration, the format, the fps and the background change."
+                      % title["base_project_id"])
+    scene = project["scenes"][0]
+    scene["duration"] = round(float(title["duration_seconds"]), 3)
+    scene["params"]["items"] = [item_line(title, size, centre_x, centre_y)]
+    scene["params"]["bg"] = "transparent"
+    scene["params"]["tallZoom"] = float(title["tall_zoom"])
+    project["theme"]["bg"] = "transparent"
+    return project
+
+
+def make_page_transparent(page):
+    """The export page paints its body black. The title layer needs a transparent body as well."""
+    index = page / "index.html"
+    html = index.read_text(encoding="utf-8")
+    old = "html, body { margin: 0; padding: 0; background: #000; }"
+    if html.count(old) != 1:
+        raise SystemExit("the export page rule changed in ZenRay Motion Design, update make_page_transparent: %s" % index)
+    index.write_text(html.replace(old, "html, body { margin: 0; padding: 0; background: transparent; }"), encoding="utf-8")
+
+
+def measure_ink(png_path, render_px, alpha_threshold):
+    """Bounding box and mass centre of the pixels whose alpha reaches the threshold."""
+    with Image.open(png_path) as picture:
+        alpha = np.asarray(picture.convert("RGBA"))[..., 3]
+    if alpha.shape != (render_px, render_px):
+        raise SystemExit("snapshot %s is %s, expected %d x %d" % (png_path, alpha.shape, render_px, render_px))
+    ys, xs = np.nonzero(alpha >= alpha_threshold * 255.0)
+    if xs.size == 0:
+        raise SystemExit("the title is invisible in %s" % png_path)
+    return {"width": int(xs.max() - xs.min() + 1), "left": int(xs.min()), "right": int(xs.max()),
+            "top": int(ys.min()), "bottom": int(ys.max()),
+            "centre_x": float(xs.mean()), "centre_y": float(ys.mean())}
+
+
+def render_title(params, out_dir):
+    """Render the title at one instant. Size and centre are calibrated over a few passes until the ink width and the
+    mass centre match the parameters. The converged pass is the delivered title layer."""
+    title = {key: need(params, "title", key) for key in TITLE_KEYS}
+    alpha_threshold = float(need(params, "checks", "text_alpha"))
+    server = load_server()
+    base = server.read_project(title["base_project_id"])
+    scale = int(title["render_scale"])
+    render_px = FRAME_PX * scale
+    target_width = float(title["width_ratio"]) * render_px
+    # The template fits a square frame at tall_zoom * 1080 / 1920 (0.9 for 1.6): one plane unit is that many frame pixels.
+    plane_scale = float(title["tall_zoom"]) * FRAME_PX / DESIGN_WIDTH_PX
+    pixels_per_unit = scale * plane_scale
+    tolerance_width = float(title["width_tolerance"])
+    tolerance_centre = float(title["centre_tolerance_px"])
+    size = float(title["size_start"])
+    centre_x = float(title["centre_x"])
+    centre_y = float(title["centre_y"])
+    history = []
+    for number in range(1, int(title["calibration_passes"]) + 1):
+        size = round(size, 2)
+        centre_x = round(centre_x, 2)
+        centre_y = round(centre_y, 2)
+        project = build_project(base, title, size, centre_x, centre_y)
+        server.write_project(title["project_id"], project)
+        page = server.cook(title["project_id"], WORK_DIR / "pages" / ("pass-%02d" % number))
+        make_page_transparent(page)
+        snap_dir = WORK_DIR / "snaps" / ("pass-%02d" % number)
+        if snap_dir.exists():
+            shutil.rmtree(snap_dir)
+        result = server.hyperframes(page, "snapshot", "--at", "%g" % float(title["instant_seconds"]), "--no-end",
+                                    "--zoom", "0,0,%d,%d" % (FRAME_PX, FRAME_PX), "--zoom-scale", str(scale),
+                                    "-o", str(snap_dir), timeout=300)
+        if result.returncode != 0:
+            raise SystemExit("HyperFrames snapshot failed on pass %d: %s"
+                             % (number, ((result.stderr or result.stdout) or "")[-600:]))
+        frames = sorted(snap_dir.glob("*.png"))
+        if len(frames) != 1:
+            raise SystemExit("expected one snapshot in %s, found %d" % (snap_dir, len(frames)))
+        ink = measure_ink(frames[0], render_px, alpha_threshold)
+        width_error = ink["width"] / target_width - 1.0
+        offset_x = ink["centre_x"] - (render_px - 1) / 2.0
+        offset_y = ink["centre_y"] - (render_px - 1) / 2.0
+        history.append({"pass": number, "size": size, "centre_x": centre_x, "centre_y": centre_y,
+                        "ink_width_px": ink["width"], "width_error": width_error,
+                        "offset_x_px": offset_x, "offset_y_px": offset_y, "snapshot": str(frames[0])})
+        print("title pass %d: size %.2f, centre %.2f x %.2f, ink width %d px (target %.0f), "
+              "mass centre offset %.2f x %.2f px"
+              % (number, size, centre_x, centre_y, ink["width"], target_width, offset_x, offset_y))
+        if abs(width_error) <= tolerance_width and abs(offset_x) <= tolerance_centre and abs(offset_y) <= tolerance_centre:
+            shutil.copyfile(frames[0], out_dir / "text-2160.png")
+            record = {"date": "26 October 2026", "instant_seconds": float(title["instant_seconds"]),
+                      "render_px": render_px, "target_width_px": target_width,
+                      "final": history[-1], "passes": history}
+            (out_dir / "calibration.json").write_text(json.dumps(record, indent=1), encoding="utf-8")
+            return
+        size = size * target_width / ink["width"]
+        centre_x = centre_x - offset_x / pixels_per_unit
+        centre_y = centre_y - offset_y / pixels_per_unit
+    raise SystemExit("the title did not converge in %d passes, last pass: %s"
+                     % (int(title["calibration_passes"]), history[-1]))
+
+
+def write_motion_copy(params):
+    """Keep a copy of the title project next to the thumbnail, so it re-opens in the Motion Design app."""
+    server = load_server()
+    project = server.read_project(need(params, "title", "project_id"))
+    target = THUMB_DIR / "Motion" / "project.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(project, ensure_ascii=False, indent=1), encoding="utf-8")
+    print("motion project: %s" % (Path(server.projects_root()) / project["id"] / "project.json"))
+
+
+def reuse_files(reuse_dir, out_dir):
+    """Take the car, the title render and the calibration from another folder, to re-run only the composite."""
+    for name in ("background-2048.png", "text-2160.png", "calibration.json"):
+        source = reuse_dir / name
+        if not source.is_file():
+            raise SystemExit("--reuse-from misses %s" % source)
+        if source.resolve() != (out_dir / name).resolve():
+            shutil.copyfile(source, out_dir / name)
+
+
+def text_at_size(render_path, size):
+    """Shrink the HyperFrames render to the output size in premultiplied alpha, so no dark fringe surrounds the glow."""
+    with Image.open(render_path) as render:
+        if render.mode != "RGBA":
+            raise SystemExit("the title render has no alpha channel: %s is %s" % (render_path, render.mode))
+        if render.size[0] != render.size[1]:
+            raise SystemExit("the title render is not square: %s" % (render.size,))
+        premultiplied = render.convert("RGBa")
+    return premultiplied.resize((size, size), RESAMPLE).convert("RGBA")
+
+
+def shift_layer(layer, fraction):
+    """Debug only: move the title sideways by a fraction of the width, to prove that the check sees it."""
+    dx = int(round(fraction * layer.size[0]))
+    canvas = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+    canvas.paste(layer, (dx, 0))
+    return canvas
+
+
+def vignette_factor(size, radius, softness, strength):
+    """Multiplier of each pixel: 1 inside the radius, 1 - strength in the corners, smoothstep across the transition."""
+    axis = np.arange(size, dtype=np.float32) - np.float32((size - 1) / 2.0)
+    distance = np.sqrt(axis[np.newaxis, :] ** 2 + axis[:, np.newaxis] ** 2)
+    half_diagonal = np.float32(np.sqrt(2.0) * (size - 1) / 2.0)   # distance from the centre to a corner
+    normalised = distance / half_diagonal                          # 0 at the centre, 1 in the corners
+    start = radius
+    end = radius + softness * (1.0 - radius)
+    ramp = np.clip((normalised - start) / (end - start), 0.0, 1.0)
+    smooth = ramp * ramp * (3.0 - 2.0 * ramp)
+    return (1.0 - strength * smooth).astype(np.float32)
+
+
+def quantise(values, rng, amplitude):
+    """Round to 8 bits with a uniform dither of plus or minus amplitude levels. A flat value stays exact."""
+    noise = (rng.random(values.shape, dtype=np.float32) - np.float32(0.5)) * np.float32(2.0 * amplitude)
+    return np.clip(np.floor(values + noise + np.float32(0.5)), 0, 255).astype(np.uint8)
+
+
+def build_vignette(params, out_dir, strength_override):
+    """Darken the corners of the background in float, then quantise with the dither."""
+    size = int(need(params, "output", "size"))
+    radius = float(need(params, "vignette", "radius"))
+    softness = float(need(params, "vignette", "softness"))
+    strength = float(need(params, "vignette", "strength")) if strength_override is None else float(strength_override)
+    if not 0.0 <= radius < 1.0 or softness <= 0.0:
+        raise SystemExit("vignette.radius must lie in [0, 1) and vignette.softness must be above 0")
+    amplitude = float(need(params, "output", "dither_amplitude"))
+    seed = int(need(params, "output", "dither_seed"))
+    background = np.asarray(Image.open(out_dir / "background-2048.png").convert("RGB")).astype(np.float32)
+    factor = vignette_factor(size, radius, softness, strength)
+    rng = np.random.default_rng(seed)
+    vignetted = quantise(background * factor[..., np.newaxis], rng, amplitude)
+    Image.fromarray(vignetted).save(out_dir / "background-vignette-2048.png")
+    print("vignette: strength %.3f, radius %.3f, softness %.3f" % (strength, radius, softness))
+    return vignetted
+
+
+def build_final(params, out_dir, vignetted, title_array):
+    """Composite the title over the vignetted background in float, then quantise and write the PNG and the JPG."""
+    amplitude = float(need(params, "output", "dither_amplitude"))
+    seed = int(need(params, "output", "dither_seed"))
+    jpg_quality = int(need(params, "output", "jpg_quality"))
+    jpg_subsampling = int(need(params, "output", "jpg_subsampling"))
+    alpha = title_array[..., 3:4].astype(np.float32) / np.float32(255.0)
+    colour = title_array[..., :3].astype(np.float32)
+    mixed = vignetted.astype(np.float32) * (np.float32(1.0) - alpha) + colour * alpha
+    rng = np.random.default_rng(seed + 1)   # a second dither, so the two rounding noises never line up
+    final = quantise(mixed, rng, amplitude)
+    picture = Image.fromarray(final)
+    picture.save(out_dir / FINAL_PNG, format="PNG")
+    picture.save(out_dir / FINAL_JPG, format="JPEG", quality=jpg_quality, subsampling=jpg_subsampling)
+    print("final: %s and %s" % (out_dir / FINAL_PNG, out_dir / FINAL_JPG))
+
+
+def write_index(params):
+    """Rewrite Index.md: every file of the thumbnail with its role, size and SHA-256, and the commands that rebuild it."""
+    project_id = need(params, "title", "project_id")
+    project_path = Path(os.path.expanduser("~/.claude/tmp/tmp-zenray-motion-design/motion-projects")) / project_id / "project.json"
+    lines = ["# Index of the ZenRay Meshes thumbnail", "",
+             "26 October 2026, rewritten by Scripts/Thumbnail.py at each run. Folder: %s" % THUMB_DIR, "",
+             "Motion Design project: %s, %s" % (project_id, project_path), "",
+             "| Identifier | Path, relative to Montage/Thumbnail | Role | Bytes | SHA-256 |",
+             "|---|---|---|---|---|"]
+    for identifier, relpath, role in INDEX_ROWS:
+        path = THUMB_DIR / relpath
+        if path.is_file():
+            lines.append("| %s | %s | %s | %d | %s |" % (identifier, relpath, role, path.stat().st_size, file_sha256(path)))
+        else:
+            lines.append("| %s | %s | %s | missing | missing |" % (identifier, relpath, role))
+    lines += ["", "## Rebuild everything", "", "```",
+              "cd %s" % THUMB_DIR,
+              "%s -I Scripts/Thumbnail.py" % PYTHON,
+              "```", "",
+              "## Check only", "", "```",
+              "%s -I Scripts/CheckThumbnail.py --dir Out" % PYTHON,
+              "```", "",
+              "## Self test, the checks must turn red", "", "```",
+              "%s -I Scripts/Thumbnail.py --reuse-from Out --out-dir Selftest/red-shift --debug-text-shift 0.1 --no-check" % PYTHON,
+              "%s -I Scripts/CheckThumbnail.py --dir Selftest/red-shift" % PYTHON,
+              "%s -I Scripts/Thumbnail.py --reuse-from Out --out-dir Selftest/red-no-vignette --debug-vignette-strength 0 --no-check" % PYTHON,
+              "%s -I Scripts/CheckThumbnail.py --dir Selftest/red-no-vignette" % PYTHON,
+              "```", ""]
+    (THUMB_DIR / "Index.md").write_text("\n".join(lines), encoding="utf-8")
+    print("index: %s" % (THUMB_DIR / "Index.md"))
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Build the ZenRay Meshes thumbnail: 2048 x 2048 car background, radial vignette, glowing title.",
+        epilog="Every value is read from Params/thumbnail.json. The debug options write a broken copy into another "
+               "folder, to prove that Scripts/CheckThumbnail.py turns red. They never write into Out.")
+    parser.add_argument("--params", default=str(PARAMS_DEFAULT), help="parameter file (default: Params/thumbnail.json)")
+    parser.add_argument("--out-dir", default=str(OUT_DIR), help="folder receiving the outputs (default: Out)")
+    parser.add_argument("--reuse-from", default=None,
+                        help="take background-2048.png, text-2160.png and calibration.json from this folder, no render")
+    parser.add_argument("--no-check", action="store_true", help="do not run Scripts/CheckThumbnail.py at the end")
+    parser.add_argument("--debug-text-shift", type=float, default=0.0,
+                        help="debug: move the title sideways by this fraction of the width")
+    parser.add_argument("--debug-vignette-strength", type=float, default=None,
+                        help="debug: replace the vignette strength of the parameter file")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global PARAMS_FILE
+    args = parse_args(argv)
+    PARAMS_FILE = Path(args.params).resolve()
+    params = load_params(PARAMS_FILE)
+    out_dir = Path(args.out_dir).resolve()
+    debug = args.debug_text_shift != 0.0 or args.debug_vignette_strength is not None
+    if debug and out_dir == OUT_DIR.resolve():
+        raise SystemExit("the debug options write broken files: give them --out-dir another folder than Out")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    if args.reuse_from:
+        reuse_files(Path(args.reuse_from).resolve(), out_dir)
+    else:
+        build_background(params, out_dir)
+        render_title(params, out_dir)
+        write_motion_copy(params)
+    size = int(need(params, "output", "size"))
+    title_layer = text_at_size(out_dir / "text-2160.png", size)
+    if args.debug_text_shift != 0.0:
+        title_layer = shift_layer(title_layer, args.debug_text_shift)
+    title_layer.save(out_dir / "text-2048.png", format="PNG")
+    vignetted = build_vignette(params, out_dir, args.debug_vignette_strength)
+    build_final(params, out_dir, vignetted, np.asarray(title_layer))
+    if out_dir == OUT_DIR.resolve():
+        write_index(params)
+    if not args.no_check:
+        result = subprocess.run([PYTHON, "-I", str(CHECK_SCRIPT), "--dir", str(out_dir), "--params", str(PARAMS_FILE)])
+        if result.returncode != 0:
+            print("CheckThumbnail failed with exit code %d" % result.returncode)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# 26 October 2026 21:10: checks of the ZenRay Meshes thumbnail. Exit code 0 only when every check passes, 1 otherwise.
+"""Check a thumbnail folder (default Out): the files, the sizes and modes, the flat background before the vignette,
+the centre and the width of the title, the halo margins, the absence of any car pixel under the title box, the
+vignette, the composite and the JPG. Every limit is read from the checks section of Params/thumbnail.json.
+
+Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I Scripts/CheckThumbnail.py [--dir Out] [--params Params/thumbnail.json]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.dont_write_bytecode = True
+
+THUMB_DIR = Path(__file__).resolve().parents[1]
+PARAMS_DEFAULT = THUMB_DIR / "Params" / "thumbnail.json"
+DIR_DEFAULT = THUMB_DIR / "Out"
+FINAL_PNG = "thumbnail-1x1-2048.png"
+FINAL_JPG = "thumbnail-1x1-2048.jpg"
+BACKGROUND = "background-2048.png"
+VIGNETTE = "background-vignette-2048.png"
+TITLE = "text-2048.png"
+REQUIRED_FILES = [FINAL_PNG, FINAL_JPG, BACKGROUND, VIGNETTE, TITLE]
+CHECK_KEYS = ["text_alpha", "centroid_x_tolerance", "centroid_y_tolerance", "title_width_min", "title_width_max",
+              "halo_alpha", "halo_margin_min", "car_threshold", "overlap_max", "corner_square", "centre_search_step",
+              "corner_darker_min", "jpg_mean_max", "composite_max_level", "composite_mean_max"]
+PARAMS_FILE = PARAMS_DEFAULT  # replaced by --params in main()
+
+
+def need(params, *keys):
+    """Return the parameter at this path, or stop with a message that names it."""
+    node = params
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            raise SystemExit("missing parameter %s in %s" % (".".join(keys), PARAMS_FILE))
+        node = node[key]
+    return node
+
+
+def hex_to_rgb(text):
+    """Turn a colour such as #606060 into three integers, or stop."""
+    value = str(text).lstrip("#")
+    if len(value) != 6:
+        raise SystemExit("a colour must look like #606060, got %r" % (text,))
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))
+
+
+def find_clear_square(car, size, square, step):
+    """The square of pixels nearest to the centre that holds no car pixel at all, as (distance, left, top), or None."""
+    counts = np.zeros((size + 1, size + 1), dtype=np.int64)
+    counts[1:, 1:] = np.cumsum(np.cumsum(car.astype(np.int64), axis=0), axis=1)
+    centre = (size - 1) / 2.0
+    best = None
+    last = size - square
+    for top in range(0, last + 1, step):
+        for left in range(0, last + 1, step):
+            bottom, right = top + square, left + square
+            inside = counts[bottom, right] - counts[top, right] - counts[bottom, left] + counts[top, left]
+            if inside:
+                continue
+            distance = (left + (square - 1) / 2.0 - centre) ** 2 + (top + (square - 1) / 2.0 - centre) ** 2
+            if best is None or distance < best[0]:
+                best = (distance, left, top)
+    return best
+
+
+def run_checks(folder, params):
+    """Run every check and return a list of (name, passed, value, limit) rows."""
+    size = int(need(params, "output", "size"))
+    expected = hex_to_rgb(need(params, "background", "expected_hex"))
+    limits = {key: need(params, "checks", key) for key in CHECK_KEYS}
+    rows = []
+
+    def record(name, passed, value, limit):
+        rows.append((name, bool(passed), str(value), str(limit)))
+
+    missing = [name for name in REQUIRED_FILES if not (folder / name).is_file()]
+    for name in missing:
+        record("file present: %s" % name, False, "missing", "present")
+    if missing:
+        return rows
+
+    final_image = Image.open(folder / FINAL_PNG)
+    record("final PNG is %d x %d RGB" % (size, size), final_image.size == (size, size) and final_image.mode == "RGB",
+           "%s %s" % (final_image.size, final_image.mode), "(%d, %d) RGB" % (size, size))
+    final = np.asarray(final_image.convert("RGB")).astype(np.float32)
+
+    jpg_image = Image.open(folder / FINAL_JPG)
+    record("final JPG reopens as %d x %d RGB" % (size, size), jpg_image.size == (size, size) and jpg_image.mode == "RGB",
+           "%s %s" % (jpg_image.size, jpg_image.mode), "(%d, %d) RGB" % (size, size))
+    jpg_difference = float(np.abs(np.asarray(jpg_image.convert("RGB")).astype(np.float32) - final).mean())
+    record("JPG agrees with the PNG (mean level difference)", jpg_difference <= limits["jpg_mean_max"],
+           "%.3f" % jpg_difference, "<= %g" % limits["jpg_mean_max"])
+
+    background = np.asarray(Image.open(folder / BACKGROUND).convert("RGB")).astype(np.float32)
+    corner_pixels = [background[0, 0], background[0, -1], background[-1, 0], background[-1, -1]]
+    corner_values = [tuple(int(v) for v in pixel) for pixel in corner_pixels]
+    record("background corners are %s before the vignette" % (expected,),
+           all(value == expected for value in corner_values), corner_values, expected)
+    car = np.abs(background - np.array(corner_values[0], dtype=np.float32)).max(axis=2) > limits["car_threshold"]
+
+    title_image = Image.open(folder / TITLE)
+    record("title layer is RGBA %d x %d" % (size, size), title_image.mode == "RGBA" and title_image.size == (size, size),
+           "%s %s" % (title_image.size, title_image.mode), "(%d, %d) RGBA" % (size, size))
+    title_rgba = np.asarray(title_image.convert("RGBA"))
+    alpha = title_rgba[..., 3].astype(np.float32)
+    ys, xs = np.nonzero(alpha >= limits["text_alpha"] * 255.0)
+    if xs.size == 0:
+        record("title is visible", False, "no ink", "present")
+        return rows
+    record("title is visible", True, "%d ink pixels" % xs.size, "present")
+
+    centre = (size - 1) / 2.0
+    offset_x = abs(float(xs.mean()) - centre)
+    limit_x = limits["centroid_x_tolerance"] * size
+    record("title mass centre, horizontal (px from the centre)", offset_x <= limit_x,
+           "%.2f px" % offset_x, "<= %.2f px, %g %% of the width" % (limit_x, 100 * limits["centroid_x_tolerance"]))
+    offset_y = abs(float(ys.mean()) - centre)
+    limit_y = limits["centroid_y_tolerance"] * size
+    record("title mass centre, vertical (px from the centre)", offset_y <= limit_y,
+           "%.2f px" % offset_y, "<= %.2f px, %g %% of the height" % (limit_y, 100 * limits["centroid_y_tolerance"]))
+
+    width_fraction = float(xs.max() - xs.min() + 1) / size
+    record("title width as a share of the frame", limits["title_width_min"] <= width_fraction <= limits["title_width_max"],
+           "%.1f %%" % (100 * width_fraction),
+           "%g to %g %%" % (100 * limits["title_width_min"], 100 * limits["title_width_max"]))
+
+    halo_ys, halo_xs = np.nonzero(alpha >= limits["halo_alpha"] * 255.0)
+    left_margin = float(halo_xs.min()) / size
+    right_margin = float(size - 1 - halo_xs.max()) / size
+    record("halo margin, left", left_margin >= limits["halo_margin_min"], "%.2f %%" % (100 * left_margin),
+           ">= %g %%" % (100 * limits["halo_margin_min"]))
+    record("halo margin, right", right_margin >= limits["halo_margin_min"], "%.2f %%" % (100 * right_margin),
+           ">= %g %%" % (100 * limits["halo_margin_min"]))
+
+    box_car = int(car[ys.min():ys.max() + 1, xs.min():xs.max() + 1].sum())
+    record("car pixels under the title box", box_car <= limits["overlap_max"], box_car,
+           "<= %d" % limits["overlap_max"])
+
+    vignette = np.asarray(Image.open(folder / VIGNETTE).convert("RGB")).astype(np.float32)
+    luma = 0.299 * vignette[..., 0] + 0.587 * vignette[..., 1] + 0.114 * vignette[..., 2]
+    square = int(limits["corner_square"])
+    corner_means = [float(luma[:square, :square].mean()), float(luma[:square, -square:].mean()),
+                    float(luma[-square:, :square].mean()), float(luma[-square:, -square:].mean())]
+    corners_mean = float(np.mean(corner_means))
+    spot = find_clear_square(car, size, square, int(limits["centre_search_step"]))
+    if spot is None:
+        record("a clear centre square without car exists", False, "none", "present")
+        return rows
+    _, left, top = spot
+    centre_mean = float(luma[top:top + square, left:left + square].mean())
+    background_luma = float(0.299 * corner_values[0][0] + 0.587 * corner_values[0][1] + 0.114 * corner_values[0][2])
+    darker = 1.0 - corners_mean / centre_mean
+    record("vignette: corners darker than the clear centre (square at %d, %d)" % (left, top),
+           darker >= limits["corner_darker_min"], "%.1f %%" % (100 * darker), ">= %g %%" % (100 * limits["corner_darker_min"]))
+    drop = centre_mean - corners_mean
+    record("vignette: drop in levels, at least the share of the background", drop >= limits["corner_darker_min"] * background_luma,
+           "%.2f levels" % drop, ">= %.2f levels" % (limits["corner_darker_min"] * background_luma))
+
+    colour = title_rgba[..., :3].astype(np.float32)
+    layer_alpha = alpha[..., np.newaxis] / np.float32(255.0)
+    mixed = vignette * (np.float32(1.0) - layer_alpha) + colour * layer_alpha
+    difference = np.abs(final - mixed)
+    record("composite equals vignette plus title (max level difference)", float(difference.max()) <= limits["composite_max_level"],
+           "%.3f" % float(difference.max()), "<= %g" % limits["composite_max_level"])
+    record("composite equals vignette plus title (mean level difference)", float(difference.mean()) <= limits["composite_mean_max"],
+           "%.3f" % float(difference.mean()), "<= %g" % limits["composite_mean_max"])
+    return rows
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Check the ZenRay Meshes thumbnail folder. Exit code 1 on any failure.")
+    parser.add_argument("--dir", default=str(DIR_DEFAULT), help="folder to check (default: Out)")
+    parser.add_argument("--params", default=str(PARAMS_DEFAULT), help="parameter file (default: Params/thumbnail.json)")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    global PARAMS_FILE
+    args = parse_args(argv)
+    PARAMS_FILE = Path(args.params).resolve()
+    with open(PARAMS_FILE, encoding="utf-8") as handle:
+        params = json.load(handle)
+    folder = Path(args.dir).resolve()
+    rows = run_checks(folder, params)
+    failed = [row for row in rows if not row[1]]
+    for name, passed, value, limit in rows:
+        print("%s  %s : %s (limit %s)" % ("PASS" if passed else "FAIL", name, value, limit))
+    print("%d checks, %d failed, folder %s" % (len(rows), len(failed), folder))
+    return 0 if rows and not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
