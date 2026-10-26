@@ -637,6 +637,56 @@ def main(params, prefix, out):
             Q2_.append(tuple(int(v - (i_ + 1) * R2 + k1 * R2) if v // R2 == i_ + 1 else int(v) for v in q)); N2_.append(n_)
         Q, N = Q2_, N2_
         print(json.dumps({"loop_decimate": {"stations": nT, "kept": len(keep), "removable": int(removable.sum())}}), file=sys.stderr)
+    # 26 October 2026: COLUMN REFINE, second move of the retopology : a column gap wider than min_ratio x target_m (median
+    # over its quads) gets k - 1 new longitudinal loops, k = round(width / target_m), on the whole gap ; each new point is
+    # a Catmull-Rom point through the four columns around it, so the surface stays where it was (the crown_n columns also
+    # carry the rail and the joints : raising crown_n moved them, v373). Only gaps whose quads are all regular are split
+    # (no T junction). New points are appended after the grid (ArchBuild reads the grid by its shape).
+    # FR : boucles longitudinales ajoutées dans les colonnes larges, points sur la spline des colonnes voisines.
+    CR = C.get("col_refine")
+    if CR and CR.get("on", 1):
+        Qa_ = np.array(Q); stq = Qa_ // R2; clq = Qa_ % R2; smin_ = stq.min(1)
+        reg_ = (stq.max(1) - smin_ >= 1) & ((stq == smin_[:, None]).sum(1) == 2)
+        cmin = np.where(np.abs(np.diff(np.sort(clq, 1), axis=1)).max(1) > 1, clq.max(1), clq.min(1))   # wrap gap R2-1 -> 0
+        gap_of = {}; bad_gap = set()
+        for qi in range(len(Q)):
+            cs = set(clq[qi].tolist())
+            if not reg_[qi] or len(cs) != 2: bad_gap.update(cs if len(cs) <= 2 else []); continue
+            j_ = int(cmin[qi]); gap_of.setdefault(j_, []).append(qi)
+        Pl = list(P); newq, newn, drop = [], [], set(); tgt = CR.get("target_m", 0.035); added = 0
+        Pg = G2
+        for j_, qis in gap_of.items():
+            if j_ in bad_gap or ((j_ + 1) % R2) in bad_gap and False: continue
+            j1 = (j_ + 1) % R2
+            w_ = [np.linalg.norm(P[Q[qi][0]] - P[Q[qi][1]]) if (Q[qi][0] % R2) != (Q[qi][1] % R2) else np.linalg.norm(P[Q[qi][1]] - P[Q[qi][2]]) for qi in qis]
+            wm = float(np.median(w_)); k = int(round(wm / tgt))
+            if wm < CR.get("min_ratio", 1.5) * tgt or k < 2: continue
+            cache = {}
+            def pt(i_, f_):
+                key_ = (i_, f_)
+                if key_ in cache: return cache[key_]
+                p0, p1, p2, p3 = Pg[i_, (j_ - 1) % R2], Pg[i_, j_], Pg[i_, j1], Pg[i_, (j_ + 2) % R2]
+                t_ = f_ / k; t2, t3 = t_ * t_, t_ * t_ * t_
+                v = 0.5 * ((2 * p1) + (-p0 + p2) * t_ + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3)
+                if not np.all(np.isfinite(v)): v = p1 + (p2 - p1) * t_
+                cache[key_] = len(Pl); Pl.append(v); return cache[key_]
+            for qi in qis:
+                q = Q[qi]; st4 = [v // R2 for v in q]; c4 = [v % R2 for v in q]
+                ia, ib = min(st4), max(st4)
+                # corners : (ia, j_), (ib, j_), (ib, j1), (ia, j1) in the quad's own winding
+                def col_line(i_):
+                    return [i_ * R2 + j_] + [pt(i_, f_) for f_ in range(1, k)] + [i_ * R2 + j1]
+                La, Lb = col_line(ia), col_line(ib)
+                # winding : keep the orientation of the original quad (its first edge direction)
+                pos = {v: n_ for n_, v in enumerate(q)}
+                for f_ in range(k):
+                    sub = [La[f_], Lb[f_], Lb[f_ + 1], La[f_ + 1]]
+                    ref = [ia * R2 + j_, ib * R2 + j_, ib * R2 + j1, ia * R2 + j1]
+                    same = (pos[ref[1]] - pos[ref[0]]) % 4 == 1
+                    newq.append(tuple(sub if same else sub[::-1])); newn.append(N[qi])
+                drop.add(qi); added += k - 1
+        Q = [q for qi, q in enumerate(Q) if qi not in drop] + newq; N = [n for qi, n in enumerate(N) if qi not in drop] + newn
+        P = np.array(Pl); print(json.dumps({"col_refine": {"gaps_split": len([1 for _ in drop]), "new_quads": len(newq)}}), file=sys.stderr)
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
     for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):
