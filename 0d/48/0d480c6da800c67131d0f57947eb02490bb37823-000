@@ -1,0 +1,251 @@
+"""26 October 2026 : ZenRay Meshes, FLOOR REMESH, the retopology of the hidden underbody on the delivery file.
+The lofted underbody (CAR_body_under_floor_C) is a thin slab made of 229 rows of two huge columns and flat fans : 35 percent of its faces are faulty (aspect, density, poles).
+It is rebuilt as ONE clean sheet of quads, the lower surface of the slab : rows across the car, columns that follow the real outline row by row (xl(z) to xr(z)),
+heights read from the old surface (lowest hit above each plan point), rows added where the surface bends (adaptive, tolerance `tol_mm`). Nothing else of the car is touched.
+Every value is a parameter (HDA) : python FloorRemesh.py <delivery_in.npz> <delivery_out.npz> [--part NAME] [--cell 0.1] [--tol-mm 2] [--obj out.obj]
+FR : retopologie du plancher caché : une seule nappe de quads propres, colonnes qui suivent le contour, rangées ajoutées là où la surface plie.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class Surface:
+    """The old floor as triangles seen in plan (x, z) : the lowest and the highest y above any plan point."""
+
+    def __init__(self, P, Q, faces):
+        tris = []
+        for i in faces:
+            q = Q[i]
+            if len(q) == 3:
+                tris.append(q)
+            else:
+                tris.append([q[0], q[1], q[2]])
+                tris.append([q[0], q[2], q[3]])
+        T = np.array(tris)
+        self.A, self.B, self.C = (P[T[:, k]][:, [0, 2]] for k in range(3))
+        self.Y = P[T][:, :, 1]
+        self.den = (self.B[:, 1] - self.C[:, 1]) * (self.A[:, 0] - self.C[:, 0]) + (self.C[:, 0] - self.B[:, 0]) * (self.A[:, 1] - self.C[:, 1])
+        self.ok = np.abs(self.den) > 1e-12
+        self.den = np.where(self.ok, self.den, 1.0)
+
+    def lowest(self, x, z):
+        """Lowest y of the surface above (x, z), or nan outside the footprint. x and z are arrays."""
+        x, z = np.atleast_1d(x).astype(float), np.atleast_1d(z).astype(float)
+        out = np.full(x.shape, np.nan)
+        for k in range(x.size):
+            l1 = ((self.B[:, 1] - self.C[:, 1]) * (x[k] - self.C[:, 0]) + (self.C[:, 0] - self.B[:, 0]) * (z[k] - self.C[:, 1])) / self.den
+            l2 = ((self.C[:, 1] - self.A[:, 1]) * (x[k] - self.C[:, 0]) + (self.A[:, 0] - self.C[:, 0]) * (z[k] - self.C[:, 1])) / self.den
+            l3 = 1.0 - l1 - l2
+            m = self.ok & (l1 >= -1e-9) & (l2 >= -1e-9) & (l3 >= -1e-9)
+            if m.any():
+                out[k] = (l1[m] * self.Y[m, 0] + l2[m] * self.Y[m, 1] + l3[m] * self.Y[m, 2]).min()
+        return out
+
+    def height(self, x, z, eps=2e-4):
+        """lowest() with a nudge : a point exactly on a seam or an edge may miss every triangle, so the four neighbours at eps are tried."""
+        h = self.lowest(x, z)
+        for k in np.nonzero(np.isnan(h))[0]:
+            xs = x[k] if np.ndim(x) else x
+            zs = z[k] if np.ndim(z) else z
+            for dx, dz in ((eps, 0), (-eps, 0), (0, eps), (0, -eps), (eps, eps), (-eps, -eps)):
+                v = self.lowest(np.array([xs + dx]), np.array([zs + dz]))[0]
+                if not np.isnan(v):
+                    h[k] = v
+                    break
+        return h
+
+    def left_edge(self, z, x_lo=-1.2, steps=240):
+        """x of the left outline at row z : the first hit scanning inwards, refined by bisection."""
+        xs = np.linspace(x_lo, 0.0, steps)
+        h = self.lowest(xs, np.full(steps, z))
+        idx = np.nonzero(~np.isnan(h))[0]
+        if idx.size == 0:
+            return None
+        k = idx[0]
+        if k == 0:
+            return float(xs[0])
+        a, b = xs[k - 1], xs[k]
+        for _ in range(26):
+            m = (a + b) / 2.0
+            if np.isnan(self.lowest(np.array([m]), np.array([z]))[0]):
+                a = m
+            else:
+                b = m
+        return float(b)
+
+
+def build_rows(S, z0, z1, cell, tol, max_rows=400):
+    """Row positions along z : uniform at `cell`, then every interval whose middle sits more than `tol` above or below the chord of its ends is cut in two (adaptive)."""
+    n = max(2, int(round((z1 - z0) / cell)) + 1)
+    zs = list(np.linspace(z0, z1, n))
+
+    def sag(za, zb):
+        mid = (za + zb) / 2.0
+        worst = 0.0
+        for x in (-0.6, -0.3, 0.0, 0.3, 0.6, 0.8):
+            h = S.height(np.array([x, x, x]), np.array([za, mid, zb]))
+            if np.isnan(h).any():
+                continue
+            worst = max(worst, abs(h[1] - (h[0] + h[2]) / 2.0))
+        return worst
+    changed = True
+    while changed and len(zs) < max_rows:
+        changed = False
+        new = [zs[0]]
+        for a, b in zip(zs[:-1], zs[1:]):
+            if (b - a) > cell / 4.0 and sag(a + 1e-6 if a == z0 else a, b - 1e-6 if b == z1 else b) > tol:
+                new.append((a + b) / 2.0)
+                changed = True
+            new.append(b)
+        zs = new
+    return np.array(zs)
+
+
+def find_steps(S, z0, z1, jump=0.04, dz=0.005):
+    """z of the outline steps : a row pair whose left outline jumps by more than `jump` metres (the wheel well notches of the floor)."""
+    zs = np.arange(z0 + 0.01, z1 - 0.01, dz)
+    xl = np.array([S.left_edge(z) if S.left_edge(z) is not None else np.nan for z in zs])
+    out = []
+    for k in range(len(zs) - 1):
+        if not (np.isnan(xl[k]) or np.isnan(xl[k + 1])) and abs(xl[k + 1] - xl[k]) > jump:
+            out.append(float((zs[k] + zs[k + 1]) / 2.0))
+    return out
+
+
+def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
+    """A main sheet of rows x columns across the narrow body of the floor, plus one strip of quads on each side where the outline steps out (the side extension of the middle section).
+    The step edges are row edges, so no sliver is needed to follow them. Returns the faces replaced, the new points and quads, the old surface and the row positions."""
+    faces = [i for i, n in enumerate(names) if str(n) == part]
+    if not faces:
+        raise SystemExit(f"no face is named {part}")
+    S = Surface(P, Q, faces)
+    verts = sorted({v for i in faces for v in Q[i]})
+    z0, z1 = float(P[verts][:, 2].min()), float(P[verts][:, 2].max())
+    steps = find_steps(S, z0, z1, jump)
+    cuts = [z0] + steps + [z1]
+    zs = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        seg = build_rows(S, a, b, cell, tol)
+        zs += list(seg if not zs else seg[1:])
+    zs = np.array(zs)
+    stepz = set(round(c, 6) for c in cuts[1:-1])
+
+    def edge(z, inner):
+        """left outline at row z ; at a step row `inner` picks the side (False : the narrow side below the step, True : the wide side above it)."""
+        zz = z0 + 1e-4 if z == z0 else (z1 - 1e-4 if z == z1 else z)
+        if round(z, 6) in stepz:
+            zz = z + (1e-4 if inner else -1e-4)
+        return S.left_edge(zz)
+    # the main sheet half width : the outline itself where it never steps out, the narrow value inside the steps
+    narrow = np.median([abs(edge(z, False)) for z in zs if z < (steps[0] if steps else z1) - 0.05]) if steps else None
+    rows = []
+    for z in zs:
+        wide = edge(z, True)
+        if wide is None:
+            raise SystemExit(f"the floor has no footprint at z = {z:.3f}")
+        in_mid = bool(steps) and steps[0] - 1e-6 <= z <= steps[-1] + 1e-6 and wide < -(narrow + jump / 2.0)
+        w = narrow if in_mid else abs(wide)
+        rows.append((float(z), float(w), float(abs(wide)) if in_mid else 0.0))
+    widest = max(r[1] for r in rows)
+    ncol = int(cols or max(2, int(round(2.0 * widest / cell))))
+    pts, quads, idx = [], [], {}
+
+    def add(x, y, z, key):
+        idx[key] = len(pts)
+        pts.append([x, y, z])
+    for i, (z, w, outer) in enumerate(rows):
+        zz = z0 + 1e-4 if z == z0 else (z1 - 1e-4 if z == z1 else z)
+        xs = np.linspace(-w, w, ncol + 1)
+        h = S.height(np.clip(xs, -w + 1e-4, w - 1e-4), np.full(xs.shape, zz))
+        for j in np.nonzero(np.isnan(h))[0]:
+            h[j] = np.nanmean(h[max(0, j - 1):j + 2])
+        for j in range(ncol + 1):
+            add(xs[j], h[j], z, ("m", i, j))
+        if outer > 0:
+            ns = max(1, int(round((outer - w) / cell)))
+            for side in (-1, 1):
+                for k in range(ns):
+                    x = side * (outer - (outer - w) * k / ns)
+                    hh = S.height(np.array([x - side * 1e-4]), np.array([zz]))[0]
+                    add(x, hh if not np.isnan(hh) else h[0 if side < 0 else -1], z, ("s", side, i, k))
+    for i in range(len(rows) - 1):
+        for j in range(ncol):
+            quads.append([idx[("m", i, j)], idx[("m", i, j + 1)], idx[("m", i + 1, j + 1)], idx[("m", i + 1, j)]])
+        a, b = rows[i], rows[i + 1]
+        if a[2] > 0 and b[2] > 0:
+            for side in (-1, 1):
+                ns = max(1, int(round((a[2] - a[1]) / cell)))
+                chain_a = [idx[("s", side, i, k)] for k in range(ns)] + [idx[("m", i, 0 if side < 0 else ncol)]]
+                chain_b = [idx[("s", side, i + 1, k)] for k in range(ns)] + [idx[("m", i + 1, 0 if side < 0 else ncol)]]
+                for k in range(ns):
+                    quads.append([chain_a[k], chain_a[k + 1], chain_b[k + 1], chain_b[k]])
+    flat = np.array(pts)
+    fixed = []
+    for q in quads:
+        p = flat[q]
+        n = np.cross(p[1] - p[0], p[3] - p[0])
+        fixed.append(q if n[1] < 0 else q[::-1])   # the lower surface faces down
+    return faces, flat, fixed, S, zs, ncol
+
+
+def deviation(S, flat, quads, samples=3):
+    """Height difference between the new sheet and the old surface at the centre and the edge middles of every new quad (metres)."""
+    pts = []
+    for q in quads:
+        p = flat[q]
+        c = p.mean(0)
+        pts.append(c)
+        for k in range(4):
+            pts.append((p[k] + p[(k + 1) % 4]) / 2.0)
+    pts = np.array(pts)
+    sub = pts[:: max(1, len(pts) // 1500)]
+    old = S.height(sub[:, 0], sub[:, 2])
+    ok = ~np.isnan(old)
+    d = np.abs(sub[ok, 1] - old[ok])
+    return float(d.max()), float(d.mean()), int((~ok).sum())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--part", default="CAR_body_under_floor_C")
+    ap.add_argument("--cell", type=float, default=0.1, help="target cell size in metres")
+    ap.add_argument("--tol-mm", type=float, default=2.0, help="rows are added where the surface sags more than this between two rows")
+    ap.add_argument("--cols", type=int, default=0, help="columns across the widest row (0 = from the cell size)")
+    ap.add_argument("--obj", default="")
+    ap.add_argument("--no-compact", action="store_true", help="keep the orphan points of the input")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = [str(x) for x in d["names"]]
+    faces, flat, quads, S, zs, ncol = remesh(P, Q, names, a.part, a.cell, a.tol_mm / 1000.0, a.cols or None)
+    dmax, dmean, miss = deviation(S, flat, quads)
+    drop = set(faces)
+    base = len(P)
+    P2 = np.vstack([P, flat])
+    Q2 = [q for i, q in enumerate(Q) if i not in drop] + [[base + v for v in q] for q in quads]
+    N2 = [n for i, n in enumerate(names) if i not in drop] + [a.part] * len(quads)
+    if not a.no_compact:
+        used = sorted({v for q in Q2 for v in q})
+        remap = {v: k for k, v in enumerate(used)}
+        P2 = P2[used]
+        Q2 = [[remap[v] for v in q] for q in Q2]
+    np.savez(a.out, P=P2, Q=np.array(Q2, dtype=object), names=np.array(N2))
+    print(json.dumps({"part": a.part, "old_faces": len(faces), "new_faces": len(quads), "rows": len(zs), "cols": ncol, "steps_z": [round(x, 3) for x in find_steps(S, float(P[sorted({v for i in faces for v in Q[i]})][:,2].min()), float(P[sorted({v for i in faces for v in Q[i]})][:,2].max()))], "deviation_max_mm": round(dmax * 1000, 2), "deviation_mean_mm": round(dmean * 1000, 2),
+                      "points_outside_old_footprint": miss, "points_in": base, "points_out": len(P2)}))
+    if a.obj:
+        import TopoFix
+        TopoFix.write_obj(a.obj, P2, Q2, N2)
+        print("obj", a.obj)
+
+
+if __name__ == "__main__":
+    main()
