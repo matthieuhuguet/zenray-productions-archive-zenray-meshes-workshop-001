@@ -1,0 +1,26 @@
+# 26 October 2026 : ZenRay Meshes, TWIST CHECK : a quad whose two triangles disagree renders as a stripe (a ruled band one
+# quad tall between two curves that do not run in step) ; per panel, the angle between the two triangle normals of every
+# quad, median / p95 / max, worst panels first. Exit code 1 if a panel's p95 exceeds the limit. FR : vrille des quads.
+# Usage: python TwistCheck.py <loft.npz> [p95_limit_deg=3]
+import sys, json
+import numpy as np
+
+
+def main(npz, lim=3.0):
+    lim = float(lim); d = np.load(npz, allow_pickle=True); P = d["P"].astype(float); Q = np.array(d["Q"]); pan = np.array([str(p) for p in d["panel"]])
+    a, b, c, e = (P[Q[:, k]] for k in range(4))
+    n1 = np.cross(b - a, c - a); n2 = np.cross(c - a, e - a)
+    l1 = np.linalg.norm(n1, axis=1); l2 = np.linalg.norm(n2, axis=1); ok = (l1 > 1e-12) & (l2 > 1e-12)
+    ang = np.zeros(len(Q)); ang[ok] = np.degrees(np.arccos(np.clip((n1[ok] / l1[ok, None] * n2[ok] / l2[ok, None]).sum(1), -1, 1)))
+    rows = []
+    for p in sorted(set(pan)):
+        m = (pan == p) & ok
+        if m.sum() < 4: continue
+        rows.append({"panel": p, "quads": int(m.sum()), "median": round(float(np.median(ang[m])), 2), "p95": round(float(np.percentile(ang[m], 95)), 2), "max": round(float(ang[m].max()), 2)})
+    rows.sort(key=lambda r: -r["p95"]); bad = [r for r in rows if r["p95"] > lim]
+    print(json.dumps({"limit_p95_deg": lim, "bad": len(bad), "panels": rows}, indent=0))
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

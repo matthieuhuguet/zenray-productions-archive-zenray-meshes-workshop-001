@@ -1,0 +1,56 @@
+# 26 October 2026 : ZenRay Meshes, PERSPECTIVE TEST : is the sheet an orthographic or a perspective render ? For each view
+# and each camera distance D (metres from the car centre, inf = orthographic), the model is projected in perspective (each
+# vertex scaled about the view axis by D / depth, which keeps the silhouette of a pinhole camera), then fitted to the
+# reference mask bbox (scale and centre, as the frame does) and the silhouette IoU is measured. The D that maximises the
+# IoU on every view tells the camera. FR : la planche est-elle en perspective ? IoU en fonction de la distance caméra.
+# Usage: python PerspTest.py <frame_dir> <mesh.obj> [dists=inf,40,25,18,12] [views=front,back,left,right,top,bottom]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+import Raster
+
+
+def persp(V, rx, uy, tz, D):
+    """camera on the +tz side looking along -tz (the renderer's convention : tz points toward the viewer)"""
+    if not np.isfinite(D): return V.copy()
+    c = 0.5 * (V.min(0) + V.max(0)); P = V - c
+    a, b, d = P @ rx, P @ uy, P @ tz
+    f = D / np.maximum(D - d, 1e-3)          # nearer to the camera (d > 0) = larger
+    return c + (a * f)[:, None] * rx + (b * f)[:, None] * uy + d[:, None] * tz
+
+
+def fit_render(r_mesh, V, F, v, shape, mref):
+    rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+    if v["name"] == "top" and tz[1] < 0 or v["name"] == "bottom" and tz[1] > 0: tz = -tz
+    a_, b_ = V @ rx, V @ uy
+    rr, cc = np.where(mref); bb = [cc.min(), rr.min(), cc.max(), rr.max()]
+    s = 0.5 * ((bb[2] - bb[0]) / (a_.max() - a_.min()) + (bb[3] - bb[1]) / (b_.max() - b_.min()))   # one scale, both axes
+    ucen, vcen = 0.5 * (a_.max() + a_.min()), 0.5 * (b_.max() + b_.min())
+    xc, yc = 0.5 * (bb[0] + bb[2]), 0.5 * (bb[1] + bb[3]); R = int(max(shape))
+    cu = ucen + (R / 2 - xc) / s; cv = vcen + (yc - R / 2) / s
+    r = Raster.Renderer(V, F); M, _, _, _ = r.render(cu * rx + cv * uy, s, (rx.tolist(), uy.tolist(), tz.tolist()), R); r.release()
+    M = ndi.binary_fill_holes(M[: shape[0], : shape[1]])
+    return float((M & mref).sum() / max((M | mref).sum(), 1)), s
+
+
+def main(fdir, mesh_path, dists="inf,40,25,18,12", views="front,back,left,right,top,bottom"):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); m = trimesh.load(mesh_path, force="mesh", process=False)
+    V0, F = np.asarray(m.vertices, float), np.asarray(m.faces)
+    Ds = [float(x) for x in dists.split(",")]; out = {}
+    for v in meta["views"]:
+        if v["name"] not in views.split(","): continue
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+        if v["name"] == "top" and tz[1] < 0 or v["name"] == "bottom" and tz[1] > 0: tz = -tz
+        res = {}
+        for D in Ds:
+            iou, s = fit_render(None, persp(V0, rx, uy, tz, D), F, v, mref.shape, mref); res["%g" % D] = round(iou, 4)
+        out[v["name"]] = res; print(v["name"], json.dumps(res), flush=True)
+    keys = ["%g" % D for D in Ds]
+    print("mean", json.dumps({k: round(float(np.mean([out[v][k] for v in out])), 4) for k in keys}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

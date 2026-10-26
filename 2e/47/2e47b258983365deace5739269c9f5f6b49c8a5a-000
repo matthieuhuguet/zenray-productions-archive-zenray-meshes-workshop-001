@@ -11,7 +11,7 @@ from PIL import Image
 from scipy import ndimage as ndi
 import Raster, SheetScore
 
-P = {"tol_px": 3, "grad_pct": 88, "normal_break": 0.25, "erode_px": 3}
+P = {"tol_px": 3, "grad_pct": 88, "normal_break": 0.25, "erode_px": 3, "depth_break_m": 0.01}   # 26 October 2026: depth steps count as lines too
 
 
 def ref_edges(img):
@@ -20,12 +20,20 @@ def ref_edges(img):
     return m > np.percentile(m, P["grad_pct"])
 
 
-def model_edges(N, M):
+def model_edges(N, M, D=None):
     E = np.zeros(M.shape, bool)
     for dy, dx in ((0, 1), (1, 0)):
         a = N[: N.shape[0] - dy, : N.shape[1] - dx]; b = N[dy:, dx:]
         d = 1 - (a * b).sum(-1); m = M[: M.shape[0] - dy, : M.shape[1] - dx] & M[dy:, dx:]
         E[: E.shape[0] - dy, : E.shape[1] - dx] |= (d > P["normal_break"]) & m
+    if D is not None and P.get("depth_break_m"):
+        # 26 October 2026: a STEP whose two faces both look at the camera (grille lip, inset rim, proud frame) has no normal
+        # break ; it is a jump of the depth, read by the second difference (a smooth steep surface has none) so the sides
+        # seen at grazing angles do not light up. FR : les marches comptent comme des traits.
+        Dz = np.where(M, D, np.nan)
+        for ax in (0, 1):
+            d2 = np.abs(np.roll(Dz, -1, ax) - 2 * Dz + np.roll(Dz, 1, ax))
+            with np.errstate(invalid="ignore"): E |= np.nan_to_num(d2, nan=0.0) > P["depth_break_m"]
     return E
 
 
@@ -33,18 +41,21 @@ def main(fdir, vdir, mesh_path, board):
     meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
     mesh = trimesh.load(mesh_path, force="mesh", process=False); r = Raster.Renderer(mesh.vertices, mesh.faces); cap = {}; orig = r.render
     def rr(*a, **k):
-        out = orig(*a, **k); cap["N"] = out[2]; return out
+        out = orig(*a, **k); cap["N"] = out[2]; cap["D"] = out[1]; return out
     r.render = rr; res, tiles = {}, []
     for v in meta["views"]:
         pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
         ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
         mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
-        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); N = cap["N"][: mref.shape[0], : mref.shape[1]]
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); N = cap["N"][: mref.shape[0], : mref.shape[1]]; Dd = cap["D"][: mref.shape[0], : mref.shape[1]]
         inner = ndi.binary_erosion(mref, iterations=P["erode_px"]) & ndi.binary_erosion(M, iterations=P["erode_px"])
-        Er = ref_edges(ref) & inner; Em = model_edges(N, M) & inner
+        Er = ref_edges(ref) & inner; Em = model_edges(N, M, Dd) & inner
+        Em0 = model_edges(N, M) & inner; dm0 = ndi.distance_transform_edt(~Em0); dr_ = ndi.distance_transform_edt(~Er)   # normal breaks only (score before 26 October 2026)
+        rec0 = float((dm0[Er] <= P["tol_px"]).mean()) if Er.any() else 0.0; pre0 = float((dr_[Em0] <= P["tol_px"]).mean()) if Em0.any() else 0.0
         dm = ndi.distance_transform_edt(~Em); dr = ndi.distance_transform_edt(~Er)
         rec = float((dm[Er] <= P["tol_px"]).mean()) if Er.any() else 0.0; pre = float((dr[Em] <= P["tol_px"]).mean()) if Em.any() else 0.0
-        f1 = 2 * pre * rec / max(pre + rec, 1e-9); res[v["name"]] = {"precision": round(pre, 3), "recall": round(rec, 3), "f1": round(f1, 3)}
+        f1 = 2 * pre * rec / max(pre + rec, 1e-9); res[v["name"]] = {"precision": round(pre, 3), "recall": round(rec, 3), "f1": round(f1, 3),
+                                                                       "f1_normal_only": round(2 * pre0 * rec0 / max(pre0 + rec0, 1e-9), 3)}
         ov = np.stack([ref // 2] * 3, -1).astype(np.uint8)
         ov[Er & (dm <= P["tol_px"])] = (60, 200, 60); ov[Er & (dm > P["tol_px"])] = (220, 60, 60); ov[Em & (dr > P["tol_px"])] = (60, 120, 230)
         tiles.append(ov)
@@ -54,6 +65,7 @@ def main(fdir, vdir, mesh_path, board):
     y0 = 0   # 25 October 2026: tiles have different heights (404, 361, 471 px) ; their start row on the board is written out
     for v, tl in zip(meta["views"], tiles): res[v["name"]]["tile_y0"] = y0; y0 += tl.shape[0]
     res["mean_f1"] = round(float(np.mean([v["f1"] for k, v in res.items() if isinstance(v, dict) and "f1" in v])), 3)
+    res["mean_f1_normal_only"] = round(float(np.mean([v["f1_normal_only"] for k, v in res.items() if isinstance(v, dict) and "f1_normal_only" in v])), 3)
     print(json.dumps(res))
 
 

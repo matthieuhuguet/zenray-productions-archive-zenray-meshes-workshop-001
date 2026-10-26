@@ -1,0 +1,48 @@
+# 26 October 2026 : ZenRay Meshes, LINE TRACE in the CURRENT frame : follows one drawn line of a reference view between rough
+# seed points (lateral, height in metres), by dynamic programming over the gradient image (strongest edge in a band around
+# the seed polyline, smoothness penalty between columns), and writes the line in world units. Traced curves made before a
+# frame refit are stale (the dlo_top and sill_crease of 25 October sat 2 to 8 cm off the sheet) ; re-trace, never convert.
+# FR : suivre un trait de la planche entre des points de départ, dans le repère courant, par programmation dynamique.
+# Usage: python LineTrace.py <frame_dir> <views_dir> <view> <seeds "u:v,u:v,..."> <out.json> [band_m=0.04] [smooth=2.0] [step_px=1]
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+
+def main(fdir, vdir, view, seeds, out, band=0.04, smooth=2.0, step=1):
+    band = float(band); smooth = float(smooth); step = int(step)
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    v = [x for x in meta["views"] if x["name"] == view][0]; pan = [p for p in sheet["panels"] if p["name"] == view][0]
+    img = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], view))).convert("L")).astype(float)
+    g = ndi.gaussian_filter(img, 0.8); G = np.hypot(ndi.sobel(g, 0), ndi.sobel(g, 1)); G /= np.percentile(G, 99.5) + 1e-9
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]; ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    s = v["px_per_m"]; bb = v["bbox"]; xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    col = lambda u: xc + (u - ucen) * s; row = lambda w: yc - (w - vcen) * s
+    S = np.array([[float(t) for t in p.split(":")] for p in seeds.split(",")]); S = S[np.argsort(S[:, 0])]
+    c0, c1 = int(np.ceil(col(S[0, 0]))), int(np.floor(col(S[-1, 0]))); cols = np.arange(c0, c1 + 1, step)
+    us = ucen + (cols - xc) / s; ws = np.interp(us, S[:, 0], S[:, 1]); rc = row(ws); bp = band * s
+    R = np.arange(int(rc.min() - bp) - 1, int(rc.max() + bp) + 2)
+    cost = np.full((len(cols), len(R)), 1e9)
+    for i, c in enumerate(cols):
+        m = np.abs(R - rc[i]) <= bp; cost[i, m] = -G[np.clip(R[m], 0, G.shape[0] - 1), int(c)]
+    # DP : accumulated cost with a quadratic jump penalty between neighbour columns
+    acc = cost.copy(); arg = np.zeros(cost.shape, int); J = np.arange(len(R))
+    for i in range(1, len(cols)):
+        pen = smooth * ((J[:, None] - J[None, :]) / max(step, 1)) ** 2 * 0.01
+        tot = acc[i - 1][None, :] + pen; arg[i] = np.argmin(tot, 1); acc[i] += tot[J, arg[i]]
+    path = [int(np.argmin(acc[-1]))]
+    for i in range(len(cols) - 1, 0, -1): path.append(arg[i, path[-1]])
+    path = path[::-1]; rr = R[path].astype(float)
+    W_ = vcen + (yc - rr) / s
+    strength = float(np.mean([-cost[i, p] for i, p in enumerate(path)]))
+    res = {"_date": "26 October 2026", "view": view, "seeds": S.tolist(), "u": [round(float(x), 4) for x in us], "v": [round(float(x), 4) for x in W_],
+           "mean_edge": round(strength, 3)}
+    json.dump(res, open(out, "w")); print(json.dumps({"n": len(us), "mean_edge": res["mean_edge"], "u_range": [res["u"][0], res["u"][-1]],
+                                                       "samples": [[res["u"][k], res["v"][k]] for k in range(0, len(us), max(1, len(us) // 8))]}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

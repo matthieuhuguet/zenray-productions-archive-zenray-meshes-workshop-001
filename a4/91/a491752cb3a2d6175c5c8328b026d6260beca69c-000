@@ -1,0 +1,46 @@
+# 26 October 2026 : ZenRay Meshes car, BODY LINER behind the panel joints. Every joint is a V groove between two panels
+# extruded panel_thick inward, which leaves a 3 mm slit through the shell : seen edge on, the background shows through the
+# car (583 to 1266 px of holes per side view). A liner, the pre gap body surface offset inward by panel_thick + liner_gap
+# along its point normals, closes every slit ; controls liner_on and liner_gap on CTRL_zrm. FR : doublure derrière les joints.
+# Usage (Houdini, live): exec(open('.../CarLiner.py').read(), {'hou': hou})
+geo = hou.node('/obj/ZRM_Car'); ctrl = geo.node('CTRL_zrm')
+tg = ctrl.parmTemplateGroup()
+for n_, l_, v_ in (("liner_on", "Body Liner Behind Joints (0 or 1)", 1.0), ("liner_gap", "Liner Gap Behind Panels (m)", 0.0015)):
+    if ctrl.parm(n_) is None:
+        tg.append(hou.FloatParmTemplate(n_, l_, 1, default_value=(v_,))); ctrl.setParmTemplateGroup(tg); tg = ctrl.parmTemplateGroup()
+for nm in ("liner_normals", "liner_offset", "liner_name", "liner_reverse", "liner_switch"):
+    if geo.node(nm): geo.node(nm).destroy()
+src = geo.node('panel_cuts')
+nr = geo.createNode('normal', 'liner_normals'); nr.setInput(0, src)
+if nr.parm('type'): nr.parm('type').set(0)   # point normals
+wo = geo.createNode('attribwrangle', 'liner_offset'); wo.setInput(0, nr); wo.parm('class').set(2)
+wo.parm('snippet').set('''// 26 October 2026 : liner, the body surface pushed inward behind the panels (panel_thick + liner_gap)
+@P -= normalize(v@N) * (chf("../CTRL_zrm/panel_thick") + chf("../CTRL_zrm/liner_gap"));
+s@name = "CAR_body_liner";''')
+# a primitive name too (exports read primitive names)
+# 26 October 2026: the liner is taken before the nose and tail cuts ; it is clipped at the cut planes (read from the
+# builders' cut files), a little inside, or it stood out behind the tail face (back view lines 0.767 -> 0.482)
+import json as _json, os as _os
+_W = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car'
+_zmax = _json.load(open(_os.path.join(_W, 'nose_v1_cut.json'))).get('cut_z', 9.0) - 0.01
+_zmin = _json.load(open(_os.path.join(_W, 'tail_v1_cut.json'))).get('cut_z', -9.0) + 0.01
+for n_, v_ in (("liner_z_min", _zmin), ("liner_z_max", _zmax)):
+    if ctrl.parm(n_) is None:
+        tg = ctrl.parmTemplateGroup(); tg.append(hou.FloatParmTemplate(n_, n_.replace('_', ' ').title() + ' (m)', 1, default_value=(v_,))); ctrl.setParmTemplateGroup(tg)
+    ctrl.parm(n_).set(v_)
+wn = geo.createNode('attribwrangle', 'liner_name'); wn.setInput(0, wo); wn.parm('class').set(1)
+wn.parm('snippet').set('''s@name = "CAR_body_liner";   // 26 October 2026
+if (@P.z > chf("../CTRL_zrm/liner_z_max") || @P.z < chf("../CTRL_zrm/liner_z_min")) removeprim(0, @primnum, 1);
+// 26 October 2026: no liner behind the glass : the 13.5 mm inset gap around each window is the window outline the sheet draws
+if (startswith(s@panel, "glass")) removeprim(0, @primnum, 1);''')
+# 26 October 2026: the liner faces INWARD (reversed winding) : seen through a joint it is a back face, dark like the inside
+# of a car, so the joint still reads as a line (outward, it took the body's shade and the top view lost its seams)
+rv = geo.node('liner_reverse') or geo.createNode('reverse', 'liner_reverse'); rv.setInput(0, wn)
+sw = geo.createNode('switch', 'liner_switch'); sw.setInput(0, geo.createNode('null', 'liner_off') if geo.node('liner_off') is None else geo.node('liner_off')); sw.setInput(1, rv)
+sw.parm('input').setExpression('ch("../CTRL_zrm/liner_on") > 0.5')
+car = geo.node('car')
+if sw not in [i for i in car.inputs() if i]: car.setInput(len(car.inputs()), sw)
+for n_ in (nr, wo, wn, sw): n_.moveToGoodPosition()
+car.cook(force=True)
+gl = wn.geometry()
+result = {"liner_prims": len(gl.prims()), "car_inputs": [i.name() if i else None for i in car.inputs()], "errors": [n.name() + ": " + " ".join(n.errors()) for n in (nr, wo, wn, sw) if n.errors()]}
