@@ -9,18 +9,80 @@ import numpy as np
 
 
 class Mesh:
-    def __init__(self): self.P, self.Q, self.N = [], [], []
-    def grid(self, G, name, close_u=False, flip=False):
-        """G: (nu, nv, 3) point grid -> quads; close_u wraps the first axis."""
-        b = len(self.P); nu, nv = G.shape[:2]; self.P.extend(G.reshape(-1, 3).tolist())
+    def __init__(self): self.P, self.Q, self.N, self.PN = [], [], [], []
+    def grid(self, G, name, close_u=False, flip=False, close_v=False):
+        """G: (nu, nv, 3) point grid -> quads; close_u wraps the first axis, close_v the second (26 October 2026)."""
+        b = len(self.P); nu, nv = G.shape[:2]; self.P.extend(G.reshape(-1, 3).tolist()); self.PN.extend([name] * (nu * nv))
         for i in range(nu if close_u else nu - 1):
-            for j in range(nv - 1):
-                a, c = i * nv + j, ((i + 1) % nu) * nv + j
-                q = (b + a, b + c, b + c + 1, b + a + 1); self.Q.append(q[::-1] if flip else q); self.N.append(name)
+            for j in range(nv if close_v else nv - 1):
+                a, c = i * nv + j, ((i + 1) % nu) * nv + j; a1, c1 = i * nv + (j + 1) % nv, ((i + 1) % nu) * nv + (j + 1) % nv
+                q = (b + a, b + c, b + c1, b + a1); self.Q.append(q[::-1] if flip else q); self.N.append(name)
+    def quads(self, P, Qi, name, flip=False):
+        """26 October 2026: explicit points and quads (local indices), for the hub disc."""
+        b = len(self.P); self.P.extend(np.asarray(P).tolist()); self.PN.extend([name] * len(P))
+        for q in Qi:
+            q = tuple(b + i for i in q); self.Q.append(q[::-1] if flip else q); self.N.append(name)
+    def weld(self, tol=1e-7):
+        """26 October 2026: WELD ; points of the same part at the same place become one (TopoCheck counted 324 unwelded
+        faces per wheel on the spokes) ; parts stay separate shells. FR : soudure des points confondus d'une même pièce."""
+        key = {}; remap = []; P2, PN2 = [], []
+        for p_, n_ in zip(self.P, self.PN):
+            k = (n_,) + tuple(int(round(c / tol)) for c in p_)
+            if k not in key: key[k] = len(P2); P2.append(p_); PN2.append(n_)
+            remap.append(key[k])
+        Q2, N2 = [], []
+        for q, n_ in zip(self.Q, self.N):
+            q2 = tuple(remap[i] for i in q)
+            if len(set(q2)) == 4: Q2.append(q2); N2.append(n_)
+        self.P, self.PN, self.Q, self.N = P2, PN2, Q2, N2
+
+
+def quad_disc(segs, radius, x_of_r, inner=0.5, ring_steps=3):
+    """26 October 2026: QUAD DISC as an INSET SQUARE and a RING (the classic cap) : a square grid of side 2 x inner x radius
+    with segs / 4 edges per side, joined to the segs points of the revolve circle by ring_steps radial quads ; the four
+    square corners are valence 3 poles on the flat centre, every corner angle near 90 or 135 degrees. The elliptical
+    mapping of a square to the disc left 175 degree corners at the rim. Replaces a revolve from radius 0 (a pole of
+    valence segs and collapsed quads). FR : disque en quads, carré intérieur et anneau, pôles sur la zone plate."""
+    m = segs // 4 + 1; u = np.linspace(-1, 1, m) * inner; X, Y = np.meshgrid(u, u, indexing="ij")
+    ring = []   # square boundary counter clockwise, starting at angle 0 like revolve
+    for j in range(m // 2, m - 1): ring.append((m - 1, j))
+    for i in range(m - 1, 0, -1): ring.append((i, m - 1))
+    for j in range(m - 1, 0, -1): ring.append((0, j))
+    for i in range(0, m - 1): ring.append((i, 0))
+    for j in range(0, m // 2): ring.append((m - 1, j))
+    ring = ring[:segs]; t = np.linspace(0, 2 * np.pi, segs, endpoint=False)
+    sq = np.stack([X, Y], -1).reshape(-1, 2); P2 = [tuple(v) for v in sq]; Qi = [(i * m + j, (i + 1) * m + j, (i + 1) * m + j + 1, i * m + j + 1) for i in range(m - 1) for j in range(m - 1)]
+    prev = [i * m + j for (i, j) in ring]
+    for k in range(1, ring_steps + 1):
+        f = k / ring_steps; cur = []
+        for n_, (i, j) in enumerate(ring):
+            a_ = np.array([X[i, j], Y[i, j]]); b_ = np.array([np.cos(t[n_]), np.sin(t[n_])]); cur.append(len(P2)); P2.append(tuple(a_ + (b_ - a_) * f))
+        for n_ in range(segs):
+            Qi.append((prev[n_], cur[n_], cur[(n_ + 1) % segs], prev[(n_ + 1) % segs]))
+        prev = cur
+    D = np.array(P2); r_ = np.linalg.norm(D, axis=1) * radius
+    P = np.stack([np.vectorize(x_of_r)(r_), radius * D[:, 0], radius * D[:, 1]], -1)
+    # orientation : the square quads and the ring quads must agree ; the ring above runs square to circle, (i, j) order
+    return P, Qi
+
+
+REFINE = {"max_aspect": 0}   # 26 October 2026: set from wheel_params "revolve_max_aspect" in build_wheel
+
+
+def refine(profile, segs, max_aspect):
+    """26 October 2026: insert points on a profile segment longer than max_aspect x the spacing around the wheel at its
+    radius (a straight segment, the shape does not change) ; TopoCheck saw 2.7 cm x 25 cm quads on the barrel."""
+    out = [profile[0]]
+    for a_, b_ in zip(profile[:-1], profile[1:]):
+        L = float(np.hypot(*(np.subtract(b_, a_)))); tang = 2 * np.pi * max(0.5 * (a_[1] + b_[1]), 1e-3) / segs
+        n = max(1, int(np.ceil(L / (max_aspect * tang))))
+        out += [tuple(np.add(a_, np.subtract(b_, a_) * k / n)) for k in range(1, n + 1)]
+    return np.array(out)
 
 
 def revolve(profile, segs):
     """profile: (n,2) of (axial x, radius) -> grid (segs, n, 3) around the x axis."""
+    if REFINE["max_aspect"] > 0: profile = refine(np.asarray(profile, float), segs, REFINE["max_aspect"])
     t = np.linspace(0, 2 * np.pi, segs, endpoint=False)
     return np.stack([np.stack([np.full(segs, x), r * np.cos(t), r * np.sin(t)], 1) for x, r in profile], 1)
 
@@ -63,7 +125,7 @@ def spoke_ribbon(p, a_center, off):
 
 
 def build_wheel(p):
-    m = Mesh(); seg = p["segments"]
+    m = Mesh(); seg = p["segments"]; REFINE["max_aspect"] = float(p.get("revolve_max_aspect", 0))
     m.grid(revolve(tyre_profile(p), seg), "tyre", close_u=True)
     rl = p["rim_r"]; lw = p["lip_w"]; fx = p["face_x"]
     lip = [(fx - 0.01, rl), (fx, rl - 0.004), (fx, rl - lw), (fx - 0.015, rl - lw)]           # lip ring, face side
@@ -71,14 +133,26 @@ def build_wheel(p):
     barrel = [(fx - 0.015, rl - lw), (-p["tyre_w"] / 2 + 0.02, rl - lw), (-p["tyre_w"] / 2 + 0.02, rl)]
     m.grid(revolve(np.array(barrel), seg), "rim_barrel", close_u=True, flip=True)
     hub = [(fx - p["concave"] + 0.01, 0.0001), (fx - p["concave"] + 0.012, p["hub_r"] * 0.6), (fx - p["concave"], p["hub_r"]), (fx - p["concave"] - p["spoke_depth"], p["hub_r"])]
-    m.grid(revolve(np.array(hub), seg), "rim_hub", close_u=True)
+    if p.get("hub_disc", 1):   # 26 October 2026: quad disc centre, the revolve starts at its ring (welded)
+        x0_, x1_, r1_ = hub[0][0], hub[1][0], hub[1][1]; dP, dQ = quad_disc(seg, r1_, lambda r: x0_ + (x1_ - x0_) * r / r1_)
+        m.quads(dP, dQ, "rim_hub", flip=True); m.grid(revolve(np.array(hub[1:]), seg), "rim_hub", close_u=True)
+    else:
+        m.grid(revolve(np.array(hub), seg), "rim_hub", close_u=True)
     offs = [-p["split_gap"] / 2 - p["spoke_w"] / 2, p["split_gap"] / 2 + p["spoke_w"] / 2] if p["split"] else [0.0]
     for k in range(p["spokes"]):
         a = 2 * math.pi * k / p["spokes"] + math.radians(p["phase_deg"])
         for o in offs:
             top, bot = spoke_ribbon(p, a, o)
-            m.grid(top, "rim_spoke"); m.grid(bot, "rim_spoke", flip=True)
-            m.grid(np.stack([top[:, 0], bot[:, 0]], 1), "rim_spoke", flip=True); m.grid(np.stack([top[:, -1], bot[:, -1]], 1), "rim_spoke")
+            if p.get("spoke_tube", 1):
+                # 26 October 2026: CLOSED TUBE ; section = top row then bottom row reversed (the long sides exist, the
+                # four ribbons of before left them open), swept from hub to lip, two end caps as quad strips ; welded.
+                sec = np.concatenate([top, bot[:, ::-1]], 1); m.grid(sec, "rim_spoke", close_v=True)
+                k_ = top.shape[1]
+                for e_, fl_ in ((0, True), (-1, False)): m.grid(np.stack([top[e_], bot[e_]], 1), "rim_spoke", flip=fl_)
+            else:
+                m.grid(top, "rim_spoke"); m.grid(bot, "rim_spoke", flip=True)
+                m.grid(np.stack([top[:, 0], bot[:, 0]], 1), "rim_spoke", flip=True); m.grid(np.stack([top[:, -1], bot[:, -1]], 1), "rim_spoke")
+    m.weld(p.get("weld_tol_m", 1e-7))   # 26 October 2026
     return m
 
 

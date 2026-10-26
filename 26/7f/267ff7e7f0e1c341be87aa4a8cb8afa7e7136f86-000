@@ -1,0 +1,227 @@
+# 26 October 2026 : ZenRay Meshes, TOPOCHECK, the senior review of a model's topology, MEASURED and never estimated :
+# what an animator or a senior tech artist checks in wireframe before a model is sold (Matthieu, 26 October 2026 : « une
+# topologie parfaite, comme si un 3D animator ou un 3D tech artist senior avait vérifié le modèle, en wireframe »).
+# Rules from ZenRayMeshes1.md section 6 (quad dominant, edge flow, poles off creases, density transitions, n-gons, panel
+# shells). Input : the real polygons exported by ExportTopo.py (P, C vertex counts, I indices, T part id, names).
+# Output : <out>.json (every measure), <out>.md (the review), <out>_wire.png (six views, wireframe on shaded surface,
+# faces with an error in red, triangles in yellow). Exit code 0 when the review runs ; the score is in the json.
+# FR : le juge de topologie, la relecture d'un senior mesurée : quads, pôles, plis, densité, symétrie, fil de fer.
+# Usage: python TopoCheck.py <topo.npz> <topo_params.json> <out_prefix> [--no-board]
+#        python TopoCheck.py --selftest      (green on a clean quad torus, red on each injected defect)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+
+DEFAULTS = {   # 26 October 2026: interface ; the params file overrides any of these (eight at most per category)
+    "faces": {"ngon_is_error": 1, "tri_is_error": 0},
+    "quality": {"aspect_max": 8.0, "angle_dev_max_deg": 55.0, "fold_max_deg": 20.0, "density_ratio_max": 3.0,
+                "min_edge_m": 1e-5, "min_area_m2": 1e-10},
+    "poles": {"sharp_deg": 30.0, "valence_min": 3, "valence_max": 5, "pole_on_sharp_is_error": 1},
+    "weld": {"crack_tol_m": 1e-5},
+    "symmetry": {"suffix_l": "_L", "suffix_r": "_R", "mirror_tol_m": 0.002},
+    "board": {"res": 1000, "views": ["three_quarter_front", "three_quarter_rear", "side", "front", "back", "top"], "edge_eps_m": 0.004},
+}
+ERRORS = ["ngon", "degenerate", "nonmanifold", "crack", "flipped", "aspect", "angle", "fold", "density", "bad_pole", "pole_on_sharp"]
+
+
+def load_params(path):
+    P = json.loads(json.dumps(DEFAULTS))
+    if path and os.path.exists(path):
+        for k, v in json.load(open(path)).items():
+            if isinstance(v, dict) and k in P: P[k].update({kk: vv for kk, vv in v.items() if not kk.startswith("_")})
+    return P
+
+
+def analyse(P, C, I, T, names, prm):
+    q, fq, po, wd, sy = prm["quality"], prm["faces"], prm["poles"], prm["weld"], prm["symmetry"]
+    nF, nP = len(C), len(P); C = C.astype(np.int64); I = I.astype(np.int64)
+    st = np.concatenate([[0], np.cumsum(C)[:-1]]); fi = np.repeat(np.arange(nF), C)
+    loc = np.arange(len(I)) - np.repeat(st, C); nx_ = I[np.repeat(st, C) + (loc + 1) % np.repeat(C, C)]
+    # Newell normals and areas ; FR : normales de Newell et aires
+    A_, B_ = P[I], P[nx_]; cr = np.cross(A_, B_); N = np.zeros((nF, 3)); np.add.at(N, fi, cr)
+    area = 0.5 * np.linalg.norm(N, axis=1); Nn = N / (np.linalg.norm(N, axis=1, keepdims=True) + 1e-30)
+    hl = np.linalg.norm(B_ - A_, axis=1); fmean = np.bincount(fi, hl, nF) / C; fmin = np.full(nF, np.inf); np.minimum.at(fmin, fi, hl)
+    # edges ; FR : arêtes uniques et leurs faces
+    E = np.sort(np.stack([I, nx_], 1), 1); uE, inv, cnt = np.unique(E, axis=0, return_inverse=True, return_counts=True); inv = inv.ravel()
+    order = np.argsort(inv, kind="stable"); est = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+    man = np.flatnonzero(cnt == 2); f1, f2 = fi[order[est[man]]], fi[order[est[man] + 1]]
+    # 26 October 2026: FLIPPED ; two faces sharing an edge must run it in opposite directions (consistent winding) ;
+    # same direction = one of them is flipped (black faces in a viewport, wrong normals in a game engine)
+    h1, h2 = order[est[man]], order[est[man] + 1]; same_dir = I[h1] == I[h2]
+    dih = np.degrees(np.arccos(np.clip((Nn[f1] * Nn[f2]).sum(1), -1, 1)))
+    sharp_e = man[dih > po["sharp_deg"]]
+    flags = {k: np.zeros(nF, bool) for k in ERRORS + ["tri"]}
+    flags["ngon"] = (C > 4) if fq["ngon_is_error"] else np.zeros(nF, bool); flags["tri"] = C == 3
+    flags["degenerate"] = (area < q["min_area_m2"]) | (fmin < q["min_edge_m"])
+    nm_e = np.flatnonzero(cnt > 2); nm_f = np.unique(fi[np.concatenate([order[est[e]:est[e] + cnt[e]] for e in nm_e])]) if len(nm_e) else np.array([], int)
+    flags["nonmanifold"][nm_f] = True
+    flags["flipped"][f1[same_dir]] = True; flags["flipped"][f2[same_dir]] = True
+    # density jump across an edge ; FR : saut de densité entre deux faces voisines
+    rr = np.maximum(fmean[f1], fmean[f2]) / np.maximum(np.minimum(fmean[f1], fmean[f2]), 1e-12); bad = rr > q["density_ratio_max"]
+    flags["density"][f1[bad]] = True; flags["density"][f2[bad]] = True
+    # quad quality : aspect, corner angle, fold inside the quad (a crease cutting it on a diagonal)
+    qs = np.flatnonzero(C == 4); Q4 = I[st[qs][:, None] + np.arange(4)]; V = P[Q4]
+    L = np.linalg.norm(np.roll(V, -1, 1) - V, axis=2); aspect = L.max(1) / np.maximum(L.min(1), 1e-12)
+    u = np.roll(V, 1, 1) - V; w = np.roll(V, -1, 1) - V
+    ang = np.degrees(np.arccos(np.clip((u * w).sum(2) / (np.linalg.norm(u, axis=2) * np.linalg.norm(w, axis=2) + 1e-20), -1, 1)))
+    adev = np.abs(ang - 90).max(1)
+    def tn(a, b, c):
+        n_ = np.cross(V[:, b] - V[:, a], V[:, c] - V[:, a]); return n_ / (np.linalg.norm(n_, axis=1, keepdims=True) + 1e-30)
+    fA = np.degrees(np.arccos(np.clip((tn(0, 1, 2) * tn(0, 2, 3)).sum(1), -1, 1))); fB = np.degrees(np.arccos(np.clip((tn(1, 2, 3) * tn(1, 3, 0)).sum(1), -1, 1)))
+    fold = np.minimum(fA, fB)
+    flags["aspect"][qs[aspect > q["aspect_max"]]] = True; flags["angle"][qs[adev > q["angle_dev_max_deg"]]] = True; flags["fold"][qs[fold > q["fold_max_deg"]]] = True
+    # poles ; FR : pôles (valence différente de 4) hors bord, et pôles posés sur une arête vive
+    used = np.zeros(nP, bool); used[I] = True
+    deg = np.bincount(uE.ravel(), minlength=nP); bnd = np.zeros(nP, bool); bnd[uE[cnt == 1].ravel()] = True
+    interior = used & ~bnd; pole = interior & (deg != 4)
+    badp = interior & ((deg < po["valence_min"]) | (deg > po["valence_max"]))
+    # 26 October 2026: a pole is wrong IN THE MIDDLE of a crease line (exactly two sharp edges through it) ; where three or
+    # more creases meet (a box corner, valence 3) it is the right topology. FR : pôle fautif au milieu d'une ligne vive seulement.
+    nsh = np.bincount(uE[sharp_e].ravel(), minlength=nP); psh = pole & (nsh == 2)
+    vf = lambda m: np.unique(fi[m[I]])
+    flags["bad_pole"][vf(badp)] = True
+    if po["pole_on_sharp_is_error"]: flags["pole_on_sharp"][vf(psh)] = True
+    # cracks : two points closer than crack_tol in the same part, both on an open boundary (an unwelded seam)
+    from scipy.spatial import cKDTree
+    ppart = np.full(nP, -1); ppart[I] = T[fi]
+    pairs = cKDTree(P[used]).query_pairs(wd["crack_tol_m"], output_type="ndarray"); ui = np.flatnonzero(used)
+    ncr = 0
+    if len(pairs):
+        a_, b_ = ui[pairs[:, 0]], ui[pairs[:, 1]]; cm = (ppart[a_] == ppart[b_]) & bnd[a_] & bnd[b_]; ncr = int(cm.sum())
+        cp = np.zeros(nP, bool); cp[a_[cm]] = True; cp[b_[cm]] = True; flags["crack"][vf(cp)] = True
+    # symmetry of the L / R parts : same face counts by type, mirrored points within mirror_tol
+    sym = []
+    nl = [n for n in names if n.endswith(sy["suffix_l"])]
+    for n in nl:
+        r_ = n[: -len(sy["suffix_l"])] + sy["suffix_r"]
+        if r_ not in list(names): continue
+        il, ir = list(names).index(n), list(names).index(r_)
+        cl, crt = np.bincount(np.minimum(C[T == il], 5), minlength=6)[3:], np.bincount(np.minimum(C[T == ir], 5), minlength=6)[3:]
+        pl = np.unique(I[np.repeat(T == il, C)]); pr = np.unique(I[np.repeat(T == ir, C)])
+        md = cKDTree(P[pr] * [-1, 1, 1]).query(P[pl])[0] if len(pl) and len(pr) else np.array([np.inf])
+        sym.append({"L": n, "R": r_, "faces_L": cl.tolist(), "faces_R": crt.tolist(), "same_counts": bool((cl == crt).all()),
+                    "mirror_p95_mm": round(float(np.percentile(md, 95)) * 1000, 2), "mirror_max_mm": round(float(md.max()) * 1000, 2)})
+    err = np.zeros(nF, bool)
+    for k in ERRORS: err |= flags[k]
+    cent = np.zeros((nF, 3)); np.add.at(cent, fi, P[I]); cent /= C[:, None]
+    cats = {}
+    for k in ERRORS + ["tri"]:
+        m = flags[k]; parts = np.bincount(T[m], minlength=len(names))
+        top = [(str(names[j]), int(parts[j])) for j in np.argsort(-parts)[:8] if parts[j] > 0]
+        ex = [round(float(x), 3) for x in cent[np.flatnonzero(m)[0]]] if m.any() else None
+        cats[k] = {"faces": int(m.sum()), "pct": round(100.0 * m.sum() / nF, 3), "parts": top, "example_xyz": ex}
+    sym_bad = [s for s in sym if not s["same_counts"] or s["mirror_p95_mm"] > sy["mirror_tol_m"] * 1000]
+    res = {"_date": "26 October 2026", "faces": nF, "points": int(used.sum()), "quads": int((C == 4).sum()), "tris": int((C == 3).sum()),
+           "ngons": int((C > 4).sum()), "quad_pct": round(100.0 * (C == 4).mean(), 3), "nonmanifold_edges": int(len(nm_e)),
+           "boundary_edges": int((cnt == 1).sum()), "cracks": ncr, "flipped_edges": int(same_dir.sum()), "interior_poles": int(pole.sum()), "bad_poles": int(badp.sum()),
+           "poles_on_sharp": int(psh.sum()), "valence_hist": {str(k): int(((deg == k) & interior).sum()) for k in range(2, 9)},
+           "aspect_p95": round(float(np.percentile(aspect, 95)), 2) if len(qs) else None,
+           "angle_dev_p95_deg": round(float(np.percentile(adev, 95)), 1) if len(qs) else None,
+           "fold_p95_deg": round(float(np.percentile(fold, 95)), 2) if len(qs) else None,
+           "edge_mm_p5_p50_p95": [round(float(np.percentile(hl, p)) * 1000, 2) for p in (5, 50, 95)],
+           "error_faces": int(err.sum()), "score_clean": round(1.0 - err.sum() / max(nF, 1), 5), "categories": cats,
+           "symmetry_pairs": len(sym), "symmetry_bad": sym_bad}
+    return res, flags, err
+
+
+def board(P, C, I, T, flags, err, prm, out_png):
+    import Raster
+    from PIL import Image, ImageDraw
+    from CleanView import VIEWS
+    b = prm["board"]; res = int(b["res"]); C64 = C.astype(np.int64); st = np.concatenate([[0], np.cumsum(C64)[:-1]])
+    tri, tp = [], []
+    for k in range(1, int(C64.max()) - 1):   # fan triangulation, vectorised per corner
+        m = C64 > k + 1; s_ = st[m]; tri.append(np.stack([I[s_], I[s_ + k], I[s_ + k + 1]], 1)); tp.append(np.flatnonzero(m))
+    F = np.concatenate(tri); tpoly = np.concatenate(tp)
+    fi = np.repeat(np.arange(len(C64)), C64); loc = np.arange(len(I)) - np.repeat(st, C64); nx_ = I[np.repeat(st, C64) + (loc + 1) % np.repeat(C64, C64)]
+    E = np.unique(np.sort(np.stack([I, nx_], 1), 1), axis=0)
+    used = np.unique(F); c = (P[used].max(0) + P[used].min(0)) / 2; ext = np.linalg.norm(P[used].max(0) - P[used].min(0))
+    r = Raster.Renderer(P, F, smooth_deg=30.0); tiles = []; s = res / (ext * 1.05)
+    for name in b["views"]:
+        rx, uy = VIEWS[name]; rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
+        M, D, N_, fid = r.render(c, s, (rx.tolist(), uy.tolist(), tz.tolist()), res)
+        Lc = np.array([0.30, 0.55, 0.78]); Lc /= np.linalg.norm(Lc); sh = np.clip(0.25 + 0.75 * np.clip((N_ * Lc).sum(-1), 0, 1), 0, 1)
+        base = np.where(M, 120 + sh * 120, 70)[..., None].repeat(3, 2)
+        pid = np.where(fid >= 0, tpoly[np.clip(fid, 0, len(tpoly) - 1)], -1)
+        e_ = (pid >= 0) & err[np.clip(pid, 0, None)]; t_ = (pid >= 0) & flags["tri"][np.clip(pid, 0, None)] & ~e_
+        base[e_] = base[e_] * 0.45 + np.array([230, 40, 40]) * 0.55; base[t_] = base[t_] * 0.5 + np.array([235, 200, 40]) * 0.5
+        im = Image.fromarray(base.astype(np.uint8)); dr = ImageDraw.Draw(im)
+        pa, pb = P[E[:, 0]] - c, P[E[:, 1]] - c; pm = (pa + pb) / 2
+        X = lambda p: p @ rx * s + res / 2; Y = lambda p: res / 2 - p @ uy * s
+        mx, my = np.round(X(pm)).astype(int), np.round(Y(pm)).astype(int); ok = (mx >= 0) & (mx < res) & (my >= 0) & (my < res)
+        dz = pm @ tz; zb = np.full(len(E), -np.inf); zb[ok] = np.nan_to_num(D[my[ok], mx[ok]], nan=-np.inf)
+        vis = ok & (dz >= zb - b["edge_eps_m"])
+        ax, ay, bx, by = X(pa[vis]), Y(pa[vis]), X(pb[vis]), Y(pb[vis])
+        for x0, y0, x1, y1 in zip(ax, ay, bx, by): dr.line((x0, y0, x1, y1), fill=(25, 25, 30))
+        dr.text((8, 6), name, fill=(255, 255, 255)); tiles.append(np.asarray(im))
+    r.release()
+    rows = [np.concatenate(tiles[i:i + 3], 1) for i in range(0, len(tiles), 3)]
+    Image.fromarray(np.concatenate(rows, 0)).save(out_png)
+
+
+def write_md(res, out_md, tag):
+    L = ["# TopoCheck %s (26 October 2026 tool)" % tag, "",
+         "Score (faces without any error) : **%.4f** ; %d faces, %.2f %% quads, %d triangles, %d n-gons." % (res["score_clean"], res["faces"], res["quad_pct"], res["tris"], res["ngons"]), "",
+         "Hard errors : non-manifold edges %d, cracks %d, flipped edges %d, bad poles %d, poles on sharp edges %d." % (res["nonmanifold_edges"], res["cracks"], res["flipped_edges"], res["bad_poles"], res["poles_on_sharp"]), "",
+         "Quads : aspect p95 %s, corner angle deviation p95 %s deg, fold p95 %s deg ; edge length p5 / p50 / p95 %s mm." % (res["aspect_p95"], res["angle_dev_p95_deg"], res["fold_p95_deg"], res["edge_mm_p5_p50_p95"]), "",
+         "| Category | Faces | % | Worst parts |", "|---|---|---|---|"]
+    for k, v in res["categories"].items():
+        L.append("| %s | %d | %.3f | %s |" % (k, v["faces"], v["pct"], ", ".join("%s %d" % p for p in v["parts"][:4])))
+    L += ["", "Symmetry pairs %d, mismatched %d : %s" % (res["symmetry_pairs"], len(res["symmetry_bad"]), ", ".join("%s (%s / %s, p95 %s mm)" % (s["L"], s["faces_L"], s["faces_R"], s["mirror_p95_mm"]) for s in res["symmetry_bad"][:12]))]
+    open(out_md, "w").write("\n".join(L) + "\n")
+
+
+def selftest():
+    # green : a clean quad torus ; red : each injected defect is caught by its own category
+    nu, nv, R, r_ = 48, 24, 1.0, 0.35
+    uu, vv = np.meshgrid(np.arange(nu), np.arange(nv), indexing="ij")
+    th, ph = 2 * np.pi * uu / nu, 2 * np.pi * vv / nv
+    P = np.stack([(R + r_ * np.cos(ph)) * np.cos(th), r_ * np.sin(ph), (R + r_ * np.cos(ph)) * np.sin(th)], -1).reshape(-1, 3)
+    idx = lambda i, j: (i % nu) * nv + (j % nv)
+    Q = [[idx(i, j), idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)] for i in range(nu) for j in range(nv)]
+    prm = load_params(None); prm["poles"]["sharp_deg"] = 30.0
+    def run(P_, faces, T_=None, names=("CAR_test_C",)):
+        C = np.array([len(f) for f in faces], np.int32); I = np.array([v for f in faces for v in f], np.int32)
+        T_ = np.zeros(len(faces), np.int32) if T_ is None else np.array(T_, np.int32)
+        return analyse(np.asarray(P_, float), C, I, T_, np.array(names), prm)[0]
+    g = run(P, Q); ok_green = g["score_clean"] == 1.0 and g["flipped_edges"] == 0 and g["nonmanifold_edges"] == 0 and g["cracks"] == 0 and g["bad_poles"] == 0
+    checks = {}
+    # n-gon : merge two neighbouring quads into a hexagon
+    Qn = [list(f) for f in Q]; a, b = Qn[0], Qn[nv]; hexa = [a[0], b[0], b[1], b[2], a[2], a[3]]; Qn = [hexa] + Qn[1:nv] + Qn[nv + 1:]
+    checks["ngon"] = run(P, Qn)["categories"]["ngon"]["faces"] >= 1
+    # non-manifold : a third face on an existing edge
+    P2 = np.vstack([P, [[0, 2, 0]]]); checks["nonmanifold"] = run(P2, Q + [[Q[5][0], Q[5][1], len(P)]])["nonmanifold_edges"] >= 1
+    # crack : duplicate the points of one ring and give the faces on one side the copies
+    P3 = P.copy(); P3 = np.vstack([P3, P[[idx(0, j) for j in range(nv)]]]); dup = {idx(0, j): len(P) + j for j in range(nv)}
+    Q3 = [[dup.get(v, v) if k < nv else v for v in f] for k, f in enumerate(Q)]
+    checks["crack"] = run(P3, Q3)["cracks"] >= 1
+    # fold : lift one vertex of a quad far off its plane
+    P4 = P.copy(); P4[idx(10, 3)] += np.array([0, 0.3, 0]); checks["fold"] = run(P4, Q)["categories"]["fold"]["faces"] >= 1
+    # degenerate : collapse one quad edge
+    P5 = P.copy(); P5[idx(20, 5)] = P5[idx(21, 5)]; checks["degenerate"] = run(P5, Q)["categories"]["degenerate"]["faces"] >= 1
+    # bad pole : a vertex of valence 6 (fan of triangles around a point)
+    c0 = len(P); P6 = np.vstack([P, [[0, 0, 0]]]); ring = [idx(30, 0), idx(31, 0), idx(32, 0), idx(32, 1), idx(31, 1), idx(30, 1)]
+    Q6 = [f for f in Q if not (set(f) <= set(ring))] + [[ring[k], ring[(k + 1) % 6], c0] for k in range(6)]
+    checks["bad_pole"] = run(P6, Q6)["bad_poles"] >= 1
+    Q7 = [list(f) for f in Q]; Q7[7] = Q7[7][::-1]; checks["flipped"] = run(P, Q7)["flipped_edges"] >= 1
+    out = {"green_clean_torus": ok_green, "green_score": g["score_clean"], "red_caught": checks, "ok": ok_green and all(checks.values())}
+    print(json.dumps(out)); return 0 if out["ok"] else 1
+
+
+def main():
+    if "--selftest" in sys.argv: sys.exit(selftest())
+    npz, prm_path, out = sys.argv[1], sys.argv[2], sys.argv[3]
+    d = np.load(npz, allow_pickle=True); prm = load_params(prm_path)
+    if "C" in d.files: Pc, Cc, Ic, Tc, Nc = d["P"], d["C"], d["I"], d["T"], d["names"]
+    else:   # 26 October 2026: a component npz (P, Q quads, names per quad) is judged as is, before Houdini
+        Q_ = [list(map(int, q)) for q in d["Q"]]; Nc, Tc = np.unique(d["names"], return_inverse=True)
+        Pc, Cc, Ic = d["P"].astype(float), np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    res, flags, err = analyse(Pc, Cc, Ic, Tc, Nc, prm)
+    d = {"P": Pc, "C": Cc, "I": Ic, "T": Tc}
+    json.dump(res, open(out + ".json", "w"), indent=1); write_md(res, out + ".md", os.path.basename(out))
+    if "--no-board" not in sys.argv: board(d["P"], d["C"], d["I"], d["T"], flags, err, prm, out + "_wire.png")
+    print(json.dumps({k: res[k] for k in ("faces", "quad_pct", "tris", "ngons", "nonmanifold_edges", "cracks", "flipped_edges", "bad_poles", "poles_on_sharp", "error_faces", "score_clean")}))
+
+
+if __name__ == "__main__":
+    main()
