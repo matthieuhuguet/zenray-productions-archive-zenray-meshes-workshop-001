@@ -39,6 +39,35 @@ def stats(path, label=""):
         if par[pr] >= 0: din = N[pr] - N[par[pr]]; din = din / (np.linalg.norm(din) + 1e-9); fa = float(np.degrees(np.arccos(np.clip(float(u[0] @ din), -1, 1))))
         rows.append({"class": cls(float(R.mean())), "length": L, "straight": float(np.linalg.norm(P[-1] - P[0]) / L), "r_mean": float(R.mean()), "taper_per_m": float((R[0] - R[-1]) / L), "turn_deg_per_m": float(turn.sum() / L) if len(turn) else 0.0,
                      "kinks": int((turn > 25).sum()), "steps": int(len(sl)), "fork_angle": fa, "strahler": so[ch[-1]]})
+    # phyllotaxis and spacing : on the BRANCH CURVES (the thickest child continues its parent, the others start new curves, as the tube builder does) : for the side branches of one curve in order along it, the azimuth step around
+    # the curve axis, the spacing along it, the side to parent length ratio ; elevation of every chain from the horizontal (the AttractionUp of Weber and Penn : do the curves climb or droop). FR : phyllotaxie, espacement, rapports.
+    cur = []; stack = [(0, None, None)]; cidx = {}
+    while stack:
+        start, pci, patt = stack.pop(); path = [start]; n = start
+        while kids[n]:
+            ks = sorted(kids[n], key=lambda c: -r[c]); n2 = ks[0]
+            for k_ in ks[1:]: stack.append((k_, len(cur), n))
+            path.append(n2); n = n2
+        cur.append({"path": path, "parent": pci, "attach": patt, "len": float(np.linalg.norm(np.diff(N[path], axis=0), axis=1).sum()) if len(path) > 1 else 0.0})
+    for ci, c_ in enumerate(cur): c_["id"] = ci
+    # fix : children were pushed with the index the PARENT will have when popped later ; recompute from membership
+    owner = {}
+    for ci, c_ in enumerate(cur):
+        for n_ in c_["path"]: owner.setdefault(n_, ci)
+    sides = {}
+    for ci, c_ in enumerate(cur):
+        if c_["path"][0] != 0 and par[c_["path"][0]] >= 0: sides.setdefault(owner[par[c_["path"][0]]], []).append((par[c_["path"][0]], ci))
+    az_all = []; sp = []; lr = []; elev = {"limb": [], "branch": []}
+    for ch in chains:
+        P_ = N[ch]; v = P_[-1] - P_[0]; e = float(np.degrees(np.arcsin(np.clip(v[1] / (np.linalg.norm(v) + 1e-9), -1, 1)))); elev.setdefault(cls(float(r[ch].mean())), []).append(e)
+    for pci, lst in sides.items():
+        pth = cur[pci]["path"]; pos = {n_: k for k, n_ in enumerate(pth)}; lst = sorted(lst, key=lambda x: pos.get(x[0], 0)); arcs = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(N[pth], axis=0), axis=1))]); prev = None
+        for node, ci in lst:
+            k = pos.get(node, 0); a0 = N[pth[max(k - 1, 0)]]; a1 = N[pth[min(k + 1, len(pth) - 1)]]; axis = (a1 - a0); axis = axis / (np.linalg.norm(axis) + 1e-9)
+            ref = np.cross(axis, [0, 1.0, 0]); ref = ref / (np.linalg.norm(ref) + 1e-9) if np.linalg.norm(ref) > 1e-6 else np.array([1.0, 0, 0]); ref2 = np.cross(axis, ref)
+            cp = cur[ci]["path"]; d_ = N[cp[1]] - N[cp[0]] if len(cp) > 1 else np.zeros(3); d_ = d_ - axis * (d_ @ axis); azi = float(np.degrees(np.arctan2(d_ @ ref2, d_ @ ref)) % 360.0)
+            if prev is not None: sp.append((float(arcs[k] - prev[0]), (azi - prev[1]) % 360.0))
+            prev = (float(arcs[k]), azi); lr.append(cur[ci]["len"] / max(cur[pci]["len"], 1e-6))
     forks = []
     for i, k in enumerate(kids):
         if len(k) >= 2 and r[i] > 0.02:
@@ -57,6 +86,9 @@ def stats(path, label=""):
     ex = [x["exponent"] for x in forks if x["exponent"] is not None]
     out["pipe_exponent_median"] = round(float(np.median(ex)), 2) if ex else None; out["pipe_exponent_p10_p90"] = [round(float(np.percentile(ex, q)), 2) for q in (10, 90)] if ex else None
     out["radius_ratio_main_child_median"] = round(float(np.median([x["ratio_main"] for x in forks])), 3) if forks else None; out["radius_ratio_second_child_median"] = round(float(np.median([x["ratio_second"] for x in forks])), 3) if forks else None
+    out["phyllotaxis"] = {"children_pairs": len(sp), "azimuth_step_deg_p10_p50_p90": [round(float(np.percentile([x[1] for x in sp], q)), 1) for q in (10, 50, 90)] if sp else None, "spacing_m_p10_p50_p90": [round(float(np.percentile([x[0] for x in sp], q)), 2) for q in (10, 50, 90)] if sp else None,
+                          "child_parent_length_ratio_p10_p50_p90": [round(float(np.percentile(lr, q)), 2) for q in (10, 50, 90)] if lr else None}
+    out["elevation_deg_median"] = {c: round(float(np.median(v)), 1) for c, v in elev.items() if v}; out["elevation_deg_p10_p90"] = {c: [round(float(np.percentile(v, q)), 1) for q in (10, 90)] for c, v in elev.items() if len(v) > 4}
     out["strahler_max"] = int(max(so.values())); out["strahler_counts"] = {str(k): int(v) for k, v in zip(*np.unique(list(so.values()), return_counts=True))}
     return out
 
