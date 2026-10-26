@@ -60,26 +60,31 @@ def main(params, body, out):
         if C.get("plan_interp", 0): return float(np.interp(abs(x), hr, zr)) if abs(x) <= hr.max() else zc
         okp = (hw >= abs(x)) & (zs <= zc)
         return float(zs[okp].min()) if okp.any() else zc
-    FF = C.get("flat_face")
+    FF = C.get("flat_face"); RC = [None]   # 26 October 2026: RC[0] = outline compensation of profile_yz (set once the insets are known)
     def z_side(y, lo, hi, x=None):
         # 26 October 2026: the two side views disagree by 8 cm at the tail and each reads with 2 to 4 cm steps ; the face is
         # flat at face_z between its bottom and top fillets (smootherstep over fillet_m to top_z and bottom_z)
         if not FF: return float(np.interp(y, ey[ok], eb[ok]))
         sm = lambda u: 0.0 if u <= 0 else 1.0 if u >= 1 else u ** 3 * (u * (6 * u - 15) + 10)
-        z = FF["face_z"]; ft, fb = FF.get("top_fillet_m", 0.08), FF.get("bottom_fillet_m", 0.06)
+        # 26 October 2026: PROFILE ; profile_yz [[y, z], ...] replaces the flat face_z by the side view outline (a face that
+        # leans, the crisp bumper lip at y 0.50, the lower piece that slopes forward to the wheel) ; no bottom fillet then.
+        # FR : profil de la face relevé sur les vues de côté, au lieu d'une face plate.
+        PYZ = FF.get("profile_yz") if FF.get("profile_on", 1) else None
+        fz = (lambda yy: float(np.interp(yy, *np.array(PYZ, float).T)) - (RC[0](yy) if RC[0] else 0.0)) if PYZ else (lambda yy: FF["face_z"])
+        z = fz(y); ft, fb = FF.get("top_fillet_m", 0.08), FF.get("bottom_fillet_m", 0.06)
         TC = FF.get("top_chamfer")
         if TC and TC.get("on", 1):
             # 26 October 2026: TOP CHAMFER ; the sheet ends the deck on a crisp edge (top view z -2.19, back view y 0.94 to
             # 1.0) then a chamfer down to the face ; the deck runs from the cut (zc, hi) to the crease (crease_z, hi - eps),
             # the chamfer from there to (face_z, hi - drop). FR : pont, arête vive, chanfrein jusqu'à la face.
-            eps, drop, zcr = TC.get("eps_m", 0.006), TC["drop_m"], TC["crease_z"]; zf_ = FF["face_z"]
+            eps, drop, zcr = TC.get("eps_m", 0.006), TC["drop_m"], TC["crease_z"]; zf_ = fz(hi - drop)
             if TC.get("follow_plan") and x is not None:
                 # 26 October 2026: the crease follows the plan corner : offset_xm [[|x|, m], ...] ahead of this column's face
                 # (top view : 7 cm at the centre, 4.5 cm at |x| 0.75), the chamfer foot on the face. FR : arête qui suit le plan.
-                zf_ = max(z_plan(x), FF["face_z"]); ox_, om_ = np.array(TC["offset_xm"], float).T; zcr = zf_ + float(np.interp(abs(x), ox_, om_))
+                zf_ = max(z_plan(x), fz(hi - drop)); ox_, om_ = np.array(TC["offset_xm"], float).T; zcr = zf_ + float(np.interp(abs(x), ox_, om_))
             if y >= hi - eps: z = zcr + (zc - zcr) * (y - (hi - eps)) / eps
             elif y >= hi - drop: z = zf_ + (zcr - zf_) * (y - (hi - drop)) / (drop - eps)
-            z += (FF["bottom_z"] - FF["face_z"]) * sm(((lo + fb) - y) / fb)
+            if not PYZ: z += (FF["bottom_z"] - FF["face_z"]) * sm(((lo + fb) - y) / fb)
             return float(z)
         if FF.get("top_to_cut", 1):
             # 26 October 2026: the top edge of the face lay 5 cm behind the clipped body edge (top_z -2.15 against the cut
@@ -103,7 +108,8 @@ def main(params, body, out):
     if C.get("skirt"): xs = np.unique(np.round(np.concatenate([xs, [C["skirt"]["x"], -C["skirt"]["x"]]]), 5))
     if C.get("extra_cols"): xs = np.unique(np.round(np.concatenate([xs] + [[v, -v] for v in C["extra_cols"]]), 5))   # 26 October 2026: columns through the corners of a sloped inset edge
     xtra_ = 2 if ((FF or {}).get("top_chamfer") or {}).get("on", 0) else 0   # 26 October 2026: crease and chamfer foot rows
-    G = np.zeros((len(xs), ny + 4 * len(INS) + 1 + xtra_ + len(C.get("extra_rows", [])), 3)); nx = len(xs)   # 26 October 2026: + extra rows
+    npf_ = len(FF["profile_yz"]) if (FF and FF.get("profile_yz") and FF.get("profile_on", 1)) else 0   # 26 October 2026: profile rows
+    G = np.zeros((len(xs), ny + 4 * len(INS) + 1 + xtra_ + len(C.get("extra_rows", [])) + npf_, 3)); nx = len(xs)   # 26 October 2026: + extra rows
     # 25 October 2026: the per column top height is noisy (sawtooth top edge seen in Houdini) ; it is taken from a smoothed
     # profile of the section top over |x| (running max then moving average over top_smooth columns)
     his = []
@@ -111,6 +117,25 @@ def main(params, body, out):
         lo_, hi_ = yrange(np.sign(x) * min(abs(x), xsec)); his.append(np.nan if hi_ is None else hi_)
     his = np.array(his); okh = np.isfinite(his); his[~okh] = np.interp(np.flatnonzero(~okh), np.flatnonzero(okh), his[okh])
     k_ = int(C.get("top_smooth", 5)); his_s = np.convolve(np.pad(his, k_ // 2, mode="edge"), np.ones(k_) / k_, mode="valid")
+    def recess(x, y):
+        r_ = 0.0
+        for k in INS:   # recess depth : full inside, linear over the bevel, zero outside ; x0 = inner edge (side pairs)
+            # 26 October 2026: bevel_bottom_m and bevel_top_m give the lower and upper faces their own height (the rear
+            # vents of the sheet : a 4.5 cm light sloped sill under the dark recess, a 7 cm face above it)
+            # 26 October 2026: y0_x [[|x|, y0], ...] slopes the lower edge of an inset (the rear vent recess rises toward the
+            # diffuser at its inner end, 0.336 at |x| 0.65 to 0.381 at 0.55) ; FR : bord bas incliné selon |x|
+            y0k = float(np.interp(abs(x), *np.array(k["y0_x"], float).T)) if k.get("y0_x") else k["y0"]
+            dxe = min(k["x"] - abs(x), abs(x) - k.get("x0", -1.0)) / k["bevel_m"]; dye = min((y - y0k) / k.get("bevel_bottom_m", k["bevel_m"]), (k["y1"] - y) / k.get("bevel_top_m", k["bevel_m"]))
+            f = float(np.clip(min(dxe, dye), 0.0, 1.0)); r_ += k["depth_m"] * f
+        return r_
+    if FF and FF.get("profile_yz") and FF.get("profile_on", 1) and FF.get("profile_is_outline", 0):
+        # 26 October 2026: PROFILE AS OUTLINE ; the side views see, at each height, the most rearward point over all columns,
+        # i.e. the face minus the SMALLEST recess across x (two neighbouring insets whose bevels overlap leave no ridge at the
+        # face). The profile is the measured mask outline ; the face is pushed back by that smallest recess so the outline
+        # matches. FR : le profil est le contour mesuré, la face recule du plus petit retrait de chaque hauteur.
+        xo_ = [x_ for x_ in xs if abs(x_) <= FF.get("outline_x_max", 0.9)]; yg_ = np.linspace(0.0, 1.5, 751)
+        rm_ = np.array([min(recess(x_, y_) for x_ in xo_) for y_ in yg_])
+        RC[0] = lambda yy: float(np.interp(yy, yg_, rm_))
     lo_prev = hi_prev = None
     lo_g, hi_g = y_low, float(np.nanmax(his_s))   # 26 October 2026: face fillets measured from the whole face, not per column
     for i, x in enumerate(xs):
@@ -124,21 +149,15 @@ def main(params, body, out):
         if INS:   # global inset rows clamped to this column's range (degenerate quads are dropped below)
             ys_ = np.sort(np.concatenate([ys_, np.clip([v for k in INS for v in (k["y0"], k["y0"] + k.get("bevel_bottom_m", k["bevel_m"]), k["y1"] - k.get("bevel_top_m", k["bevel_m"]), k["y1"])], lo, hi)]))   # 26 October 2026: per side bevels
         ys_ = np.sort(np.concatenate([ys_, [np.clip(C.get("skirt", {}).get("y", lo), lo, hi)]]))   # same row count in every column
-        if C.get("extra_rows"): ys_ = np.sort(np.concatenate([ys_, np.clip(C["extra_rows"], lo, hi)]))   # 26 October 2026: rows through the corners of a sloped inset edge
+        if C.get("extra_rows"): ys_ = np.sort(np.concatenate([ys_, np.clip(C["extra_rows"], lo, hi)]))
+        if FF and FF.get("profile_yz") and FF.get("profile_on", 1): ys_ = np.sort(np.concatenate([ys_, np.clip([q_[0] for q_ in FF["profile_yz"]], lo, hi)]))   # 26 October 2026: rows on the profile vertices (crisp lip)   # 26 October 2026: rows through the corners of a sloped inset edge
         TC_ = (FF or {}).get("top_chamfer")
         if TC_ and TC_.get("on", 1):   # 26 October 2026: rows exactly on the crease and the chamfer foot (crisp edges)
             ys_ = np.sort(np.concatenate([ys_, [hi - TC_.get("eps_m", 0.006), hi - TC_["drop_m"]]]))
         for j, y in enumerate(ys_):
             zb = z_side(y, lo_g, hi, x)   # 26 October 2026: the top fillet follows each column top (watertight with the body)
             z = min(max(z_plan(x), zb, ztip), zc)
-            for k in INS:   # recess depth : full inside, linear over the bevel, zero outside ; x0 = inner edge (side pairs)
-                # 26 October 2026: bevel_bottom_m and bevel_top_m give the lower and upper faces their own height (the rear
-                # vents of the sheet : a 4.5 cm light sloped sill under the dark recess, a 7 cm face above it)
-                # 26 October 2026: y0_x [[|x|, y0], ...] slopes the lower edge of an inset (the rear vent recess rises toward the
-                # diffuser at its inner end, 0.336 at |x| 0.65 to 0.381 at 0.55) ; FR : bord bas incliné selon |x|
-                y0k = float(np.interp(abs(x), *np.array(k["y0_x"], float).T)) if k.get("y0_x") else k["y0"]
-                dxe = min(k["x"] - abs(x), abs(x) - k.get("x0", -1.0)) / k["bevel_m"]; dye = min((y - y0k) / k.get("bevel_bottom_m", k["bevel_m"]), (k["y1"] - y) / k.get("bevel_top_m", k["bevel_m"]))
-                f = float(np.clip(min(dxe, dye), 0.0, 1.0)); z += k["depth_m"] * f
+            z += recess(x, y)
             G[i, j] = (x, y, z)
     nyy = G.shape[1]; PP, Q, N = G.reshape(-1, 3).tolist(), [], []
     def name_at(c):   # 26 October 2026: a quad takes the name of the inset whose inner area holds its centre
