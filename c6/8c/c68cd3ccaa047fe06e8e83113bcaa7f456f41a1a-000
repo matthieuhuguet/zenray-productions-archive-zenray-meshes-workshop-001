@@ -126,20 +126,51 @@ def audio(cfg):
     D, sr = pl["totalSeconds"], int(a["sampleRate"])
     m = a["music"]
     music = abs_path(m["src"])
-    head = m["trimHead"]
-    if head == "auto":
-        r = sh([FFMPEG, "-hide_banner", "-nostats", "-t", "8", "-i", music, "-af", "silencedetect=n=-50dB:d=0.05", "-f", "null", "-"])
-        mm = re.search(r"silence_start: 0\b[\s\S]*?silence_end: ([0-9.]+)", r.stderr)
-        head = float(mm.group(1)) if mm else 0.0
+    # where the music starts on the timeline : placeAt (seconds), or placeAfter (the id of a clip : it starts when that clip ends) ; 0 by default
+    place = 0.0
+    if m.get("placeAfter"):
+        place = [c for c in pl["clips"] if c["id"] == m["placeAfter"]][0]["end"] / pl["fps"]
+    elif m.get("placeAt") is not None:
+        place = float(m["placeAt"])
+    L = D - place                                  # seconds of music to lay down
+    start = m.get("startAt")                       # seconds into the track, a number or "m:ss" ; absent = from the beginning of the track
+    if start is not None:
+        head = sum(float(x) * 60 ** k for k, x in enumerate(reversed(str(start).split(":"))))
+    else:
+        head = m["trimHead"]
+        if head == "auto":
+            r = sh([FFMPEG, "-hide_banner", "-nostats", "-t", "8", "-i", music, "-af", "silencedetect=n=-50dB:d=0.05", "-f", "null", "-"])
+            mm = re.search(r"silence_start: 0\b[\s\S]*?silence_end: ([0-9.]+)", r.stderr)
+            head = float(mm.group(1)) if mm else 0.0
     head = float(head)
-    print(f"music : leading silence cut {head:.3f} s, segment {D:.3f} s")
-    seg = ["-ss", f"{head:.4f}", "-t", f"{D:.4f}", "-i", music]
-    meas = loudnorm_pass(seg, m["targetLufs"], m["truePeak"], 11)
+    avail = float(probe(str(music))["format"]["duration"]) - head
+    seg_wav = out / "music-segment.wav"
+    if avail >= L:
+        must([FFMPEG, "-hide_banner", "-nostats", "-y", "-ss", f"{head:.4f}", "-t", f"{L:.4f}", "-i", music, "-ar", str(sr), "-ac", "2", "-c:a", "pcm_f32le", seg_wav])
+        loops = 1
+    elif m.get("loop"):
+        # not enough track after the start : the same stretch is repeated, each join is a crossfade (acrossfade) so the loop point does not click
+        x = float(m.get("loopCrossfade", 1.0))
+        loops = int(-(-(L - x) // (avail - x)))
+        base = out / "music-base.wav"
+        must([FFMPEG, "-hide_banner", "-nostats", "-y", "-ss", f"{head:.4f}", "-i", music, "-ar", str(sr), "-ac", "2", "-c:a", "pcm_f32le", base])
+        cmd = [FFMPEG, "-hide_banner", "-nostats", "-y"]
+        for _ in range(loops):
+            cmd += ["-i", base]
+        fc = ";".join(f"[{'a' + str(k - 1) if k > 1 else '0:a'}][{k}:a]acrossfade=d={x}:c1=tri:c2=tri[a{k}]" for k in range(1, loops))
+        must(cmd + ["-filter_complex", fc + f";[a{loops - 1}]atrim=0:{L:.4f}[o]", "-map", "[o]", "-c:a", "pcm_f32le", seg_wav])
+    else:
+        raise SystemExit(f"the music has only {avail:.2f} s after {head:.2f} s and {L:.2f} s are needed : set audio.music.loop to true")
+    print(f"music : starts at {head:.3f} s in the track, laid at {place:.3f} s on the timeline, {L:.3f} s, {loops} pass{'es' if loops > 1 else ''} of the track")
+    seg = ["-i", seg_wav]
+    lra = float(m.get("lra", 11))   # the LRA target must be at least the measured one, or loudnorm leaves linear mode and compresses the dynamics
+    meas = loudnorm_pass(seg, m["targetLufs"], m["truePeak"], lra)
     print("music measured", {k: meas[k] for k in ("input_i", "input_tp", "input_lra")})
     fin, fout = float(m["fadeIn"]), float(m["fadeOut"])
     music_wav = out / "music.wav"
+    delay = int(round(place * 1000))
     must([FFMPEG, "-hide_banner", "-nostats", "-y", *seg, "-af",
-          f"aresample={sr},{linear_filter(meas, m['targetLufs'], m['truePeak'], 11)},aresample={sr},afade=t=in:st=0:d={fin},afade=t=out:st={D - fout:.4f}:d={fout},atrim=0:{D:.4f},apad=whole_dur={D:.4f}",
+          f"aresample={sr},{linear_filter(meas, m['targetLufs'], m['truePeak'], lra)},aresample={sr},afade=t=in:st=0:d={fin},afade=t=out:st={L - fout:.4f}:d={fout},adelay={delay}|{delay},apad=whole_dur={D:.4f},atrim=0:{D:.4f}",
           "-ac", "2", "-c:a", "pcm_f32le", music_wav])
     # the sound of the clips that carry one (clip 1 : ZenRay SFX), placed at the start of its clip
     ins, chains, labels = [], [], ["[0:a]"]
@@ -176,7 +207,7 @@ def audio(cfg):
     else:
         raise SystemExit("master loudness did not converge")
     meas2 = {**meas2, "gainDb": round(gain, 3), "masterI": got["I"], "masterTP": got["TP"]}
-    json.dump({"musicHeadCut": head, "musicMeasured": meas, "mixMeasured": meas2}, open(out / "audio.json", "w"), indent=1)
+    json.dump({"musicHeadCut": head, "musicStartInTrack": head, "musicPlacedAt": place, "musicSeconds": L, "musicPasses": loops, "musicMeasured": meas, "mixMeasured": meas2}, open(out / "audio.json", "w"), indent=1)
     print("master", master)
 
 
@@ -304,9 +335,11 @@ def verify(cfg, target=None, selftest=False):
         return float(mm[-1]) if mm and mm[-1] != "-inf" else -120.0
     D = pl["totalSeconds"]
     fi, fo = cfg["audio"]["music"]["fadeIn"], cfg["audio"]["music"]["fadeOut"]
-    a0, a1, a2 = rms(0.0, 0.04), rms(fi + 0.05, 0.2), rms(D - 0.04, 0.04)
+    mu = cfg["audio"]["music"]
+    place = [c for c in pl["clips"] if c["id"] == mu["placeAfter"]][0]["end"] / pl["fps"] if mu.get("placeAfter") else float(mu.get("placeAt") or 0.0)
+    a0, a1, a2 = rms(place, 0.04), rms(place + fi + 0.05, 0.2), rms(D - 0.04, 0.04)
     a3 = rms(D - fo - 0.25, 0.2)
-    rep.check("music fade in", a0 < a1 - 12, f"first 40 ms {a0} dB, after the fade {a1} dB")
+    rep.check(f"music fade in (music starts at {place:.3f} s)", a0 < a1 - 12, f"first 40 ms {a0} dB, after the fade {a1} dB")
     rep.check("music fade out", a2 < a3 - 12, f"last 40 ms {a2} dB, before the fade {a3} dB")
     # clip boundaries, against the sources scaled by a plain scale (so a crop, a pad or a wrong order shows)
     tmp = Path(tempfile.mkdtemp(prefix="montage-verify-"))
@@ -351,7 +384,7 @@ def index(cfg):
     out = ATELIER / o["dir"]
     ad = json.load(open(out / "audio.json")) if (out / "audio.json").exists() else {}
     vr = json.load(open(out / "verify.json")) if (out / "verify.json").exists() else []
-    L = ["# ZenRay Meshes, montage final 1:1 : index mapping (26 October 2026)", "",
+    L = [f"# {cfg['title']} : index mapping (26 October 2026)", "",
          f"Project : `{cfg['project']}` (ZenRay Assets). Atelier : `{ATELIER}`. Every path below is relative to the atelier unless it starts with `/`. (26 October 2026)", "",
          "## 1. Deliverables", "", "| ID | File | Format | Size | sha256 |", "|---|---|---|---|---|"]
     for ext, fid in (("mp4", "OUT-MP4"), ("mov", "OUT-MOV")):
@@ -375,7 +408,7 @@ def index(cfg):
     mm, mx = ad.get("musicMeasured", {}), ad.get("mixMeasured", {})
     au = cfg["audio"]
     L += ["", "## 4. Audio chain", "",
-          f"- Music : leading silence cut {ad.get('musicHeadCut', 'n/a')} s, loudnorm two pass linear to {au['music']['targetLufs']} LUFS (measured before : {mm.get('input_i', 'n/a')} LUFS, true peak {mm.get('input_tp', 'n/a')} dBTP), fade in {au['music']['fadeIn']} s, fade out {au['music']['fadeOut']} s.",
+          f"- Music : starts {ad.get('musicStartInTrack', 'n/a')} s into the track, laid at {ad.get('musicPlacedAt', 0)} s on the timeline for {round(float(ad.get('musicSeconds', 0)), 3)} s ({ad.get('musicPasses', 1)} pass of the track), loudnorm two pass linear to {au['music']['targetLufs']} LUFS (measured before : {mm.get('input_i', 'n/a')} LUFS, true peak {mm.get('input_tp', 'n/a')} dBTP), fade in {au['music']['fadeIn']} s, fade out {au['music']['fadeOut']} s.",
           f"- Clip 1 sound (ZenRay SFX) mixed in at {au['clipAudio']['gainDb']} dB, starting at frame 0.",
           f"- Master : one constant gain of {mx.get('gainDb', 'n/a')} dB brings the mix ({mx.get('I', 'n/a')} LUFS) to {au['master']['targetLufs']} LUFS (measured {mx.get('masterI', 'n/a')} LUFS), then a limiter at {au['master']['limiterCeilingDb']} dBFS (measured true peak {mx.get('masterTP', 'n/a')} dBTP), AAC {o['audioBitrate']}, {au['sampleRate']} Hz. (26 October 2026)", "",
           "## 5. Montage, scripts, parameters", "", "| ID | File | Role |", "|---|---|---|",
@@ -396,8 +429,9 @@ def index(cfg):
         for f in sorted(x for x in th.rglob("*") if x.is_file() and "work" not in x.relative_to(th).parts and x.suffix.lower() in (".png", ".jpg", ".json", ".py", ".md")):
             rel = f.relative_to(ATELIER)
             L.append(f"| THUMB-{rel.parts[1].upper() if len(rel.parts) > 2 else 'ROOT'} | `{rel}` | {f.stat().st_size / 1e6:.2f} MB | `{sha256(f)}` |")
-    (ATELIER / "Index.md").write_text("\n".join(L) + "\n")
-    print("index", ATELIER / "Index.md")
+    idx = ATELIER / o.get("index", "Index.md")
+    idx.write_text("\n".join(L) + "\n")
+    print("index", idx)
 
 
 def main():
