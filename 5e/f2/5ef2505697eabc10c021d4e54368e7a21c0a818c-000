@@ -1,0 +1,45 @@
+# 26 October 2026 : ZenRay Meshes, ROW FIT : for every named row of the loft and every chosen view, the distance from the row
+# (projected in the panel camera of the score) to the nearest reference edge pixel (gradient edges, as LineScore), median
+# and share within tol, along the row ; a row that sits on a drawn line scores near 0 px. It says WHICH row is off and by
+# how much in metres, where the global line score only says "lower". FR : distance de chaque rangée au trait le plus proche.
+# Usage: python RowFit.py <frame_dir> <views_dir> <loft.npz> [views=left,right] [tol_px=2] [z_range=-1.2,1.0]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+import LineScore, RowOverlay
+
+
+def main(fdir, vdir, npz, views="left,right", tol=2, zr="-1.2,1.0"):
+    tol = float(tol); z0, z1 = (float(v) for v in zr.split(","))
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    d = np.load(npz, allow_pickle=True); nt, R = d["grid_shape"]; gc = d["grid_cols"]; P = d["P"].reshape(nt, len(gc), 3).astype(float)
+    nh = len(RowOverlay.ROWS); name = lambda j: RowOverlay.ROWS[nh - 1 - j] if j < nh else RowOverlay.ROWS[j - (nh - 1)]
+    first = {}
+    for k, j in enumerate(gc):
+        if j not in first: first[j] = k
+    out = {}
+    for v in meta["views"]:
+        if v["name"] not in views.split(","): continue
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        Er = LineScore.ref_edges(ref) & ndi.binary_erosion(mref, iterations=2); dr = ndi.distance_transform_edt(~Er)
+        res = {}
+        for j in sorted(first):
+            X = P[:, first[j]]
+            side = np.sign(X[len(X) // 2, 0]); want = -1 if v["name"] == "left" else 1   # the near side of each view
+            if v["name"] in ("left", "right") and side != want * np.sign(np.array(v["tz"])[0] if np.array(v["tz"])[0] != 0 else 1): pass
+            sel = (X[:, 2] >= z0) & (X[:, 2] <= z1)
+            if sel.sum() < 5: continue
+            uv = RowOverlay.project(meta, v, X[sel]); c = np.clip(np.round(uv[:, 0]).astype(int), 0, dr.shape[1] - 1); r_ = np.clip(np.round(uv[:, 1]).astype(int), 0, dr.shape[0] - 1)
+            dist = dr[r_, c]; s = v["px_per_m"]
+            key = name(j) + ("_L" if X[len(X) // 2, 0] > 0 else "_R")
+            res[key] = {"median_px": round(float(np.median(dist)), 2), "median_mm": round(float(np.median(dist)) / s * 1000, 1), "within_tol": round(float((dist <= tol).mean()), 3)}
+        out[v["name"]] = res
+    print(json.dumps(out, indent=1))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
