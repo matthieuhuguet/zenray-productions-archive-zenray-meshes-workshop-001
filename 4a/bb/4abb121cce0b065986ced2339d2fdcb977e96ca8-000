@@ -1,0 +1,28 @@
+# 26 October 2026 : ZenRay Meshes, PART VIEW : the delivery polygons of the parts whose name contains a word, seen along an axis (back, front, side, top), faulty faces coloured by category, painter order (nearest last),
+# framed on the part. FR : gros plan filaire d'une pièce, fautes en couleur. Usage: python PartView.py <tag> <word> <back|front|side|top> <out.png> [px_per_m=1500] [pad_m=0.05]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw
+import TopoCheck as TC
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+tag, word, view, out = sys.argv[1:5]; ppm = float(sys.argv[5]) if len(sys.argv) > 5 else 1500.0; pad = float(sys.argv[6]) if len(sys.argv) > 6 else 0.05
+d = np.load(W + "work/car/delivery_%s.npz" % tag, allow_pickle=True); tp = TC.load_params(W + "work/car/topo_params.json"); Q_ = [list(map(int, q)) for q in d["Q"]]; N, T = np.unique(d["names"], return_inverse=True)
+P = d["P"].astype(float); C = np.array([len(q) for q in Q_], np.int32); I = np.array([v for q in Q_ for v in q], np.int32); res, flags, err = TC.analyse(P, C, I, T, N, tp)
+st = np.concatenate([[0], np.cumsum(C.astype(np.int64))[:-1]]); sel = [f for f in range(len(C)) if word in str(N[T[f]])]
+AX = {"back": (0, 1, 2, -1), "front": (0, 1, 2, 1), "side": (2, 1, 0, 1), "top": (0, 2, 1, 1)}   # screen u axis, screen v axis, depth axis, depth sign (nearest last)
+au, av, ad, sg = AX[view]; cen = np.array([P[I[st[f]:st[f] + C[f]]].mean(0) for f in sel])
+if view == "back": cen_d = cen[:, 2]; order = np.argsort(cen_d)   # looking from +z toward -z : the part with the smallest z is nearest the camera at the back
+else: order = np.argsort(sg * cen[:, ad])
+vs = np.concatenate([P[I[st[f]:st[f] + C[f]]] for f in sel]); u0, u1 = vs[:, au].min() - pad, vs[:, au].max() + pad; v0, v1 = vs[:, av].min() - pad, vs[:, av].max() + pad
+Wd, Ht = int((u1 - u0) * ppm), int((v1 - v0) * ppm); im = Image.new("RGB", (Wd, Ht), (60, 60, 60)); dr = ImageDraw.Draw(im)
+def pt(p): return (((u1 - p[au]) if view == "back" else (p[au] - u0)) * ppm, (v1 - p[av]) * ppm)
+CAT = [("pole_on_sharp", (255, 170, 40)), ("bad_pole", (250, 230, 60)), ("density", (120, 200, 255)), ("angle", (200, 120, 255)), ("aspect", (120, 255, 150)), ("fold", (255, 120, 200))]
+for k in order:
+    f = sel[k]; q = I[st[f]:st[f] + C[f]]; col = (225, 225, 225)
+    if err[f]:
+        col = (235, 90, 90)
+        for nm, c in CAT:
+            if flags.get(nm) is not None and flags[nm][f]: col = c; break
+    dr.polygon([pt(P[v]) for v in q], fill=col, outline=(30, 30, 30))
+im.save(out); print("faces", len(sel), "faulty", int(sum(err[f] for f in sel)), "image", im.size)
