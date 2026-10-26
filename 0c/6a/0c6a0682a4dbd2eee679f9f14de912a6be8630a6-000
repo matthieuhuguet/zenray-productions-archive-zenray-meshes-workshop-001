@@ -1,0 +1,61 @@
+# 26 October 2026 : ZenRay Meshes, GRADIENT PROFILE : the sheet lines along a scan, in world metres, for any of the six
+# views. The night of 26 October 2026 ran on this measure (door crease pair, shoulder band, splitter blade, tail deck edge,
+# rail joint, buttress edge) written each time as an inline heredoc ; it is now one tool. A scan is a straight line in
+# world coordinates : one fixed coordinate (--fix z=-0.9) and one scanned coordinate (--scan y 0.2 0.5) ; the view maps
+# them to sheet pixels with the frame of work/car/frame/frame.json, the gradient (Sobel, Gaussian sigma) is sampled along
+# the scan and its local maxima above --min are printed, strongest first or in scan order.
+# FR : les traits de la planche le long d'un balayage, en mètres, pour les six vues ; la mesure de la nuit devient un outil.
+# Usage: python GradientProfile.py <view> --fix z=-0.9 --scan y 0.2 0.5 [--step 0.003] [--min 40] [--sigma 0.8] [--component perp|mag]
+#        several fixed values : --fix z=-0.9,-1.1,-1.3   (one profile per value)
+import sys, os, json, argparse
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+P = {"frame": os.path.join(W, "work/car/frame/frame.json"), "views": os.path.join(W, "work/car/views"),
+     "step": 0.003, "min": 40.0, "sigma": 0.8}   # 26 October 2026: interface ; defaults are the values used all night
+AX = {"x": 0, "y": 1, "z": 2}
+
+
+def view_map(meta, name):
+    v = [x for x in meta["views"] if x["name"] == name][0]
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]; ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    s = v["px_per_m"]; bb = v["bbox"]; xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    def to_px(pt):   # pt : dict axis -> world value (the view's depth axis is ignored)
+        U = np.sign(rx[a]) * pt[a]; V = np.sign(uy[b]) * pt[b]
+        return xc + (U - ucen) * s, yc - (V - vcen) * s
+    return a, b, to_px, v
+
+
+def profile(view, fix_axis, fix_value, scan_axis, s0, s1, step=P["step"], vmin=P["min"], sigma=P["sigma"], component="perp"):
+    meta = json.load(open(P["frame"])); a, b, to_px, v = view_map(meta, view)
+    if {AX[fix_axis], AX[scan_axis]} != {a, b}: raise SystemExit("view %s shows axes %s and %s, not %s and %s" % (view, "xyz"[a], "xyz"[b], fix_axis, scan_axis))
+    sheet = json.load(open(os.path.join(P["views"], "sheet.json"))); pan = [p for p in sheet["panels"] if p["name"] == view][0]
+    img = np.asarray(Image.open(os.path.join(P["views"], "%02d_%s_rgb.png" % (pan["index"], view))).convert("L")).astype(float)
+    g = ndi.gaussian_filter(img, sigma); gx, gy = ndi.sobel(g, 1), ndi.sobel(g, 0)
+    ts = np.arange(s0, s1 + 1e-9, step) if s1 > s0 else np.arange(s0, s1 - 1e-9, -step)
+    pts = [to_px({AX[fix_axis]: fix_value, AX[scan_axis]: t}) for t in ts]; cols = np.array([p[0] for p in pts]); rows = np.array([p[1] for p in pts])
+    # the component across the scan direction (a line crossing the scan) unless mag is asked
+    dpx, dpy = cols[-1] - cols[0], rows[-1] - rows[0]; n_ = np.hypot(dpx, dpy) + 1e-9
+    gxs = ndi.map_coordinates(gx, [rows, cols], order=1); gys = ndi.map_coordinates(gy, [rows, cols], order=1)
+    vals = np.abs(gxs * dpx / n_ + gys * dpy / n_) if component == "perp" else np.hypot(gxs, gys)
+    pk = [(round(float(ts[i]), 4), int(vals[i])) for i in range(1, len(ts) - 1) if vals[i] > vals[i - 1] and vals[i] >= vals[i + 1] and vals[i] > vmin]
+    return pk
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("view"); ap.add_argument("--fix", required=True); ap.add_argument("--scan", nargs=3, required=True)
+    ap.add_argument("--step", type=float, default=P["step"]); ap.add_argument("--min", type=float, default=P["min"]); ap.add_argument("--sigma", type=float, default=P["sigma"])
+    ap.add_argument("--component", default="perp", choices=["perp", "mag"])
+    A = ap.parse_args(); fa, fv = A.fix.split("="); sa, s0, s1 = A.scan[0], float(A.scan[1]), float(A.scan[2])
+    out = {"view": A.view, "scan": sa, "fixed": fa, "profiles": []}
+    for f in [float(x) for x in fv.split(",")]:
+        out["profiles"].append({fa: f, "peaks": profile(A.view, fa, f, sa, s0, s1, A.step, A.min, A.sigma, A.component)})
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()
