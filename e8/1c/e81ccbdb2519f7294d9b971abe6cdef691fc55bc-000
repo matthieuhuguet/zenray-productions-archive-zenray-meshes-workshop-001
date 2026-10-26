@@ -1,0 +1,58 @@
+# 26 October 2026 : ZenRay Meshes, END VIEW ENVELOPES in metres : for the front and back views, the top outline H(x) (height of
+# the silhouette at each lateral position) and the half width W(y) (silhouette half width at each height), reference mask
+# against the model rendered in the same panel camera (SheetScore.render_in_panel). It tells which row to move and by how much
+# (a dome = centre too high and roof corners too low ; a narrow haunch = W too small at the haunch height).
+# FR : enveloppes des vues de bout en mètres, référence contre modèle, pour savoir quelle rangée bouger et de combien.
+# Usage: python EndEnvelope.py <frame_dir> <views_dir> <mesh.obj> [step_m=0.05] [views=front,back]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+import Raster, SheetScore
+
+
+def envelopes(M, v, meta):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); s = v["px_per_m"]; bb = v["bbox"]
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2; vcen = lo[1] + D[1] - D[1] / 2
+    rows = np.where(M.any(1))[0]; cols = np.where(M.any(0))[0]
+    H = {}   # lateral metres (view right positive) -> top height
+    for c in cols:
+        r = np.argmax(M[:, c]); H[(c - xc) / s] = vcen + (yc - r) / s
+    W = {}   # height -> (left, right) in metres
+    for r in rows:
+        cc = np.where(M[r])[0]; W[vcen + (yc - r) / s] = ((cc[0] - xc) / s, (cc[-1] - xc) / s)
+    return H, W
+
+
+def main(fdir, vdir, mesh_path, step=0.05, views="front,back"):
+    step = float(step); meta = json.load(open(os.path.join(fdir, "frame.json")))
+    mesh = trimesh.load(mesh_path, force="mesh", process=False); r = Raster.Renderer(mesh.vertices, mesh.faces); out = {}
+    for v in meta["views"]:
+        if v["name"] not in views.split(","): continue
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape)
+        Hr, Wr = envelopes(mref, v, meta); Hm, Wm = envelopes(M, v, meta)
+        def at(d, q):
+            k = np.array(sorted(d)); return float(np.interp(q, k, [d[x] if not isinstance(d[x], tuple) else 0 for x in k]))
+        res = {"H": [], "W": []}
+        xs = np.arange(-1.15, 1.15 + 1e-9, step)
+        kr, km = np.array(sorted(Hr)), np.array(sorted(Hm))
+        for x in xs:
+            if x < kr[0] or x > kr[-1]: continue
+            hr = float(np.interp(x, kr, [Hr[k] for k in kr])); hm = float(np.interp(x, km, [Hm[k] for k in km])) if km[0] <= x <= km[-1] else None
+            res["H"].append([round(float(x), 3), round(hr, 3), None if hm is None else round(hm, 3), None if hm is None else round(1000 * (hm - hr))])
+        yr, ym = np.array(sorted(Wr)), np.array(sorted(Wm))
+        for y in np.arange(0.0, 1.40, step):
+            if y < yr[0] or y > yr[-1]: continue
+            lr = float(np.interp(y, yr, [Wr[k][0] for k in yr])); rr_ = float(np.interp(y, yr, [Wr[k][1] for k in yr]))
+            if ym[0] <= y <= ym[-1]:
+                lm = float(np.interp(y, ym, [Wm[k][0] for k in ym])); rm = float(np.interp(y, ym, [Wm[k][1] for k in ym]))
+                res["W"].append([round(float(y), 3), round(0.5 * (rr_ - lr), 3), round(0.5 * (rm - lm), 3), round(1000 * (0.5 * (rm - lm) - 0.5 * (rr_ - lr)))])
+            else:
+                res["W"].append([round(float(y), 3), round(0.5 * (rr_ - lr), 3), None, None])
+        out[v["name"]] = res
+    r.release(); print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

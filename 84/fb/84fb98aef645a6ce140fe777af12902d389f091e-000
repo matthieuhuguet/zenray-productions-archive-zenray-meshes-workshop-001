@@ -1,0 +1,56 @@
+# 26 October 2026 : ZenRay Meshes, ROW OVERLAY : the named rows of the row loft (character lines) drawn on each reference view
+# of the sheet, in the panel camera of SheetScore (same frame), one colour per row, scaled up for reading. It answers
+# "is this line where the sheet draws it" without a render : a row off its drawn line is moved in the cage or the loft
+# params, never guessed. FR : les rangées du loft tracées sur chaque vue de la planche, une couleur par rangée.
+# Usage: python RowOverlay.py <frame_dir> <views_dir> <loft.npz> <out.png> [views=front,back,left,top] [scale=2] [x_side=1]
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+ROWS = ['floor_centre', 'floor_edge', 'fender_inner', 'sill', 'door_low', 'belt', 'belt_top', 'glass_base', 'roof_edge', 'roof_centre']
+COL = {"roof_centre": (255, 60, 60), "roof_edge": (255, 160, 0), "glass_base": (255, 240, 0), "belt_top": (60, 220, 60),
+       "belt": (0, 200, 255), "door_low": (60, 90, 255), "sill": (200, 60, 255), "fender_inner": (255, 80, 200),
+       "floor_edge": (160, 160, 160), "floor_centre": (90, 90, 90)}
+
+
+def project(meta, v, X):
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]; xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2
+    return np.stack([xc + (X @ rx - ucen) * s, yc - (X @ uy - vcen) * s], -1)
+
+
+def main(fdir, vdir, npz, out, views="front,back,left,top", scale=2, x_side=1):
+    scale = int(scale); x_side = float(x_side)
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    d = np.load(npz, allow_pickle=True); nt, R = d["grid_shape"]; gc = d["grid_cols"]; P = d["P"].reshape(nt, len(gc), 3)
+    nh = len(ROWS); name = lambda j: ROWS[nh - 1 - j] if j < nh else ROWS[j - (nh - 1)]
+    first = {}
+    for k, j in enumerate(gc):
+        if j not in first: first[j] = k
+    tiles = []
+    font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 14)
+    for v in meta["views"]:
+        if v["name"] not in views.split(","): continue
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        im = Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("RGB")
+        im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS); dr = ImageDraw.Draw(im)
+        for j in sorted(first):   # 26 October 2026: grid_shape[1] counts the inserted columns, the named rows are the base columns
+            k = first[j]; X = P[:, k].astype(float)
+            # one side only (x_side) for the side and top views, both for the end views
+            if v["name"] in ("left", "right", "top", "bottom") and np.sign(X[len(X) // 2, 0]) not in (np.sign(x_side), 0): continue
+            uv = project(meta, v, X) * scale
+            dr.line([tuple(p) for p in uv], fill=COL[name(j)], width=2)
+        y = 4
+        for n in ROWS[::-1]:
+            dr.text((6, y), n, fill=COL[n], font=font); y += 16
+        tiles.append(np.asarray(im))
+    Wd = max(t.shape[1] for t in tiles)
+    Image.fromarray(np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0)).save(out)
+    print(out)
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
