@@ -1,0 +1,19 @@
+# 26 October 2026 : ZenRay Meshes, FOLIAGE DIAGNOSTIC : in each height band and each view, the leaves only of the built tree against the reference foliage mask : how many pixels are missing, how many are in excess.
+# FR : feuillage seul du modèle contre le masque de feuillage de la référence, par bande et par vue (excès ou manque). Usage: python FoliageDiag.py <tag> [obj=tree]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import BranchLab as B, ComponentScore as C, Raster, SheetScore
+tag = sys.argv[1]; obj = sys.argv[2] if len(sys.argv) > 2 else "tree"
+V, R, A = B._views_with_arg(obj); dl = np.load(B.W + "work/%s/topo_%s.npz" % (obj, tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); lid = [i for i, n in enumerate(N) if str(n) == "leaves"]; r = Raster.Renderer(P, F[np.isin(T, lid)])
+top = float(P[:, 1].max()); cb = V.crown_base; bands = {"low": (cb, cb + (top - cb) / 3), "mid": (cb + (top - cb) / 3, cb + 2 * (top - cb) / 3), "high": (cb + 2 * (top - cb) / 3, top)}
+out = {}
+for band, (ya, yb) in bands.items():
+    for vn in ("front", "back", "right", "left"):
+        v = [x for x in V.meta["views"] if x["name"] == vn][0]; fol = np.asarray(Image.open(B.W + "work/%s/views/foliage_%s.png" % (obj, vn))) > 127; M, _ = SheetScore.render_in_panel(r, V.meta, v, fol.shape)
+        ra, rb = int(round(V.cal[vn][0][1] * yb + V.cal[vn][1][1])), int(round(V.cal[vn][0][1] * ya + V.cal[vn][1][1])); bm = np.zeros(fol.shape, bool); bm[ra:rb, :] = True
+        both = int((fol & M & bm).sum()); miss = int((fol & ~M & bm).sum()); extra = int((M & ~fol & bm).sum()); out["%s_%s" % (band, vn)] = {"ref": int((fol & bm).sum()), "model": int((M & bm).sum()), "miss": miss, "extra": extra, "iou": round(both / max(both + miss + extra, 1), 3)}
+r.release()
+for band in bands: print(band, " | ".join("%s ref %d model %d miss %d extra %d iou %.2f" % (vn, o["ref"], o["model"], o["miss"], o["extra"], o["iou"]) for vn in ("front", "back", "right", "left") for o in [out["%s_%s" % (band, vn)]]))
+json.dump(out, open(B.W + "versions/FoliageDiag_%s_%s.json" % (obj, tag), "w"), indent=1)
