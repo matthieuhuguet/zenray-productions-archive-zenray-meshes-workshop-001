@@ -1,0 +1,37 @@
+# 26 October 2026 : ZenRay Meshes, LIMB SCORE by X-RAY, the occlusion aware measure of the wood components of an organic model (second component, shared).
+# EN: the reference is opaque (leaves hide limbs) and the model is rendered in its own wood layer, leaves removed. So the right questions are asymmetric : (1) recall, how
+# much of the reference wood of each thickness class (thick = main limbs, medium = branches, thin = twigs, OrganicClasses) is covered by model wood, and by model wood of
+# the same class ; (2) leak, how much model wood falls OUTSIDE the reference silhouette (never allowed) ; model wood behind a reference leaf is not penalised, nothing
+# can be seen there. score = class recall x (1 - leak). FR : mesure du bois en rayons X, rappel par épaisseur, fuite hors de la silhouette.
+# Usage: python LimbScore.py <obj=tree> <tag> [class=thick]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import ComponentScore as C, Raster, SheetScore, OrganicClasses
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+
+
+def main(obj="tree", tag="v17", cls="thick", quiet=False):
+    prm = json.load(open(W + "work/%s/component_params.json" % obj)); Pt = prm["paths"]; meta = json.load(open(W + Pt["frame"] + "/frame.json")); cal = json.load(open(W + Pt["cal"].format(obj=obj)))
+    ms = json.load(open(W + Pt["measure"].format(obj=obj))); cb = ms["trunk"]["crown_base_y"]; tr_r = ms["trunk"]["radius"][-1]; r1, r2 = OrganicClasses.radii(tr_r, **{k: v for k, v in prm["wood_classes"].items() if k in ("thick_frac", "med_frac")})
+    dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); wid = [i for i, n in enumerate(N) if str(n) == "branches"]; r = Raster.Renderer(P, F[np.isin(T, wid)]); out = {}
+    for v in meta["views"]:
+        vn = v["name"]
+        if vn in prm.get("skip_views", []): continue
+        mref = np.asarray(Image.open(W + Pt["frame"] + "/mask_%s.png" % vn)) > 127; wood = np.asarray(Image.open(W + Pt["views"] + "/wood_%s.png" % vn)) > 127; ppm = abs(cal[vn][0][0])
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); rows = np.zeros(mref.shape[0], bool); a, b = cal[vn][1] if False else (None, None)
+        if vn in ("front", "back", "right", "left"):   # the crown only : from the crown base up
+            py = int(round(cal[vn][0][1] * cb + cal[vn][1][1])); rows[: py + 1] = True
+        else: rows[:] = True
+        rc, mc = OrganicClasses.wood_classes(wood, ppm, r1, r2), OrganicClasses.wood_classes(M, ppm, r1, r2); ref = rc[cls] & rows[:, None]; mod = M & rows[:, None]
+        if ref.sum() == 0: continue
+        out[vn] = {"recall_cover": round(float((mod & ref).sum() / ref.sum()), 3), "recall_class": round(float((mc[cls] & ref).sum() / ref.sum()), 3), "leak": round(float((mod & ~mref).sum() / max(mod.sum(), 1)), 3)}
+    r.release(); rc_ = np.mean([v["recall_class"] for v in out.values()]); cv_ = np.mean([v["recall_cover"] for v in out.values()]); lk_ = np.mean([v["leak"] for v in out.values()])
+    out["score"] = round(float(rc_ * (1 - lk_)), 3); out["cover"] = round(float(cv_), 3); out["leak"] = round(float(lk_), 3); out["class"] = cls
+    if not quiet: print(json.dumps(out))
+    return out
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

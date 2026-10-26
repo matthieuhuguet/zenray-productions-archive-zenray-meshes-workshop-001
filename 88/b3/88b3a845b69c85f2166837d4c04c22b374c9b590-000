@@ -1,0 +1,53 @@
+# 26 October 2026 : ZenRay Meshes, TRUNK CONTOUR SCORE (organic, first component, shared by any tree like object).
+# EN: the trunk is judged by its CONTOUR, not by a colour class : in the band below the crown base (nothing hides it but a few hanging leaves) the left and right
+# boundary of the reference silhouette, row by row, is compared with the boundary of the model WOOD seen alone (its own layer, leaves hidden), in the four side views,
+# in centimetres ; the reference is drawn half transparent under the model contour so the relief (shading) stays readable. Rows where the reference run is
+# polluted (width outside 0.6 to 1.5 of its median) are flagged and left out. FR : le tronc se juge par son contour, rangée par rangée, en centimètres.
+# Usage: python TrunkScore.py <obj=tree> <tag> [step_m=0.1]   -> versions/Trunk_<obj>_<tag>.json and _contour.png
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw
+import ComponentScore as C, Raster, SheetScore
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+
+
+def runs(row):
+    d = np.diff(np.concatenate([[0], row.astype(np.int8), [0]])); s = np.flatnonzero(d == 1); e = np.flatnonzero(d == -1) - 1; return list(zip(s, e))
+
+
+def near(rs, c):
+    return min(rs, key=lambda r: abs((r[0] + r[1]) / 2 - c)) if rs else None
+
+
+def main(obj="tree", tag="v15", step=0.1):
+    step = float(step); prm = json.load(open(W + "work/%s/component_params.json" % obj)); Pt = prm["paths"]; meta = json.load(open(W + Pt["frame"] + "/frame.json")); cal = json.load(open(W + Pt["cal"].format(obj=obj)))
+    ms = json.load(open(W + Pt["measure"].format(obj=obj))); tr = np.array(ms["trunk"]["points"]); cb = ms["trunk"]["crown_base_y"]
+    dl = np.load(W + Pt["topo"].format(tag=tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); wid = [i for i, n in enumerate(N) if str(n) == "branches"]; r = Raster.Renderer(P, F[np.isin(T, wid)]); res = {}; tiles = []
+    for v in meta["views"]:
+        vn = v["name"]
+        if vn not in ("front", "back", "right", "left"): continue
+        mref = np.asarray(Image.open(W + Pt["frame"] + "/mask_%s.png" % vn)) > 127; ref = np.asarray(Image.open(W + Pt["views"] + "/%02d_%s_rgb.png" % ([p for p in json.load(open(W + Pt["views"] + "/sheet.json"))["panels"] if p["name"] == vn][0]["index"], vn)).convert("L"))
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); a, b = np.array(cal[vn][0]), np.array(cal[vn][1]); ppm = abs(a[0]); errs = []
+        ov = np.stack([ref] * 3, -1).astype(float) * 0.55; ov = ov.astype(np.uint8)
+        for y in np.arange(0.2, cb - 0.1, step):
+            py = int(round(a[1] * y + b[1])); yy = tr[np.argmin(abs(tr[:, 1] - y))]; pc = a[0] * (yy @ np.array(v["rx"], float)) + b[0]
+            rr, rm = near(runs(mref[py]), pc), near(runs(M[py]), pc)
+            if rr is None or rm is None: continue
+            ov[py, rr[0]] = (230, 60, 60); ov[py, rr[1]] = (230, 60, 60); ov[py, rm[0]] = (80, 220, 240); ov[py, rm[1]] = (80, 220, 240)
+            errs.append((y, (rm[0] - rr[0]) / ppm * 100, (rm[1] - rr[1]) / ppm * 100, (rr[1] - rr[0] + 1) / ppm, (rm[1] - rm[0] + 1) / ppm))
+        e = np.array(errs); wmed = np.median(e[:, 3]); ok = (e[:, 3] > 0.6 * wmed) & (e[:, 3] < 1.5 * wmed) if len(e) else np.array([], bool)
+        res[vn] = {"rows": int(len(e)), "rows_used": int(ok.sum()), "left_cm": round(float(np.median(np.abs(e[ok, 1]))), 1) if ok.any() else None, "right_cm": round(float(np.median(np.abs(e[ok, 2]))), 1) if ok.any() else None,
+                   "width_cm": round(float(np.median(np.abs(e[ok, 4] - e[ok, 3])) * 100), 1) if ok.any() else None,
+                   "left_signed_cm": round(float(np.median(e[ok, 1])), 1) if ok.any() else None, "right_signed_cm": round(float(np.median(e[ok, 2])), 1) if ok.any() else None,
+                   "by_height": {str(round(float(y_), 1)): [round(float(l_), 1), round(float(r_), 1)] for y_, l_, r_ in e[ok][::10, :3]}}
+        # crop of the trunk band for the image
+        y0 = int(a[1] * cb + b[1]) - 20; y1 = int(a[1] * 0.0 + b[1]) + 10; tiles.append(ov[max(y0, 0): y1])
+    r.release(); allv = [v for k, v in res.items() if v["left_cm"] is not None]; res["mean_edge_cm"] = round(float(np.mean([(v["left_cm"] + v["right_cm"]) / 2 for v in allv])), 1) if allv else None
+    Wd = max(t.shape[1] for t in tiles); H = max(t.shape[0] for t in tiles); img = np.concatenate([np.pad(t, ((0, H - t.shape[0]), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 1)
+    im = Image.fromarray(img); d = ImageDraw.Draw(im); d.text((6, 4), "%s %s trunk band : reference contour red, model wood contour cyan, edge error (median cm) %s" % (obj, tag, res["mean_edge_cm"]), fill=(255, 255, 0)); im.save(W + "versions/Trunk_%s_%s_contour.png" % (obj, tag))
+    json.dump(res, open(W + "versions/Trunk_%s_%s.json" % (obj, tag), "w"), indent=1); print(json.dumps(res))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])

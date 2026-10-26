@@ -1,0 +1,46 @@
+# 26 October 2026 : ZenRay Meshes, TRUNK FIT from the contours of ALL FOUR side views (shared organic tool, first component of any tree like object).
+# EN: row by row from the ground to the crown base, the run of the object silhouette that follows the trunk (tracked from the bottom, nearest to the previous centre) is
+# read in the front, back, right and left views ; rows polluted by a branch stub or hanging leaves (width outside 0.7 to 1.4 of the running median) are dropped for that
+# view ; x(y) is the median of front and back, z(y) the median of right and left, the radius the median of the four half widths ; a light smoothing keeps the base flare.
+# Writes a measure file (trunk points, radius, crown_base_y) read by TreeGrow. FR : tronc ajusté sur les contours des quatre vues, médiane et lissage.
+# Usage: python TrunkFit.py <obj=tree> [step_m=0.2] [smooth_m=0.35]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+import TrunkScore as TS
+W = TS.W
+
+
+def main(obj="tree", step=0.2, smooth=0.35):
+    step, smooth = float(step), float(smooth); prm = json.load(open(W + "work/%s/component_params.json" % obj)); Pt = prm["paths"]; meta = json.load(open(W + Pt["frame"] + "/frame.json"))
+    cal = json.load(open(W + Pt["cal"].format(obj=obj))); mpath = W + Pt["measure"].format(obj=obj); ms = json.load(open(mpath))
+    if not os.path.exists(mpath.replace(".json", "_orig.json")): json.dump(ms, open(mpath.replace(".json", "_orig.json"), "w"))
+    cb = ms["trunk"]["crown_base_y"]; tr0 = np.array(ms["trunk"]["points"]); ys = np.arange(0.0, cb + 1e-6, step); est = {vn: [] for vn in ("front", "back", "right", "left")}
+    for vn in est:
+        v = [x for x in meta["views"] if x["name"] == vn][0]; m = np.asarray(Image.open(W + Pt["frame"] + "/mask_%s.png" % vn)) > 127; a, b = np.array(cal[vn][0]), np.array(cal[vn][1]); ppm = abs(a[0]); rx = np.array(v["rx"], float)
+        c_prev = a[0] * (tr0[0] @ rx) + b[0]; widths = []; rows = []
+        for y in ys:
+            py = int(round(a[1] * min(y + 0.05, cb) + b[1])); r_ = TS.near(TS.runs(m[py]), c_prev)
+            if r_ is None: rows.append((y, np.nan, np.nan)); continue
+            c = (r_[0] + r_[1]) / 2; w = (r_[1] - r_[0] + 1) / ppm; widths.append(w); rows.append((y, c, w)); c_prev = c
+        rows = np.array(rows); wm = ndi.median_filter(np.nan_to_num(rows[:, 2], nan=np.nanmedian(rows[:, 2])), size=7); bad = ~np.isfinite(rows[:, 2]) | (rows[:, 2] < 0.7 * wm) | (rows[:, 2] > 1.4 * wm)
+        u = (rows[:, 1] - b[0]) / a[0]; sign = 1.0 if (rx[np.argmax(np.abs(rx))] > 0) else -1.0   # world coordinate along the view axis
+        axis = int(np.argmax(np.abs(rx))); coord = u * sign if True else u
+        coord = np.where(bad, np.nan, (rows[:, 1] - b[0]) / a[0] * (1.0 / np.dot(rx, np.eye(3)[axis])))
+        est[vn] = (np.where(bad, np.nan, coord), np.where(bad, np.nan, rows[:, 2] / 2), axis)
+    xs = np.nanmedian(np.stack([est["front"][0], est["back"][0]]), 0); zs = np.nanmedian(np.stack([est["right"][0], est["left"][0]]), 0)
+    rr = np.nanmedian(np.stack([est[v][1] for v in est]), 0)
+    def fill(a_):
+        ok = np.isfinite(a_); return np.interp(np.arange(len(a_)), np.flatnonzero(ok), a_[ok])
+    xs, zs, rr = fill(xs), fill(zs), fill(rr); sg = max(smooth / step, 0.5)
+    # smoothing keeps the base : the first rows are reflected so the flare is not eaten
+    sm = lambda a_: ndi.gaussian_filter1d(a_, sg, mode="nearest")
+    xs, zs, rr = sm(xs), sm(zs), sm(rr)
+    pts = [[float(x), float(y), float(z)] for x, y, z in zip(xs, ys, zs)]; ms["trunk"]["points"] = pts; ms["trunk"]["radius"] = [round(float(r), 4) for r in rr]; ms["_trunk_fit"] = "TrunkFit.py 26 October 2026, four views"
+    json.dump(ms, open(mpath, "w")); print(json.dumps({"rows": len(ys), "radius": [round(float(rr[0]), 2), round(float(rr[len(rr) // 2]), 2), round(float(rr[-1]), 2)], "top": pts[-1]}))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
