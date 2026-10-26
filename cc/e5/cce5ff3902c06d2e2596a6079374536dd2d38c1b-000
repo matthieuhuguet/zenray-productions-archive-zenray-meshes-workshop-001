@@ -1,0 +1,56 @@
+# 26 October 2026: scratch exploration of the V470 background (not the delivered pipeline).
+import importlib.util
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.dont_write_bytecode = True  # the EvolutionVideo module lives in a shared Scripts folder: never write a cache there
+EVOLUTION_PATH = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/EvolutionVideo.py")
+WORK = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Montage/Thumbnail/Work")
+SOURCE = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/versions/Car_v470_materials.png")
+
+spec = importlib.util.spec_from_file_location("EvolutionVideo", str(EVOLUTION_PATH))
+evo = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evo)
+
+crop = (0, 0, 1800, 1800)
+bg = evo.sample_corner(("Car_v470_materials.png", crop))
+print("corner sample of the source crop:", bg)
+settings = {"size": 2048, "margin": 0.03, "label_band": 0.075, "label": 0, "caption_tolerance": 6,
+            "font_px": 82, "font_path": evo.first_existing(evo.FONT_CANDIDATES), "background": bg}
+out = WORK / "bg-explore-2048.png"
+evo.render_frame(("Car_v470_materials.png", str(out), crop, None, "v470", settings))
+img = np.asarray(Image.open(out).convert("RGB")).astype(np.int32)
+print("size", img.shape, "corners", img[0, 0], img[0, -1], img[-1, 0], img[-1, -1])
+car = np.abs(img - np.array(bg)).max(axis=2) > 12
+rows = car.sum(axis=1)
+cols = car.sum(axis=0)
+print("car pixels", int(car.sum()))
+# runs of rows with no car pixel at all
+empty = rows == 0
+runs, start = [], None
+for y, e in enumerate(empty):
+    if e and start is None:
+        start = y
+    if not e and start is not None:
+        runs.append((start, y - 1)); start = None
+if start is not None:
+    runs.append((start, len(empty) - 1))
+print("fully empty row runs (y0, y1, height):", [(a, b, b - a + 1) for a, b in runs])
+emptyc = cols == 0
+runs, start = [], None
+for x, e in enumerate(emptyc):
+    if e and start is None:
+        start = x
+    if not e and start is not None:
+        runs.append((start, x - 1)); start = None
+if start is not None:
+    runs.append((start, len(emptyc) - 1))
+print("fully empty column runs (x0, x1, width):", [(a, b, b - a + 1) for a, b in runs])
+# car pixel bounding box per horizontal half of the frame
+ys, xs = np.nonzero(car)
+print("car bbox x", xs.min(), xs.max(), "y", ys.min(), ys.max())
+prev = Image.open(out).convert("RGB").resize((1024, 1024), Image.LANCZOS)
+prev.save(WORK / "bg-explore-preview-1024.png")
