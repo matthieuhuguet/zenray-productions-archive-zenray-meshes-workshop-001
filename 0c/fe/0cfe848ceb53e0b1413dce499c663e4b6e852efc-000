@@ -219,6 +219,7 @@ def main(params, prefix, out):
     E_s = cj["exp_rows"]; nh_s = len(E_s); ss = int(C.get("side_subdiv", 1)); srow = set(C.get("side_rows", []))
     vent_k = []   # 26 October 2026: columns moved onto the vent's lower edge
     vent_slot = []   # 26 October 2026: slot columns to put back on their segment outside the vent window
+    edge_rec, edge_idx = [], []   # 26 October 2026: side edge columns (row, other row, column index)
     rname = lambda j: E_s[nh_s - 1 - j] if j < nh_s else E_s[j - (nh_s - 1)]
     for j in range(R):
         cols.append((j, j, 0.0, j, 1.0))
@@ -234,8 +235,8 @@ def main(params, prefix, out):
             SE_ = C.get("side_edge")
             if SE_ and SE_.get("on", 1):
                 h_ = np.maximum(np.linalg.norm(G[:, j + 1, :2] - G[:, j, :2], axis=1), 1e-3); ue_ = np.clip(SE_["m"] / h_, 0.005, 0.45 / ss)
-                if rname(j) in SE_["rows"]: us_.append(ue_)
-                if rname(j + 1) in SE_["rows"]: us_.append(1.0 - ue_)
+                if rname(j) in SE_["rows"]: us_.append(ue_); edge_rec.append((rname(j), rname(j + 1), us_[-1]))
+                if rname(j + 1) in SE_["rows"]: us_.append(1.0 - ue_); edge_rec.append((rname(j + 1), rname(j), us_[-1]))
                 us_.sort(key=lambda v_: float(np.mean(v_)))
             # 26 October 2026: VENT ; the front fender vent of the sheet (a slot under the shoulder line, tip at z 0.95, open
             # to the door joint) : the inserted column of the band nearest to the vent's lower edge is moved onto it (per
@@ -288,6 +289,10 @@ def main(params, prefix, out):
                 else:
                     ub_ = np.full_like(zr_, float(np.mean(us_[iu]))) if np.ndim(us_[iu]) == 0 else us_[iu]
                     us_[iu] = ub_ + wv_ * (ut_ - ub_); vent_k.append(len(cols) + iu)
+            for (rr_, oo_, arr_) in edge_rec:   # 26 October 2026: index of each side edge column (for edge_dy)
+                hit_ = [i_ for i_, v_ in enumerate(us_) if v_ is arr_]
+                if hit_ and (rr_, oo_, len(cols) + hit_[0]) not in edge_idx: edge_idx.append((rr_, oo_, len(cols) + hit_[0]))
+            edge_rec.clear()
             cols += [(j, j + 1, u_, j, 1.0) for u_ in us_]
     G2 = np.zeros((len(t), len(cols), 3))
     for k, (a, b, u, _, pw) in enumerate(cols):
@@ -414,6 +419,17 @@ def main(params, prefix, out):
                 t1 = np.where(lo_, fk / np.maximum(f_kc, 1e-6), (fk - f_kc) / np.maximum(1 - f_kc, 1e-6))
                 Pn = np.where(lo_[:, None], A_ + t1[:, None] * (Cp - A_), Cp + t1[:, None] * (B_ - Cp))
                 G2[:, k] = (1 - wz[:, None]) * G2[:, k] + wz[:, None] * Pn
+    # 26 October 2026: EDGE DY ; the side edge column of a row on the side of a given band moves in y over a z window : on
+    # the rear haunch the buttress crease made the band above belt_top rise (crease 45 -> 37 degrees, under the 41 degree
+    # line threshold, the top view lost the haunch line) ; dropping the edge column a few mm gives a crisp corner back.
+    # FR : la colonne fine d'une rangée descend de quelques mm, l'arête redevient vive.
+    for rn_, ed_ in C.get("edge_dy", {}).items():
+        if not ed_.get("on", 1): continue
+        zq_e = G2[:, 0, 2]; rpe = ed_.get("ramp_m", 0.1); z0e, z1e = ed_["z"]
+        sste = lambda u: np.where(u <= 0, 0.0, np.where(u >= 1, 1.0, u ** 3 * (u * (6 * u - 15) + 10)))
+        we_ = sste((zq_e - (z0e - rpe)) / rpe) * sste(((z1e + rpe) - zq_e) / rpe)
+        for (rr_, oo_, k_) in edge_idx:
+            if rr_ == rn_ and oo_ == ed_["side"]: G2[:, k_, 1] += ed_["dy"] * we_
     VT2 = C.get("vent")
     for vs_ in vent_slot:   # 26 October 2026: outside the window the added columns lie on the old straight segment (lower wall to far row)
         Plo_, Pfar_ = G2[:, vs_["k_lo"]].copy(), G2[:, vs_["k_far"]].copy(); w_ = vs_["wv"][:, None]
