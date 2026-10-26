@@ -42,6 +42,32 @@ def main(params, wparams, body, out):
     # SIDE STRIPS (25 October 2026): thin frames along a side polyline [z, y] (A and B pillars between the glasses), width
     # w across the line in the side plane, posed on the body side by the same ray, mirrored ; values in "strips"
     for nm0, st_ in A.get("strips", {}).items():
+        if "row" in st_:
+            # 26 October 2026: ROW STRIP ; the strip follows a named loft row in 3D (here roof_edge), offset along the band
+            # toward the next column (d0 to d1 m) and lifted by protrude along the surface normal ; a ray cast side
+            # polyline stopped matching the body when the row moved (light triangles on the windshield). FR : bande sur
+            # une rangée réelle du loft, elle suit la rangée quand celle-ci bouge.
+            L_ = np.load(st_.get("loft", "work/car/loft_v2.npz"), allow_pickle=True); nt_, R_ = L_["grid_shape"]; gc_ = L_["grid_cols"]
+            G_ = L_["P"].reshape(nt_, R_, 3); first_ = {}
+            for k_, j_ in enumerate(gc_): first_.setdefault(int(j_), k_)
+            rows_ = st_.get("rows_order", ["roof_centre", "roof_edge", "glass_base", "belt_top", "belt", "door_low", "sill", "fender_inner", "floor_edge", "floor_centre"])
+            ce = first_[rows_.index(st_["row"])]; cin = ce + int(st_.get("toward", -1))
+            z_ = G_[:, ce, 2]; z0_, z1_ = st_["z"]; idx_ = np.flatnonzero((z_ >= z0_) & (z_ <= z1_)); ns = st_.get("steps", 40)
+            pick = idx_[np.unique(np.linspace(0, len(idx_) - 1, ns).astype(int))]
+            G = np.zeros((len(pick), 2, 3))
+            for ii, i in enumerate(pick):
+                Pe, Pc = G_[i, ce], G_[i, cin]; dv = Pc - Pe; dv /= max(np.linalg.norm(dv), 1e-9)
+                tz = G_[min(i + 1, nt_ - 1), ce] - G_[max(i - 1, 0), ce]; nv = np.cross(tz, dv); nv /= max(np.linalg.norm(nv), 1e-9)
+                if nv[1] < 0: nv = -nv   # outward : upward and outward on the roof rail
+                for j, dd in enumerate((st_.get("d0", 0.008), st_.get("d1", 0.036))):
+                    G[ii, j] = Pe + dv * dd + nv * st_.get("protrude", 0.004)
+            G[..., 0] = np.abs(G[..., 0])
+            ns = len(pick)
+            for sd, tag in ((1, "L"), (-1, "R")):
+                P = G.reshape(-1, 3) * [sd, 1, 1]; b = sum(len(p) for p in allP); allP.append(P)
+                for i in range(ns - 1):
+                    q = (b + 2 * i, b + 2 * i + 1, b + 2 * i + 3, b + 2 * i + 2); allQ.append(q if sd > 0 else q[::-1]); allN.append("%s_%s" % (nm0, tag))
+            continue
         pts = np.array(st_["zy"], float); ns = st_.get("steps", 8)
         wv = np.linspace(st_["w"], st_.get("w_end", st_["w"]), ns) / 2   # 25 October 2026: width may taper along the strip
         t = np.linspace(0, 1, ns); L = np.array([np.interp(t, np.linspace(0, 1, len(pts)), pts[:, k]) for k in (0, 1)]).T

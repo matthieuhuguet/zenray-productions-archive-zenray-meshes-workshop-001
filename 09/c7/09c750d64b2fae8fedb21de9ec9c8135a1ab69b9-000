@@ -1,0 +1,45 @@
+#!/bin/zsh
+# 26 October 2026 : ZenRay Meshes, ONE AUDIT per version : every check of the night in one command, one Markdown report
+# (versions/Audit_<tag>.md) and two images (hero and board). Silhouette (filled and raw, holes), lines (with steps and
+# normal only), end and plan envelopes, the longest missed sheet lines per view, row fit, quad twist, row inflections.
+# FR : un seul audit par version, tous les contrôles, un rapport Markdown et deux images.
+# Usage: zsh Scripts/Audit.sh <tag>      (after BuildCar.sh <tag> ; reads work/car/car_<tag>.npz/.obj and work/car/loft_v2.npz)
+set -e
+# 26 October 2026: PY is an array, zsh does not split a string variable into words
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=(/Users/zenray/.venvs/zenray-uv/bin/python -I); T=$1; O=$W/versions/Audit_$T; F=$W/work/car/frame; V=$W/work/car/views
+cd $W; mkdir -p $O
+$PY Scripts/SheetScore.py $F $V work/car/car_$T.obj $O/vs_ref.png > $O/silhouette.json
+[ -f work/car/lines_$T.json ] || $PY Scripts/LineScore.py $F $V work/car/car_$T.obj $O/lines.png > work/car/lines_$T.json
+$PY Scripts/EndEnvelope.py $F $V work/car/car_$T.obj 0.05 front,back > $O/env_ends.json
+$PY Scripts/LineGaps.py $F versions/Car_${T}_lines.png work/car/lines_$T.json front,back,left,right,top,bottom 0.3 4 > $O/line_gaps.json 2>/dev/null || echo '{}' > $O/line_gaps.json
+$PY Scripts/RowFit.py $F $V work/car/loft_v2.npz left,right 2 -1.2,1.0 > $O/row_fit.json
+$PY Scripts/TwistCheck.py work/car/loft_v2.npz 3 > $O/twist.json || true
+$PY Scripts/ShapeCheck.py work/car/loft_v2.npz work/car/arch_loft 2>/dev/null | tail -1 > $O/shape.json
+CV_VIEWS=three_quarter_front,three_quarter_rear $PY Scripts/CleanView.py work/car/car_$T.npz $O/hero.png "" 10 1400 > /dev/null 2>&1
+$PY Scripts/SheetBoard.py $F $V work/car/car_$T.npz $O/board.png 10 > /dev/null 2>&1
+$PY - "$T" "$O" <<'PYEOF'
+import json, sys, os
+T, O = sys.argv[1], sys.argv[2]; W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+s = json.load(open(f"{O}/silhouette.json")); l = json.load(open(f"{W}/work/car/lines_{T}.json"))
+e = json.load(open(f"{O}/env_ends.json")); g = json.load(open(f"{O}/line_gaps.json")); r = json.load(open(f"{O}/row_fit.json"))
+tw = json.load(open(f"{O}/twist.json")); sh = json.load(open(f"{O}/shape.json"))
+L = [f"# Audit {T} (26 October 2026 tool)", "", "| View | Silhouette filled | Raw | Lines (steps) | Lines (normal only) |", "|---|---|---|---|---|"]
+for v in ("front", "back", "left", "right", "top", "bottom"):
+    L.append(f"| {v} | {s['silhouette_iou'][v]} | {s['raw_iou'][v]} | {l[v]['f1']} | {l[v].get('f1_normal_only', '')} |")
+L.append(f"| mean | {s['mean_kept']} | {s['mean_raw']} | {l['mean_f1']} | {l.get('mean_f1_normal_only', '')} |")
+L += ["", "## End view envelopes, worst errors (mm, model minus sheet)"]
+for v, d in e.items():
+    H = sorted(d["H"], key=lambda h: -abs(h[3] or 0))[:4]; Wd = sorted(d["W"], key=lambda h: -abs(h[3] or 0))[:4]
+    L.append(f"- {v} top H(x): " + ", ".join(f"x {h[0]}: {h[3]:+d}" for h in H if h[3] is not None))
+    L.append(f"- {v} half width W(y): " + ", ".join(f"y {h[0]}: {h[3]:+d}" for h in Wd if h[3] is not None))
+L += ["", "## Longest sheet lines the model misses"]
+for v, d in g.items():
+    for x in d[:2]: L.append(f"- {v}: {x['len_m']} m from {x['from']} to {x['to']}")
+L += ["", "## Row fit (median mm to the nearest sheet line, side views)"]
+for v, d in r.items():
+    worst = sorted(d.items(), key=lambda kv: -kv[1]["median_mm"])[:4]
+    L.append(f"- {v}: " + ", ".join(f"{k} {x['median_mm']}" for k, x in worst))
+L += ["", "## Surface", f"- quad twist, panels over the limit: {tw['bad']} ; worst: " + ", ".join(f"{p['panel']} p95 {p['p95']}" for p in tw['panels'][:3]),
+      f"- folds: {sh.get('folds')} ; rows flagged wavy: {', '.join(sh.get('too_wavy', []))}", "", f"![hero]({O}/hero.png)", "", f"![board]({O}/board.png)"]
+open(f"{O}.md", "w").write("\n".join(L) + "\n"); print(f"{O}.md")
+PYEOF
