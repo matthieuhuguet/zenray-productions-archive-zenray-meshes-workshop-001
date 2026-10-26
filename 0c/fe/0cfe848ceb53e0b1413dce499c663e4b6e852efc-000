@@ -20,6 +20,18 @@ def main(params, prefix, out):
         n = max(1, int(abs(st[i] - st[i + 1]) * C["n_per_m"]))
         for k in range(n): zs.append(i + k / n); seg.append(i)
     zs.append(S - 1); seg.append(S - 2)
+    # 26 October 2026: FORCED STATIONS ; force_z inserts a dense station at exactly these world z values (the nose clip plane
+    # 2.08), so the Clip SOP runs along an edge loop instead of cutting quads in the middle (Clip made the pentagons of the
+    # front fenders and bumper) ; the shape is only sampled once more, nothing moves. FR : stations insérées sur les plans de coupe.
+    FZ_ = C.get("force_z", [])
+    if FZ_:
+        # the dense station z is the LINEAR interpolation of the nominal station list (zt below, G[:, j, 2] = zt), so the
+        # parameter of a world z is the exact inverse of that linear map
+        for zf_ in FZ_:
+            if not (st.min() < zf_ < st.max()): continue
+            o_ = np.argsort(st); tf_ = float(np.interp(zf_, st[o_], np.arange(S)[o_]))
+            if any(abs(tf_ - z_) < 1e-9 for z_ in zs): continue
+            k_ = int(np.searchsorted(np.array(zs), tf_)); zs.insert(k_, tf_); seg.insert(k_, int(min(max(np.floor(tf_), 0), S - 2)))
     t = np.array(zs)                                     # station parameter (fractional index), monotone
     G = np.zeros((len(t), R, 3))
     for j in range(R):
@@ -479,6 +491,14 @@ def main(params, prefix, out):
             if core: colsk.add(k)
         CUTS.append((i0k, colsk, DCk.get("pairs", [[DCk.get("front", "door"), DCk.get("back", "quarter")]])))
         if DCk is DC: i0, dc_cols = i0k, colsk
+    # 26 October 2026: PLANE STATIONS ; the nose and tail clip planes cut quads in the middle (Clip SOP : 50 pentagons) ;
+    # the station nearest each plane is moved onto it (within max_m), so the clip runs along an edge loop.
+    # FR : la station la plus proche d'un plan de coupe est posée dessus, la coupe suit une boucle d'arêtes.
+    PS_ = C.get("plane_stations", {}); ps_keep = set()
+    for zc_ in list(PS_.get("z", [])) + list(C.get("force_z", [])):
+        zs_ = np.nanmedian(G2[:, :, 2], axis=1); i_ = int(np.argmin(np.abs(zs_ - zc_)))
+        if PS_.get("z") and zc_ in PS_["z"] and np.nanmax(np.abs(G2[i_, :, 2] - zc_)) <= PS_.get("max_m", 0.02): G2[i_, :, 2] = zc_
+        if np.nanmax(np.abs(G2[i_, :, 2] - zc_)) <= 1e-3: ps_keep.add(i_)   # the forced station stays through the decimation
     P = G2.reshape(-1, 3); Q, N = [], []
     idx = lambda i, j: i * R2 + (j % R2)
     def col_u(k):   # 26 October 2026: position of a column across the top band, 0 roof centre, 1 roof edge, -1 elsewhere
@@ -510,13 +530,15 @@ def main(params, prefix, out):
     if C.get("arch_cut", 0):
         Wp = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
         Rc = Wp["tyre_r"] * C.get("arch_pad_cut", 1.14); x0 = C.get("arch_x0", 0.40)
+        AB = C.get("arch_band"); Rc_true = Rc
+        if AB and AB.get("on", 1): Rc = Rc + AB.get("band_m", 0.024)   # 26 October 2026: the grid is cut at the outer loop of the band
         cen = np.array([(i["y"], i["z"]) for i in Wp["instances"] if i["x"] > 0])
         P_pre = P.copy()   # 26 October 2026: the surface before the cut, read back below (x on the arch ring)
         Qa = np.array(Q); ce = P[Qa].mean(1); inside = np.zeros(len(Qa), bool)
         for yc, zc in cen: inside |= (np.abs(ce[:, 0]) > x0) & (np.hypot(ce[:, 1] - yc, ce[:, 2] - zc) < Rc)
         bnd = np.intersect1d(np.unique(Qa[inside].ravel()), np.unique(Qa[~inside].ravel()))
         for v in bnd:
-            if abs(P[v, 0]) <= x0: continue
+            if abs(P[v, 0]) <= max(x0, C.get("arch_snap_x_min", 0.0)): continue   # 26 October 2026: floor boundary not snapped (its station row collapsed into fans of triangles)
             dd = np.hypot(P[v, 1] - cen[:, 0], P[v, 2] - cen[:, 1]); k = int(np.argmin(dd))
             if dd[k] < Rc * 1.4 and dd[k] > 1e-6:
                 ny_ = cen[k, 0] + (P[v, 1] - cen[k, 0]) * Rc / dd[k]
@@ -525,6 +547,23 @@ def main(params, prefix, out):
                 elif abs(P[v, 1] - cen[k, 0]) < Rc:   # 25 October 2026: low points slide along z only, never below the floor
                     P[v, 2] = cen[k, 1] + np.sign(P[v, 2] - cen[k, 1]) * np.sqrt(Rc ** 2 - (P[v, 1] - cen[k, 0]) ** 2)
         Q = [q for q, k_ in zip(Q, inside) if not k_]; N = [n for n, k_ in zip(N, inside) if not k_]
+        # 26 October 2026: UNIFORM ARCH BOUNDARY ; the boundary vertices sit on the circle but at the uneven angles where the grid
+        # was cut (cells 1 to 8 cm along the arc : the stretched quads and fans of the arch ring, TopoCheck arch gate) ; they are
+        # re-spaced evenly in angle between the two feet, in order, so the ring cells meet them at a regular step and the relax
+        # below finishes the job. y and z only, x is read back on the surface afterwards. FR : bord d'arche à pas régulier.
+        AU = C.get("arch_uniform")
+        if AU and AU.get("on", 1):
+            used_u = np.zeros(len(P), bool); used_u[np.array(Q).ravel()] = True; nmoved = 0
+            for k_u, (yc, zc) in enumerate(cen):
+                for sg in (1, -1):
+                    vs = [v for v in bnd if used_u[v] and np.sign(P[v, 0]) == sg and abs(P[v, 0]) > x0 and int(np.argmin(np.hypot(P[v, 1] - cen[:, 0], P[v, 2] - cen[:, 1]))) == k_u
+                          and abs(np.hypot(P[v, 1] - yc, P[v, 2] - zc) - Rc) < AU.get("on_circle_tol_m", 0.01) and P[v, 1] > yc + AU.get("y_min_rel_m", 0.0)]
+                    if len(vs) < 6: continue
+                    ph = lambda v: (lambda a_: a_ + 2 * np.pi if a_ < -np.pi / 2 else a_)(float(np.arctan2(P[v, 1] - yc, P[v, 2] - zc)))
+                    vs.sort(key=ph); phs = np.array([ph(v) for v in vs]); newp = np.linspace(phs[0], phs[-1], len(vs))
+                    for v, a_ in zip(vs[1:-1], newp[1:-1]):
+                        P[v, 1] = yc + Rc * np.sin(a_); P[v, 2] = zc + Rc * np.cos(a_); nmoved += 1
+            print(json.dumps({"arch_uniform": {"moved": nmoved}}), file=sys.stderr)
         # 26 October 2026: RING RELAX ; the snapped boundary vertices pulled fan shaped quads (shards around the arch top) ;
         # the vertices of the ring around each arch (within arch_relax_m outside the circle) move toward the mean of their
         # grid neighbours in y and z, the boundary staying on the circle. FR : anneau autour du passage lissé.
@@ -543,7 +582,7 @@ def main(params, prefix, out):
             # 26 October 2026: WEIGHTED ; an all or nothing ring relaxed some sections of the shoulder row (belt_top) and not
             # their neighbours (8 cm jump in x over 8 cm, a vertical fold in front of the front arch) ; the blend now falls
             # smoothly from 0.5 on the circle to 0 at the ring edge
-            u_ = np.clip((d_all[idv] - Rc) / rr_, 0.0, 1.0); wgt = 0.5 * (1.0 - u_ * u_ * (3.0 - 2.0 * u_))
+            u_ = np.clip((d_all[idv] - Rc) / rr_, 0.0, 1.0); wgt = C.get("arch_relax_w", 0.5) * (1.0 - u_ * u_ * (3.0 - 2.0 * u_))   # 26 October 2026: arch_relax_w, the weight on the circle (0.5 before)
             for _ in range(it_):
                 Ms = []
                 for a in axes_:
@@ -583,6 +622,154 @@ def main(params, prefix, out):
             near = np.isin(Qa2, bnd).any(1) | ((np.abs(cq[:, 0]) > x0) & (dq < Rc + C.get("arch_fold_ring_m", 0.03)))   # 26 October 2026: the whole ring, not only the boundary
             drop = near & (cosv < np.cos(np.radians(fmax)))
             Q = [q for q, k_ in zip(Q, drop) if not k_]; N = [n for n, k_ in zip(N, drop) if not k_]
+    # 26 October 2026: ARCH BAND, the wheel arch as a car modeller makes it : the grid is cut at Rc + band_m, the cut
+    # boundary on the side (|x| > x_side) is chained in order, and k loops concentric to the arch join it to the true circle
+    # Rc ; every body line (row or station) ends on the outer loop, the band carries the lip support loops (ZenRayMeshes1.md
+    # section 15, support loops ; the U patch of arch_patch crossed character rows). x of each new point is read back on the
+    # surface before the cut. FR : bande de boucles concentriques autour de l'arche, les lignes du corps meurent dessus.
+    if C.get("arch_cut", 0) and AB and AB.get("on", 1):
+        from scipy.interpolate import LinearNDInterpolator
+        from collections import defaultdict
+        Pl = [p_ for p_ in P]; Qn, Nn = [], []; kb = int(AB.get("k", 3)); xs_b = AB.get("x_side", 0.9); bstats = []
+        edge_q = defaultdict(list)
+        for qi, q in enumerate(Q):
+            for e_ in range(4): edge_q[(min(q[e_], q[(e_ + 1) % 4]), max(q[e_], q[(e_ + 1) % 4]))].append(qi)
+        for (yc, zc) in cen:
+            for sg in (1, -1):
+                on_c = lambda v: abs(np.hypot(P[v, 1] - yc, P[v, 2] - zc) - Rc) < AB.get("on_circle_tol_m", 0.006) and P[v, 0] * sg > xs_b
+                bnd_e = [e for e, qs in edge_q.items() if len(qs) == 1 and on_c(e[0]) and on_c(e[1])]
+                if len(bnd_e) < 4: bstats.append({"z": round(float(zc), 2), "side": sg, "skipped": "no boundary"}); continue
+                adj = defaultdict(list)
+                for a_, b_ in bnd_e: adj[a_].append(b_); adj[b_].append(a_)
+                # longest chain : start from an end (degree 1), walk
+                ends = [v for v, nb in adj.items() if len(nb) == 1]; best = []
+                for st_ in (ends or list(adj)[:1]):
+                    ch = [st_]; prev = None
+                    while True:
+                        nx_ = [w for w in adj[ch[-1]] if w != prev and w not in ch[-2:]]
+                        if not nx_: break
+                        prev = ch[-1]; ch.append(nx_[0])
+                        if len(ch) > 4000: break
+                    if len(ch) > len(best): best = ch
+                ch = best
+                src = (np.sign(P_pre[:, 0]) == sg) & (np.abs(P_pre[:, 0]) > xs_b - 0.1) & (np.abs(P_pre[:, 2] - zc) < Rc + 0.3)
+                Xf = LinearNDInterpolator(P_pre[src][:, 1:3], P_pre[src][:, 0])
+                rows_ = [ch]
+                for r in range(1, kb + 1):
+                    rad = Rc - (Rc - Rc_true) * r / kb; row = []
+                    for v in ch:
+                        dy, dz = P[v, 1] - yc, P[v, 2] - zc; d_ = np.hypot(dy, dz)
+                        y_, z_ = yc + dy * rad / d_, zc + dz * rad / d_; xv = Xf(y_, z_)
+                        xv = float(xv) if np.isfinite(xv) else float(P[v, 0])
+                        row.append(len(Pl)); Pl.append(np.array([xv, y_, z_]))
+                    rows_.append(row)
+                # winding from the grid quad on the first boundary edge
+                qref = Q[edge_q[(min(ch[0], ch[1]), max(ch[0], ch[1]))][0]]; iref = list(qref).index(ch[0])
+                grid_dir = qref[(iref + 1) % 4] == ch[1]   # the grid quad runs ch0 -> ch1 ; the band quad must run ch1 -> ch0
+                nm_b = N[edge_q[(min(ch[0], ch[1]), max(ch[0], ch[1]))][0]]
+                for r in range(kb):
+                    A_, B_ = rows_[r], rows_[r + 1]
+                    for u in range(len(ch) - 1):
+                        q = (A_[u], A_[u + 1], B_[u + 1], B_[u])
+                        if grid_dir: q = q[::-1]
+                        # name : the panel of the grid quad on that boundary edge
+                        e0 = (min(ch[u], ch[u + 1]), max(ch[u], ch[u + 1])); nm_ = N[edge_q[e0][0]] if e0 in edge_q else nm_b
+                        Qn.append(tuple(int(v) for v in q)); Nn.append(nm_)
+                bstats.append({"z": round(float(zc), 2), "side": sg, "chain": len(ch), "loops": kb})
+        Q = Q + Qn; N = N + Nn; P = np.array(Pl); print(json.dumps({"arch_band": bstats}), file=sys.stderr)
+    # 26 October 2026: ARCH PATCH, the third move of the retopology : around each arch, on each side, the grid quads of a
+    # U window (rows from the start of the vertical side up to band_m above the circle, k stations on each side of the
+    # opening) are replaced by k loops that turn around the arch, between the outer path of the window (existing grid
+    # points, so the patch is welded to the rest) and the arc on the circle ; feet on the first side row (existing points).
+    # x of every new point is read back on the surface before the cut. The truncated grid made fans of stretched quads
+    # around the opening (TopoCheck, the red rays above each arch). FR : boucles concentriques autour de chaque passage.
+    AP = C.get("arch_patch")
+    if C.get("arch_cut", 0) and AP and AP.get("on", 1):
+        from scipy.interpolate import LinearNDInterpolator
+        nT = len(t); ngrid = nT * R2; Pl = [p_ for p_ in P]; Qn, Nn = [], []
+        Qarr = np.array(Q); used_ = np.zeros(len(P), bool); used_[Qarr.ravel()] = True
+        k_ = int(AP.get("k", 8)); band_ = AP.get("band_m", 0.1); xs_ = AP.get("x_side", 1.0)
+        zst_ = np.nanmedian(G2[:, :, 2], axis=1); drop_q = np.zeros(len(Q), bool); stats_ = []
+        for (yc, zc) in cen:
+            ic = int(np.argmin(np.abs(zst_ - zc)))
+            for sg in (1, -1):
+                xs_c = G2[ic, :, 0] * sg; ys_c = G2[ic, :, 1]
+                side_cols = [j for j in range(R2) if xs_c[j] > xs_]
+                if len(side_cols) < 4: continue
+                jlo = min(side_cols, key=lambda j: ys_c[j])
+                # 26 October 2026: up the side = toward the neighbour column that is still a side column ; stop if y falls
+                dj = 1 if xs_c[(jlo + 1) % R2] > xs_ and ys_c[(jlo + 1) % R2] >= ys_c[jlo] else -1
+                path_c = [jlo]
+                while ys_c[path_c[-1]] < yc + Rc + band_ and len(path_c) < R2 // 2:
+                    nxt_ = (path_c[-1] + dj) % R2
+                    if ys_c[nxt_] < ys_c[path_c[-1]] - 1e-4 or xs_c[nxt_] < AP.get("x_stop", 0.85): break   # 26 October 2026: the side turns into the hood
+                    if cols[nxt_][0] == cols[nxt_][1] and rname(cols[nxt_][0]) in AP.get("stop_rows", ["belt_top", "glass_base"]):
+                        path_c.append(nxt_); break   # 26 October 2026: a character row stays an edge loop, the window ends on it
+                    path_c.append(nxt_)
+                if ys_c[path_c[-1]] < yc + Rc + AP.get("band_min_m", 0.03): stats_.append({"z": round(float(zc), 2), "side": sg, "skipped": "side ends below the arch"}); continue
+                jhi = path_c[-1]
+                if AP.get("debug"): print(json.dumps({"path": [(int(j), rname(cols[j][0]), rname(cols[j][1]), round(float(ys_c[j]), 3), round(float(xs_c[j]), 3)) for j in path_c]}), file=sys.stderr)
+                ia_ = ic
+                while ia_ > 0 and used_[idx(ia_, jlo)] == False: ia_ -= 1
+                ib_ = ic
+                while ib_ < nT - 1 and used_[idx(ib_, jlo)] == False: ib_ += 1
+                sbf, sbr = ia_, ib_; ia, ib = sbf - k_, sbr + k_
+                # 26 October 2026: the feet must be on the circle (a foot found far away means the first side row is cut
+                # by something else there, the nose or the tail) ; FR : pieds sur le cercle, sinon pas de patch
+                if abs(np.hypot(P[idx(sbf, jlo), 1] - yc, P[idx(sbf, jlo), 2] - zc) - Rc) > 0.03 or abs(np.hypot(P[idx(sbr, jlo), 1] - yc, P[idx(sbr, jlo), 2] - zc) - Rc) > 0.03:
+                    stats_.append({"z": round(float(zc), 2), "side": sg, "skipped": "feet off the circle"}); continue
+                if ia < 1 or ib > nT - 2: continue
+                # window quads : grid quads with all corners in stations [ia, ib] and columns in path_c (grid points only)
+                cset = set(path_c); win = []
+                for qi, q in enumerate(Q):
+                    if max(q) >= ngrid: continue
+                    if all(ia <= v // R2 <= ib and (v % R2) in cset for v in q) and not all((v % R2) == jlo for v in q): win.append(qi)
+                if not win: continue
+                # outer path (u), feet (r)
+                outer = [idx(ia, j) for j in path_c] + [idx(i, jhi) for i in range(ia + 1, ib + 1)] + [idx(ib, j) for j in path_c[-2::-1]]
+                Nu = len(outer) - 1; fr = [idx(ia + r, jlo) for r in range(k_ + 1)]; rr = [idx(ib - r, jlo) for r in range(k_ + 1)]
+                Po = np.array([Pl[v] for v in outer]); dpo = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(Po[:, 1:], axis=0), axis=1))]); su = dpo / max(dpo[-1], 1e-9)
+                pf, pr = np.array(Pl[fr[-1]]), np.array(Pl[rr[-1]])
+                a0 = np.arctan2(pf[1] - yc, pf[2] - zc); a1 = np.arctan2(pr[1] - yc, pr[2] - zc)
+                # the arc goes over the top : from the foot nearer the nose to the other, through y > yc
+                mid_ = np.arctan2(1.0, 0.0)
+                def ang_between(a_s, a_e):
+                    for a_e2 in (a_e, a_e + 2 * np.pi, a_e - 2 * np.pi):
+                        lo_, hi_ = min(a_s, a_e2), max(a_s, a_e2)
+                        if lo_ <= mid_ <= hi_ or lo_ <= mid_ + 2 * np.pi <= hi_ or lo_ <= mid_ - 2 * np.pi <= hi_: return a_e2
+                    return a_e
+                a1 = ang_between(a0, a1)
+                inner = [pf[1:]] + [np.array([yc + Rc * np.sin(a0 + (a1 - a0) * su[u]), zc + Rc * np.cos(a0 + (a1 - a0) * su[u])]) for u in range(1, Nu)] + [pr[1:]]
+                # side surface before the cut : x = X(y, z)
+                src = (np.sign(P_pre[:, 0]) == sg) & (np.abs(P_pre[:, 0]) > xs_ - 0.2) & (np.abs(P_pre[:, 2] - zc) < Rc + band_ + 0.3)
+                Xf = LinearNDInterpolator(P_pre[src][:, 1:3], P_pre[src][:, 0])
+                def vfrac(foot):
+                    pp_ = np.array([Pl[v] for v in foot]); d_ = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pp_[:, 1:], axis=0), axis=1))]); return d_ / max(d_[-1], 1e-9)
+                vf_, vr_ = vfrac(fr), vfrac(rr)
+                V = np.zeros((Nu + 1, k_ + 1), np.int64)
+                for u in range(Nu + 1):
+                    for r in range(k_ + 1):
+                        if r == 0: V[u, r] = outer[u]; continue
+                        if u == 0: V[u, r] = fr[r]; continue
+                        if u == Nu: V[u, r] = rr[r]; continue
+                        if r == k_ and False: pass
+                        v_ = (1 - su[u]) * vf_[r] + su[u] * vr_[r]
+                        yz = np.array(Pl[outer[u]][1:]) + v_ * (inner[u] - np.array(Pl[outer[u]][1:]))
+                        xv = float(Xf(yz[0], yz[1])) if np.isfinite(Xf(yz[0], yz[1])) else float(Pl[outer[u]][0])
+                        V[u, r] = len(Pl); Pl.append(np.array([xv, yz[0], yz[1]]))
+                # winding as the removed window quads (sign of the normal in x)
+                q0 = Q[win[0]]; nq0 = np.cross(np.array(Pl[q0[1]]) - np.array(Pl[q0[0]]), np.array(Pl[q0[3]]) - np.array(Pl[q0[0]]))[0]
+                cen_w = {qi: np.mean([Pl[v] for v in Q[qi]], axis=0) for qi in win}
+                for u in range(Nu):
+                    for r in range(k_):
+                        q = (int(V[u, r]), int(V[u + 1, r]), int(V[u + 1, r + 1]), int(V[u, r + 1]))
+                        nq = np.cross(np.array(Pl[q[1]]) - np.array(Pl[q[0]]), np.array(Pl[q[3]]) - np.array(Pl[q[0]]))[0]
+                        if nq * nq0 < 0: q = q[::-1]
+                        cq = np.mean([Pl[v] for v in q], axis=0); nm_ = N[min(win, key=lambda qi: float(np.sum((cen_w[qi][1:] - cq[1:]) ** 2)))]
+                        Qn.append(q); Nn.append(nm_)
+                drop_q[win] = True; stats_.append({"z": round(float(zc), 2), "side": sg, "loops": k_, "around": Nu, "removed": len(win), "jlo": int(jlo), "jhi": int(jhi), "path": len(path_c), "ia": int(ia), "ib": int(ib)})
+        Q = [q for qi, q in enumerate(Q) if not drop_q[qi]] + Qn; N = [n for qi, n in enumerate(N) if not drop_q[qi]] + Nn
+        P = np.array(Pl); print(json.dumps({"arch_patch": stats_}), file=sys.stderr)
     # 26 October 2026: LOOP DECIMATION, the first move of the retopology : the shape is computed on dense stations (n_per_m),
     # then every station loop whose removal moves the surface by less than tol_m is removed (greedy, each removed point
     # within tol_m of the segment that replaces it, at most max_gap_m between two kept stations). A loop stays where any
@@ -591,10 +778,10 @@ def main(params, prefix, out):
     # FR : décimation de boucles : on retire les stations inutiles à la forme, à tol_m près.
     LD = C.get("loop_decimate")
     if LD and LD.get("on", 1):
-        Qa_ = np.array(Q); nT = len(t); st_q = Qa_ // R2; cl_q = Qa_ % R2
-        smin = st_q.min(1); reg = (st_q.max(1) - smin == 1) & ((st_q == smin[:, None]).sum(1) == 2)
+        Qa_ = np.array(Q); nT = len(t); st_q = Qa_ // R2; cl_q = Qa_ % R2; newp_ = (Qa_ >= nT * R2).any(1)   # 26 October 2026: arch patch points
+        smin = st_q.min(1); reg = (st_q.max(1) - smin == 1) & ((st_q == smin[:, None]).sum(1) == 2) & ~newp_
         bad_st = np.zeros(nT + 1, bool)
-        for qi in np.flatnonzero(~reg): bad_st[np.unique(st_q[qi])] = True
+        for qi in np.flatnonzero(~reg): bad_st[np.unique(st_q[qi][Qa_[qi] < nT * R2])] = True
         row_cov = [dict() for _ in range(nT)]
         for qi in np.flatnonzero(reg): row_cov[smin[qi]][int(cl_q[qi][st_q[qi] == smin[qi]].min()) if True else 0] = N[qi]
         Wp_ = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
@@ -605,6 +792,7 @@ def main(params, prefix, out):
             for inst in Wp_["instances"]: in_arch |= np.abs(zst - inst["z"]) < Ra_
         removable = np.zeros(nT, bool)
         for i in range(1, nT - 1):
+            if i in ps_keep: continue   # 26 October 2026: clip plane stations stay
             removable[i] = (not bad_st[i]) and (not in_arch[i]) and row_cov[i - 1] == row_cov[i] and len(row_cov[i]) > 0
         # 26 October 2026: the joints are grooves built from the quads beside them (CarPanels) ; a long quad next to a joint
         # makes a wide shallow groove that draws no line (v369, top normal lines 0.875 -> 0.842) : joint_guard stations on
@@ -622,10 +810,14 @@ def main(params, prefix, out):
                 v_ = G2[k_] - A0; tt = np.clip((v_ * d_).sum(1) / L2, 0, 1); e_ = np.linalg.norm(v_ - tt[:, None] * d_, axis=1)
                 if np.nanmax(e_) > tol_: return False
             return True
-        keep = [0]; a_ = 0; i = 1
+        # 26 October 2026: GRADED spacing (LoopTools Space in the reference videos, ZenRayMeshes1.md 15.1) : a kept interval
+        # is at most grade times the previous one, so loops open up gradually ; FR : écarts gradués, jamais de saut brusque
+        grade_ = LD.get("grade", 0.0)
+        seglen = lambda a_, b_: float(np.nanmax(np.linalg.norm(G2[b_] - G2[a_], axis=1)))
+        keep = [0]; a_ = 0; i = 1; Lprev = seglen(0, 1)
         while i < nT - 1:
-            if removable[i] and seg_ok(a_, i + 1): i += 1; continue
-            keep.append(i); a_ = i; i += 1
+            if removable[i] and seg_ok(a_, i + 1) and (grade_ <= 0 or seglen(a_, i + 1) <= grade_ * Lprev): i += 1; continue
+            keep.append(i); Lprev = seglen(a_, i); a_ = i; i += 1
         keep.append(nT - 1); keep_s = set(keep); nxt = {}
         for k0, k1 in zip(keep[:-1], keep[1:]): nxt[k0] = k1
         Q2_, N2_ = [], []
@@ -645,19 +837,27 @@ def main(params, prefix, out):
     # FR : boucles longitudinales ajoutées dans les colonnes larges, points sur la spline des colonnes voisines.
     CR = C.get("col_refine")
     if CR and CR.get("on", 1):
-        Qa_ = np.array(Q); stq = Qa_ // R2; clq = Qa_ % R2; smin_ = stq.min(1)
-        reg_ = (stq.max(1) - smin_ >= 1) & ((stq == smin_[:, None]).sum(1) == 2)
+        Qa_ = np.array(Q); stq = Qa_ // R2; clq = Qa_ % R2; smin_ = stq.min(1); ng_ = len(t) * R2
+        reg_ = (stq.max(1) - smin_ >= 1) & ((stq == smin_[:, None]).sum(1) == 2) & ~(Qa_ >= ng_).any(1)   # 26 October 2026: arch patch quads are not grid quads
         cmin = np.where(np.abs(np.diff(np.sort(clq, 1), axis=1)).max(1) > 1, clq.max(1), clq.min(1))   # wrap gap R2-1 -> 0
         gap_of = {}; bad_gap = set()
+        why_ = {"irregular": 0, "cols": 0}
         for qi in range(len(Q)):
-            cs = set(clq[qi].tolist())
-            if not reg_[qi] or len(cs) != 2: bad_gap.update(cs if len(cs) <= 2 else []); continue
+            cs = set(clq[qi][Qa_[qi] < ng_].tolist())
+            if not reg_[qi]: why_["irregular"] += 1
+            elif len(cs) != 2: why_["cols"] += 1
+            # 26 October 2026: a gap touched by an irregular quad is closed for THAT panel only (gap, panel) : the arch patch
+            # touches the side columns at its window edges, the door columns of the same gap stay free
+            if not reg_[qi] or len(cs) != 2:
+                for c_ in (cs if len(cs) <= 2 else []): bad_gap.add((c_, N[qi])); bad_gap.add(((c_ - 1) % R2, N[qi]))
+                continue
             j_ = int(cmin[qi]); gap_of.setdefault(j_, []).append(qi)
         Pl = list(P); newq, newn, drop = [], [], set(); tgt = CR.get("target_m", 0.035); added = 0
         Pg = G2
         pan_ok = CR.get("panels")   # 26 October 2026: only these panels (the floor split moved the chassis plates, v375)
         for j_, qis in gap_of.items():
-            if j_ in bad_gap: continue
+            qis = [qi for qi in qis if (j_, N[qi]) not in bad_gap]
+            if not qis: continue
             if pan_ok:   # 26 October 2026: per quad ; a panel is its own shell behind a joint, so no T junction at its end
                 qis = [qi for qi in qis if any(N[qi].startswith(pp_) for pp_ in pan_ok)]
                 if not qis: continue
@@ -696,7 +896,7 @@ def main(params, prefix, out):
                     newq.append(tuple(sub if same else sub[::-1])); newn.append(N[qi])
                 drop.add(qi); added += k - 1
         Q = [q for qi, q in enumerate(Q) if qi not in drop] + newq; N = [n for qi, n in enumerate(N) if qi not in drop] + newn
-        P = np.array(Pl); print(json.dumps({"col_refine": {"gaps_split": len([1 for _ in drop]), "new_quads": len(newq)}}), file=sys.stderr)
+        P = np.array(Pl); print(json.dumps({"col_refine": {"gaps_split": len([1 for _ in drop]), "new_quads": len(newq), "gaps": len(gap_of), "bad_gaps": len(bad_gap), "why": why_}}), file=sys.stderr)
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
     for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):

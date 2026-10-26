@@ -14,4 +14,28 @@ for k in cuts:
           else 'c.z < 0 && n.z < -0.3 && (s@panel == "fascia_rear_C" || s@panel == "bumper_rear_C")')
     lines.append("if (%s && c.x > %.4f && c.x < %.4f && c.y > %.4f && c.y < %.4f) removeprim(0, @primnum, 1);" % (zc, k["x0"], k["x1"], k["y0"], k["y1"]))
 w.parm("snippet").set("\n".join(lines)); w.moveToGoodPosition()
+# 26 October 2026: UNSHARE POINTS BY PANEL ; Primitive Split keeps the points shared where two panels meet, so a joint
+# without a gap (door to rocker) was one continuous surface, PolyExtrude gave no side wall there (58 open edges per door) and
+# the door was not a separate shell, which a rig needs. Each (panel, point) now gets its own point ; the gap wrangle then sees
+# two coincident points at every joint. FR : points non partagés entre panneaux, chaque panneau devient une coque indépendante.
+for nm_ in ("panel_unshare", "panel_unshare_clean"):
+    o_ = geo.node(nm_); o_ and o_.destroy()
+if globals().get("UNSHARE", 1):
+    u = geo.createNode("attribwrangle", "panel_unshare"); u.parm("class").set(0); u.setInput(0, w)
+    u.parm("snippet").set("""// 26 October 2026 : one point per (panel, original point) ; flat array map[panel * npoints + point]
+string names[] = uniquevals(0, "prim", "panel"); int np0 = npoints(0); int map[]; resize(map, len(names) * np0);
+for (int i = 0; i < len(map); i++) map[i] = -1;
+int nprm = nprimitives(0);
+for (int pr = 0; pr < nprm; pr++) {
+    int pid = find(names, prim(0, "panel", pr)); int pts[] = primpoints(0, pr);
+    for (int k = 0; k < len(pts); k++) {
+        int key = pid * np0 + pts[k]; int np = map[key];
+        if (np < 0) { vector pos = point(0, "P", pts[k]); np = addpoint(0, pos); map[key] = np; }
+        setvertexpoint(0, pr, k, np);
+    }
+}""")
+    uc = geo.createNode("clean", "panel_unshare_clean"); uc.setInput(0, u)
+    for pn_, v_ in (("delunusedpts", 1), ("deldegengeo", 0), ("fusepts", 0), ("delzeroarea", 0), ("dodelpts", 1)):
+        if uc.parm(pn_): uc.parm(pn_).set(v_)
+    dst.setInput(0, uc); u.moveToGoodPosition(); uc.moveToGoodPosition()
 result = {"cuts": len(cuts), "prims": len(geo.node("OUT_panels").geometry().prims())}

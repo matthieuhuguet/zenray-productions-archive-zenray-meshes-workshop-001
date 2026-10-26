@@ -1,0 +1,247 @@
+# 26 October 2026 : ZenRay Meshes, COMPONENT COMPLETION of the car being iterated, measured against the reference component
+# sheet (numbered markers of work/car/components/markers_v1.json, 43 components of ZenRayMeshes1.md section 10).
+# EN: the model is rendered in the six sheet panel cameras with face ids, each face is mapped to a reference component by the
+# part name patterns of work/car/component_params.json, then per component : BUILT (a part exists), PLACEMENT (the reference
+# marker lands on that component in the model render), LINES (F1 of the reference edges against the model edges inside the
+# component's own region), TOPOLOGY (share of faces without a TopoCheck fault). Completion = weighted sum, ranked, with the tool
+# that makes the component. Reuses SheetScore.render_in_panel, LineScore edges, RegionCensus face ids and TopoCheck flags.
+# FR : complétion par composant de la voiture en cours, face à la planche des composants de la référence.
+# Usage: python ComponentScore.py <tag> [--no-board]   -> versions/Components_<tag>.json, .md, _board.png
+import sys, os, json, re, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+import Raster, SheetScore, LineScore, TopoCheck
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+INK = "/Users/zenray/Library/Fonts/InterVariable.ttf"
+
+
+def comp_of_part(name, comps):
+    """component number (str) of a part name, by the regex lists of the parameters file ; None when no component owns it."""
+    base = re.sub(r"_[0-9]+$", "", str(name))   # 26 October 2026: instances carry a numeric suffix (CAR_grille_upright_01) ; the patterns name the family
+    for k, c in comps.items():
+        for pat in c.get("parts", []):
+            if re.fullmatch(pat, base) or re.fullmatch(pat, str(name)): return k
+    return None
+
+
+def next_action(row, low):
+    """the one thing to do for this component, from its weakest sub score (FR : le geste suivant)."""
+    if row["completion"] >= 0.90: return "keep"
+    if low == "topo":
+        kinds = ", ".join("%s %d" % kv for kv in row.get("fault_kinds", {}).items()) or "none"
+        return "retopology of %s : faults %s" % (row["tool"], kinds)
+    if low == "line":
+        r_, p_ = row.get("line_recall", 0), row.get("line_precision", 0)
+        return ("model misses reference lines (recall %.2f < precision %.2f) : add the cuts, creases or joints in %s" if r_ < p_ else "model has extra lines (precision %.2f < recall %.2f) : remove or merge the loops in %s") % ((r_, p_, row["tool"]) if r_ < p_ else (p_, r_, row["tool"]))
+    return "marker not on the component : check the placement and the hiding order in %s" % row["tool"]
+
+
+def colour(p):
+    return (70, 190, 90) if p >= 0.90 else (235, 170, 40) if p >= 0.75 else (225, 70, 60)
+
+
+def main(tag, board=True, prm=None, write=True):
+    prm = prm or json.load(open(W + "work/car/component_params.json")); comps = prm["components"]; wt = prm["weights"]; L = prm["line"]
+    LineScore.P["tol_px"] = L["tol_px"]
+    meta = json.load(open(W + "work/car/frame/frame.json")); sheet = json.load(open(W + "work/car/views/sheet.json"))
+    markers = json.load(open(W + "work/car/components/markers_v1.json"))["markers"]
+    names_ref = json.load(open(W + "work/car/components/components_v1.json"))["components"]
+    car = np.load(W + "work/car/car_%s.npz" % tag, allow_pickle=True); T, N = car["T"], car["names"]
+    part_comp = np.array([comp_of_part(n, comps) or "" for n in N]); unowned = [str(n) for n, c in zip(N, part_comp) if c == "" and str(n) not in prm["extra_parts_ok"]]
+    comp_ids = sorted(comps, key=int); cid = {k: i + 1 for i, k in enumerate(comp_ids)}; lut = np.zeros(len(N) + 1, np.int32)
+    for j, c in enumerate(part_comp): lut[j] = cid[c] if c else 0
+    # 1) render every panel with face ids, build the component id map and the model edges
+    r = Raster.Renderer(car["P"], car["F"]); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["D"], cap["N"], cap["F"] = out[1], out[2], out[3]; return out
+    r.render = rr
+    views = {}
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(W + "work/car/views/%02d_%s_rgb.png" % (pan["index"], v["name"])).convert("L"))
+        mref = np.asarray(Image.open(W + "work/car/frame/mask_%s.png" % v["name"])) > 127
+        M, shade = SheetScore.render_in_panel(r, meta, v, mref.shape); sh = mref.shape
+        Dd, Nn, Fi = cap["D"][: sh[0], : sh[1]], cap["N"][: sh[0], : sh[1]], cap["F"][: sh[0], : sh[1]]
+        fid = np.where(M & (Fi >= 0) & (Fi < len(T)), Fi, 0); cmap = np.where(M & (Fi >= 0) & (Fi < len(T)), lut[T[fid]], 0)
+        inner = ndi.binary_erosion(mref, iterations=LineScore.P["erode_px"]) & ndi.binary_erosion(M, iterations=LineScore.P["erode_px"])
+        Er = LineScore.ref_edges(ref) & inner; Em = LineScore.model_edges(Nn, M, Dd) & inner
+        views[v["name"]] = {"pan": pan, "cmap": cmap, "M": M, "shade": shade, "Er": Er, "Em": Em, "mref": mref, "N": Nn, "D": Dd, "dm": ndi.distance_transform_edt(~Em),
+                            "dr": ndi.distance_transform_edt(~Er), "ref": ref}
+    r.release()
+    # 2) topology share per part from the TopoCheck flags on the delivery file
+    dl = np.load(W + "work/car/delivery_%s.npz" % tag, allow_pickle=True); tprm = TopoCheck.load_params(W + "work/car/topo_params.json")
+    Q_ = [list(map(int, q)) for q in dl["Q"]]; Nc, Tc = np.unique(dl["names"], return_inverse=True)
+    Cc = np.array([len(q) for q in Q_], np.int32); Ic = np.array([x for q in Q_ for x in q], np.int32)
+    res_t, flags, err = TopoCheck.analyse(dl["P"].astype(float), Cc, Ic, Tc, Nc, tprm)
+    t_faces, t_err = collections.Counter(), collections.Counter(); t_kinds = collections.defaultdict(collections.Counter)
+    for j, nm in enumerate(Nc):
+        m = Tc == j; k = comp_of_part(nm, comps) or "_"
+        t_faces[k] += int(m.sum()); t_err[k] += int(err[m].sum())
+        for kind in TopoCheck.ERRORS:
+            t_kinds[k][kind] += int(flags[kind][m].sum())
+    # 3) per component measures
+    out = {}; R = prm["marker"]["radius_px"]
+    for k in comp_ids:
+        c = comps[k]; row = {"n": int(k), "name": names_ref.get(k, ""), "tool": c.get("tool", ""), "family": c.get("family", c.get("kind", "")), "kind": c.get("kind", "part"),
+                             "hidden": bool(c.get("hidden", False))}
+        if k == "1":   # the loft itself : mean silhouette IoU over the six panels (hole filled, as SheetScore) ; FR : la caisse de blocage se note par la silhouette
+            ious = [float((ndi.binary_fill_holes(vw["M"]) & vw["mref"]).sum() / max((ndi.binary_fill_holes(vw["M"]) | vw["mref"]).sum(), 1)) for vw in views.values()]
+            row.update({"completion": round(float(np.mean(ious)), 3), "silhouette_iou": [round(x, 4) for x in ious], "note": "mean silhouette IoU of the six panels", "kind": "part", "faces": res_t["faces"]}); out[k] = row; continue
+        if c.get("kind") in ("internal", "group", "doubtful"):
+            row["completion"] = None; row["note"] = c.get("note", ""); out[k] = row; continue
+        nfaces = t_faces.get(k, 0); row["faces"] = nfaces; row["built"] = nfaces > 0
+        if not row["built"]:
+            row.update({"place": 0.0, "line": None, "topo": None, "completion": 0.0, "note": "no part"}); out[k] = row; continue
+        row["topo"] = round(1.0 - t_err.get(k, 0) / max(nfaces, 1), 4); row["fault_faces"] = int(t_err.get(k, 0)); row["fault_kinds"] = {a: b for a, b in t_kinds[k].most_common(4) if b}
+        # placement : the reference marker of this component, found in the window around it in the model render
+        hits, tot, areas = 0, 0, {}; found = []
+        for m in markers:
+            if str(m["n"]) != k: continue
+            for vn, vw in views.items():
+                p = vw["pan"]["rect"]; x, y = m["x"] - p[0], m["y"] - p[1]
+                if not (0 <= x < vw["cmap"].shape[1] and 0 <= y < vw["cmap"].shape[0]): continue
+                win = vw["cmap"][max(0, y - R): y + R + 1, max(0, x - R): x + R + 1]; tot += 1
+                # 26 October 2026: the markers were placed by eye, often on a boundary ; on the component (within R px) counts 1, near it (within near_factor x R) counts half
+                reg = vw["cmap"] == cid[k]; dist = float(ndi.distance_transform_edt(~reg)[y, x]) if reg.any() else 1e9
+                hits += 1.0 if dist <= R else 0.5 if dist <= prm["marker"]["near_factor"] * R else 0.0
+                inv = {v_: k_ for k_, v_ in cid.items()}; found.append([vn, int(x), int(y), inv.get(int(vw["cmap"][y, x]), "-"), round(dist, 1)])
+        row["marker_found"] = found; row["markers"] = tot; row["place"] = round(hits / tot, 3) if tot else None
+        # lines : pooled F1 of the edges inside the component's dilated region over the six views
+        tpr = nr = tpm = nm_ = 0; area = 0; tpr1 = tpm1 = 0; cs = []
+        for vn, vw in views.items():
+            reg = vw["cmap"] == cid[k]; a = int(reg.sum()); area += a
+            if a < 20: continue
+            reg = ndi.binary_dilation(reg, iterations=L["region_dilate_px"]); er, em, dm = vw["Er"] & reg, vw["Em"] & reg, vw["dm"]
+            if c.get("depth_break_m"):   # 26 October 2026: a feature a few millimetres tall (bolt heads, 6 mm) is invisible to the 1 cm depth step of the global edge map ; per component threshold
+                old_db = LineScore.P["depth_break_m"]; LineScore.P["depth_break_m"] = c["depth_break_m"]
+                Em_c = LineScore.model_edges(vw["N"], vw["M"], vw["D"]) & ndi.binary_erosion(vw["mref"], iterations=LineScore.P["erode_px"]) & ndi.binary_erosion(vw["M"], iterations=LineScore.P["erode_px"])
+                LineScore.P["depth_break_m"] = old_db; em = Em_c & reg; dm = ndi.distance_transform_edt(~Em_c)
+            nr += int(er.sum()); tpr += int((dm[er] <= L["tol_px"]).sum()); nm_ += int(em.sum()); tpm += int((vw["dr"][em] <= L["tol_px"]).sum())
+            tpr1 += int((dm[er] <= L["fine_px"]).sum()); tpm1 += int((vw["dr"][em] <= L["fine_px"]).sum())
+            core = ndi.binary_erosion(vw["cmap"] == cid[k], iterations=3)
+            if core.sum() > 200:   # tone : correlation of the high passed reference luminance with the high passed model shading, inside the component
+                hp = lambda a: a.astype(float) - ndi.gaussian_filter(a.astype(float), 6.0); a_, b_ = hp(vw["ref"])[core], hp(vw["shade"])[core]
+                if a_.std() > 1e-6 and b_.std() > 1e-6: cs.append((float(np.corrcoef(a_, b_)[0, 1]), int(core.sum())))
+        if cs: row["tone_corr"] = round(sum(c_ * n_ for c_, n_ in cs) / sum(n_ for c_, n_ in cs), 3)
+        row["area_px"] = area; row["ref_edge_px"] = nr; row["model_edge_px"] = nm_
+        if nr + nm_ >= L["min_edge_px"] and nr > 0 and nm_ > 0:
+            rec, pre = tpr / nr, tpm / nm_; f1 = 2 * pre * rec / max(pre + rec, 1e-9)
+            rec1, pre1 = tpr1 / nr, tpm1 / nm_; row["line_f1_fine"] = round(2 * pre1 * rec1 / max(pre1 + rec1, 1e-9), 3)
+            row.update({"line_recall": round(rec, 3), "line_precision": round(pre, 3), "line_f1": round(f1, 3), "line": round(min(1.0, row["line_f1_fine"] / L["ceiling_fine_f1"]), 3)})
+        else: row["line"] = None
+        # completion : weighted sum of the sub scores that exist, weights renormalised
+        # 26 October 2026: placement is a FACTOR, not a term : lines and topology are measured inside the model's own component region, so
+        # they cannot tell a swapped part from the right one (selftest) ; only the reference marker ties the component to its place.
+        # factor = place_floor + (1 - place_floor) x place, 1 when the component has no marker. FR : le placement est un facteur.
+        parts = {"line": row["line"], "topo": row["topo"]}; ws = {q: wt[q] for q, val in parts.items() if val is not None}
+        base = sum(ws[q] * parts[q] for q in ws) / sum(ws.values()); row["base"] = round(base, 3)
+        pf = prm["place_floor"]; row["completion"] = round(base * (pf + (1 - pf) * (row["place"] if row["place"] is not None else 1.0)), 3)
+        cand = dict(parts); cand["place"] = row["place"] if row["place"] is not None else 1.0
+        low = min(cand, key=lambda q: cand[q]); row["weakest"] = low; row["next"] = next_action(row, low); out[k] = row
+    for k, c in comps.items():
+        if c.get("kind") == "group":
+            ch = [out[x]["completion"] for x in c["children"] if out[x].get("completion") is not None]
+            out[k]["completion"] = round(float(np.mean(ch)), 3) if ch else None; out[k]["note"] = "mean of " + ",".join(c["children"])
+    scored = [v for v in out.values() if v.get("completion") is not None and v["kind"] == "part"]
+    th = prm["thresholds"]
+    summary = {"_date": "26 October 2026", "tag": tag, "components_scored": len(scored), "mean_completion": round(float(np.mean([v["completion"] for v in scored])), 3),
+               "area_weighted_completion": round(float(sum(v["completion"] * max(v.get("area_px", 0), 1) for v in scored) / sum(max(v.get("area_px", 0), 1) for v in scored)), 3),
+               "exact": [v["n"] for v in scored if v["completion"] >= th["exact"]], "close": [v["n"] for v in scored if th["close"] <= v["completion"] < th["exact"]],
+               "not_exact": [v["n"] for v in scored if v["completion"] < th["close"]], "unowned_parts": unowned, "topology_all": {"faces": res_t["faces"], "score_clean": res_t["score_clean"]}}
+    result = {"summary": summary, "components": out}
+    main.last = {"views": views, "cid": cid, "comp_ids": comp_ids}
+    if not write: return result
+    base = W + "versions/Components_%s" % tag; json.dump(result, open(base + ".json", "w"), indent=1, ensure_ascii=False); write_md(result, base + ".md")
+    if board: draw_board(prm, meta, sheet, markers, views, out, comp_ids, cid, base + "_board.png", names_ref)
+    print(json.dumps(summary))
+    return result
+
+
+def write_md(res, path):
+    s, c = res["summary"], res["components"]; rows = sorted([v for v in c.values() if v.get("completion") is not None and v["kind"] == "part"], key=lambda v: v["completion"])
+    L = ["# Component completion %s (%s)" % (s["tag"], s["_date"]), "",
+         "Mean %.1f %%, area weighted %.1f %%, %d components scored : exact (>= 90) %d, close (75 to 90) %d, not exact (< 75) %d." % (
+             100 * s["mean_completion"], 100 * s["area_weighted_completion"], s["components_scored"], len(s["exact"]), len(s["close"]), len(s["not_exact"])), "",
+         "| N | Component | % | place | lines F1 (3 px / 1.5 px) | topology | weakest | next | tool |", "|---|---|---|---|---|---|---|---|---|"]
+    f = lambda x, n=2: "-" if x is None else ("%." + str(n) + "f") % x
+    for v in rows:
+        L.append("| %d | %s | %.0f | %s | %s / %s | %s | %s | %s | %s |" % (v["n"], v["name"], 100 * v["completion"], f(v.get("place")), f(v.get("line_f1")), f(v.get("line_f1_fine")),
+                                                                          f(v.get("topo"), 3), v.get("weakest", v.get("note", "")), v.get("next", v.get("note", "")), v["tool"]))
+    L += ["", "Not scored : " + ", ".join("%d %s (%s)" % (v["n"], v["name"], v["kind"]) for v in c.values() if v.get("completion") is None and v["kind"] != "part"), ""]
+    if s["unowned_parts"]: L.append("Parts no component owns : " + ", ".join(s["unowned_parts"]))
+    open(path, "w").write("\n".join(L) + "\n")
+
+
+def draw_board(prm, meta, sheet, markers, views, out, comp_ids, cid, path, names_ref, scale=2):
+    """the model sheet in the layout of the reference sheet : each panel reproduction pasted at its rect, tinted by the
+    completion of the component under each pixel, the reference markers drawn on it with their percentage."""
+    S = Image.open(W + "refs/objects/06_Car/06_Car_6views_25-October-2026.png").convert("RGB"); sheet_im = Image.new("RGB", S.size, (40, 40, 40))
+    for vn, vw in views.items():
+        sh = vw["shade"]; img = np.stack([sh] * 3, -1).astype(float); cm = vw["cmap"]
+        pc = np.zeros((len(comp_ids) + 1, 3)); pa = np.zeros(len(comp_ids) + 1)
+        for k in comp_ids:
+            cp = out[k].get("completion")
+            if cp is not None and out[k]["kind"] == "part": pc[cid[k]] = colour(cp); pa[cid[k]] = 0.38
+        img = img * (1 - pa[cm][..., None]) + pc[cm] * pa[cm][..., None]; img[~vw["M"]] = (30, 30, 30)
+        sheet_im.paste(Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)), tuple(vw["pan"]["rect"][:2]))
+    ref_im = S.copy(); fnt = ImageFont.truetype(INK, 11 * scale)
+    legend_w = 460 * scale
+    full = Image.new("RGB", (S.width * scale * 2 + legend_w, S.height * scale), (245, 244, 240))
+    for j, base in enumerate((ref_im, sheet_im)):
+        full.paste(base.resize((S.width * scale, S.height * scale), Image.LANCZOS), (j * S.width * scale, 0))
+    d = ImageDraw.Draw(full); r = 11 * scale
+    for m in markers:
+        k = str(m["n"]); cp = out.get(k, {}).get("completion")
+        for j in (0, 1):
+            x, y = m["x"] * scale + j * S.width * scale, m["y"] * scale
+            fill = (204, 124, 94) if j == 0 else (colour(cp) if cp is not None else (140, 140, 140))
+            d.ellipse((x - r, y - r, x + r, y + r), fill=fill, outline=(255, 255, 255), width=scale)
+            d.text((x, y), str(m["n"]), font=fnt, fill=(20, 20, 20) if j else (255, 255, 255), anchor="mm")
+    lf = ImageFont.truetype(INK, 12 * scale); x0 = S.width * scale * 2 + 14 * scale
+    rows = sorted([(v["completion"], v) for v in out.values() if v.get("completion") is not None and v["kind"] == "part"], key=lambda t: t[0])
+    row_h = (S.height * scale - 60 * scale) / max(len(rows), 1)
+    d.text((x0, 16 * scale), "completion, weakest first", font=lf, fill=(40, 40, 40))
+    for i, (cp, v) in enumerate(rows):
+        y = 44 * scale + (i + 0.5) * row_h
+        d.ellipse((x0, y - 8 * scale, x0 + 16 * scale, y + 8 * scale), fill=colour(cp))
+        d.text((x0 + 22 * scale, y), "%2d %-26s %3.0f %%" % (v["n"], v["name"][:26], 100 * cp), font=lf, fill=(40, 40, 40), anchor="lm")
+    full.save(path)
+
+
+def crop(tag, n, pad=14):
+    """diagnostic image of one component : for each view that shows it, the reference panel | the model shading | the edge overlay
+    (green = reference line the model has, red = reference line missing, blue = model line the reference does not have), cropped on
+    the component region and magnified 3x. FR : image de diagnostic d'un composant, pour décider du geste."""
+    res = main(tag, False, None, False); V, cid = main.last["views"], main.last["cid"]; tiles = []; tol = json.load(open(W + "work/car/component_params.json"))["line"]["fine_px"]
+    for vn, vw in V.items():
+        reg = vw["cmap"] == cid[str(n)]
+        if reg.sum() < 60: continue
+        ys, xs = np.nonzero(reg); y0, y1, x0, x1 = max(ys.min() - pad, 0), ys.max() + pad, max(xs.min() - pad, 0), xs.max() + pad
+        ref = np.stack([vw["ref"]] * 3, -1)[y0:y1, x0:x1]; mod = np.stack([vw["shade"]] * 3, -1)[y0:y1, x0:x1].copy()
+        ov = (ref // 2).copy(); er, em, dm, dr = vw["Er"][y0:y1, x0:x1], vw["Em"][y0:y1, x0:x1], vw["dm"][y0:y1, x0:x1], vw["dr"][y0:y1, x0:x1]
+        ov[er & (dm <= tol)] = (60, 200, 60); ov[er & (dm > tol)] = (230, 60, 60); ov[em & (dr > tol)] = (70, 130, 240)
+        m = vw["cmap"][y0:y1, x0:x1] == cid[str(n)]; mod[m] = (0.6 * mod[m] + 0.4 * np.array([255, 160, 40])).astype(np.uint8)
+        row = np.hstack([ref, mod, ov]); im = Image.fromarray(row.astype(np.uint8)); im = im.resize((im.width * 3, im.height * 3), Image.NEAREST)
+        ImageDraw.Draw(im).text((6, 4), "%s  ref | model (component orange) | green match, red missing, blue extra" % vn, fill=(255, 255, 0)); tiles.append(im)
+    Wd = max(t.width for t in tiles); out = Image.new("RGB", (Wd, sum(t.height for t in tiles)), (30, 30, 30)); y = 0
+    for t in tiles: out.paste(t, (0, y)); y += t.height
+    path = W + "versions/Components_%s_crop%s.png" % (tag, n); out.save(path); print(path)
+
+
+def selftest(tag):
+    """two ways : the hood component scores green with its own parts and red when its parts are swapped for the roof's ; FR : vert puis rouge."""
+    import copy
+    base = json.load(open(W + "work/car/component_params.json")); good = main(tag, False, copy.deepcopy(base), False)["components"]["3"]["completion"]
+    bad_p = copy.deepcopy(base); bad_p["components"]["3"]["parts"] = ["CAR_body_roof_C"]; bad_p["components"]["18"]["parts"] = ["CAR_body_hood_C"]
+    bad = main(tag, False, bad_p, False)["components"]["3"]["completion"]
+    ok = good >= base["thresholds"]["exact"] and bad < base["thresholds"]["close"]
+    print(json.dumps({"hood_own_parts": good, "hood_swapped_with_roof": bad, "verdict": "green and red as expected" if ok else "FAIL"})); return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv: sys.exit(selftest(sys.argv[1]))
+    if "--crop" in sys.argv: crop(sys.argv[1], sys.argv[sys.argv.index("--crop") + 1]); sys.exit(0)
+    main(sys.argv[1], "--no-board" not in sys.argv)

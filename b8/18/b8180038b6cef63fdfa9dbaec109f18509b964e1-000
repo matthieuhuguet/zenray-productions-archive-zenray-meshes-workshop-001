@@ -145,21 +145,38 @@ def main(params, body, out):
         lo_prev, hi_prev = lo, hi
         SK = C.get("skirt")   # 26 October 2026: the face goes down to the real rear bottom between the tyres (back view)
         if SK and abs(x) < SK["x"]: lo = min(lo, SK["y"])
-        ys_ = np.linspace(lo, hi, ny)
+        ys_u = np.linspace(lo, hi, ny); imp = []   # uniform rows, then the rows that carry a feature (insets, profile, chamfer, skirt, extra)
         if INS:   # global inset rows clamped to this column's range (degenerate quads are dropped below)
-            ys_ = np.sort(np.concatenate([ys_, np.clip([v for k in INS for v in (k["y0"], k["y0"] + k.get("bevel_bottom_m", k["bevel_m"]), k["y1"] - k.get("bevel_top_m", k["bevel_m"]), k["y1"])], lo, hi)]))   # 26 October 2026: per side bevels
-        ys_ = np.sort(np.concatenate([ys_, [np.clip(C.get("skirt", {}).get("y", lo), lo, hi)]]))   # same row count in every column
-        if C.get("extra_rows"): ys_ = np.sort(np.concatenate([ys_, np.clip(C["extra_rows"], lo, hi)]))
-        if FF and FF.get("profile_yz") and FF.get("profile_on", 1): ys_ = np.sort(np.concatenate([ys_, np.clip([q_[0] for q_ in FF["profile_yz"]], lo, hi)]))   # 26 October 2026: rows on the profile vertices (crisp lip)   # 26 October 2026: rows through the corners of a sloped inset edge
+            imp += list(np.clip([v for k in INS for v in (k["y0"], k["y0"] + k.get("bevel_bottom_m", k["bevel_m"]), k["y1"] - k.get("bevel_top_m", k["bevel_m"]), k["y1"])], lo, hi))   # 26 October 2026: per side bevels
+        imp += [float(np.clip(C.get("skirt", {}).get("y", lo), lo, hi))]   # same row count in every column
+        if C.get("extra_rows"): imp += list(np.clip(C["extra_rows"], lo, hi))
+        if FF and FF.get("profile_yz") and FF.get("profile_on", 1): imp += list(np.clip([q_[0] for q_ in FF["profile_yz"]], lo, hi))   # 26 October 2026: rows on the profile vertices (crisp lip)
         TC_ = (FF or {}).get("top_chamfer")
         if TC_ and TC_.get("on", 1):   # 26 October 2026: rows exactly on the crease and the chamfer foot (crisp edges)
-            ys_ = np.sort(np.concatenate([ys_, [hi - TC_.get("eps_m", 0.006), hi - TC_["drop_m"]]]))
+            imp += [hi - TC_.get("eps_m", 0.006), hi - TC_["drop_m"]]
+        # 26 October 2026: MIN ROW GAP ; a uniform row that lands within min_row_gap_m of a feature row made a 3 to 10 mm strip (aspect 6 to 15, TopoCheck
+        # density) : it is moved away from the feature rows, the row count and the feature rows are unchanged. FR : pas de bande plus fine que le seuil.
+        gmin = float(C.get("min_row_gap_m", 0.0))
+        if gmin > 0 and imp:
+            ia = np.array(imp)
+            for k_ in range(len(ys_u)):
+                u_ = ys_u[k_]
+                if k_ in (0, len(ys_u) - 1): continue
+                near = ia[np.abs(ia - u_) < gmin]
+                if len(near):
+                    c_ = float(near[np.argmin(np.abs(near - u_))]); cand = [c_ - gmin, c_ + gmin]; cand = [v for v in cand if lo < v < hi and np.min(np.abs(ia - v)) >= gmin - 1e-9]
+                    if cand: ys_u[k_] = min(cand, key=lambda v: abs(v - u_))
+        ys_ = np.sort(np.concatenate([ys_u, imp]))
         for j, y in enumerate(ys_):
             zb = z_side(y, lo_g, hi, x)   # 26 October 2026: the top fillet follows each column top (watertight with the body)
             z = min(max(z_plan(x), zb, ztip), zc)
             z += recess(x, y)
             G[i, j] = (x, y, z)
     nyy = G.shape[1]; PP, Q, N = G.reshape(-1, 3).tolist(), [], []
+    AC_ = C.get("arch_clear", {"on": 1}); ARC_ = None
+    if AC_.get("on", 1):
+        Wp_ = json.load(open(os.path.join(W, AC_.get("wheels", "wheel_params.json"))))
+        ARC_ = (AC_.get("x0", 0.40), Wp_["tyre_r"] * AC_.get("pad", 1.14), [(i["y"], i["z"]) for i in Wp_["instances"] if i["x"] > 0])
     def name_at(c):   # 26 October 2026: a quad takes the name of the inset whose inner area holds its centre
         for k in INS:
             if k.get("x0", -1.0) + 1e-6 < abs(c[0]) < k["x"] - 1e-6 and k["y0"] + 1e-6 < c[1] < k["y1"] - 1e-6:
@@ -170,6 +187,9 @@ def main(params, body, out):
             a, b = i * nyy + j, (i + 1) * nyy + j; q = [a, a + 1, b + 1, b]
             P4 = G.reshape(-1, 3)[q]
             if np.linalg.norm(np.cross(P4[2] - P4[0], P4[3] - P4[1])) < 1e-9: continue   # degenerate (clamped rows)
+            if ARC_ is not None:   # 26 October 2026: quads inside a wheel arch cylinder are left out (the Boolean SOP made n-gons)
+                c4 = P4.mean(0)
+                if abs(c4[0]) > ARC_[0] and any(np.hypot(c4[1] - yc_, c4[2] - zc_) < ARC_[1] for yc_, zc_ in ARC_[2]): continue
             Q.append(q); N.append(name_at(P4.mean(0)))
     json.dump({"_date": "25 October 2026", "cut_z": zc, "cut_tilt": None}, open(out.replace(".npz", "_cut.json"), "w"))
     np.savez(out, P=np.array(PP, np.float32), Q=np.array(Q, dtype=object), names=np.array(N))

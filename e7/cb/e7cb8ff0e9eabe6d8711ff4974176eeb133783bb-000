@@ -9,6 +9,38 @@ import numpy as np
 import trimesh
 
 
+def surface_strip(ray, bm, L, nv, wv, st_):
+    """26 October 2026: a thin frame that follows the body surface instead of the side plane. The side plane offset cast along -x skews
+    a quad where the surface slopes in x (the B pillar : corner angles 40 to 140 degrees, ComponentScore topology 0.43). Here the centre line is
+    the ray hit, the across direction is normal x tangent, so every quad is a rectangle on the surface. FR : bande dans le repère tangent de la surface."""
+    ns = len(L); C = np.full((ns, 3), np.nan); Nm = np.zeros((ns, 3)); ok = np.zeros(ns, bool)
+    def hit(z, y):
+        loc, _, it = ray.intersects_location(np.array([[3.0, y, z]]), np.array([[-1.0, 0, 0]]), multiple_hits=False)
+        if len(loc) and float(loc[0, 0]) > st_.get("near_x_min", 0.2):
+            n_ = bm.face_normals[it[0]]; return float(loc[0, 0]), (n_ if n_[0] > 0 else -n_)
+        return None
+    for i in range(ns):
+        z, y = L[i]; h = hit(z, y)   # the pillar sits in the joint between two glass panels, the ray falls through the gap : sample both sides of it
+        if h is None:
+            for dz in st_.get("sample_dz", [0.01, 0.02, 0.03, 0.045, 0.06]):
+                a, b = hit(z - dz, y), hit(z + dz, y)
+                if a is not None and b is not None: h = ((a[0] + b[0]) / 2, a[1] + b[1]); break
+        if h is not None:
+            C[i] = (h[0], y, z); Nm[i] = h[1] / max(np.linalg.norm(h[1]), 1e-9); ok[i] = True
+    for k in range(3):
+        C[~ok, k] = np.interp(np.flatnonzero(~ok), np.flatnonzero(ok), C[ok, k]); Nm[~ok, k] = np.interp(np.flatnonzero(~ok), np.flatnonzero(ok), Nm[ok, k])
+    Nm /= np.linalg.norm(Nm, axis=1, keepdims=True)
+    for _ in range(int(st_.get("smooth_normals", 0))):   # 26 October 2026: neighbouring rows share their normal so the quads between them stay planar
+        Nm[1:-1] = Nm[:-2] + 2 * Nm[1:-1] + Nm[2:]; Nm /= np.linalg.norm(Nm, axis=1, keepdims=True)
+    Tg = np.gradient(C, axis=0); Tg /= np.maximum(np.linalg.norm(Tg, axis=1, keepdims=True), 1e-9)
+    Sd = np.cross(Nm, Tg); Sd /= np.linalg.norm(Sd, axis=1, keepdims=True)
+    side = np.stack([np.zeros(ns), nv[:, 1], nv[:, 0]], 1)        # the (z, y) normal of the plane version, as a 3D direction, keeps the winding
+    Sd[(Sd * side).sum(1) < 0] *= -1
+    G = np.zeros((ns, 2, 3))
+    for j, sgn in enumerate((-1, 1)): G[:, j] = C + sgn * wv[:, None] * Sd + Nm * st_.get("protrude", 0.004)
+    return G
+
+
 def main(params, wparams, body, out):
     A = json.load(open(params)); W = json.load(open(wparams)); d = np.load(body, allow_pickle=True)
     bm = trimesh.Trimesh(d["P"], d["F"], process=False); ray = trimesh.ray.ray_triangle.RayMeshIntersector(bm)
@@ -72,12 +104,16 @@ def main(params, wparams, body, out):
         wv = np.linspace(st_["w"], st_.get("w_end", st_["w"]), ns) / 2   # 25 October 2026: width may taper along the strip
         t = np.linspace(0, 1, ns); L = np.array([np.interp(t, np.linspace(0, 1, len(pts)), pts[:, k]) for k in (0, 1)]).T
         dv = np.gradient(L, axis=0); nv = np.stack([-dv[:, 1], dv[:, 0]], 1); nv /= np.linalg.norm(nv, axis=1, keepdims=True)
-        G = np.zeros((ns, 2, 3))
-        for i in range(ns):
+        G = np.zeros((ns, 2, 3)); SF = st_.get("surface_frame", 0)
+        if SF: G = surface_strip(ray, bm, L, nv, wv, st_)   # 26 October 2026: strip in the tangent frame of the body surface
+        for i in range(0 if SF else ns):
             for j, sgn in enumerate((-1, 1)):
                 z, y = L[i] + sgn * wv[i] * nv[i]
                 loc, _, _ = ray.intersects_location(np.array([[3.0, y, z]]), np.array([[-1.0, 0, 0]]), multiple_hits=False)
-                G[i, j] = ((float(loc[0, 0]) if len(loc) else np.nan) + st_.get("protrude", 0.004), y, z)
+                # 26 October 2026: a ray that misses the near side (glass opening of the body mesh) hits the FAR wall at x < 0 : that is a miss, not a
+                # point (the B pillar had a vertex at x = -0.85 and a quad across the whole car, ComponentScore fault). FR : un impact de l'autre côté est un raté.
+                hit_ = len(loc) and float(loc[0, 0]) > st_.get("near_x_min", 0.2)
+                G[i, j] = ((float(loc[0, 0]) if hit_ else np.nan) + st_.get("protrude", 0.004), y, z)
         for j in range(2):   # 25 October 2026: misses inherit their neighbours (a constant 1.0 made wings on the roof)
             col = G[:, j, 0]; ok_ = np.isfinite(col)
             if ok_.any(): col[~ok_] = np.interp(np.flatnonzero(~ok_), np.flatnonzero(ok_), col[ok_])

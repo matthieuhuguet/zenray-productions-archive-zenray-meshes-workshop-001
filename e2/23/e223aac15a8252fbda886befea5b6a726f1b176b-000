@@ -1,0 +1,173 @@
+# 26 October 2026 : ZenRay Meshes, ANIMREVIEW, the SENIOR REVIEW as PASS / FAIL gates : what a senior 3D animator or tech artist
+# checks before he signs a model off as ready to rig, subdivide, animate and sell (Matthieu, 26 October 2026 : « le module de
+# topology pour vérifier que ce soit parfait pour un tech artist animator 3D senior »). It sits on top of TopoCheck.analyse
+# (faces, poles, quality) and adds what only a review of the WHOLE asset sees : placement and units, part separation and names,
+# watertight shells and their winding, mirror symmetry, wheel rig pivots, the wheel arch ring, edge length range, fault budget.
+# Rules : ZenRayMeshes1.md section 6 (topology) and section 15 (two reference tutorials). Thresholds live in work/car/topo_params.json,
+# key "review" (defaults below, HDA interface). Output : <out>.md (the table and the worst offenders), <out>.json.
+# FR : la relecture d'un senior en portes PASS / FAIL : placement, pièces séparées, coques fermées, symétrie, pivots de roues, anneau d'arche.
+# Usage: python AnimReview.py <topo.npz> <topo_params.json> <wheel_params.json> <out_prefix>
+#        python AnimReview.py --selftest
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import TopoCheck as TC
+
+DEFAULTS = {   # 26 October 2026: eight at most per gate family ; a params file under "review" overrides
+    "placement": {"ground_tol_m": 0.002, "center_tol_m": 0.003, "length_min_m": 3.5, "length_max_m": 5.6},
+    # 26 October 2026: n-gons are errors (0 allowed) ; triangles are tolerated below 0.5 % of the visible faces (ZenRayMeshes1.md 6.1 : only on flat rigid zones, the budget is a stance, not a measure of a defect)
+    "topology": {"quad_pct_min": 99.5, "tri_pct_max": 0.5, "ngon_max": 0, "bad_pole_pct_max": 0.5, "crack_max": 0, "fault_pct_max": 2.0, "hidden_fault_pct_max": 15.0,
+                 "hidden": ["liner", "under_", "wheelwell", "susp", "wheel_brake", "bolt"]},
+    "quality": {"aspect_fault_pct_max": 1.0, "fold_p95_max_deg": 6.0, "edge_ratio_p95_p50_max": 6.0},
+    "symmetry": {"mirror_p99_mm_max": 3.0, "mirror_max_mm_max": 10.0},
+    "shells": {"closed_required": ["CAR_body_hood_C", "CAR_body_decklid_C", "CAR_body_door", "wheel_tyre", "wheel_brake_disc"], "open_edges_max": 0},   # 26 October 2026: the nose facets are single sided seam pieces, not part of the closed hood shell
+    "wheels": {"axle_tol_m": 0.002, "radius_std_m": 0.002},
+    "arch": {"ring_m": 0.12, "fault_pct_max": 5.0, "pad": 1.14},
+    "naming": {"pattern": "(_L|_R|_C|_FL|_FR|_RL|_RR)(_[0-9]+)?$|_[0-9]+$"},
+}
+
+
+def load_review_params(path):
+    P = json.loads(json.dumps(DEFAULTS))
+    if path and os.path.exists(path):
+        for k, v in json.load(open(path)).get("review", {}).items():
+            if k in P and isinstance(v, dict): P[k].update({kk: vv for kk, vv in v.items() if not kk.startswith("_")})
+    return P
+
+
+def shell_info(P, C, I, T, names):
+    """per part : faces, open (boundary) edges, signed volume of each connected component, first open-edge position."""
+    C64 = C.astype(np.int64); st = np.concatenate([[0], np.cumsum(C64)[:-1]]); fi = np.repeat(np.arange(len(C64)), C64)
+    loc = np.arange(len(I)) - np.repeat(st, C64); nx = I[np.repeat(st, C64) + (loc + 1) % np.repeat(C64, C64)]
+    E = np.sort(np.stack([I, nx], 1), 1); out = {}
+    for k, n in enumerate(names):
+        m = T[fi] == k
+        if not m.any(): continue
+        e = E[m]; ue, cnt = np.unique(e, axis=0, return_counts=True); op = ue[cnt == 1]
+        faces = np.flatnonzero(T == k)
+        # signed volume of the whole part (sum over fan triangles), closed or not
+        vol = 0.0
+        for f in faces:
+            q = I[st[f]:st[f] + C64[f]]
+            for j in range(1, len(q) - 1): vol += float(np.dot(P[q[0]], np.cross(P[q[j]], P[q[j + 1]]))) / 6.0
+        out[str(n)] = {"faces": int(len(faces)), "open_edges": int(len(op)), "volume_m3": round(vol, 6),
+                       "open_at": [round(float(x), 3) for x in P[op[0, 0]]] if len(op) else None}
+    return out
+
+
+def review(P, C, I, T, names, wheels, prm, topo_prm):
+    R = []   # rows (gate, ok, measured, limit, note)
+    def gate(name, ok, measured, limit, note=""): R.append({"gate": name, "ok": bool(ok), "measured": measured, "limit": limit, "note": note})
+    res, flags, err = TC.analyse(P, C, I, T, names, topo_prm)
+    used = np.unique(I); V = P[used]; bb0, bb1 = V.min(0), V.max(0)
+    # 1 placement and units
+    pl = prm["placement"]
+    gate("placement.ground", abs(bb0[1]) <= pl["ground_tol_m"], round(float(bb0[1]), 4), "|min y| <= %g m" % pl["ground_tol_m"], "lowest point of the tyres on y = 0")
+    gate("placement.centered", abs((bb0[0] + bb1[0]) / 2) <= pl["center_tol_m"], round(float((bb0[0] + bb1[0]) / 2), 4), "|x centre| <= %g m" % pl["center_tol_m"])
+    L = float(bb1[2] - bb0[2]); gate("placement.length_m", pl["length_min_m"] <= L <= pl["length_max_m"], round(L, 3), "%g to %g m" % (pl["length_min_m"], pl["length_max_m"]), "real world units, forward = +z")
+    # 2 topology gates (from the judge) : strict on the VISIBLE parts, a budget on the hidden ones (liner, underbody, wheel wells,
+    # suspension, brakes), as a senior does ; FR : strict sur le visible, un budget sur le caché
+    tp = prm["topology"]; Cn = C.astype(np.int64)
+    hid_ids = [i for i, n in enumerate(names) if any(h in str(n) for h in tp["hidden"])]; hid = np.isin(T, hid_ids); vis = ~hid; nv = int(vis.sum())
+    pct = lambda m: 100.0 * float((m & vis).sum()) / max(nv, 1)
+    gate("topology.quads_pct", res["quad_pct"] >= tp["quad_pct_min"], res["quad_pct"], ">= %g" % tp["quad_pct_min"])
+    def worst(k, mask):
+        parts = np.bincount(T[flags[k] & mask], minlength=len(names)); return ", ".join("%s %d" % (names[j], parts[j]) for j in np.argsort(-parts)[:3] if parts[j])
+    gate("topology.triangles_visible_pct", pct(flags["tri"]) <= tp["tri_pct_max"], round(pct(flags["tri"]), 3), "<= %g %%" % tp["tri_pct_max"], "worst: " + worst("tri", vis))
+    gate("topology.ngons", int(flags["ngon"].sum()) <= tp["ngon_max"], int(flags["ngon"].sum()), "<= %d" % tp["ngon_max"], "worst: " + worst("ngon", np.ones(len(T), bool)))
+    gate("topology.bad_pole_faces_visible_pct", pct(flags["bad_pole"]) <= tp["bad_pole_pct_max"], round(pct(flags["bad_pole"]), 3), "<= %g %%" % tp["bad_pole_pct_max"], "worst: " + worst("bad_pole", vis))
+    gate("topology.cracks_nonmanifold_flipped", res["cracks"] + res["nonmanifold_edges"] + res["flipped_edges"] <= tp["crack_max"], res["cracks"] + res["nonmanifold_edges"] + res["flipped_edges"], "<= %d" % tp["crack_max"])
+    fv = pct(err); gate("topology.fault_pct_visible", fv <= tp["fault_pct_max"], round(fv, 2), "<= %g %%" % tp["fault_pct_max"], "%d faulty faces of %d visible" % (int((err & vis).sum()), nv))
+    fh = 100.0 * float((err & hid).sum()) / max(int(hid.sum()), 1); gate("topology.fault_pct_hidden", fh <= tp["hidden_fault_pct_max"], round(fh, 2), "<= %g %%" % tp["hidden_fault_pct_max"], "%d faulty faces of %d hidden (liner, underbody, wheel wells)" % (int((err & hid).sum()), int(hid.sum())))
+    # 3 quality
+    qp = prm["quality"]
+    gate("quality.aspect_fault_pct_visible", pct(flags["aspect"]) <= qp["aspect_fault_pct_max"], round(pct(flags["aspect"]), 3), "<= %g %%" % qp["aspect_fault_pct_max"], "stretched quads (support strips exempt) ; worst: " + worst("aspect", vis))
+    gate("quality.fold_p95_deg", (res["fold_p95_deg"] or 0) <= qp["fold_p95_max_deg"], res["fold_p95_deg"], "<= %g" % qp["fold_p95_max_deg"])
+    e5, e50, e95 = res["edge_mm_p5_p50_p95"]; gate("quality.edge_ratio_p95_p50", e95 / max(e50, 1e-9) <= qp["edge_ratio_p95_p50_max"], round(e95 / max(e50, 1e-9), 2), "<= %g" % qp["edge_ratio_p95_p50_max"], "edge mm p5 %.1f p50 %.1f p95 %.1f" % (e5, e50, e95))
+    # 4 symmetry : whole asset mirrored on x
+    from scipy.spatial import cKDTree
+    sy = prm["symmetry"]; body = np.isin(T, [i for i, n in enumerate(names) if str(n).startswith("CAR_body_") and "liner" not in str(n)])
+    pb = np.unique(I[np.repeat(body, C.astype(np.int64))]); Pb = P[pb]
+    dd = cKDTree(Pb * [-1, 1, 1]).query(Pb)[0] * 1000.0
+    gate("symmetry.mirror_p99_mm", float(np.percentile(dd, 99)) <= sy["mirror_p99_mm_max"], round(float(np.percentile(dd, 99)), 2), "<= %g mm" % sy["mirror_p99_mm_max"], "body points mirrored on x, nearest point distance")
+    gate("symmetry.mirror_max_mm", float(dd.max()) <= sy["mirror_max_mm_max"], round(float(dd.max()), 2), "<= %g mm" % sy["mirror_max_mm_max"])
+    # 5 shells, winding, separation
+    sh = shell_info(P, C, I, T, names); nm = prm["shells"]
+    miss = [r for r in ("hood", "decklid", "door_L", "door_R") if not any(("_" + r) in n or n.endswith(r) for n in sh)]
+    gate("rig.separate_panels", not miss, "missing " + ",".join(miss) if miss else "hood, decklid, door L R present", "all present", "doors, hood and decklid are separate named shells (hinge pivots can be set)")
+    bad = []
+    for n, s in sh.items():
+        if any(k in n for k in nm["closed_required"]) and s["open_edges"] > nm["open_edges_max"]: bad.append((n, s["open_edges"], s["open_at"]))
+    gate("rig.closed_shells", not bad, len(bad), "0 open parts among " + ",".join(nm["closed_required"]), "; ".join("%s %d open edges at %s" % b for b in bad[:6]))
+    neg = [(n, s["volume_m3"]) for n, s in sh.items() if s["open_edges"] == 0 and s["volume_m3"] < 0]
+    gate("rig.outward_normals", not neg, len(neg), "0 closed shell with negative volume", "; ".join("%s %.4f" % x for x in neg[:6]))
+    import re; rx = re.compile(prm["naming"]["pattern"]); badn = [str(n) for n in names if not str(n).startswith("CAR_") or not rx.search(str(n))]
+    gate("rig.naming", not badn, len(badn), "every part CAR_<group>_<name><_L|_R|_C|_FL..>", ", ".join(badn[:8]))
+    # 6 wheels : concentric on the axle, axis along x
+    wh = prm["wheels"]; wbad = []
+    for inst in wheels["instances"]:
+        tag = inst["tag"]; k = [i for i, n in enumerate(names) if str(n) == "CAR_wheel_tyre_" + tag]
+        if not k: wbad.append(tag + " tyre missing"); continue
+        fcs = np.flatnonzero(T == k[0]); pts = np.unique(np.concatenate([I[np.repeat(T == k[0], C.astype(np.int64))]])); Q = P[pts]
+        cy, cz = Q[:, 1].mean(), Q[:, 2].mean(); r = np.hypot(Q[:, 1] - inst["y"], Q[:, 2] - inst["z"])
+        tr = r > 0.98 * r.max(); dax = float(np.hypot(Q[tr, 1].mean() - inst["y"], Q[tr, 2].mean() - inst["z"])); rs = float(np.std(r[tr]))   # tread points only
+        if dax > wh["axle_tol_m"] or rs > wh["radius_std_m"]: wbad.append("%s axle off %.1f mm, radius std %.1f mm" % (tag, dax * 1000, rs * 1000))
+    gate("wheels.axle_pivot", not wbad, "ok" if not wbad else len(wbad), "centre within %g m of the axle, radius std <= %g m" % (wh["axle_tol_m"], wh["radius_std_m"]), "; ".join(wbad))
+    # 7 wheel arch ring : fault rate in the ring around each arch
+    ar = prm["arch"]; Rc = wheels["tyre_r"] * ar["pad"]; cen = [(i["y"], i["z"]) for i in wheels["instances"] if i["x"] > 0]
+    cent = np.zeros((len(C), 3)); C64 = C.astype(np.int64); fi = np.repeat(np.arange(len(C)), C64); np.add.at(cent, fi, P[I]); cent /= C64[:, None]
+    inr = np.zeros(len(C), bool)
+    for yc, zc in cen: inr |= (np.abs(cent[:, 0]) > 0.4) & (np.hypot(cent[:, 1] - yc, cent[:, 2] - zc) > Rc - 0.01) & (np.hypot(cent[:, 1] - yc, cent[:, 2] - zc) < Rc + ar["ring_m"]) & np.isin(T, [i for i, n in enumerate(names) if str(n).startswith("CAR_body_")])
+    rp = 100.0 * err[inr].mean() if inr.any() else 0.0
+    gate("arch.ring_fault_pct", rp <= ar["fault_pct_max"], round(float(rp), 2), "<= %g %%" % ar["fault_pct_max"], "%d faces in the %g m ring around the four arches" % (int(inr.sum()), ar["ring_m"]))
+    passed = sum(r["ok"] for r in R)
+    return {"_date": "26 October 2026", "passed": passed, "total": len(R), "all_pass": passed == len(R), "gates": R, "shells": sh, "topo": {k: res[k] for k in ("faces", "quad_pct", "tris", "ngons", "bad_poles", "error_faces", "score_clean")}}
+
+
+def write_md(rep, path, tag):
+    L = ["# AnimReview %s (26 October 2026 tool)" % tag, "", "Senior review gates : **%d of %d pass**%s." % (rep["passed"], rep["total"], "" if rep["all_pass"] else ", the asset is NOT yet signed off"), "",
+         "| Gate | Result | Measured | Limit | Note |", "|---|---|---|---|---|"]
+    for g in rep["gates"]: L.append("| %s | %s | %s | %s | %s |" % (g["gate"], "PASS" if g["ok"] else "FAIL", g["measured"], g["limit"], g["note"]))
+    op = [(n, s["open_edges"], s["open_at"]) for n, s in rep["shells"].items() if s["open_edges"] > 0]
+    L += ["", "Open parts (boundary edges) : %d of %d ; examples : %s" % (len(op), len(rep["shells"]), ", ".join("%s %d" % (a, b) for a, b, c in sorted(op, key=lambda x: -x[1])[:8]))]
+    open(path, "w").write("\n".join(L) + "\n")
+
+
+def selftest():
+    # green : two closed cube parts mirrored on x, named like the car ; red : an open part, a part off the ground
+    def cube(cx, cy, cz, s, name_id):
+        v = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], float) * s + [cx, cy, cz]
+        q = [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]]   # outward windings for this vertex order
+        return v, q
+    verts, quads, tid = [], [], []
+    for k, (cx, name) in enumerate(((0.9, "CAR_wheel_tyre_FL"), (-0.9, "CAR_wheel_tyre_FR"))):
+        v, q = cube(cx, 0.4, 1.3, 0.4, k); b = len(verts); verts += v.tolist(); quads += [[b + i for i in f] for f in q]; tid += [k] * 6
+    names = np.array(["CAR_wheel_tyre_FL", "CAR_wheel_tyre_FR"]); Pm = np.array(verts); Cm = np.full(len(quads), 4, np.int32); Im = np.array([i for f in quads for i in f], np.int32); Tm = np.array(tid, np.int32)
+    sh = shell_info(Pm, Cm, Im, Tm, names)
+    vols = [s["volume_m3"] for s in sh.values()]; closed_ok = all(s["open_edges"] == 0 for s in sh.values())
+    # open part : drop one face of the first cube
+    keep = np.ones(len(quads), bool); keep[0] = False
+    Q2 = [q for q, k in zip(quads, keep) if k]; C2 = np.full(len(Q2), 4, np.int32); I2 = np.array([i for f in Q2 for i in f], np.int32); T2 = Tm[keep]
+    sh2 = shell_info(Pm, C2, I2, T2, names); open_caught = sh2["CAR_wheel_tyre_FL"]["open_edges"] == 4
+    # a flipped (inside out) cube must read a negative volume
+    Q3 = [f[::-1] for f in quads]; I3 = np.array([i for f in Q3 for i in f], np.int32); sh3 = shell_info(Pm, Cm, I3, Tm, names)
+    flip_caught = sh3["CAR_wheel_tyre_FL"]["volume_m3"] * sh["CAR_wheel_tyre_FL"]["volume_m3"] < 0
+    out = {"closed_cubes_zero_open_edges": closed_ok, "outward_volume_positive": all(v > 0 for v in vols), "open_part_caught": open_caught, "inside_out_caught": flip_caught}
+    out["ok"] = all(out.values()); print(json.dumps(out)); return 0 if out["ok"] else 1
+
+
+def main():
+    if "--selftest" in sys.argv: sys.exit(selftest())
+    npz, tprm, wprm, out = sys.argv[1:5]
+    d = np.load(npz, allow_pickle=True); prm = load_review_params(tprm); topo_prm = TC.load_params(tprm); wheels = json.load(open(wprm))
+    if "C" in d.files: Pc, Cc, Ic, Tc, Nc = d["P"], d["C"], d["I"], d["T"], d["names"]
+    else:   # 26 October 2026: a polygon list (P, Q, names per polygon), the delivery file
+        Q_ = [list(map(int, q)) for q in d["Q"]]; Nc, Tc = np.unique(d["names"], return_inverse=True)
+        Pc, Cc, Ic = d["P"].astype(float), np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    json.dump(rep, open(out + ".json", "w"), indent=1); write_md(rep, out + ".md", os.path.basename(out))
+    print(json.dumps({"passed": rep["passed"], "total": rep["total"], "failed": [g["gate"] for g in rep["gates"] if not g["ok"]]}))
+
+
+if __name__ == "__main__":
+    main()

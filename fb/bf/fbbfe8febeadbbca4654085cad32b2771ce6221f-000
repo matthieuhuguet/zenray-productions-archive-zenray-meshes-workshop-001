@@ -3,20 +3,23 @@
 # drop polygons that collapse, ORIENT every connected piece consistently (breadth first over shared edges, the majority
 # winding of the piece is kept), and a closed piece outward (positive signed volume). Parts stay separate shells.
 # FR : réparation de topologie par pièce : soudure, faces effondrées, orientation cohérente (vers l'extérieur si fermé).
-# Usage: python TopoFix.py <in.npz> <out.npz> [weld_tol_m=1e-7]
+# Usage: python TopoFix.py <in.npz> <out.npz> [weld_tol_m=1e-7] [--across] [--nofix] [--cap=part1,part2] [--split5] [--obj=<out.obj>]
+#        --nofix keeps the polygons as they are (a topology export), --cap closes clipped thick panels (cap_ladder), --obj writes a grouped polygon OBJ
 #        python TopoFix.py --selftest
 import sys, json
 from collections import defaultdict, deque
 import numpy as np
 
 
-def weld(P, Q, N, tol=1e-7):
+def weld(P, Q, N, tol=1e-7, across=False):
+    """across : weld coincident points whatever their part (26 October 2026, a component made of one grid whose parts share
+    points, the tail face and its insets ; clamped rows left coincident points, TopoCheck cracks)."""
     key, remap, P2 = {}, np.empty(len(P), np.int64), []
     pn = [None] * len(P)
     for q, n in zip(Q, N):
         for v in q: pn[v] = n
     for i, p in enumerate(P):
-        k = (pn[i],) + tuple(int(round(c / tol)) for c in p)
+        k = (None if across else pn[i],) + tuple(int(round(c / tol)) for c in p)
         if k not in key: key[k] = len(P2); P2.append(p)
         remap[i] = key[k]
     Q2, N2 = [], []
@@ -62,10 +65,88 @@ def orient(P, Q, N):
     return Q, flips
 
 
-def fix(P, Q, N, tol=1e-7):
-    P2, Q2, N2 = weld(np.asarray(P, float), [list(map(int, q)) for q in Q], list(N), tol)
+def cap_ladder(P, Q, N, parts):
+    """26 October 2026 : CAP a thick panel cut open by a clip plane (the hood and decklid at the nose and tail cuts, AnimReview
+    rig.closed_shells). The open boundary of such a panel is ONE loop : the outer surface edge, a side wall edge, the inner
+    surface edge back, a side wall edge. The loop is read as two rows of equal length and the rows are bridged by quads (a ladder,
+    the same wall PolyExtrude gives the other borders), so the panel becomes a closed shell without an n-gon.
+    FR : fermeture d'un panneau épais coupé par un plan, échelle de quads entre ses deux surfaces."""
+    from collections import defaultdict
+    Q = [list(q) for q in Q]; N = list(N); added = 0; report = {}
+    for part in parts:
+        ids = [i for i, n in enumerate(N) if n == part]
+        if not ids: continue
+        cnt = defaultdict(int)
+        for i in ids:
+            q = Q[i]
+            for k in range(len(q)): cnt[(min(q[k], q[k - 1]), max(q[k], q[k - 1]))] += 1
+        adj = defaultdict(list)
+        for (a_, b_), c in cnt.items():
+            if c == 1: adj[a_].append(b_); adj[b_].append(a_)
+        seen = set(); loops = []
+        for v0 in list(adj):
+            if v0 in seen or len(adj[v0]) != 2: continue
+            loop = [v0]; seen.add(v0); prev = None; cur = v0
+            while True:
+                nx = [w for w in adj[cur] if w != prev]
+                if not nx or nx[0] == v0: break
+                prev, cur = cur, nx[0]
+                if cur in seen: break
+                loop.append(cur); seen.add(cur)
+            loops.append(loop)
+        report[part] = []
+        for loop in loops:
+            L = len(loop)
+            if L < 6 or L % 2: report[part].append({"loop": L, "skipped": "odd or short"}); continue
+            h = L // 2; best = None
+            for r in range(L):   # rotation that makes loop[r + k] face loop[r - 1 - k] across the thickness (shortest rungs)
+                tot = sum(float(np.linalg.norm(P[loop[(r + k) % L]] - P[loop[(r - 1 - k) % L]])) for k in range(h))
+                if best is None or tot < best[0]: best = (tot, r)
+            r = best[1]; A = [loop[(r + k) % L] for k in range(h)]; B = [loop[(r - 1 - k) % L] for k in range(h)]
+            for k in range(h - 1):
+                Q.append([A[k], A[k + 1], B[k + 1], B[k]]); N.append(part); added += 1
+            report[part].append({"loop": L, "rungs": h - 1, "mean_rung_mm": round(1000 * best[0] / h, 2)})
+    return Q, N, added, report
+
+
+def split_pentagons(P, Q, N):
+    """26 October 2026 : a pentagon (the Clip SOP leaves one where the plane cuts a corner of a quad) becomes one quad and one
+    triangle ; of the five ways to cut it, the quad whose corner angles are closest to 90 degrees is kept. Hexagons and more are
+    left and reported. FR : un pentagone devient un quad et un triangle, la coupe qui donne le quad le plus carré.
+    """
+    out_q, out_n, done, left = [], [], 0, 0
+    for q, n in zip(Q, N):
+        if len(q) != 5:
+            out_q.append(q); out_n.append(n); left += (len(q) > 5); continue
+        best = None
+        for r in range(5):
+            v = [q[(r + k) % 5] for k in range(5)]; A = np.array([P[i] for i in v[:4]])
+            ang = []
+            for k in range(4):
+                u, w = A[k - 1] - A[k], A[(k + 1) % 4] - A[k]; ang.append(np.degrees(np.arccos(np.clip(u @ w / (np.linalg.norm(u) * np.linalg.norm(w) + 1e-20), -1, 1))))
+            sc = max(abs(a_ - 90) for a_ in ang)
+            if best is None or sc < best[0]: best = (sc, v)
+        v = best[1]; out_q += [[v[0], v[1], v[2], v[3]], [v[0], v[3], v[4]]]; out_n += [n, n]; done += 1
+    return out_q, out_n, done, left
+
+
+def fix(P, Q, N, tol=1e-7, across=False):
+    P2, Q2, N2 = weld(np.asarray(P, float), [list(map(int, q)) for q in Q], list(N), tol, across)
     Q3, flips = orient(P2, Q2, N2)
     return P2, Q3, N2, {"points_in": len(P), "points_out": len(P2), "polys_in": len(Q), "polys_out": len(Q3), "flipped": flips}
+
+
+def write_obj(path, P, Q, N):
+    """26 October 2026 : polygon OBJ, one group per part (quads stay quads), the file a buyer opens in Maya, Blender or Houdini.
+    FR : OBJ en polygones, un groupe par pièce, les quads restent des quads."""
+    order = {}
+    for i, n in enumerate(N): order.setdefault(n, []).append(i)
+    with open(path, "w") as f:
+        f.write("# ZenRay Meshes delivery, 26 October 2026, metres, y up, forward +z\n")
+        for p_ in np.asarray(P, float): f.write("v %.6f %.6f %.6f\n" % tuple(p_))
+        for n, ids in sorted(order.items()):
+            f.write("g %s\n" % n)
+            for i in ids: f.write("f " + " ".join(str(v + 1) for v in Q[i]) + "\n")
 
 
 def save(out, P, Q, N):
@@ -85,10 +166,36 @@ def selftest():
     P3, Q3, _, st3 = fix(V, [q[::-1] for q in Q], ["CAR_cube_C"] * 6)
     vol3 = sum(np.dot(P3[q[0]], np.cross(P3[q[k]], P3[q[k + 1]])) / 6.0 for q in Q3 for k in range(1, len(q) - 1))
     ok3 = abs(vol3 - 1.0) < 1e-9
-    print(json.dumps({"weld_and_flip": bool(ok), "inside_out": bool(ok3), "ok": bool(ok and ok3)})); return 0 if ok and ok3 else 1
+    # cap : a thick plate (two 2 x 2 grids 0.1 apart) with side walls on three borders, the fourth border open : the ladder closes it
+    nxg = 3; Pp = np.array([[x, y, 0.0] for y in (0.0, 0.1) for x in range(nxg)] + [[x, y, 1.0] for y in (0.0, 0.1) for x in range(nxg)], float)
+    # points : layer y=0 z=0 : 0..2 ; layer y=0.1 z=0 : 3..5 ; y=0 z=1 : 6..8 ; y=0.1 z=1 : 9..11
+    Qp = [[0, 1, 7, 6], [1, 2, 8, 7], [3, 9, 10, 4], [4, 10, 11, 5], [0, 6, 9, 3], [2, 5, 11, 8],   # outer, inner, two side walls (x ends)
+          [6, 7, 10, 9], [7, 8, 11, 10]]   # side wall at z = 1 ; the z = 0 border (points 0..5) stays open
+    Qc, Nc, nadd, rep = cap_ladder(Pp, Qp, ["CAR_plate_C"] * len(Qp), ["CAR_plate_C"])
+    from collections import defaultdict
+    ec = defaultdict(int)
+    for q in Qc:
+        for k in range(len(q)): ec[(min(q[k], q[k - 1]), max(q[k], q[k - 1]))] += 1
+    cap_ok = nadd == 2 and all(c == 2 for c in ec.values())
+    print(json.dumps({"weld_and_flip": bool(ok), "inside_out": bool(ok3), "cap_closes_plate": bool(cap_ok), "ok": bool(ok and ok3 and cap_ok)})); return 0 if (ok and ok3 and cap_ok) else 1
 
 
 if __name__ == "__main__":
     if "--selftest" in sys.argv: sys.exit(selftest())
-    d = np.load(sys.argv[1], allow_pickle=True); tol = float(sys.argv[3]) if len(sys.argv) > 3 else 1e-7
-    P2, Q2, N2, st = fix(d["P"], d["Q"], d["names"], tol); save(sys.argv[2], P2, Q2, N2); print(json.dumps(st))
+    cap_arg = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--cap=")]
+    args_ = [a for a in sys.argv[1:] if not a.startswith("--")]
+    d = np.load(args_[0], allow_pickle=True); tol = float(args_[2]) if len(args_) > 2 else 1e-7
+    if "Q" in d.files: Pin, Qin, Nin = d["P"], d["Q"], list(d["names"])
+    else:   # a topology export (P, C, I, T, names) : rebuild polygons and a name per polygon
+        C_ = d["C"].astype(int); st_ = np.concatenate([[0], np.cumsum(C_)[:-1]]); Qin = [list(map(int, d["I"][s0:s0 + c])) for s0, c in zip(st_, C_)]; Nin = [str(d["names"][t]) for t in d["T"]]; Pin = d["P"]
+    if "--nofix" in sys.argv: P2, Q2, N2, st = np.asarray(Pin, float), [list(map(int, q)) for q in Qin], Nin, {"fix": "skipped"}
+    else: P2, Q2, N2, st = fix(Pin, Qin, Nin, tol, "--across" in sys.argv)
+    if "--split5" in sys.argv:
+        Q2, N2, n5, left = split_pentagons(P2, Q2, N2); st["pentagons_split"] = n5; st["polygons_over_5_left"] = left
+    if cap_arg:
+        Q2, N2, nadd, rep = cap_ladder(P2, Q2, N2, cap_arg[0].split(",")); st["cap_quads"] = nadd; st["cap"] = rep
+        if nadd: Q2, fl = orient(P2, Q2, N2); st["flipped_after_cap"] = fl
+    save(args_[1], P2, Q2, N2)
+    obj_arg = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--obj=")]
+    if obj_arg: write_obj(obj_arg[0], P2, Q2, N2); st["obj"] = obj_arg[0]
+    print(json.dumps(st))
