@@ -1,0 +1,54 @@
+# 26 October 2026 : radius error of the branch curves against the 3D truth skeleton of a synthetic tree. FR : erreur de rayon contre la vérité.
+# Usage : python RadiusTruthTest.py obj=tree_syn   (English identifiers, comments English first)
+import sys, json, numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts")
+import BranchLab as B, BranchMethods as M
+from scipy.spatial import cKDTree
+obj = "tree_syn"
+for a in sys.argv[1:]:
+    k, v = a.split("=")
+    if k == "obj": obj = v
+V, RL, E, geo, root, r_root = M.setup(obj)
+N, par = M.m20_staged(V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, tau2=0.2, sub2=4.5, avg2=0.25, tol=0.08)
+T = json.load(open("/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/%s/tree_w_truth_skeleton.json" % obj))
+tn = np.array(T["nodes"]); tr = np.array(T["radius"]); tt = cKDTree(tn)
+d, j = tt.query(N); rt = tr[j]
+ok = (d < 0.25) & (par >= 0)
+rr = B.radius_from_ridge(V, RL, N, par, r_root)
+print("n curve nodes", len(N), "matched", int(ok.sum()), "root r", round(r_root, 3), "truth root r", round(float(tr[0]), 3))
+bins = [(0.0, 0.05), (0.05, 0.1), (0.1, 0.2), (0.2, 0.4), (0.4, 2.0)]
+def rep(name, r):
+    out = []
+    for lo, hi in bins:
+        m = ok & (rt >= lo) & (rt < hi)
+        out.append("%.2f-%.2f n=%d med x%.2f mae_log %.2f" % (lo, hi, m.sum(), np.median(r[m] / rt[m]) if m.sum() else float("nan"), np.mean(np.abs(np.log(r[m] / rt[m]))) if m.sum() else float("nan")))
+    tot = np.mean(np.abs(np.log(np.maximum(r[ok], 1e-3) / rt[ok])))
+    print("%-34s total mae_log %.3f | %s" % (name, tot, " | ".join(out)))
+rep("ridge only", rr)
+best = None
+for expo in (1.6, 1.8, 2.0, 2.2, 2.4):
+    for tip in (0.01, 0.02, 0.03):
+        for rk in (0.8, 1.0):
+            rp = B.pipe_radius(par, r_root * rk, tip_r=tip, expo=expo); rp[par < 0] = r_root
+            tot = np.mean(np.abs(np.log(np.maximum(rp[ok], 1e-3) / rt[ok])))
+            if best is None or tot < best[0]: best = (tot, expo, tip, rk)
+            if (expo, tip, rk) in ((1.6, 0.02, 0.8), (2.0, 0.02, 1.0), (2.2, 0.02, 1.0)): rep("pipe e=%.1f tip=%.2f rk=%.1f" % (expo, tip, rk), rp)
+print("best pipe (mae_log, expo, tip, root_k):", best)
+rp = B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6); g = np.sqrt(rr * rp); g[par < 0] = r_root
+rep("current geometric mean", g)
+for w in (0.25, 0.5, 0.75):
+    rp2 = B.pipe_radius(par, r_root * best[3], tip_r=best[2], expo=best[1]); rp2[par < 0] = r_root
+    rep("blend w_ridge=%.2f (best pipe)" % w, np.exp(w * np.log(np.maximum(rr, 1e-3)) + (1 - w) * np.log(rp2)))
+rep("best pipe alone", rp2)
+
+# 26 October 2026 : thin branches trust the pipe model, thick ones the ridge scale, the weight follows the pipe estimate (never the truth). Parameters picked on one half of the nodes, checked on the other half. FR : poids selon l'estimation du tuyau.
+rp = B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6); rp[par < 0] = r_root
+idx = np.nonzero(ok)[0]; half = {0: idx[idx % 2 == 0], 1: idx[idx % 2 == 1]}
+def mae(r, ii): return float(np.mean(np.abs(np.log(np.maximum(r[ii], 1e-3) / rt[ii]))))
+res = []
+for a in (0.03, 0.05, 0.08):
+    for b in (0.12, 0.2, 0.3, 0.45):
+        w = np.clip((rp - a) / (b - a), 0, 1); r = np.exp((1 - w) * np.log(np.maximum(rp, 1e-3)) + w * np.log(np.maximum(rr, 1e-3))); r[par < 0] = r_root
+        res.append((mae(r, idx), mae(r, half[0]), mae(r, half[1]), a, b))
+res.sort(); print("rule  all  half0  half1   a  b    (current geometric mean : %.3f %.3f %.3f)" % (mae(g, idx), mae(g, half[0]), mae(g, half[1])))
+for x in res[:6]: print("%.3f %.3f %.3f  a=%.2f b=%.2f" % x)
