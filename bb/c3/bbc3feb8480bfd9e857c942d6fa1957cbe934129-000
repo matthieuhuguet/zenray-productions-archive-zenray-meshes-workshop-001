@@ -1,0 +1,63 @@
+# 26 October 2026 : ZenRay Meshes, WOOD SKELETON from 3D evidence (shared organic tool : any tree like object whose sheet shows its limbs).
+# EN: the wood evidence volume (Evidence3D.py, optionally cut by the top view) is closed, thinned to a one voxel skeleton (skimage skeletonize, 3D),
+# connected into a tree by shortest paths from the trunk top, spurs shorter than min_spur_m are removed, and every node gets the radius of the
+# evidence around it (euclidean distance transform) never larger than its parent's. The result replaces the space colonisation limbs when the
+# sheet already shows where the limbs are. FR : squelette du bois depuis l'évidence 3D, relié au haut du tronc, rayons par la transformée de distance.
+# Usage (module) : N, par, rad, tips = WoodSkeleton.build(evidence_npz, root_xyz, y_min, **opts)
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+
+
+def build(path, root, y_min, close_it=1, min_spur_m=0.8, rmin=0.04, rscale=1.0, join_m=1.2, y_cut_top=None):
+    e = np.load(path); occ = e["occ"].copy(); org = np.array(e["origin"], float); vx = float(e["voxel"]); root = np.asarray(root, float)
+    iy = int(np.floor((y_min - org[1]) / vx)); occ[:, :max(iy, 0), :] = False
+    if close_it: occ = ndi.binary_closing(occ, iterations=int(close_it)) | occ
+    lab, n = ndi.label(occ, structure=np.ones((3, 3, 3))); 
+    if n > 1:   # keep the components that come within join_m of the trunk top or of a kept component
+        sizes = ndi.sum(occ, lab, range(1, n + 1)); keep = [i + 1 for i, s in enumerate(sizes) if s >= 6]; occ = np.isin(lab, keep)
+    from skimage.morphology import skeletonize
+    sk = skeletonize(occ); ids = np.argwhere(sk); P = org + (ids + 0.5) * vx; dist = ndi.distance_transform_edt(occ) * vx; rad0 = dist[tuple(ids.T)]
+    if len(P) < 3: return np.array([root]), np.array([-1]), np.array([rmin]), []
+    # graph by neighbourhood, tree by Dijkstra from the skeleton point nearest to the root
+    import networkx as nx
+    t = cKDTree(P); pairs = t.query_pairs(vx * 1.75, output_type="ndarray"); G = nx.Graph()
+    G.add_nodes_from(range(len(P))); G.add_weighted_edges_from([(int(a), int(b), float(np.linalg.norm(P[a] - P[b]))) for a, b in pairs])
+    r0 = int(np.argmin(np.linalg.norm(P - root, axis=1))); comp = nx.node_connected_component(G, r0)
+    # other components within join_m of the main one are bridged by their closest pair
+    rest = [c for c in nx.connected_components(G) if r0 not in c]; main = np.array(sorted(comp)); tm = cKDTree(P[main])
+    for c in sorted(rest, key=len, reverse=True):
+        c = np.array(sorted(c)); d, j = tm.query(P[c]); k = int(np.argmin(d))
+        if d[k] <= join_m and len(c) >= 4: G.add_edge(int(c[k]), int(main[j[k]]), weight=float(d[k])); main = np.concatenate([main, c]); tm = cKDTree(P[main])
+    paths = nx.single_source_dijkstra_path(G, r0, weight="weight"); par = {r0: -1}
+    for node, pth in paths.items():
+        if len(pth) > 1: par[node] = pth[-2]
+    nodes = sorted(par); idx = {n_: i + 1 for i, n_ in enumerate(nodes)}   # index 0 is the trunk top
+    N = np.vstack([root, P[nodes]]); parent = np.array([-1] + [(idx[par[n_]] if par[n_] >= 0 else 0) for n_ in nodes]); rad = np.concatenate([[rad0[r0]], rad0[nodes]])
+    # remove spurs (leaf chains shorter than min_spur_m that end on a branching node), two passes
+    for _ in range(2):
+        ch = [[] for _ in N]
+        for i, q in enumerate(parent):
+            if q >= 0: ch[q].append(i)
+        drop = np.zeros(len(N), bool)
+        for i in range(1, len(N)):
+            if ch[i]: continue
+            chain, j, L = [i], i, 0.0
+            while parent[j] >= 0 and len(ch[parent[j]]) == 1 and parent[j] != 0: L += np.linalg.norm(N[j] - N[parent[j]]); j = parent[j]; chain.append(j)
+            if parent[j] >= 0 and len(ch[parent[j]]) > 1 and L + np.linalg.norm(N[j] - N[parent[j]]) < min_spur_m: drop[chain] = True
+        keep = ~drop; keep[0] = True; newi = -np.ones(len(N), int); newi[keep] = np.arange(keep.sum()); N = N[keep]; rad = rad[keep]; parent = np.array([newi[q] if q >= 0 else -1 for q in parent[keep]])
+    # radius : distance transform, floor rmin, never larger than the parent (walk from the root outward)
+    rad = np.maximum(rad * rscale, rmin); order = np.argsort(np.array([_depth(parent, i) for i in range(len(N))]))
+    for i in order:
+        if parent[i] >= 0: rad[i] = min(rad[i], rad[parent[i]])
+    ch = [[] for _ in N]
+    for i, q in enumerate(parent):
+        if q >= 0: ch[q].append(i)
+    tips = [i for i in range(len(N)) if not ch[i]]
+    return N, parent, rad, tips
+
+
+def _depth(parent, i):
+    d = 0
+    while parent[i] >= 0: i = parent[i]; d += 1
+    return d
