@@ -583,6 +583,53 @@ def main(params, prefix, out):
             near = np.isin(Qa2, bnd).any(1) | ((np.abs(cq[:, 0]) > x0) & (dq < Rc + C.get("arch_fold_ring_m", 0.03)))   # 26 October 2026: the whole ring, not only the boundary
             drop = near & (cosv < np.cos(np.radians(fmax)))
             Q = [q for q, k_ in zip(Q, drop) if not k_]; N = [n for n, k_ in zip(N, drop) if not k_]
+    # 26 October 2026: LOOP DECIMATION, the first move of the retopology : the shape is computed on dense stations (n_per_m),
+    # then every station loop whose removal moves the surface by less than tol_m is removed (greedy, each removed point
+    # within tol_m of the segment that replaces it, at most max_gap_m between two kept stations). A loop stays where any
+    # quad touching it is irregular (arch rings, cuts), where the coverage or the panel name changes (joints, door cut),
+    # and inside the wheel arch windows. Curved zones keep tight loops, flat zones open up, the shape does not move.
+    # FR : décimation de boucles : on retire les stations inutiles à la forme, à tol_m près.
+    LD = C.get("loop_decimate")
+    if LD and LD.get("on", 1):
+        Qa_ = np.array(Q); nT = len(t); st_q = Qa_ // R2; cl_q = Qa_ % R2
+        smin = st_q.min(1); reg = (st_q.max(1) - smin == 1) & ((st_q == smin[:, None]).sum(1) == 2)
+        bad_st = np.zeros(nT + 1, bool)
+        for qi in np.flatnonzero(~reg): bad_st[np.unique(st_q[qi])] = True
+        row_cov = [dict() for _ in range(nT)]
+        for qi in np.flatnonzero(reg): row_cov[smin[qi]][int(cl_q[qi][st_q[qi] == smin[qi]].min()) if True else 0] = N[qi]
+        Wp_ = json.load(open(os.path.join(os.path.dirname(os.path.abspath(params)), C.get("wheels", "wheel_params.json"))))
+        Ra_ = Wp_["tyre_r"] * C.get("arch_pad_cut", 1.14) + LD.get("arch_margin_m", 0.1)
+        zst = np.nanmedian(G2[:, :, 2], axis=1)
+        in_arch = np.zeros(nT, bool)
+        if LD.get("arch_exclude", 1):
+            for inst in Wp_["instances"]: in_arch |= np.abs(zst - inst["z"]) < Ra_
+        removable = np.zeros(nT, bool)
+        for i in range(1, nT - 1):
+            removable[i] = (not bad_st[i]) and (not in_arch[i]) and row_cov[i - 1] == row_cov[i] and len(row_cov[i]) > 0
+        used_cols = sorted(row_cov[0].keys()) if row_cov[0] else list(range(R2))
+        tol_, gmax_ = LD.get("tol_m", 0.0005), LD.get("max_gap_m", 0.04)
+        def seg_ok(a_, b_):
+            A0 = G2[a_]; B0 = G2[b_]; d_ = B0 - A0; L2 = (d_ * d_).sum(1) + 1e-20
+            if np.sqrt(L2).max() > gmax_: return False
+            for k_ in range(a_ + 1, b_):
+                v_ = G2[k_] - A0; tt = np.clip((v_ * d_).sum(1) / L2, 0, 1); e_ = np.linalg.norm(v_ - tt[:, None] * d_, axis=1)
+                if np.nanmax(e_) > tol_: return False
+            return True
+        keep = [0]; a_ = 0; i = 1
+        while i < nT - 1:
+            if removable[i] and seg_ok(a_, i + 1): i += 1; continue
+            keep.append(i); a_ = i; i += 1
+        keep.append(nT - 1); keep_s = set(keep); nxt = {}
+        for k0, k1 in zip(keep[:-1], keep[1:]): nxt[k0] = k1
+        Q2_, N2_ = [], []
+        for qi, (q, n_) in enumerate(zip(Q, N)):
+            if not reg[qi]: Q2_.append(q); N2_.append(n_); continue
+            i_ = smin[qi]
+            if i_ not in keep_s: continue
+            k1 = nxt.get(i_, i_ + 1)
+            Q2_.append(tuple(int(v - (i_ + 1) * R2 + k1 * R2) if v // R2 == i_ + 1 else int(v) for v in q)); N2_.append(n_)
+        Q, N = Q2_, N2_
+        print(json.dumps({"loop_decimate": {"stations": nT, "kept": len(keep), "removable": int(removable.sum())}}), file=sys.stderr)
     h = R // 2                                           # end caps between symmetric ring pairs, as the cage
     for i, flip, cap in ((0, True, panels[(S - 1) * R_orig]), (len(t) - 1, False, panels[(S - 1) * R_orig + R_orig // 2 - 1])):
         for j in range(h - 1):
