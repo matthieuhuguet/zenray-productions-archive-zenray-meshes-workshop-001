@@ -1,0 +1,189 @@
+# 26 October 2026 : ZenRay Meshes, BRANCH LAB, the fast common bench of the branch tournament (shared by every organic object).
+# EN: no render, no Houdini. A branch set is a list of 3D polylines with radii ; the bench projects it into the calibrated sheet views and judges it against SOFT ridge maps
+# of the reference photograph (multi scale ridge filter, no binary mask, relief kept), so a tournament of methods costs seconds. Car lesson (skill section 42) : few control points,
+# smooth by construction, measured on the sheet, one clean component first.
+# FR : banc commun du tournoi des méthodes de branches : courbes 3D projetées dans les vues calibrées, jugées contre des cartes de crêtes douces de la référence.
+# Usage : python BranchLab.py ridge <obj=tree>          -> writes work/<obj>/ridge_<view>.npy and versions/Ridge_<obj>.png (a look at the soft maps)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+SIDE = ("front", "back", "right", "left")
+
+
+class Views:
+    def __init__(self, obj="tree"):
+        self.obj = obj; prm = json.load(open(W + "work/%s/component_params.json" % obj)); self.Pt = prm["paths"]; self.meta = json.load(open(W + self.Pt["frame"] + "/frame.json"))
+        self.cal = json.load(open(W + self.Pt["cal"].format(obj=obj))); self.ms = json.load(open(W + self.Pt["measure"].format(obj=obj))); sh = json.load(open(W + self.Pt["views"] + "/sheet.json"))
+        self.idx = {p["name"]: p["index"] for p in sh["panels"]}; self.vm = {v["name"]: v for v in self.meta["views"]}
+        self.gray = {}; self.mask = {}
+        for vn in self.vm:
+            self.gray[vn] = np.asarray(Image.open(W + self.Pt["views"] + "/%02d_%s_rgb.png" % (self.idx[vn], vn)).convert("L")).astype(np.float32) / 255.0
+            self.mask[vn] = np.asarray(Image.open(W + self.Pt["frame"] + "/mask_%s.png" % vn)) > 127
+        self.crown_base = self.ms["trunk"]["crown_base_y"]; self.ppm = {vn: abs(self.cal[vn][0][0]) for vn in self.vm}
+
+    def project(self, vn, P):
+        P = np.asarray(P, float); v = self.vm[vn]; u = P @ np.array(v["rx"]); w = P @ np.array(v["uy"]); a, b = np.array(self.cal[vn][0]), np.array(self.cal[vn][1])
+        return a[0] * u + b[0], a[1] * w + b[1]
+
+    def ridge(self, vn, sigmas=(1.2, 2.0, 3.2, 5.0, 8.0, 12.0)):
+        # soft bright-ridge map in 0..1 inside the object mask, plus the sigma index of the best scale (thickness cue). FR : crêtes claires, multi échelle.
+        from skimage.filters import sato
+        g = self.gray[vn]; m = self.mask[vn]; g = np.where(m, g, np.median(g[m])); best = np.zeros_like(g); arg = np.zeros(g.shape, np.int8)
+        for i, s in enumerate(sigmas):
+            r = sato(g, sigmas=[s], black_ridges=False) * s ** 0.5; sel = r > best; best[sel] = r[sel]; arg[sel] = i
+        best = best * m; hi = np.percentile(best[m], 99.0); return np.clip(best / max(hi, 1e-6), 0, 1), arg
+
+
+def main_ridge(obj="tree"):
+    V = Views(obj); tiles = []
+    for vn in ("front", "back", "right", "left", "top", "bottom"):
+        R, a = V.ridge(vn); np.save(W + "work/%s/ridge_%s.npy" % (obj, vn), R.astype(np.float16)); np.save(W + "work/%s/ridgescale_%s.npy" % (obj, vn), a)
+        g = V.gray[vn]; tiles.append(np.concatenate([(g * 255).astype(np.uint8), (R * 255).astype(np.uint8)], 0))
+    H = max(t.shape[0] for t in tiles); Wd = max(t.shape[1] for t in tiles); im = np.concatenate([np.pad(t, ((0, H - t.shape[0]), (0, Wd - t.shape[1]))) for t in tiles], 1)
+    for vn in ("front", "back", "right", "left", "top", "bottom"):   # visible wood by ridge (soft source, one threshold), read by TreeGrow carve_mask=ridgewood. FR : bois visible par les crêtes.
+        R_ = np.load(W + "work/%s/ridge_%s.npy" % (obj, vn)).astype(np.float32); A_ = np.load(W + "work/%s/ridgescale_%s.npy" % (obj, vn)); Image.fromarray((((R_ >= 0.45) & (A_ >= 1)) * 255).astype(np.uint8)).save(W + "work/%s/views/ridgewood_%s.png" % (obj, vn))
+    Image.fromarray(im).save(W + "versions/Ridge_%s.png" % obj); print("ridge maps", im.shape)
+
+
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# bench : soft ridge maps, evidence volume, tree graph, score, overlay board. A tree graph is (nodes (N,3), parent (N,), radius (N,)). FR : banc, volume d'évidence, score, planche.
+SIGMAS = (1.2, 2.0, 3.2, 5.0, 8.0, 12.0)
+LENGTH_BUDGET_M = 150.0
+ALL5 = ("front", "back", "right", "left", "top", "bottom")
+
+
+def load_ridge(obj="tree"):
+    R, A = {}, {}
+    for vn in ALL5:
+        R[vn] = np.load(W + "work/%s/ridge_%s.npy" % (obj, vn)).astype(np.float32); A[vn] = np.load(W + "work/%s/ridgescale_%s.npy" % (obj, vn))
+    return R, A
+
+
+def limb_map(R, A, kmin=1):
+    return {vn: R[vn] * (A[vn] >= kmin) for vn in R}
+
+
+def _sample(M, py, px):
+    from scipy.ndimage import map_coordinates
+    return map_coordinates(M, [py, px], order=1, mode="constant", cval=0.0)
+
+
+def evidence_volume(V, RL, h=0.1, y0=None, pair="max", comb="min"):
+    # soft AND of three view pairs : max(front, back) over (x, y), max(right, left) over (z, y), max(top, bottom) over (x, z). FR : ET doux de trois couples de vues.
+    lo = np.array(V.meta["lo"]); D = np.array(V.meta["dims_m"]); y0 = lo[1] if y0 is None else y0
+    xs = lo[0] + (np.arange(int(D[0] / h)) + 0.5) * h; ys = y0 + (np.arange(int((lo[1] + D[1] - y0) / h)) + 0.5) * h; zs = lo[2] + (np.arange(int(D[2] / h)) + 0.5) * h
+    X, Y = np.meshgrid(xs, ys, indexing="ij"); P = np.stack([X.ravel(), Y.ravel(), np.zeros(X.size)], 1)
+    pf = np.maximum if pair == "max" else np.minimum   # opposite views : max keeps a limb seen from one side, min demands both (truth AUC 0.57 for max, 0.86 for min at thick scale, 26 October 2026)
+    Fxy = pf(*[_sample(RL[v], *V.project(v, P)[::-1]).reshape(X.shape) for v in ("front", "back")])
+    Z, Y2 = np.meshgrid(zs, ys, indexing="ij"); P = np.stack([np.zeros(Z.size), Y2.ravel(), Z.ravel()], 1)
+    Fzy = pf(*[_sample(RL[v], *V.project(v, P)[::-1]).reshape(Z.shape) for v in ("right", "left")])
+    X3, Z3 = np.meshgrid(xs, zs, indexing="ij"); P = np.stack([X3.ravel(), np.zeros(X3.size), Z3.ravel()], 1)
+    Txz = pf(*[_sample(RL[v], *V.project(v, P)[::-1]).reshape(X3.shape) for v in ("top", "bottom")])
+    a_, b_, c_ = Fxy[:, :, None], Fzy.T[None, :, :], Txz[:, None, :]; E = np.minimum(np.minimum(a_, b_), c_) if comb == "min" else np.cbrt(a_ * b_ * c_); return E.astype(np.float32), (xs[0], ys[0], zs[0], h)
+
+
+def prune_depth_leaves(nodes, parent):
+    return nodes, parent
+
+
+def pipe_radius(parent, r_root, tip_r=0.02, expo=2.2):
+    # pipe model : the cross section area of a branch is the sum of its children's ; tips get tip_r, the root is rescaled to r_root. FR : modèle des tuyaux.
+    N = len(parent); kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    r = np.zeros(N); order = []; st = [i for i in range(N) if parent[i] < 0]
+    while st:
+        i = st.pop(); order.append(i); st.extend(kids[i])
+    for i in reversed(order):
+        r[i] = tip_r if not kids[i] else (sum(r[k] ** expo for k in kids[i])) ** (1.0 / expo)
+    roots = [i for i in range(N) if parent[i] < 0]; k = r_root / max(r[roots[0]], 1e-9); return r * k
+
+
+def radius_from_ridge(V, RL, nodes, parent, r_root, k=1.73, r_min=0.03):
+    # radius = sqrt(3) x the sato scale of the strongest ridge under the node, median over the views that see it, then forced to taper from the root. FR : rayon lu sur l'échelle de la crête.
+    from scipy.ndimage import maximum_filter
+    N = len(nodes); est = np.full((N, 6), np.nan)
+    for j, vn in enumerate(("front", "back", "right", "left", "top", "bottom")):
+        M = RL[vn]; A = V.ridge_arg[vn]; Mx = maximum_filter(M, size=5); px, py = V.project(vn, nodes); ix = np.round(px).astype(int); iy = np.round(py).astype(int); ok = (ix >= 2) & (ix < M.shape[1] - 2) & (iy >= 2) & (iy < M.shape[0] - 2)
+        for i in np.nonzero(ok)[0]:
+            win = M[iy[i] - 2: iy[i] + 3, ix[i] - 2: ix[i] + 3]; m = win.max()
+            if m >= 0.3: a = np.unravel_index(win.argmax(), win.shape); est[i, j] = SIGMAS[A[iy[i] - 2 + a[0], ix[i] - 2 + a[1]]] * k / V.ppm[vn]
+    r = np.nanmedian(np.where(np.isnan(est), np.nan, est), axis=1) if np.isfinite(est).any() else np.full(N, r_min)
+    order = []; kids = [[] for _ in range(N)]
+    for i, p_ in enumerate(parent):
+        if p_ >= 0: kids[p_].append(i)
+    st = [i for i in range(N) if parent[i] < 0]
+    while st:
+        i = st.pop(); order.append(i); st.extend(kids[i])
+    for i in order:   # top down : fill gaps from the parent, never thicker than the parent, floor r_min
+        r[i] = r_root if parent[i] < 0 else (r[parent[i]] if np.isnan(r[i]) else min(r[i], r[parent[i]]))
+        r[i] = max(r[i], r_min) if parent[i] >= 0 else r[i]
+    for _ in range(3):   # light smoothing along every parent child pair, then the taper is enforced again
+        for i in order:
+            if parent[i] >= 0: r[i] = min(0.5 * r[i] + 0.5 * r[parent[i]], r[parent[i]])
+    return r
+
+
+def densify(nodes, parent, step=0.05):
+    pts = []
+    for i, p_ in enumerate(parent):
+        if p_ < 0: continue
+        a, b = nodes[p_], nodes[i]; n = max(int(np.linalg.norm(b - a) / step), 1); pts.append(a[None] + (b - a)[None] * (np.arange(n + 1) / n)[:, None])
+    return np.concatenate(pts, 0) if pts else np.zeros((0, 3))
+
+
+def score(V, RL, nodes, parent, radius, ymin=None, tol_px=2):
+    # precision : sampled model points that sit on a limb ridge ; recall : thick and medium ridge mass covered by the drawn model ; F = harmonic. FR : précision, rappel, F.
+    from scipy.ndimage import maximum_filter, binary_dilation
+    from PIL import ImageDraw
+    ymin = V.crown_base - 0.3 if ymin is None else ymin; out = {}; Ps = []; Rt = []; Rm = []; pts = densify(nodes, parent)
+    for vn in ("front", "back", "right", "left", "top", "bottom"):
+        M = RL[vn]; Mx = maximum_filter(M, size=3); sh = M.shape
+        keep = pts[:, 1] >= ymin; px, py = V.project(vn, pts[keep]); ok = (px >= 0) & (px < sh[1] - 1) & (py >= 0) & (py < sh[0] - 1); hit = _sample(Mx, py[ok], px[ok])
+        prec = float(np.mean(np.clip(hit / 0.5, 0, 1))) if len(hit) else 0.0
+        cv = Image.new("L", (sh[1], sh[0]), 0); d = ImageDraw.Draw(cv)
+        for i, p_ in enumerate(parent):
+            if p_ < 0 or nodes[i][1] < ymin: continue
+            ax, ay = V.project(vn, nodes[p_][None]); bx, by = V.project(vn, nodes[i][None]); d.line([(float(ax[0]), float(ay[0])), (float(bx[0]), float(by[0]))], fill=255, width=3)   # fixed width : the recall judges the centreline, the radius is judged apart
+        cvm = binary_dilation(np.asarray(cv) > 0, iterations=tol_px)
+        if vn in ("front", "back", "right", "left"):
+            rows = np.zeros(sh[0], bool); rows[: int(round(V.cal[vn][0][1] * ymin + V.cal[vn][1][1])) + 1] = True; rows = rows[:, None]
+        else: rows = np.ones((sh[0], 1), bool)
+        A = V.ridge_arg[vn]; thick = (M >= 0.5) & (A >= 3) & rows; med = (M >= 0.5) & (A >= 1) & (A < 3) & rows
+        rt = float((thick & cvm).sum() / max(thick.sum(), 1)); rm = float((med & cvm).sum() / max(med.sum(), 1)); Ps.append(prec); Rt.append(rt); Rm.append(rm); out[vn] = (round(prec, 3), round(rt, 3), round(rm, 3))
+    P_, Rt_, Rm_ = float(np.mean(Ps)), float(np.mean(Rt)), float(np.mean(Rm)); Rr = 0.6 * Rt_ + 0.4 * Rm_; F = 2 * P_ * Rr / max(P_ + Rr, 1e-9)
+    out.update({"precision": round(P_, 3), "recall_thick": round(Rt_, 3), "recall_med": round(Rm_, 3), "F": round(F, 3), "n_nodes": int(len(nodes)), "length_m": round(float(np.sum([np.linalg.norm(nodes[i] - nodes[p_]) for i, p_ in enumerate(parent) if p_ >= 0])), 1)})
+    out["G"] = round(F / max(1.0, out["length_m"] / LENGTH_BUDGET_M), 3); return out   # complexity prior : the reference limb ridges are about 20 to 70 m of 2D skeleton per view (measured 26 October 2026), so 150 m of 3D limbs and twigs is the budget
+
+
+def board(V, nodes, parent, radius, path, title, ymin=None):
+    # the reference photograph dimmed, the model branches drawn on it in colour by height, width true to the radius : the picture sent to Matthieu. FR : planche de recouvrement.
+    from PIL import ImageDraw
+    ymin = V.crown_base - 0.3 if ymin is None else ymin; tiles = []
+    for vn in ("front", "back", "right", "left", "top", "bottom"):
+        g = (V.gray[vn] * 200).astype(np.uint8); im = Image.fromarray(np.stack([g] * 3, -1)); d = ImageDraw.Draw(im)
+        for i, p_ in enumerate(parent):
+            if p_ < 0 or nodes[i][1] < ymin: continue
+            ax, ay = V.project(vn, nodes[p_][None]); bx, by = V.project(vn, nodes[i][None]); t = np.clip((nodes[i][1] - ymin) / 10.0, 0, 1); col = (int(255 * t), int(220 - 120 * t), int(255 * (1 - t))); w = max(1, int(round(2 * radius[i] * V.ppm[vn])))
+            d.line([(float(ax[0]), float(ay[0])), (float(bx[0]), float(by[0]))], fill=col, width=w)
+        tiles.append(np.asarray(im))
+    H = max(t.shape[0] for t in tiles); Wd = max(t.shape[1] for t in tiles); im = Image.fromarray(np.concatenate([np.pad(t, ((0, H - t.shape[0]), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 1)); ImageDraw.Draw(im).text((6, 4), title, fill=(255, 255, 0)); im.save(path)
+
+
+def _views_with_arg(obj="tree"):
+    V = Views(obj); V.obj = obj; R, A = load_ridge(obj); V.ridge_arg = A; return V, R, A
+
+
+def bench_tag(tag, obj="tree"):
+    # score the branches of a built tree version from its skeleton file, with the same judge as the tournament. FR : même juge pour une version construite.
+    V, R, A = _views_with_arg(obj); RL = limb_map(R, A, 1); sk = json.load(open(W + "work/%s/tree_%s_skeleton.json" % (obj, tag))); N = np.array(sk["nodes"]); par = np.array(sk["parent"]); rad = np.array(sk["radius"])
+    s = score(V, RL, N, par, rad); print(json.dumps({k: s[k] for k in ("G", "F", "precision", "recall_thick", "recall_med", "n_nodes", "length_m")}))
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "ridge": main_ridge(*sys.argv[2:])
+    elif sys.argv[1] == "bench": bench_tag(*sys.argv[2:])
