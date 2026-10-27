@@ -1,0 +1,41 @@
+"""27 October 2026 : ZenRay Meshes, GAP MAP of a delivery against the six-view reference sheet.
+For each view : the missing pixels (reference, not the model), the extra pixels (model, not the reference), their biggest blobs,
+and each blob's centre in metres along the two axes of the view (the same frame SheetScore uses). Writes JSON.
+Usage: python GapMap.py <frame_dir> <views_dir> <mesh.obj> <out.json>
+FR : carte des écarts par vue : pixels manquants, pixels en trop, plus gros îlots en mètres sur les axes de la vue."""
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+import Raster, SheetScore as SS
+
+fdir, vdir, mesh_path, out = sys.argv[1:5]
+meta = json.load(open(os.path.join(fdir, "frame.json")))
+mesh = trimesh.load(mesh_path, force="mesh", process=False)
+mr = Raster.Renderer(mesh.vertices, mesh.faces)
+report = {}
+for v in meta["views"]:
+    mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+    M, _ = SS.render_in_panel(mr, meta, v, mref.shape)
+    M = ndi.binary_fill_holes(M)
+    R = int(max(mref.shape)); s = v["px_per_m"]
+    miss = mref & ~M; extra = M & ~mref
+    def blobs(mask, k=5):
+        lab, n = ndi.label(mask)
+        if n == 0: return []
+        sizes = ndi.sum(mask, lab, range(1, n + 1)); order = np.argsort(-sizes)[:k]
+        res = []
+        for i in order:
+            ys, xs = np.nonzero(lab == i + 1)
+            cx, cy = xs.mean(), ys.mean()
+            res.append({"px": int(sizes[i]), "centre_px": [round(float(cx)), round(float(cy))],
+                        "bbox_px": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]})
+        return res
+    report[v["name"]] = {"axes": [v.get("rx"), v.get("uy")], "iou": round(float((M & mref).sum() / max((M | mref).sum(), 1)), 4),
+                         "missing_px": int(miss.sum()), "extra_px": int(extra.sum()), "ref_px": int(mref.sum()),
+                         "missing_blobs": blobs(miss), "extra_blobs": blobs(extra), "shape": list(mref.shape), "px_per_m": s}
+mr.release()
+json.dump(report, open(out, "w"), indent=1, ensure_ascii=False)
+for k, r in report.items():
+    print(k, "iou", r["iou"], "missing", r["missing_px"], "extra", r["extra_px"], "biggest missing", [b["px"] for b in r["missing_blobs"][:3]])

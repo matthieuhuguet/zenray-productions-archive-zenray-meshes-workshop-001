@@ -1,0 +1,57 @@
+"""27 October 2026 : ZenRay Meshes, HOOD GUIDES from the six-view reference (archetype method, not a mask fit).
+Measures, from two orthogonal views of the sheet, the hood's height profile y_top(z) (right view, silhouette top)
+and its half width x_half(z) (top view, mask extent across), with the frame mapping of SheetScore (checked against the render).
+Compares them with the current hood of a delivery. Usage: python HoodGuides.py <delivery.npz> <out.json>
+FR : profils de capot mesurés sur deux vues orthogonales, comparés au capot actuel."""
+import sys, json, numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+meta = json.load(open(W + "/work/car/frame/frame.json"))
+lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+V = {v["name"]: v for v in meta["views"]}
+def frame(v, shape):
+    rx, uy = np.array(v["rx"]), np.array(v["uy"])
+    a = int(np.argmax(np.abs(rx))); b = int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]; R = int(max(shape))
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    cu = umin + D[a] / 2 + (R / 2 - xc) / s; cv = vmax - D[b] / 2 + (yc - R / 2) / s
+    return cu, cv, s, R
+def mask(name): return np.asarray(Image.open(W + "/work/car/frame/mask_%s.png" % name)) > 127
+# side view (right) : horizontal = z, vertical = y ; top view : horizontal = -z, vertical = x
+m = mask("right"); cu, cv, s, R = frame(V["right"], m.shape)
+zs = []; ytop = []
+for px in range(m.shape[1]):
+    col = np.nonzero(m[:, px])[0]
+    if col.size == 0: continue
+    zs.append(cu + (px - R / 2) / s); ytop.append(cv - (col.min() - R / 2) / s)
+zs = np.array(zs); ytop = np.array(ytop)
+mt = mask("top"); cu2, cv2, s2, R2 = frame(V["top"], mt.shape)
+zt = []; half = []
+for px in range(mt.shape[1]):
+    rows = np.nonzero(mt[:, px])[0]
+    if rows.size == 0: continue
+    xs = cv2 - (rows - R2 / 2) / s2
+    zt.append(-(cu2 + (px - R2 / 2) / s2)); half.append(max(abs(xs.min()), abs(xs.max())))
+zt = np.array(zt); half = np.array(half)
+def at(arr_z, arr_v, z): return float(np.interp(z, arr_z[np.argsort(arr_z)], arr_v[np.argsort(arr_z)]))
+out = {"reference": []}
+for z in np.arange(-0.6, 2.31, 0.2):
+    out["reference"].append({"z": round(float(z), 2), "y_top": round(at(zs, ytop, z), 3), "x_half": round(at(zt, half, z), 3)})
+# current hood of the delivery
+if len(sys.argv) > 1:
+    d = np.load(sys.argv[1], allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    idx = [i for i, n in enumerate(names) if n == "CAR_body_hood_C"]
+    vs = sorted({v for i in idx for v in d["Q"][i]}); H = P[vs]
+    cur = []
+    for z in np.arange(-0.6, 2.31, 0.2):
+        sel = H[np.abs(H[:, 2] - z) < 0.05]
+        cur.append({"z": round(float(z), 2), "y_top": round(float(sel[:, 1].max()), 3) if len(sel) else None,
+                    "x_half": round(float(np.abs(sel[:, 0]).max()), 3) if len(sel) else None})
+    out["current"] = cur
+json.dump(out, open(sys.argv[2] if len(sys.argv) > 2 else W + "/Reports/hood_guides.json", "w"), indent=1)
+print("z      ref_y_top ref_x_half | cur_y_top cur_x_half")
+for i, r in enumerate(out["reference"]):
+    c = out.get("current", [{}] * len(out["reference"]))[i]
+    print(f"{r['z']:+.2f}  {r['y_top']:.3f}     {r['x_half']:.3f}    | {c.get('y_top')}  {c.get('x_half')}")
