@@ -1,0 +1,142 @@
+# 27 October 2026: ZenRay Meshes, BuildCleanFrontHood.py
+# Clean front of hood with measured shutline at Z = 2.1935 m, eliminating all overlapping layers and orphan remnants.
+import os, sys, json
+from scipy.spatial import cKDTree
+import numpy as np
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, os.path.join(W, "Scripts"))
+import AnimReview, TopoCheck as TC, RelaxQuads, PlanarizeQuads
+
+def build_delivery_v546():
+    inp_npz = os.path.join(W, "work/car/delivery_v545.npz")
+    out_npz = os.path.join(W, "work/car/delivery_v546.npz")
+    out_obj = os.path.join(W, "versions/ZenRayCar_v546.obj")
+
+    d = np.load(inp_npz, allow_pickle=True)
+    P = d["P"].astype(float).copy()
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+    names = [str(n) for n in d["names"]]
+
+    # 1. Generate clean closed Hood shell from Z=1.56 to Z=2.1935
+    nu, nv = 25, 17
+    thickness_m = 0.012
+
+    z_pts = np.linspace(1.56, 2.1935, nu)
+    t_full = (z_pts - 1.56) / (2.26 - 1.56)
+    y_center = 0.865 - 0.340 * (t_full ** 1.35)
+    x_edge = 0.646 + 0.105 * (t_full ** 0.8)
+    y_edge = 0.858 - 0.343 * (t_full ** 1.25)
+    x_crease = x_edge * 0.48
+
+    p_grid = np.zeros((nu, nv, 3))
+    for i in range(nu):
+        z = z_pts[i]; yc = y_center[i]; ye = y_edge[i]; xe = x_edge[i]; xc = x_crease[i]
+        xs = np.linspace(-xe, xe, nv)
+        ctrl_x = np.array([-xe, -xc, 0.0, xc, xe])
+        ctrl_y = np.array([ye, yc - 0.006, yc, yc - 0.006, ye])
+        ys = np.interp(xs, ctrl_x, ctrl_y)
+        for j in range(nv):
+            p_grid[i, j] = [xs[j], ys[j], z]
+
+    du = np.gradient(p_grid, axis=0); dv = np.gradient(p_grid, axis=1)
+    normals = np.cross(du, dv)
+    normals /= np.maximum(np.linalg.norm(normals, axis=2, keepdims=True), 1e-12)
+    if normals[:, :, 1].mean() < 0:
+        normals *= -1
+
+    outer = p_grid
+    inner = p_grid - thickness_m * normals
+
+    hood_pts = np.vstack([outer.reshape(-1, 3), inner.reshape(-1, 3)])
+    hood_pt_offset = len(P)
+    P = np.vstack([P, hood_pts])
+
+    a, b = nu, nv
+    offset = a * b
+    hood_faces = []
+    for i in range(a - 1):
+        for j in range(b - 1):
+            q = [hood_pt_offset + (i * b + j),
+                 hood_pt_offset + ((i + 1) * b + j),
+                 hood_pt_offset + ((i + 1) * b + j + 1),
+                 hood_pt_offset + (i * b + j + 1)]
+            hood_faces.append(q)
+            hood_faces.append([hood_pt_offset + (x - hood_pt_offset + offset) for x in q[::-1]])
+
+    border = list(range(b)) + [i * b + b - 1 for i in range(1, a)] + [(a - 1) * b + j for j in range(b - 2, -1, -1)] + [i * b for i in range(a - 2, 0, -1)]
+    for c, d_ in zip(border, border[1:] + border[:1]):
+        hood_faces.append([hood_pt_offset + c, hood_pt_offset + d_, hood_pt_offset + (d_ + offset), hood_pt_offset + (c + offset)])
+
+    # 2. Filter out old hood and all 20 orphan nose facet remnants
+    keep_idx = [i for i, n in enumerate(names) if n != "CAR_body_hood_C" and "nose" not in n]
+    final_Q = [Q_[i] for i in keep_idx] + hood_faces
+    final_names = [("CAR_liner_cabin_C" if names[i] == "CAR_body_liner_C" else names[i]) for i in keep_idx] + ["CAR_body_hood_C"] * len(hood_faces)
+
+    # 3. Compact vertex indices
+    used_v = np.unique([v for q in final_Q for v in q])
+    v_map = {old: new for new, old in enumerate(used_v)}
+    clean_P = P[used_v]
+    clean_Q = [[v_map[v] for v in q] for q in final_Q]
+
+    nP = len(clean_P)
+    Cc = np.array([len(q) for q in clean_Q], np.int32)
+    Ic = np.array([v for q in clean_Q for v in q], np.int32)
+    C64 = Cc.astype(np.int64); st = np.concatenate([[0], np.cumsum(C64)[:-1]])
+    qs = np.flatnonzero(Cc == 4); Q4 = Ic[st[qs][:, None] + np.arange(4)]
+
+    def fix_sym(P_in):
+        body_parts = [n for n in set(final_names) if str(n).startswith("CAR_body_") and "liner" not in str(n)]
+        body_faces_idx = [i for i, n in enumerate(final_names) if n in body_parts]
+        v_to_part = {}
+        for i in body_faces_idx:
+            for v in clean_Q[i]: v_to_part[v] = final_names[i]
+        pb = sorted(v_to_part.keys())
+        Pb = P_in[pb]
+        tree = cKDTree(Pb * [-1, 1, 1])
+        dd, ii = tree.query(Pb)
+        bad = np.where(dd * 1000.0 > 8.0)[0]
+        for idx in bad:
+            v_orig = pb[idx]; v_mirror_idx = pb[ii[idx]]
+            target = np.array([-P_in[v_mirror_idx, 0], P_in[v_mirror_idx, 1], P_in[v_mirror_idx, 2]])
+            P_in[v_orig] = 0.5 * (P_in[v_orig] + target)
+            P_in[v_mirror_idx] = 0.5 * (P_in[v_mirror_idx] + np.array([-P_in[v_orig, 0], P_in[v_orig, 1], P_in[v_orig, 2]]))
+        return P_in
+
+    # 4. Multi-pass regular moves for quad angles
+    cur_P = clean_P.copy()
+    tp_file = os.path.join(W, "work/car/topo_params.json")
+    for step_i in range(8):
+        dev_thresh = 40.0 if step_i < 5 else 35.0
+        acc = RelaxQuads.regular_moves(cur_P, Q4, nP, dev_min_deg=dev_thresh)
+        vn = np.zeros((nP, 3))
+        v = cur_P[Q4]
+        f4 = np.cross(v[:, 2] - v[:, 0], v[:, 3] - v[:, 1])
+        f4 /= np.linalg.norm(f4, axis=1, keepdims=True) + 1e-30
+        for k in range(4): np.add.at(vn, Q4[:, k], f4)
+        vn /= np.linalg.norm(vn, axis=1, keepdims=True) + 1e-30
+        acc -= (acc * vn).sum(1)[:, None] * vn
+        dist = np.linalg.norm(acc, axis=1)
+        over = dist > 0.002
+        if over.any(): acc[over] *= (0.002 / dist[over])[:, None]
+        P_cand = cur_P + 0.4 * acc
+        P_cand = fix_sym(P_cand)
+        P_guarded, e0, e1, rounds = RelaxQuads.guard(cur_P, P_cand, clean_Q, final_names, tp_file, 30, RelaxQuads.mirror_map(cur_P))
+        cur_P = fix_sym(P_guarded)
+
+    # 5. Planarize quads
+    P_plan, _, _, _ = PlanarizeQuads.planarize(cur_P, clean_Q, max_m=0.005, step=0.35, iters=40, target_deg=5.5)
+    P_plan = fix_sym(P_plan)
+    P_guarded, e0, e1, rounds = PlanarizeQuads.guard(cur_P, P_plan, clean_Q, final_names, tp_file, 30, RelaxQuads.mirror_map(cur_P))
+    cur_P = fix_sym(P_guarded)
+
+    # 6. Save delivery files
+    np.savez(out_npz, P=cur_P.astype(np.float32), Q=np.array(clean_Q, dtype=object), names=np.array(final_names))
+    print(f"Saved {out_npz}")
+
+    import TopoFix
+    TopoFix.write_obj(out_obj, cur_P, clean_Q, final_names)
+    print(f"Saved {out_obj}")
+
+if __name__ == "__main__":
+    build_delivery_v546()
