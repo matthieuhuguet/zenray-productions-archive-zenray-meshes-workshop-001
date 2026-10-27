@@ -1,0 +1,57 @@
+# 27 October 2026: Convert native NURBSSurface into closed watertight Lego quad shell
+import hou, numpy as np
+
+node = hou.pwd()
+in_geo = node.inputs()[0].geometry()
+geo = node.geometry()
+geo.clear()
+
+surface = in_geo.prims()[0]
+nu = 25 # 24 quad segments along Z
+nv = 17 # 16 quad segments along X
+thickness_m = 0.012
+
+u_vals = np.linspace(0, 1, nu)
+v_vals = np.linspace(0, 1, nv)
+
+p = np.array([[surface.positionAt(float(u), float(v)) for v in v_vals] for u in u_vals])
+a, b = p.shape[:2]
+
+# Compute normals from surface tangents:
+du = np.gradient(p, axis=0)
+dv = np.gradient(p, axis=1)
+normals = np.cross(du, dv)
+normals /= np.maximum(np.linalg.norm(normals, axis=2, keepdims=True), 1e-12)
+# Ensure normal points upwards (positive Y):
+if normals[:,:,1].mean() < 0:
+    normals *= -1
+
+outer = p
+inner = p - thickness_m * normals
+
+pts = np.vstack([outer.reshape(-1, 3), inner.reshape(-1, 3)])
+points = geo.createPoints([hou.Vector3(*pt) for pt in pts])
+offset = a * b
+
+faces = []
+for i in range(a - 1):
+    for j in range(b - 1):
+        q = [i * b + j, (i + 1) * b + j, (i + 1) * b + j + 1, i * b + j + 1]
+        faces.append(q) # outer face
+        faces.append([x + offset for x in q[::-1]]) # inner face (reversed)
+
+# Border quads:
+border = list(range(b)) + [i * b + b - 1 for i in range(1, a)] + [(a - 1) * b + j for j in range(b - 2, -1, -1)] + [i * b for i in range(a - 2, 0, -1)]
+for c, d in zip(border, border[1:] + border[:1]):
+    faces.append([c, d, d + offset, c + offset])
+
+# Create polygons:
+for f in faces:
+    poly = geo.createPolygon()
+    for v in f:
+        poly.addVertex(points[v])
+
+# Add component name attribute:
+name_attrib = geo.addAttrib(hou.attribType.Prim, 'name', '')
+for prim in geo.prims():
+    prim.setAttribValue('name', 'CAR_body_hood_C')
