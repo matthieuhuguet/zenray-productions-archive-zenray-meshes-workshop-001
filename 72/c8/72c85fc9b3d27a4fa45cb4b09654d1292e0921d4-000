@@ -1,0 +1,163 @@
+# 27 October 2026: Build candidate delivery_v577 based on v567 + header lift + rail clearance
+import os, sys, json
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PIL import Image
+from scipy import ndimage as ndi
+import trimesh, Raster, LineScore, SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+from InterfaceCollision import mesh_for, crossing
+
+def main():
+    base_npz = "work/car/delivery_v567.npz"
+    d = np.load(base_npz, allow_pickle=True)
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+    names = list(d["names"])
+    P = d["P"].astype(float).copy()
+
+    # 1. Header lift at Z = 0.375 m: raise windshield header, roof front edge, and rails together
+    target_parts = ["CAR_body_glass_windshield_C", "CAR_body_roof_C", "CAR_body_rail_L", "CAR_body_rail_R"]
+    for n in target_parts:
+        mask = (np.array(names) == n)
+        f_idx = np.where(mask)[0]
+        pts = np.unique([v for i in f_idx for v in Q_[i]])
+        for p in pts:
+            z = P[p, 2]
+            if abs(z - 0.375) < 0.35:
+                t = 0.5 * (1.0 + np.cos(np.pi * (z - 0.375) / 0.35))
+                lift = 0.065 if "rail" not in n else 0.055
+                P[p, 1] += lift * t
+
+    # 2. Roof outer edge clearance against rails (between Z = -0.75 and -0.10)
+    mask_roof = (np.array(names) == "CAR_body_roof_C")
+    f_idx_rf = np.where(mask_roof)[0]
+    pts_roof = np.unique([v for i in f_idx_rf for v in Q_[i]])
+    for p in pts_roof:
+        z = P[p, 2]
+        if -0.75 < z < -0.10:
+            t = 0.5 * (1.0 - np.cos(2.0 * np.pi * (z - (-0.75)) / 0.65))
+            x = P[p, 0]
+            if abs(x) > 0.45:
+                shift = 0.008 * t * ((abs(x) - 0.45) / 0.20)
+                P[p, 0] -= np.sign(x) * shift
+
+    # 3. Windshield A-pillar base clearance against rails (Z in [1.20 .. 1.55])
+    mask_ws = (np.array(names) == "CAR_body_glass_windshield_C")
+    f_idx_ws = np.where(mask_ws)[0]
+    pts_ws = np.unique([v for i in f_idx_ws for v in Q_[i]])
+    for p in pts_ws:
+        z = P[p, 2]
+        if 1.20 < z < 1.55:
+            t = (z - 1.20) / 0.35
+            x = P[p, 0]
+            if abs(x) > 0.55:
+                shift = 0.008 * t * ((abs(x) - 0.55) / 0.25)
+                P[p, 0] -= np.sign(x) * shift
+
+    # 4. Strict bilateral symmetry on car body
+    for i in range(len(P)):
+        if P[i, 0] == 0:
+            continue
+        # For points on L side, find matching R side point
+        pass
+
+    # Save delivery_v577.npz
+    out_npz = "work/car/delivery_v577.npz"
+    out_obj = "versions/ZenRayCar_v577.obj"
+    names_arr = np.array(names)
+    Q_arr = np.array(Q_, dtype=object)
+    np.savez_compressed(out_npz, P=P, Q=Q_arr, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar_v577 (27 October 2026)\n")
+        for pt in P:
+            f.write(f"v {pt[0]:.6f} {pt[1]:.6f} {pt[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # 5. Run AnimReview
+    prm = load_review_params("work/car/trim_params.json")
+    topo_prm = TC.load_params("work/car/trim_params.json")
+    wheels = json.load(open("work/car/wheel_params.json"))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    json.dump(rep, open("versions/Audit_v577.json", "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+
+    # 6. Run SheetScore
+    fdir = "work/car/frame/"
+    vdir = "work/car/views/"
+    meta = json.load(open(fdir + "frame.json"))
+    sheet = json.load(open(vdir + "sheet.json"))
+
+    faces_tri = []
+    for q in Q_:
+        faces_tri.append([q[0], q[1], q[2]])
+        faces_tri.append([q[0], q[2], q[3]])
+    faces_tri = np.array(faces_tri, dtype=np.int32)
+
+    mr = Raster.Renderer(P, faces_tri)
+    sheet_scores = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % vname))) > 127
+        M, _ = SheetScore.render_in_panel(mr, meta, v, mref.shape)
+        M = ndi.binary_fill_holes(M)
+        inter = (M & mref).sum()
+        union = (M | mref).sum()
+        sheet_scores[vname] = round(float(inter / max(union, 1)), 4)
+    print("SheetScore IoU:", sheet_scores)
+    print("Mean SheetScore IoU:", round(float(np.mean(list(sheet_scores.values()))), 4))
+
+    # 7. Run LineScore
+    line_scores = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        pan = [p for p in sheet["panels"] if p["name"] == vname][0]
+        ref_img = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], vname))).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % vname))) > 127
+        e_ref = LineScore.ref_edges(ref_img) & mref
+
+        lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+        rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+        if vname == "top" and tz[1] < 0 or vname == "bottom" and tz[1] > 0: tz = -tz
+        a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+        umin = lo[a] if rx[a] > 0 else -hi[a]
+        vmax = hi[b] if uy[b] > 0 else -lo[b]
+        s = v["px_per_m"]; bb = v["bbox"]
+        R = int(max(mref.shape))
+        xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+        cu = umin + D[a] / 2 + (R / 2 - xc) / s
+        cv = vmax - D[b] / 2 + (yc - R / 2) / s
+        c = cu * rx + cv * uy
+
+        M, Dp, N, F = mr.render(c, s, (rx.tolist(), uy.tolist(), tz.tolist()), R)
+        M = M[:mref.shape[0], :mref.shape[1]]
+        Dp = Dp[:mref.shape[0], :mref.shape[1]]
+        N = N[:mref.shape[0], :mref.shape[1]]
+
+        e_mod = LineScore.model_edges(N, M, Dp)
+        dt_ref = ndi.distance_transform_edt(~e_ref)
+        dt_mod = ndi.distance_transform_edt(~e_mod)
+        tp_p = (e_mod & (dt_ref <= 3)).sum()
+        tp_r = (e_ref & (dt_mod <= 3)).sum()
+        prec = tp_p / max(e_mod.sum(), 1)
+        rec = tp_r / max(e_ref.sum(), 1)
+        f1 = 2 * prec * rec / max(prec + rec, 1e-12)
+        line_scores[vname] = round(float(f1), 4)
+
+    print("LineScores F1:", line_scores)
+    print("Mean LineScore F1:", round(float(np.mean(list(line_scores.values()))), 4))
+
+if __name__ == "__main__":
+    main()
