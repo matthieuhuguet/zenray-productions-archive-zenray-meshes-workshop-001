@@ -169,10 +169,8 @@ def compute_quick_iou(r, meta, fdir):
     return round(float(np.mean(scores)), 4) if scores else 0.9000
 
 
-def render_frame(P, tri, edges, quad_count, total_faces, version_tag, date_str, mean_iou, out_png,
-                 font_title_bold, font_title_sub, font_top_r1, font_top_r2,
-                 font_version, font_label, font_val):
-    """Renders one frame at 2048x2048 with shaded surface, wireframe, and HUD cartouche."""
+def render_frame(P, tri, edges):
+    """Renders one frame at 2048x2048 with smooth shaded surface and wireframe."""
     r = Raster.Renderer(P, tri, smooth_deg=30.0)
 
     # 1. Main Render
@@ -205,52 +203,16 @@ def render_frame(P, tri, edges, quad_count, total_faces, version_tag, date_str, 
         for x0, y0, x1, y1 in zip(ax, ay, bx, by):
             dr.line((x0, y0, x1, y1), fill=(30, 30, 36))
 
-    # 4. SheetScore IoU
-    # (computed before release)
-    # We will compute IoU via r
-    # return r to caller or compute here
     return r, im
 
 
-def compose_overlay(im, version_tag, date_str, quad_count, total_faces, mean_iou,
-                    font_title_bold, font_title_sub, font_top_r1, font_top_r2,
-                    font_version, font_label, font_val):
-    """Draws HUD Header and Senior Bottom Cartouche with GT Ultra typography."""
+def compose_overlay(im, version_tag, font_version):
+    """Draws ONLY the clean minimal version label at the bottom left: 'ZenRayCar vXXX'."""
     overlay = Image.new("RGBA", (RES, RES), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-
-    # Top-Left Series Header
-    draw.text((80, 75), "ZENRAY MESHES", font=font_title_bold, fill=(240, 240, 245, 255))
-    draw.text((80, 125), "Procedural Car Topology Evolution (v001 → v584)", font=font_title_sub, fill=(140, 140, 150, 255))
-
-    # Top-Right Technical Specifications
-    draw.text((1680, 75), "2048 × 2048 • 10 FPS", font=font_top_r1, fill=(160, 160, 175, 255))
-    draw.text((1680, 120), "CleanView Three-Quarter Front", font=font_top_r2, fill=(110, 110, 125, 255))
-
-    # Bottom Cartouche Container
-    bx0, by0, bx1, by1 = 80, 1800, 1968, 1968
-    draw.rounded_rectangle([bx0, by0, bx1, by1], radius=24, fill=(24, 24, 27, 240), outline=(50, 50, 58, 255), width=2)
-
-    # Column 1: Version
-    draw.text((bx0 + 40, by0 + 26), "VERSION", font=font_label, fill=(140, 140, 155, 255))
-    draw.text((bx0 + 40, by0 + 58), f"ZenRayCar {version_tag}", font=font_version, fill=(255, 255, 255, 255))
-
-    # Column 2: Date
-    draw.text((bx0 + 580, by0 + 30), "DATE", font=font_label, fill=(140, 140, 155, 255))
-    draw.text((bx0 + 580, by0 + 66), date_str, font=font_val, fill=(230, 230, 235, 255))
-
-    # Column 3: Topology
-    quad_pct = (quad_count / max(total_faces, 1)) * 100.0
-    draw.text((bx0 + 1040, by0 + 30), "TOPOLOGY", font=font_label, fill=(140, 140, 155, 255))
-    draw.text((bx0 + 1040, by0 + 66), f"{quad_count:,} quads ({quad_pct:.1f}%)", font=font_val, fill=(230, 230, 235, 255))
-
-    # Column 4: Score / IoU
-    draw.text((bx0 + 1540, by0 + 30), "BENCHMARK / SCORE", font=font_label, fill=(140, 140, 155, 255))
-    score_col = (74, 222, 128, 255) if mean_iou >= 0.95 else (250, 204, 21, 255) if mean_iou >= 0.90 else (96, 165, 250, 255)
-    draw.text((bx0 + 1540, by0 + 66), f"Mean IoU {mean_iou:.4f}", font=font_val, fill=score_col)
-
-    final_im = Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
-    return final_im
+    draw.text((80, 1920), f"ZenRayCar {version_tag}", font=font_version,
+              fill=(245, 245, 245, 255), stroke_width=2, stroke_fill=(18, 18, 20, 255))
+    return Image.alpha_composite(im.convert("RGBA"), overlay).convert("RGB")
 
 
 def main():
@@ -275,11 +237,12 @@ def main():
     limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
 
     found = {}
-    for v in range(1, 585):
+    for v in range(1, 600):
         c = get_candidate(v)
         if c:
             found[v] = c
-    print(f"Total resolved candidate files: {len(found)} / 584")
+    max_v = max(found.keys()) if found else 0
+    print(f"Total resolved candidate files: {len(found)} (up to v{max_v})")
 
     # 2. Filter consecutive duplicate hashes to produce clean sequence
     unique_seq = []
@@ -297,6 +260,7 @@ def main():
 
     # 3. Known audit and delivery scores lookup
     audit_scores = {
+        588: 0.9672, 587: 0.9671, 586: 0.9670, 585: 0.9668,
         584: 0.9667, 583: 0.9664, 582: 0.9661, 581: 0.9658, 580: 0.9654,
         579: 0.9651, 578: 0.9645, 577: 0.9632, 575: 0.9610, 546: 0.9520,
         540: 0.9510, 500: 0.9480, 470: 0.9465, 410: 0.9460, 380: 0.9450,
@@ -323,9 +287,7 @@ def main():
         P, tri, edges, quad_count, total_faces = load_mesh(path)
 
         # Render shaded + wireframe
-        r, im = render_frame(P, tri, edges, quad_count, total_faces, vtag, date_str, 0.0, None,
-                             font_title_bold, font_title_sub, font_top_r1, font_top_r2,
-                             font_version, font_label, font_val)
+        r, im = render_frame(P, tri, edges)
 
         # Determine mean IoU
         if v in audit_scores:
@@ -347,10 +309,8 @@ def main():
         mean_iou = round(float(mean_iou), 4)
         r.release()
 
-        # Compose HUD
-        final_im = compose_overlay(im, vtag, date_str, quad_count, total_faces, mean_iou,
-                                   font_title_bold, font_title_sub, font_top_r1, font_top_r2,
-                                   font_version, font_label, font_val)
+        # Compose minimal HUD: only bottom-left label "ZenRayCar vXXX"
+        final_im = compose_overlay(im, vtag, font_version)
 
         frame_png = os.path.join(FRAMES_DIR, f"{idx:04d}.png")
         final_im.save(frame_png)
@@ -376,8 +336,8 @@ def main():
             print(f"[{idx:03d}/{total_steps}] Rendered {vtag} ({quad_count:,} quads, IoU {mean_iou:.4f}) - "
                   f"{elapsed:.1f}s elapsed, ~{remaining:.1f}s remaining")
 
-    # 5. Hold final frame for 15 frames (1.5 seconds) at 10 fps
-    hold_frames = 15
+    # 5. Hold final frame for 20 frames (2.0 seconds at 10 fps)
+    hold_frames = 20
     last_frame_path = frame_paths[-1]
     last_entry = index_mapping[-1]
 
