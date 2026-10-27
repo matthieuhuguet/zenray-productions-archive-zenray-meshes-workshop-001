@@ -1,0 +1,56 @@
+# 27 October 2026: Symmetrize the 5 outlier points on CAR_body to achieve 100% pass on symmetry gate
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np
+from scipy.spatial import cKDTree
+from TopoFix import save, write_obj
+
+def fix_symmetry():
+    src_path = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/delivery_v541.npz"
+    dst_npz = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/delivery_v542.npz"
+    dst_obj = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/versions/ZenRayCar_v542.obj"
+
+    d = np.load(src_path, allow_pickle=True)
+    P = d["P"].copy()
+    Q = d["Q"]
+    names = d["names"]
+
+    body_parts = [n for n in set(names) if str(n).startswith("CAR_body_") and "liner" not in str(n)]
+    body_faces_idx = [i for i, n in enumerate(names) if n in body_parts]
+
+    v_to_part = {}
+    for i in body_faces_idx:
+        for v in Q[i]:
+            v_to_part[v] = names[i]
+
+    pb = sorted(v_to_part.keys())
+    Pb = P[pb]
+
+    tree = cKDTree(Pb * [-1, 1, 1])
+    dd, ii = tree.query(Pb)
+    dd_mm = dd * 1000.0
+
+    bad = np.where(dd_mm > 10.0)[0]
+    print(f"Points with mirror_dist > 10mm before fix: {len(bad)}, max: {dd_mm.max():.2f} mm")
+
+    for idx in bad:
+        v_orig = pb[idx]
+        v_mirror_idx = pb[ii[idx]]
+        target = np.array([-P[v_mirror_idx, 0], P[v_mirror_idx, 1], P[v_mirror_idx, 2]])
+        P[v_orig] = 0.5 * (P[v_orig] + target)
+        P[v_mirror_idx] = 0.5 * (P[v_mirror_idx] + np.array([-P[v_orig, 0], P[v_orig, 1], P[v_orig, 2]]))
+
+    Pb_new = P[pb]
+    tree_new = cKDTree(Pb_new * [-1, 1, 1])
+    dd_new = tree_new.query(Pb_new)[0] * 1000.0
+    bad_new = np.where(dd_new > 10.0)[0]
+    print(f"Points with mirror_dist > 10mm after fix: {len(bad_new)}, max: {dd_new.max():.2f} mm, p99: {np.percentile(dd_new, 99):.2f} mm")
+
+    save(dst_npz, P, Q, names)
+    write_obj(dst_obj, P, Q, names)
+    print("Saved delivery_v542.npz and ZenRayCar_v542.obj")
+    return dst_npz, dst_obj
+
+if __name__ == "__main__":
+    fix_symmetry()
