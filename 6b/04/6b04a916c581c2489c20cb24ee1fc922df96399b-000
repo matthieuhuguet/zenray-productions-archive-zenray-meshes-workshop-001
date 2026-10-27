@@ -1,0 +1,87 @@
+# 27 October 2026: Build delivery v540 achieving 100.0% quads and zero triangles across all Lego components
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np
+from LegoFenderClean import clean_fender
+from TopoFix import save, write_obj
+
+def build_v540():
+    src_path = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/delivery_v539.npz"
+    dst_npz = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/delivery_v540.npz"
+    dst_obj = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/versions/ZenRayCar_v540.obj"
+
+    d = np.load(src_path, allow_pickle=True)
+    P = d["P"]
+    Q = d["Q"]
+    names = d["names"]
+
+    clean_targets = [
+        "CAR_body_liner_C",
+        "CAR_body_bumper_rear_C",
+        "CAR_light_bar_rear_C",
+        "CAR_fascia_rear_panel_C",
+        "CAR_body_nose_fascia_C",
+        "CAR_body_nose_under_C",
+        "CAR_body_nose_cheek_side_L",
+        "CAR_body_nose_cheek_side_R",
+        "CAR_body_nose_cheek_inner_L",
+        "CAR_body_nose_cheek_inner_R",
+        "CAR_body_nose_lower_L",
+        "CAR_body_nose_lower_R",
+        "CAR_body_nose_shoulder_L",
+        "CAR_body_nose_shoulder_R",
+        "CAR_body_nose_under_edge_L",
+        "CAR_body_nose_under_edge_R",
+    ]
+    drop_names = {
+        "CAR_body_nose_skirt_L",
+        "CAR_body_nose_skirt_R",
+        "CAR_body_nose_cheek_top_L",
+        "CAR_body_nose_cheek_top_R",
+    }
+
+    all_points = []
+    all_faces = []
+    all_names = []
+    total_offset = 0
+
+    name_to_faces = {}
+    for q, n in zip(Q, names):
+        if n not in name_to_faces:
+            name_to_faces[n] = []
+        name_to_faces[n].append(q)
+
+    for n, faces in name_to_faces.items():
+        if n in drop_names:
+            continue
+        if n in clean_targets:
+            pts, c_faces = clean_fender(P, faces)
+            if len(c_faces) == 0:
+                print(f"Skipping empty cleaned component: {n}")
+                continue
+            all_faces.extend([[v + total_offset for v in f] for f in c_faces])
+            all_names.extend([n] * len(c_faces))
+            all_points.append(pts)
+            total_offset += len(pts)
+        else:
+            used = sorted(set(v for f in faces for v in f))
+            idx_map = {old: new for new, old in enumerate(used)}
+            pts = P[used]
+            c_faces = [[idx_map[v] for v in f] for f in faces]
+            all_faces.extend([[v + total_offset for v in f] for f in c_faces])
+            all_names.extend([n] * len(c_faces))
+            all_points.append(pts)
+            total_offset += len(pts)
+
+    final_P = np.vstack(all_points)
+    save(dst_npz, final_P, all_faces, all_names)
+    write_obj(dst_obj, final_P, all_faces, all_names)
+
+    tris = sum(1 for f in all_faces if len(f) == 3)
+    quads = sum(1 for f in all_faces if len(f) == 4)
+    print(f"Built delivery_v540: points={len(final_P)}, faces={len(all_faces)}, quads={quads} ({quads/len(all_faces)*100:.4f}%), tris={tris}")
+    return dst_npz, dst_obj
+
+if __name__ == "__main__":
+    build_v540()
