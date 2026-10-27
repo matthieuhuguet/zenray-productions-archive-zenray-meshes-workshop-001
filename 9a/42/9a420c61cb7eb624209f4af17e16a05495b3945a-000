@@ -1,0 +1,39 @@
+"""27 October 2026 : ZenRay Meshes, GATE of one loop candidate against the last kept version.
+Keeps the candidate only when every measured number holds or improves : absolute faults DOWN, quads kept at 100 %,
+six-view silhouette and line scores not lower, review gates not fewer, arch ring fault rate not worse.
+FR : porte de décision d'une candidate, comparée à la dernière version gardée."""
+import json, os, sys
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+N, C = sys.argv[1], sys.argv[2]
+ver = lambda t: f"{W}/versions/{t}"
+
+def topo(t):
+    d = json.load(open(ver(f"Topo_{t}.json"))); return {"error_faces": d["error_faces"], "quad_pct": d["quad_pct"], "tris": d["tris"]}
+
+def review(t):
+    d = json.load(open(ver(f"Review_{t}.json")))
+    ring = [g["measured"] for g in d["gates"] if g["gate"] == "arch.ring_fault_pct"][0]
+    vis = [g["measured"] for g in d["gates"] if g["gate"] == "topology.fault_pct_visible"][0]
+    return {"passed": d["passed"], "total": d["total"], "ring_pct": ring, "visible_pct": vis}
+
+def six(t):
+    s = json.load(open(f"{ver(f'Audit_{t}')}/silhouette.json")); l = json.load(open(f"{ver(f'Audit_{t}')}/lines.json"))
+    return {"silhouette": s["mean_kept"], "lines_f1": l["mean_f1"], "lines_normal": l["mean_f1_normal_only"]}
+
+base = {**topo(N), **review(N), **six(N)}
+cand = {**topo(C), **review(C), **six(C)}
+checks = {
+    "faults_down": cand["error_faces"] < base["error_faces"],
+    "quads_kept": cand["quad_pct"] >= 99.9 and cand["tris"] <= base["tris"],
+    "silhouette_not_lower": cand["silhouette"] >= base["silhouette"] - 0.0005,
+    "lines_not_lower": cand["lines_f1"] >= base["lines_f1"] - 0.001 and cand["lines_normal"] >= base["lines_normal"] - 0.001,
+    "gates_not_fewer": cand["passed"] >= base["passed"],
+    "ring_not_worse": cand["ring_pct"] <= base["ring_pct"] + 0.05,
+}
+verdict = "KEEP" if all(checks.values()) else "DROP"
+out = {"base": N, "candidate": C, "base_numbers": base, "candidate_numbers": cand, "checks": checks, "verdict": verdict}
+json.dump(out, open(ver(f"Gate_{C}.json"), "w"), indent=1, ensure_ascii=False)
+print(json.dumps({"verdict": verdict, "faults": [base["error_faces"], cand["error_faces"]], "silhouette": [base["silhouette"], cand["silhouette"]],
+                  "lines": [base["lines_f1"], cand["lines_f1"]], "normal": [base["lines_normal"], cand["lines_normal"]],
+                  "gates": [base["passed"], cand["passed"]], "ring": [base["ring_pct"], cand["ring_pct"]], "failed": [k for k, v in checks.items() if not v]}))
