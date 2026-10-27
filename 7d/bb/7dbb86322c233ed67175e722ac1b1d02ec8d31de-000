@@ -16,6 +16,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import TopoCheck as TC  # noqa: E402
 from RelaxQuads import topology  # noqa: E402
+from PlanarizeQuads import mirror_map, quad_fold  # noqa: E402
 
 
 def vertex_normals(P, Q4, Q3, n):
@@ -45,6 +46,7 @@ def main():
     ap.add_argument("--max-mm", type=float, default=8.0)
     ap.add_argument("--crease-deg", type=float, default=25.0)
     ap.add_argument("--turn-deg", type=float, default=15.0)
+    ap.add_argument("--fold-cap-deg", type=float, default=10.0, help="a quad whose fold passes this angle and grew goes back (keeps the fold p95 gate)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--obj", default="")
     a = ap.parse_args()
@@ -55,6 +57,8 @@ def main():
     names = [str(x) for x in d["names"]]
     P0 = np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else P.copy()
     n = len(P)
+    mir = mirror_map(P0)
+    paired = mir >= 0
     tp = TC.load_params(a.guard)
     N, T = np.unique(np.array(names), return_inverse=True)
     C = np.array([len(q) for q in Q], np.int32)
@@ -87,6 +91,8 @@ def main():
         sig = a.sigma_mm / 1000.0 * (1.0 if ps < a.passes // 2 else 0.5)
         fv = np.unique(I[np.isin(vf, np.flatnonzero(err))])
         cand = fv[(free[fv]) | (is_slide[fv])]
+        cand = np.unique(np.concatenate([cand, mir[cand][mir[cand] >= 0]]))   # the mirror images of the points are candidates too
+        cand = cand[(free[cand]) | (is_slide[cand])]
         if not len(cand):
             break
         vn = vertex_normals(P, Q4, Q3, n)
@@ -102,6 +108,13 @@ def main():
             t = P[sl_b[pos]] - P[sl_a[pos]]
             t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-30
             mv[sc] = rng.normal(0.0, sig, (len(sc), 1)) * t
+        # symmetric moves : the move of the point with the smaller index is mirrored onto its image, a point on the plane x = 0 keeps x
+        can = np.flatnonzero((np.linalg.norm(mv, axis=1) > 0) & paired & (mir > np.arange(n)))
+        mv[mir[can]] = mv[can] * np.array([-1.0, 1.0, 1.0])
+        loose = np.flatnonzero((mir == np.arange(n)) & (np.linalg.norm(mv, axis=1) > 0))
+        mv[loose, 0] = 0.0
+        low = np.flatnonzero((np.linalg.norm(mv, axis=1) > 0) & paired & (mir < np.arange(n)) & ~np.isin(np.arange(n), mir[can]))
+        mv[low] = 0.0   # an image whose canonical point was not proposed stays put
         Pt = P + mv
         dlt = Pt - P0
         nn = np.linalg.norm(dlt, axis=1)
@@ -110,7 +123,15 @@ def main():
             Pt[over] = P0[over] + dlt[over] * (cap / nn[over])[:, None]
         err2 = TC.analyse(Pt, C, I, T, N, tp)[2].astype(bool)
         dv = np.bincount(I, weights=(err2.astype(int) - err.astype(int))[vf], minlength=n)
+        dv = dv + np.where(paired & (mir != np.arange(n)), dv[np.maximum(mir, 0)], 0.0)   # a pair is judged on both sides together
         good = (dv < 0) & (np.linalg.norm(Pt - P, axis=1) > 0)
+        # the fold cap : a quad that folds more than the cap and more than before sends its points back
+        f0 = quad_fold(P[Q4]); f1 = quad_fold(Pt[Q4])
+        badq = (f1 > a.fold_cap_deg) & (f1 > f0 + 0.5)
+        if badq.any():
+            bv = np.unique(Q4[badq].ravel())
+            good[bv] = False
+            mb = mir[bv]; good[mb[mb >= 0]] = False
         Pn = P.copy()
         Pn[good] = Pt[good]
         # the guard : a face that is faulty now and was not before sends its points (and, when it has none moved, its ring) back
@@ -123,6 +144,8 @@ def main():
             if (np.linalg.norm(Pn[back] - P[back], axis=1) < 1e-12).all():
                 faces = np.unique(vf[np.isin(I, back)])
                 back = np.unique(I[np.isin(vf, faces)])
+            mb = mir[back]
+            back = np.unique(np.concatenate([back, mb[mb >= 0]]))
             Pn[back] = P[back]
         e3 = TC.analyse(Pn, C, I, T, N, tp)[2].astype(bool)
         if int(e3.sum()) <= int(err.sum()) and not (e3 & ~err).any():

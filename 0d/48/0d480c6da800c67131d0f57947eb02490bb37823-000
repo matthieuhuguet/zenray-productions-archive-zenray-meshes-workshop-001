@@ -163,6 +163,7 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04, min_div=6.0):
     ns_all = max(1, int(round(max([r[2] - r[1] for r in rows] + [0.0]) / cell)))   # side strip columns, the same on every row
     ncol = int(cols or max(2, int(round(2.0 * widest / cell))))
     pts, quads, idx = [], [], {}
+    side_h = {}
 
     def add(x, y, z, key):
         idx[key] = len(pts)
@@ -173,6 +174,7 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04, min_div=6.0):
         h = S.height(np.clip(xs, -w + 1e-4, w - 1e-4), np.full(xs.shape, zz))
         for j in np.nonzero(np.isnan(h))[0]:
             h[j] = np.nanmean(h[max(0, j - 1):j + 2])
+        h = 0.5 * (h + h[::-1])   # 27 October 2026: left and right heights are averaged, the old surface differs by up to 10 mm across a pocket wall and the review measures the mirror error ; FR : hauteurs symétriques
         for j in range(ncol + 1):
             add(xs[j], h[j], z, ("m", i, j))
         if outer > 0:
@@ -181,7 +183,9 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04, min_div=6.0):
                 for k in range(ns):
                     x = side * (outer - (outer - w) * k / ns)
                     hh = S.height(np.array([x - side * 1e-4]), np.array([zz]))[0]
-                    add(x, hh if not np.isnan(hh) else h[0 if side < 0 else -1], z, ("s", side, i, k))
+                    hh = hh if not np.isnan(hh) else h[0 if side < 0 else -1]
+                    side_h.setdefault((i, k), {})[side] = hh
+                    add(x, hh, z, ("s", side, i, k))
     for i in range(len(rows) - 1):
         for j in range(ncol):
             quads.append([idx[("m", i, j)], idx[("m", i, j + 1)], idx[("m", i + 1, j + 1)], idx[("m", i + 1, j)]])
@@ -194,6 +198,9 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04, min_div=6.0):
                 for k in range(ns):
                     quads.append([chain_a[k], chain_a[k + 1], chain_b[k + 1], chain_b[k]])
     flat = np.array(pts)
+    for (i_, k_), hs in side_h.items():   # the side strip heights are averaged between the two sides too
+        if -1 in hs and 1 in hs:
+            m_ = 0.5 * (hs[-1] + hs[1]); flat[idx[("s", -1, i_, k_)], 1] = m_; flat[idx[("s", 1, i_, k_)], 1] = m_
     fixed = []
     for q in quads:
         p = flat[q]

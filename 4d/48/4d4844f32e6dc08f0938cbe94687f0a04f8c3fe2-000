@@ -61,7 +61,15 @@ def planarize(P, Q, max_m=0.005, target_deg=17.0, iters=80, step=0.3, anchor=Non
     return P, fold0, fold1, np.linalg.norm(P - P0, axis=1)
 
 
-def guard(P0, P, Q, names, params, rounds=12):
+def mirror_map(P, tol_m=0.003):
+    """For every point the index of its mirror image across x = 0 (itself on the plane), or -1 when no point lies within `tol_m` of the mirrored position.
+    The L and R parts of the car are mirror images, the symmetry gate of the review measures it, so every cleanup move is applied to both sides alike. FR : indice du point symétrique."""
+    from scipy.spatial import cKDTree
+    d, j = cKDTree(P).query(P * np.array([-1.0, 1.0, 1.0]))
+    return np.where(d < tol_m, j, -1)
+
+
+def guard(P0, P, Q, names, params, rounds=12, mirror=None):
     """The guard of the gain rule : every face that is faulty after the move but was not before sends its points back to where they started, until no face is newly faulty
     (so the set of faulty faces can only shrink). Returns the points, the faulty counts before and after, and the rounds used."""
     import TopoCheck as TC
@@ -84,6 +92,9 @@ def guard(P0, P, Q, names, params, rounds=12):
             # the face has no moved point of its own : a neighbour caused it (a pole on a crease, a density ratio), so the ring around it goes back too
             faces = np.unique(vf[np.isin(I, back)])
             back = np.unique(I[np.isin(vf, faces)])
+        if mirror is not None:
+            mb = mirror[back]
+            back = np.unique(np.concatenate([back, mb[mb >= 0]]))   # a face sent back sends its mirror image back too
         P[back] = P0[back]
     err = TC.analyse(P, C, I, T, N, tp)[2].astype(bool)
     return P, int(err0.sum()), int(err.sum()), used
@@ -109,7 +120,7 @@ def main():
     P2, f0, f1, mv = planarize(P, Q, a.max_mm / 1000.0, a.target_deg, a.iters, a.step, np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else None)
     gd = None
     if a.guard:
-        P2, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds)
+        P2, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds, mirror_map(np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else P))
         f1 = quad_fold(P2[np.array([q for q in Q if len(q) == 4])])
         mv = np.linalg.norm(P2 - P, axis=1)
         gd = {"faults_before": e0, "faults_after": e1, "guard_rounds": rounds}
