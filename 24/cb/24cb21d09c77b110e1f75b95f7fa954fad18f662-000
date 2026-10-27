@@ -1,0 +1,152 @@
+"""27 October 2026 : ZenRay Meshes, RELAX QUADS, tangential smoothing of the delivery file with the face by face guard of PlanarizeQuads.
+Every free point (not on a crease, not on an open border) moves toward the average of its neighbours, but only along the surface (the normal part of the move is removed), a little per pass, at most `--max-mm` from where it started.
+It evens out the trapezoids and the thin strips that TopoCheck flags as angle, aspect or density faults ; the guard (same as PlanarizeQuads) sends back every face that would become faulty.
+Same faces, same names, same point count. python RelaxQuads.py <delivery_in.npz> <delivery_out.npz> --guard topo_params.json [--max-mm 8] [--iters 20] [--step 0.4] [--crease-deg 25] [--obj out.obj]
+FR : lissage tangent des points libres, chaque point à quelques millimètres au plus de sa place, la garde annule toute face qui deviendrait fautive.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from PlanarizeQuads import guard  # noqa: E402
+
+
+def topology(P, Q, crease_deg):
+    """Neighbour lists as flat arrays and the mask of points that must stay (creases, open borders)."""
+    n = len(P)
+    ea, eb = [], []
+    for q in Q:
+        k = len(q)
+        for i in range(k):
+            ea.append(q[i]); eb.append(q[(i + 1) % k])
+    ea, eb = np.array(ea), np.array(eb)
+    lo, hi = np.minimum(ea, eb), np.maximum(ea, eb)
+    key = lo.astype(np.int64) * (n + 1) + hi
+    uk, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    border = np.zeros(n, bool)
+    open_e = cnt[inv] == 1
+    border[ea[open_e]] = True
+    border[eb[open_e]] = True
+    # face normals and the dihedral angle of every manifold edge
+    fn = np.zeros((len(Q), 3))
+    for i, q in enumerate(Q):
+        v = P[q]
+        fn[i] = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]) if len(q) >= 4 else np.cross(v[1] - v[0], v[2] - v[0])
+    fn /= np.linalg.norm(fn, axis=1, keepdims=True) + 1e-30
+    face_of = np.repeat(np.arange(len(Q)), [len(q) for q in Q])
+    order = np.argsort(inv, kind="stable")
+    crease = np.zeros(n, bool)
+    first = np.searchsorted(inv[order], np.arange(len(uk)))
+    two = np.flatnonzero(cnt == 2)
+    f1 = face_of[order[first[two]]]
+    f2 = face_of[order[first[two] + 1]]
+    dih = np.degrees(np.arccos(np.clip((fn[f1] * fn[f2]).sum(1), -1, 1)))
+    sharp = two[dih > crease_deg]
+    a_ = uk[sharp] // (n + 1)
+    b_ = uk[sharp] % (n + 1)
+    crease[a_] = True
+    crease[b_] = True
+    return ea, eb, border | crease, fn, face_of, border, crease, (a_, b_)
+
+
+def relax(P, Q, max_m=0.008, iters=20, step=0.4, crease_deg=25.0, slide=True, turn_deg=15.0, anchor=None):
+    Pstart = P.copy()
+    P0 = P.copy() if anchor is None else anchor.copy()   # 27 October 2026: the cap on the move is measured from the anchor (the file before the whole chain)
+    P = P.copy()
+    n = len(P)
+    ea, eb, fixed, _, _, border, crease, (ca, cb) = topology(Pstart, Q, crease_deg)
+    src = np.concatenate([ea, eb])
+    dst = np.concatenate([eb, ea])
+    free = ~fixed
+    # 27 October 2026 : SLIDING ALONG A CREASE ; a point that sits on exactly two crease edges (a rim, a seam line inside a panel) may move along its curve toward the midpoint of its two crease neighbours,
+    # which evens the spacing of a rim without moving the rim ; points on an open border or at a junction stay. FR : glissement le long d'un pli.
+    cn = {}
+    if slide:
+        for x, y in zip(ca, cb):
+            cn.setdefault(int(x), set()).add(int(y)); cn.setdefault(int(y), set()).add(int(x))
+    sl_idx = np.array([v for v, nb in cn.items() if len(nb) == 2 and not border[v]], dtype=int)
+    sl_a = np.array([sorted(cn[v])[0] for v in sl_idx], dtype=int) if len(sl_idx) else np.zeros(0, int)
+    sl_b = np.array([sorted(cn[v])[1] for v in sl_idx], dtype=int) if len(sl_idx) else np.zeros(0, int)
+    if len(sl_idx):
+        # a crease that turns sharply (a corner) keeps its point : sliding would cut the corner
+        u1 = Pstart[sl_idx] - Pstart[sl_a]
+        u2 = Pstart[sl_b] - Pstart[sl_idx]
+        cosv = (u1 * u2).sum(1) / (np.linalg.norm(u1, axis=1) * np.linalg.norm(u2, axis=1) + 1e-30)
+        keep = cosv >= np.cos(np.radians(turn_deg))
+        sl_idx, sl_a, sl_b = sl_idx[keep], sl_a[keep], sl_b[keep]
+    Q4 = np.array([q for q in Q if len(q) == 4])
+    Q3 = np.array([q for q in Q if len(q) == 3]) if any(len(q) == 3 for q in Q) else np.zeros((0, 3), int)
+    for _ in range(iters):
+        # vertex normals from the face normals of the current points (vectorised over the quads and the triangles)
+        vn = np.zeros((n, 3))
+        v = P[Q4]
+        f4 = np.cross(v[:, 2] - v[:, 0], v[:, 3] - v[:, 1])
+        f4 /= np.linalg.norm(f4, axis=1, keepdims=True) + 1e-30
+        for k in range(4):
+            np.add.at(vn, Q4[:, k], f4)
+        if len(Q3):
+            v = P[Q3]
+            f3 = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+            f3 /= np.linalg.norm(f3, axis=1, keepdims=True) + 1e-30
+            for k in range(3):
+                np.add.at(vn, Q3[:, k], f3)
+        vn /= np.linalg.norm(vn, axis=1, keepdims=True) + 1e-30
+        acc = np.zeros((n, 3))
+        cnt = np.zeros(n)
+        np.add.at(acc, src, P[dst])
+        np.add.at(cnt, src, 1.0)
+        avg = acc / np.maximum(cnt, 1.0)[:, None]
+        mv = avg - P
+        mv -= (mv * vn).sum(1)[:, None] * vn          # along the surface only
+        mv[~free] = 0.0
+        if len(sl_idx):
+            t = P[sl_b] - P[sl_a]
+            t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-30
+            m = 0.5 * (P[sl_a] + P[sl_b]) - P[sl_idx]
+            mv[sl_idx] = (m * t).sum(1)[:, None] * t
+        P += step * mv
+        d = P - P0
+        nn = np.linalg.norm(d, axis=1)
+        over = nn > max_m
+        if over.any():
+            P[over] = P0[over] + d[over] * (max_m / nn[over])[:, None]
+    return P
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--max-mm", type=float, default=8.0)
+    ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--step", type=float, default=0.4)
+    ap.add_argument("--crease-deg", type=float, default=25.0, help="points on an edge sharper than this stay where they are")
+    ap.add_argument("--turn-deg", type=float, default=15.0, help="a crease that turns more than this at a point keeps the point (corner)")
+    ap.add_argument("--anchor", default="", help="npz whose points the move cap is measured from (the start of a chain of cleanups)")
+    ap.add_argument("--no-slide", action="store_true", help="points on a crease stay (no sliding along it)")
+    ap.add_argument("--rounds", type=int, default=40)
+    ap.add_argument("--guard", required=True, help="topo_params.json")
+    ap.add_argument("--obj", default="")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = [str(x) for x in d["names"]]
+    P2 = relax(P, Q, a.max_mm / 1000.0, a.iters, a.step, a.crease_deg, not a.no_slide, a.turn_deg, np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else None)
+    P3, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds)
+    mv = np.linalg.norm(P3 - P, axis=1)
+    np.savez(a.out, P=P3.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(names))
+    print(json.dumps({"faults_before": e0, "faults_after": e1, "guard_rounds": rounds, "points_moved": int((mv > 1e-6).sum()), "move_max_mm": round(float(mv.max()) * 1000, 2),
+                      "move_mean_mm_of_moved": round(float(mv[mv > 1e-6].mean()) * 1000, 3) if (mv > 1e-6).any() else 0.0}))
+    if a.obj:
+        import TopoFix
+        TopoFix.write_obj(a.obj, P3, Q, names)
+        print("obj", a.obj)
+
+
+if __name__ == "__main__":
+    main()

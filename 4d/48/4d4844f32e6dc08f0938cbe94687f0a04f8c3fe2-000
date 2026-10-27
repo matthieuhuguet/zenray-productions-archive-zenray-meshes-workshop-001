@@ -1,7 +1,7 @@
 """27 October 2026 : ZenRay Meshes, PLANARIZE QUADS, the cleanup of twisted quads on the delivery file.
 TopoCheck flags a quad as a FOLD when both of its triangulations bend by more than `fold_max_deg` (a twisted quad). The loft builds such quads where two rows or two seams shear against each other.
 Every flagged quad is pulled toward the best fit plane of its four corners, a little per pass, each vertex moving at most `--max-mm` from where it started ; quads that stay flat are not touched.
-Nothing else changes : same faces, same names, same vertex count. Every value is a parameter (HDA) : python PlanarizeQuads.py <delivery_in.npz> <delivery_out.npz> [--max-mm 3] [--target-deg 15] [--iters 80] [--step 0.5] [--guard topo_params.json] [--obj out.obj]
+Nothing else changes : same faces, same names, same vertex count. Every value is a parameter (HDA) : python PlanarizeQuads.py <delivery_in.npz> <delivery_out.npz> [--max-mm 5] [--target-deg 17] [--iters 80] [--step 0.3] [--guard topo_params.json] [--obj out.obj]
 FR : les quads vrillés (pli en diagonale) sont rapprochés de leur plan moyen, chaque sommet bougeant d'au plus quelques millimètres.
 """
 import argparse
@@ -24,9 +24,9 @@ def quad_fold(V):
     return np.minimum(fA, fB)
 
 
-def planarize(P, Q, max_m=0.003, target_deg=15.0, iters=80, step=0.5):
+def planarize(P, Q, max_m=0.005, target_deg=17.0, iters=80, step=0.3, anchor=None):
     """Returns the new points, the fold before and after (arrays over the quads) and the displacement of every point (metres)."""
-    P0 = P.copy()
+    P0 = P.copy() if anchor is None else anchor.copy()   # 27 October 2026: the cap on the move is measured from the anchor (the file before the whole chain)
     P = P.copy()
     qi = np.array([i for i, q in enumerate(Q) if len(q) == 4])
     Q4 = np.array([Q[i] for i in qi])
@@ -93,11 +93,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inp")
     ap.add_argument("out")
-    ap.add_argument("--max-mm", type=float, default=3.0, help="largest move of any vertex from its original place (mm)")
-    ap.add_argument("--target-deg", type=float, default=15.0, help="quads above this fold angle are pulled flat (the judge limit is 20)")
+    ap.add_argument("--max-mm", type=float, default=5.0, help="largest move of any vertex from its original place (mm)")
+    ap.add_argument("--target-deg", type=float, default=17.0, help="quads above this fold angle are pulled flat (the judge limit is 20)")
     ap.add_argument("--iters", type=int, default=80)
-    ap.add_argument("--step", type=float, default=0.5, help="share of the distance to the plane taken per pass")
+    ap.add_argument("--step", type=float, default=0.3, help="share of the distance to the plane taken per pass")
     ap.add_argument("--rounds", type=int, default=40, help="most rounds of the guard")
+    ap.add_argument("--anchor", default="", help="npz whose points the move cap is measured from (the start of a chain of cleanups)")
     ap.add_argument("--guard", default="", help="topo_params.json : points of every face that becomes faulty go back (the faulty set can only shrink)")
     ap.add_argument("--obj", default="")
     a = ap.parse_args()
@@ -105,7 +106,7 @@ def main():
     P = d["P"].astype(float)
     Q = [list(map(int, q)) for q in d["Q"]]
     names = [str(x) for x in d["names"]]
-    P2, f0, f1, mv = planarize(P, Q, a.max_mm / 1000.0, a.target_deg, a.iters, a.step)
+    P2, f0, f1, mv = planarize(P, Q, a.max_mm / 1000.0, a.target_deg, a.iters, a.step, np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else None)
     gd = None
     if a.guard:
         P2, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds)
