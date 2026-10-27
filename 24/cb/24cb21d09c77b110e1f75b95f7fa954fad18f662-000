@@ -53,7 +53,47 @@ def topology(P, Q, crease_deg):
     return ea, eb, border | crease, fn, face_of, border, crease, (a_, b_)
 
 
-def relax(P, Q, max_m=0.008, iters=20, step=0.4, crease_deg=25.0, slide=True, turn_deg=15.0, anchor=None):
+def regular_moves(P, Q4, n, dev_min_deg=25.0):
+    """The move of every point toward the corners of the best fit rectangle of each quad whose worst corner is off 90 degrees by more than `dev_min_deg` (the rectangle keeps the mean lengths of the opposite edges).
+    Averaged over the quads that share the point. FR : déplacement vers le rectangle ajusté de chaque quad dont un coin s'écarte de 90 degrés."""
+    V = P[Q4]
+    u = np.roll(V, 1, 1) - V
+    w = np.roll(V, -1, 1) - V
+    ang = np.degrees(np.arccos(np.clip((u * w).sum(2) / (np.linalg.norm(u, axis=2) * np.linalg.norm(w, axis=2) + 1e-20), -1, 1)))
+    adev = np.abs(ang - 90).max(1)
+    sel = adev > dev_min_deg
+    acc = np.zeros((n, 3))
+    cnt = np.zeros(n)
+    if not sel.any():
+        return acc
+    Vs = V[sel]
+    c = Vs.mean(1, keepdims=True)
+    e1 = 0.5 * ((Vs[:, 1] - Vs[:, 0]) + (Vs[:, 2] - Vs[:, 3]))
+    e2 = 0.5 * ((Vs[:, 3] - Vs[:, 0]) + (Vs[:, 2] - Vs[:, 1]))
+    nn = np.cross(e1, e2)
+    nn /= np.linalg.norm(nn, axis=1, keepdims=True) + 1e-30
+    a = np.linalg.norm(e1, axis=1) / 2.0
+    b = np.linalg.norm(e2, axis=1) / 2.0
+    h1 = e1 / (np.linalg.norm(e1, axis=1, keepdims=True) + 1e-30)
+    h2 = e2 / (np.linalg.norm(e2, axis=1, keepdims=True) + 1e-30)
+    cs = (h1 * h2).sum(1)
+    sn = (np.cross(h1, h2) * nn).sum(1)
+    theta = np.arctan2(sn, cs)
+    delta = (theta - np.pi / 2.0) / 2.0
+    def rot(x, ang_):
+        return x * np.cos(ang_)[:, None] + np.cross(nn, x) * np.sin(ang_)[:, None] + nn * ((nn * x).sum(1) * (1 - np.cos(ang_)))[:, None]
+    g1 = rot(h1, delta)
+    g2 = rot(h2, -delta)
+    ctr = c[:, 0]
+    T = np.stack([ctr - a[:, None] * g1 - b[:, None] * g2, ctr + a[:, None] * g1 - b[:, None] * g2,
+                  ctr + a[:, None] * g1 + b[:, None] * g2, ctr - a[:, None] * g1 + b[:, None] * g2], 1)
+    for k in range(4):
+        np.add.at(acc, Q4[sel][:, k], T[:, k] - Vs[:, k])
+        np.add.at(cnt, Q4[sel][:, k], 1.0)
+    return acc / np.maximum(cnt, 1.0)[:, None]
+
+
+def relax(P, Q, max_m=0.008, iters=20, step=0.4, crease_deg=25.0, slide=True, turn_deg=15.0, anchor=None, mode="laplace", dev_min=25.0):
     Pstart = P.copy()
     P0 = P.copy() if anchor is None else anchor.copy()   # 27 October 2026: the cap on the move is measured from the anchor (the file before the whole chain)
     P = P.copy()
@@ -101,12 +141,14 @@ def relax(P, Q, max_m=0.008, iters=20, step=0.4, crease_deg=25.0, slide=True, tu
         np.add.at(cnt, src, 1.0)
         avg = acc / np.maximum(cnt, 1.0)[:, None]
         mv = avg - P
+        if mode == "regular":
+            mv = regular_moves(P, Q4, n, dev_min)
         mv -= (mv * vn).sum(1)[:, None] * vn          # along the surface only
         mv[~free] = 0.0
         if len(sl_idx):
             t = P[sl_b] - P[sl_a]
             t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-30
-            m = 0.5 * (P[sl_a] + P[sl_b]) - P[sl_idx]
+            m = (0.5 * (P[sl_a] + P[sl_b]) - P[sl_idx]) if mode == "laplace" else mv[sl_idx]
             mv[sl_idx] = (m * t).sum(1)[:, None] * t
         P += step * mv
         d = P - P0
@@ -125,6 +167,8 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--step", type=float, default=0.4)
     ap.add_argument("--crease-deg", type=float, default=25.0, help="points on an edge sharper than this stay where they are")
+    ap.add_argument("--mode", default="laplace", choices=["laplace", "regular"], help="laplace : toward the neighbour average ; regular : toward the best fit rectangle of the quads whose corner is off 90 degrees by more than --dev-min")
+    ap.add_argument("--dev-min", type=float, default=25.0)
     ap.add_argument("--turn-deg", type=float, default=15.0, help="a crease that turns more than this at a point keeps the point (corner)")
     ap.add_argument("--anchor", default="", help="npz whose points the move cap is measured from (the start of a chain of cleanups)")
     ap.add_argument("--no-slide", action="store_true", help="points on a crease stay (no sliding along it)")
@@ -136,7 +180,7 @@ def main():
     P = d["P"].astype(float)
     Q = [list(map(int, q)) for q in d["Q"]]
     names = [str(x) for x in d["names"]]
-    P2 = relax(P, Q, a.max_mm / 1000.0, a.iters, a.step, a.crease_deg, not a.no_slide, a.turn_deg, np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else None)
+    P2 = relax(P, Q, a.max_mm / 1000.0, a.iters, a.step, a.crease_deg, not a.no_slide, a.turn_deg, np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else None, a.mode, a.dev_min)
     P3, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds)
     mv = np.linalg.norm(P3 - P, axis=1)
     np.savez(a.out, P=P3.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(names))
