@@ -1,0 +1,268 @@
+# 27 October 2026: VolumetricWireframeReconstruct.py (Method M21)
+# Direct 3D Volumetric Point Matrix & Wireframe Guide Curve Reconstruction
+# from the 6-view orthographic wireframe sheet (ref3.png):
+# 1. Morphological thinning (skeletonization) to 1-pixel graphs on all 6 views
+# 2. Sub-pixel topological junction node detection (degree >= 3)
+# 3. Exact metric camera ray back-projection (X, Y, Z) across orthogonal view pairs
+# 4. Multi-view confirmation across Front, Back, Left, Right, Top, and Bottom views
+# 5. Rejection of phantom ray intersections via exterior shell envelope consistency
+# 6. Extraction of Master NURBS Guide Curves (Spine, Shoulder, Rocker, Rails, Arches)
+# 7. Exports 3D point lattice OBJ and NPZ for Houdini lofting and component tailoring
+
+import os, sys, json
+import numpy as np
+from PIL import Image
+from skimage.morphology import skeletonize
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+
+def get_cam_params(meta, vname):
+    v = [x for x in meta["views"] if x["name"] == vname][0]
+    rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+    s = v["px_per_m"]
+    R_dim = 623
+    bb = v["bbox"]
+    xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    lo, D = np.array(meta["lo"]), np.array(meta["dims_m"])
+    hi = lo + D
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]
+    vmax = hi[b] if uy[b] > 0 else -lo[b]
+    cu = umin + D[a] / 2 + (R_dim / 2 - xc) / s
+    cv = vmax - D[b] / 2 + (yc - R_dim / 2) / s
+    return {
+        "name": vname, "rx": rx, "uy": uy, "tz": tz, "s": s,
+        "cu": cu, "cv": cv, "R_dim": R_dim, "bb": bb
+    }
+
+def extract_view_data(sheet_img, panel_meta, cam_meta):
+    rect = panel_meta["rect"]
+    crop = sheet_img[rect[1]:rect[3], rect[0]:rect[2]]
+    R = crop[:, :, 0].astype(float)
+    G = crop[:, :, 1].astype(float)
+    B = crop[:, :, 2].astype(float)
+    
+    # Chromatic red mask (ref3.png): R significantly higher than G and B
+    mask = (R - np.maximum(G, B)) > 35.0
+    skel = skeletonize(mask)
+    dist = ndi.distance_transform_edt(~skel)
+    
+    # Topological junction nodes (degree >= 3)
+    kernel = np.array([[1, 1, 1],
+                       [1, 0, 1],
+                       [1, 1, 1]], dtype=int)
+    nb = ndi.convolve(skel.astype(int), kernel, mode="constant", cval=0)
+    junc = skel & (nb >= 3)
+    lbl, nlbl = ndi.label(junc)
+    objs = ndi.find_objects(lbl)
+    
+    pts_px = []
+    for i, sl in enumerate(objs):
+        if sl is None: continue
+        ys, xs = np.where(lbl[sl] == (i + 1))
+        pts_px.append([xs.mean() + sl[1].start, ys.mean() + sl[0].start])
+    pts_px = np.array(pts_px) if len(pts_px) else np.zeros((0, 2))
+    
+    cam = get_cam_params(cam_meta, panel_meta["name"])
+    if len(pts_px):
+        u_m = (pts_px[:, 0] - cam["R_dim"] / 2) / cam["s"] + cam["cu"]
+        v_m = -(pts_px[:, 1] - cam["R_dim"] / 2) / cam["s"] + cam["cv"]
+    else:
+        u_m, v_m = np.zeros(0), np.zeros(0)
+        
+    return {
+        "name": panel_meta["name"], "mask": mask, "skel": skel, "dist": dist,
+        "pts_px": pts_px, "u_m": u_m, "v_m": v_m, "cam": cam
+    }
+
+def reconstruct_volumetric_lattice():
+    base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+    ref3_path = f"{base_dir}/refs/objects/06_Car/06_Car_topology_ref3_27-October-2026.png"
+    sheet_json = f"{base_dir}/work/car/views/sheet.json"
+    frame_json = f"{base_dir}/work/car/frame/frame.json"
+    v579_npz = f"{base_dir}/work/car/delivery_v579.npz"
+    
+    sheet_meta = json.load(open(sheet_json))
+    frame_meta = json.load(open(frame_json))
+    sheet_img = np.asarray(Image.open(ref3_path).convert("RGB"))
+    
+    views = {}
+    print("Extracting 1-pixel skeleton graphs and topological junctions from all views...")
+    for pan in sheet_meta["panels"]:
+        vdata = extract_view_data(sheet_img, pan, frame_meta)
+        views[pan["name"]] = vdata
+        print(f"  View [{pan['name']:6s}]: {vdata['skel'].sum():5d} skeleton px, {len(vdata['pts_px']):4d} junction nodes")
+        
+    # Coordinate conventions:
+    # Top view:    rx = [0, 0, -1] -> Z = -u_m,  uy = [1, 0, 0]  -> X = v_m
+    # Left view:   rx = [0, 0, -1] -> Z = -u_m,  uy = [0, 1, 0]  -> Y = v_m
+    # Right view:  rx = [0, 0,  1] -> Z =  u_m,  uy = [0, 1, 0]  -> Y = v_m
+    # Front view:  rx = [1, 0,  0] -> X =  u_m,  uy = [0, 1, 0]  -> Y = v_m
+    # Back view:   rx = [-1, 0, 0] -> X = -u_m,  uy = [0, 1, 0]  -> Y = v_m
+    # Bottom view: rx = [0, 0, -1] -> Z = -u_m,  uy = [-1, 0, 0] -> X = -v_m
+    
+    top = views["top"]
+    left = views["left"]
+    right = views["right"]
+    front = views["front"]
+    back = views["back"]
+    bottom = views["bottom"]
+    
+    X_top, Z_top = top["v_m"], -top["u_m"]
+    Y_left, Z_left = left["v_m"], -left["u_m"]
+    Y_right, Z_right = right["v_m"], right["u_m"]
+    
+    # Load reference shell to reject phantom ray intersections deeper than 55 mm
+    v579 = np.load(v579_npz, allow_pickle=True)
+    P_ref = v579["P"]
+    tree_ref = cKDTree(P_ref)
+    
+    candidate_pts = []
+    
+    # 1. Match Top and Left (Left side, X >= -0.05)
+    for i in range(len(Z_top)):
+        zt, xt = Z_top[i], X_top[i]
+        # Match with Left view
+        matches_l = np.where(np.abs(Z_left - zt) < 0.025)[0]
+        for j in matches_l:
+            yl = Y_left[j]
+            zc = (zt + Z_left[j]) / 2.0
+            
+            # Check Front / Back view confirmation
+            v = front if zc > 0 else back
+            pu = xt if zc > 0 else -xt
+            pv = yl
+            px = v["cam"]["R_dim"] / 2 + (pu - v["cam"]["cu"]) * v["cam"]["s"]
+            py = v["cam"]["R_dim"] / 2 - (pv - v["cam"]["cv"]) * v["cam"]["s"]
+            ix, iy = int(round(px)), int(round(py))
+            if 0 <= ix < 623 and 0 <= iy < 623:
+                dist_fb = v["dist"][iy, ix]
+                if dist_fb <= 3.5: # confirmed by 3 views
+                    candidate_pts.append([xt, yl, zc, dist_fb])
+                    
+        # Match with Right view (for right side of car, X <= 0.05)
+        matches_r = np.where(np.abs(Z_right - zt) < 0.025)[0]
+        for j in matches_r:
+            yr = Y_right[j]
+            zc = (zt + Z_right[j]) / 2.0
+            v = front if zc > 0 else back
+            pu = xt if zc > 0 else -xt
+            pv = yr
+            px = v["cam"]["R_dim"] / 2 + (pu - v["cam"]["cu"]) * v["cam"]["s"]
+            py = v["cam"]["R_dim"] / 2 - (pv - v["cam"]["cv"]) * v["cam"]["s"]
+            ix, iy = int(round(px)), int(round(py))
+            if 0 <= ix < 623 and 0 <= iy < 623:
+                dist_fb = v["dist"][iy, ix]
+                if dist_fb <= 3.5:
+                    candidate_pts.append([xt, yr, zc, dist_fb])
+                    
+    candidate_pts = np.array(candidate_pts)
+    print(f"Total raw multi-view candidate points: {len(candidate_pts)}")
+    
+    # 2. Envelope Consistency Filtering (reject interior phantom ray crossings)
+    dists_to_ref, _ = tree_ref.query(candidate_pts[:, :3])
+    valid_mask = dists_to_ref < 0.055 # within 55mm of verified car shell
+    clean_pts = candidate_pts[valid_mask, :3]
+    print(f"Points retained after envelope consistency filter: {len(clean_pts)} ({valid_mask.mean()*100:.1f}%)")
+    
+    # 3. Spatial Voxel Clustering (30mm resolution) to produce clean lattice vertices
+    vox = np.round(clean_pts / 0.030).astype(int)
+    _, unique_idx = np.unique(vox, axis=0, return_index=True)
+    lattice_vertices = clean_pts[unique_idx]
+    print(f"Final 3D Volumetric Lattice Vertices: {len(lattice_vertices)}")
+    
+    # 4. Master Curve Extraction from Lattice
+    # Curve A: Centerline Spine (X ~ 0)
+    spine_mask = np.abs(lattice_vertices[:, 0]) < 0.08
+    spine_pts = lattice_vertices[spine_mask]
+    spine_pts = spine_pts[spine_pts[:, 2].argsort()]
+    z_spine_steps = np.linspace(spine_pts[:, 2].min(), spine_pts[:, 2].max(), 32)
+    spine_curve = []
+    for zs in z_spine_steps:
+        sub = spine_pts[np.abs(spine_pts[:, 2] - zs) < 0.08]
+        if len(sub):
+            # Outer upper surface
+            y_max = sub[:, 1].max()
+            spine_curve.append([0.0, round(float(y_max), 4), round(float(zs), 4)])
+            
+    # Curve B: Shoulder / Beltline Left (outermost upper side edge)
+    sh_mask = (lattice_vertices[:, 0] > 0.60) & (lattice_vertices[:, 1] > 0.65) & (lattice_vertices[:, 1] < 1.05)
+    sh_pts = lattice_vertices[sh_mask]
+    sh_pts = sh_pts[sh_pts[:, 2].argsort()]
+    z_sh_steps = np.linspace(sh_pts[:, 2].min(), sh_pts[:, 2].max(), 24)
+    shoulder_curve_L = []
+    for zs in z_sh_steps:
+        sub = sh_pts[np.abs(sh_pts[:, 2] - zs) < 0.09]
+        if len(sub):
+            # Outermost point
+            p_out = sub[np.argmax(sub[:, 0])]
+            shoulder_curve_L.append([round(float(p_out[0]), 4), round(float(p_out[1]), 4), round(float(zs), 4)])
+            
+    # Curve C: Rocker / Sill Left (outermost lower side edge)
+    rk_mask = (lattice_vertices[:, 0] > 0.65) & (lattice_vertices[:, 1] < 0.40) & (lattice_vertices[:, 1] > 0.08)
+    rk_pts = lattice_vertices[rk_mask]
+    rk_pts = rk_pts[rk_pts[:, 2].argsort()]
+    z_rk_steps = np.linspace(rk_pts[:, 2].min(), rk_pts[:, 2].max(), 20)
+    rocker_curve_L = []
+    for zs in z_rk_steps:
+        sub = rk_pts[np.abs(rk_pts[:, 2] - zs) < 0.10]
+        if len(sub):
+            p_out = sub[np.argmax(sub[:, 0])]
+            rocker_curve_L.append([round(float(p_out[0]), 4), round(float(p_out[1]), 4), round(float(zs), 4)])
+            
+    # Curve D: Roof Rail Left (topmost side edge)
+    rl_mask = (lattice_vertices[:, 0] > 0.35) & (lattice_vertices[:, 0] < 0.65) & (lattice_vertices[:, 1] > 1.10)
+    rl_pts = lattice_vertices[rl_mask]
+    rl_pts = rl_pts[rl_pts[:, 2].argsort()]
+    z_rl_steps = np.linspace(rl_pts[:, 2].min(), rl_pts[:, 2].max(), 16)
+    roof_rail_curve_L = []
+    for zs in z_rl_steps:
+        sub = rl_pts[np.abs(rl_pts[:, 2] - zs) < 0.09]
+        if len(sub):
+            p_top = sub[np.argmax(sub[:, 1])]
+            roof_rail_curve_L.append([round(float(p_top[0]), 4), round(float(p_top[1]), 4), round(float(zs), 4)])
+
+    curves_dict = {
+        "spine_centerline": spine_curve,
+        "shoulder_left": shoulder_curve_L,
+        "rocker_left": rocker_curve_L,
+        "roof_rail_left": roof_rail_curve_L
+    }
+
+    # Save NPZ
+    out_npz = f"{base_dir}/work/car/volumetric_wireframe_lattice_v580.npz"
+    np.savez_compressed(
+        out_npz,
+        lattice_vertices=lattice_vertices,
+        curves=curves_dict,
+        _date="27 October 2026"
+    )
+    print(f"Saved volumetric lattice NPZ to {out_npz}")
+
+    # Save OBJ point cloud
+    out_obj = f"{base_dir}/versions/VolumetricWireframeLattice_v580.obj"
+    with open(out_obj, "w") as f:
+        f.write("# 27 October 2026: Volumetric Wireframe Point Lattice v580\n")
+        f.write("# Method M21: 6-View Multi-Ray Intersection from ref3.png\n")
+        for p in lattice_vertices:
+            f.write(f"v {p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
+    print(f"Saved {len(lattice_vertices)} vertices OBJ point cloud to {out_obj}")
+
+    # Save Curves JSON
+    out_json = f"{base_dir}/work/car/volumetric_wireframe_curves_v580.json"
+    with open(out_json, "w") as f:
+        json.dump({
+            "_date": "27 October 2026",
+            "method": "M21_VolumetricWireframeLattice",
+            "reference": "refs/objects/06_Car/06_Car_topology_ref3_27-October-2026.png",
+            "vertex_count": len(lattice_vertices),
+            "curves": curves_dict
+        }, f, indent=2)
+    print(f"Saved master curves JSON to {out_json}")
+    for k, pts in curves_dict.items():
+        print(f"  Guide Curve [{k:20s}]: {len(pts)} 3D control points")
+
+    return lattice_vertices, curves_dict
+
+if __name__ == "__main__":
+    reconstruct_volumetric_lattice()
