@@ -1,0 +1,126 @@
+"""27 October 2026 : ZenRay Meshes, PLANARIZE QUADS, the cleanup of twisted quads on the delivery file.
+TopoCheck flags a quad as a FOLD when both of its triangulations bend by more than `fold_max_deg` (a twisted quad). The loft builds such quads where two rows or two seams shear against each other.
+Every flagged quad is pulled toward the best fit plane of its four corners, a little per pass, each vertex moving at most `--max-mm` from where it started ; quads that stay flat are not touched.
+Nothing else changes : same faces, same names, same vertex count. Every value is a parameter (HDA) : python PlanarizeQuads.py <delivery_in.npz> <delivery_out.npz> [--max-mm 3] [--target-deg 15] [--iters 80] [--step 0.5] [--guard topo_params.json] [--obj out.obj]
+FR : les quads vrillés (pli en diagonale) sont rapprochés de leur plan moyen, chaque sommet bougeant d'au plus quelques millimètres.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def quad_fold(V):
+    """V is (n, 4, 3). Returns the fold angle of TopoCheck (the smaller bend of the two triangulations, degrees) for every quad."""
+    def tn(a, b, c):
+        n_ = np.cross(V[:, b] - V[:, a], V[:, c] - V[:, a])
+        return n_ / (np.linalg.norm(n_, axis=1, keepdims=True) + 1e-30)
+    fA = np.degrees(np.arccos(np.clip((tn(0, 1, 2) * tn(0, 2, 3)).sum(1), -1, 1)))
+    fB = np.degrees(np.arccos(np.clip((tn(1, 2, 3) * tn(1, 3, 0)).sum(1), -1, 1)))
+    return np.minimum(fA, fB)
+
+
+def planarize(P, Q, max_m=0.003, target_deg=15.0, iters=80, step=0.5):
+    """Returns the new points, the fold before and after (arrays over the quads) and the displacement of every point (metres)."""
+    P0 = P.copy()
+    P = P.copy()
+    qi = np.array([i for i, q in enumerate(Q) if len(q) == 4])
+    Q4 = np.array([Q[i] for i in qi])
+    fold0 = quad_fold(P[Q4])
+    for _ in range(iters):
+        V = P[Q4]
+        fold = quad_fold(V)
+        bad = fold > target_deg
+        if not bad.any():
+            break
+        Vb = V[bad]
+        c = Vb.mean(1, keepdims=True)
+        X = Vb - c
+        # normal of the best plane : the direction of least variance of the four corners (smallest singular vector)
+        _, _, vt = np.linalg.svd(X)
+        nrm = vt[:, 2, :]
+        dist = (X * nrm[:, None, :]).sum(2)
+        move = -dist[:, :, None] * nrm[:, None, :]          # projection onto the plane
+        acc = np.zeros_like(P)
+        cnt = np.zeros(len(P))
+        for k in range(4):
+            np.add.at(acc, Q4[bad][:, k], move[:, k])
+            np.add.at(cnt, Q4[bad][:, k], 1.0)
+        hit = cnt > 0
+        P[hit] += step * acc[hit] / cnt[hit, None]
+        d = P - P0
+        n = np.linalg.norm(d, axis=1)
+        over = n > max_m
+        if over.any():
+            P[over] = P0[over] + d[over] * (max_m / n[over])[:, None]
+    fold1 = quad_fold(P[Q4])
+    return P, fold0, fold1, np.linalg.norm(P - P0, axis=1)
+
+
+def guard(P0, P, Q, names, params, rounds=12):
+    """The guard of the gain rule : every face that is faulty after the move but was not before sends its points back to where they started, until no face is newly faulty
+    (so the set of faulty faces can only shrink). Returns the points, the faulty counts before and after, and the rounds used."""
+    import TopoCheck as TC
+    tp = TC.load_params(params)
+    N, T = np.unique(np.array(names), return_inverse=True)
+    C = np.array([len(q) for q in Q], np.int32)
+    I = np.array([v for q in Q for v in q], np.int32)
+    st = np.concatenate([[0], np.cumsum(C.astype(np.int64))[:-1]])
+    vf = np.repeat(np.arange(len(C)), C)
+    err0 = TC.analyse(P0, C, I, T, N, tp)[2].astype(bool)
+    P = P.copy()
+    used = 0
+    for used in range(1, rounds + 1):
+        err = TC.analyse(P, C, I, T, N, tp)[2].astype(bool)
+        new = np.flatnonzero(err & ~err0)
+        if not len(new):
+            break
+        back = np.unique(np.concatenate([I[st[f]:st[f] + C[f]] for f in new]))
+        if (np.linalg.norm(P[back] - P0[back], axis=1) < 1e-12).all():
+            # the face has no moved point of its own : a neighbour caused it (a pole on a crease, a density ratio), so the ring around it goes back too
+            faces = np.unique(vf[np.isin(I, back)])
+            back = np.unique(I[np.isin(vf, faces)])
+        P[back] = P0[back]
+    err = TC.analyse(P, C, I, T, N, tp)[2].astype(bool)
+    return P, int(err0.sum()), int(err.sum()), used
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--max-mm", type=float, default=3.0, help="largest move of any vertex from its original place (mm)")
+    ap.add_argument("--target-deg", type=float, default=15.0, help="quads above this fold angle are pulled flat (the judge limit is 20)")
+    ap.add_argument("--iters", type=int, default=80)
+    ap.add_argument("--step", type=float, default=0.5, help="share of the distance to the plane taken per pass")
+    ap.add_argument("--rounds", type=int, default=40, help="most rounds of the guard")
+    ap.add_argument("--guard", default="", help="topo_params.json : points of every face that becomes faulty go back (the faulty set can only shrink)")
+    ap.add_argument("--obj", default="")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = [str(x) for x in d["names"]]
+    P2, f0, f1, mv = planarize(P, Q, a.max_mm / 1000.0, a.target_deg, a.iters, a.step)
+    gd = None
+    if a.guard:
+        P2, e0, e1, rounds = guard(P, P2, Q, names, a.guard, a.rounds)
+        f1 = quad_fold(P2[np.array([q for q in Q if len(q) == 4])])
+        mv = np.linalg.norm(P2 - P, axis=1)
+        gd = {"faults_before": e0, "faults_after": e1, "guard_rounds": rounds}
+    np.savez(a.out, P=P2.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(names))
+    print(json.dumps({"quads": int(len(f0)), "fold_over_20_before": int((f0 > 20).sum()), "fold_over_20_after": int((f1 > 20).sum()),
+                      "fold_p95_before": round(float(np.percentile(f0, 95)), 2), "fold_p95_after": round(float(np.percentile(f1, 95)), 2),
+                      "points_moved": int((mv > 1e-6).sum()), "move_max_mm": round(float(mv.max()) * 1000, 2), "move_mean_mm_of_moved": round(float(mv[mv > 1e-6].mean()) * 1000, 3) if (mv > 1e-6).any() else 0.0, **(gd or {})}))
+    if a.obj:
+        import TopoFix
+        TopoFix.write_obj(a.obj, P2, Q, names)
+        print("obj", a.obj)
+
+
+if __name__ == "__main__":
+    main()
