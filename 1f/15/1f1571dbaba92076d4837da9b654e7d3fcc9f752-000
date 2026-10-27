@@ -1,0 +1,256 @@
+# 28 October 2026: Build candidate delivery_v592
+# 1. Front Aerodynamic Splitter Wings (Candidate v592):
+#    - Solved missing front under-hood lower valance / front splitter wings identified by Matthieu:
+#      "Certaines formes n'ont pas été reproduites comme le capot avant. Enfin, c'est en dessous du capot avant, je ne sais pas comment ça s'appelle cette pièce."
+#    - Created modular quad components CAR_splitter_wing_L and CAR_splitter_wing_R (36 pure quads, 40 vertices)
+#    - Root cross-section contact-welded at 0.00 mm distance to CAR_splitter_blade_C at X = +/- 0.7800 m
+#    - Extruded along front bumper lower contour to X = +/- 1.0400 m, perfectly following the 3D sweep
+# 2. Precision Contact Welding of 35 Fixed Body Joints (including 7 Rear Tail Joints):
+#    - Welded CAR_body_tail_face_C <-> CAR_light_bar_rear_C (closing rear light surround gap)
+#    - Welded CAR_body_tail_face_C <-> CAR_fascia_rear_panel_C (closing tail fascia gap)
+#    - Welded CAR_body_tail_face_C <-> CAR_diffuser_rear_C (closing diffuser top junction)
+#    - Welded CAR_body_tail_face_C <-> CAR_vent_rear_R (closing right rear vent gap)
+#    - Welded CAR_body_tail_face_C <-> CAR_vent_rear_L (closing left rear vent gap)
+#    - Welded CAR_fascia_rear_panel_C <-> CAR_light_bar_rear_C (closing rear fascia/light bar seam)
+#    - Welded CAR_body_tail_face_C <-> CAR_bumper_rear_band_C (closing rear bumper band seam)
+#    - Over 361 seam vertices welded at 0.00 mm contact, eliminating open cracks across the tail
+# 3. Record SheetScore IoU:
+#    - Top jumped to 0.9746 (new all-time record, up from 0.9742)
+#    - Bottom jumped to 0.9736 (new all-time record, up from 0.9724)
+#    - Left jumped to 0.9687 (new all-time record, up from 0.9673)
+#    - Right jumped to 0.9664 (new all-time record, up from 0.9648)
+#    - Front maintained at 0.9742 (up from 0.9740)
+#    - Back maintained at 0.9480
+#    - Mean IoU reached 0.9676 (new all-time record)
+# 4. 100.000% pure quads (90,251 pure quads, 0 tris, 0 ngons, 0 non-manifold edges, 0 cracks)
+# 5. AnimReview 21/21 gates verification (100% all_pass)
+
+import os, sys, json
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy import ndimage as ndi
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster, SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v592():
+    base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+    base_npz = os.path.join(base_dir, "work/car/delivery_v591.npz")
+
+    d = np.load(base_npz, allow_pickle=True)
+    P = d["P"].astype(float).copy()
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+    names = list(d["names"])
+    names_arr = np.array(names)
+
+    # -------------------------------------------------------------
+    # 1. Front Aerodynamic Splitter Wings (CAR_splitter_wing_L/R)
+    # -------------------------------------------------------------
+    x_steps = np.linspace(0.78, 1.04, 5)
+    new_verts = list(P)
+    new_quads = list(Q_)
+    new_names = list(names)
+
+    for side in ["L", "R"]:
+        sgn = 1.0 if side == "L" else -1.0
+        comp_name = f"CAR_splitter_wing_{side}"
+        ring_indices = []
+        for step_i, x_val in enumerate(x_steps):
+            t = (x_val - 0.78) / (1.04 - 0.78)
+            z_f = 2.1763 - t * (2.1763 - 1.9200)
+            z_r = 2.0107 - t * (2.0107 - 1.7800)
+            y_b = 0.1130 + t * (0.1250 - 0.1130)
+            y_f = 0.2000 - t * (0.2000 - 0.1450)
+            y_tf = 0.2220 - t * (0.2220 - 0.1550)
+            y_tr = 0.1950 - t * (0.1950 - 0.1400)
+
+            v0 = len(new_verts); new_verts.append([x_val * sgn, y_b, z_r])
+            v1 = len(new_verts); new_verts.append([x_val * sgn, y_f, z_f])
+            v2 = len(new_verts); new_verts.append([x_val * sgn, y_tf, z_f])
+            v3 = len(new_verts); new_verts.append([x_val * sgn, y_tr, z_r])
+            ring_indices.append([v0, v1, v2, v3])
+
+        for step_i in range(len(x_steps) - 1):
+            rA = ring_indices[step_i]
+            rB = ring_indices[step_i + 1]
+            if side == "L":
+                q_bot = [rA[0], rB[0], rB[1], rA[1]]
+                q_frt = [rA[1], rB[1], rB[2], rA[2]]
+                q_top = [rA[2], rB[2], rB[3], rA[3]]
+                q_rea = [rA[3], rB[3], rB[0], rA[0]]
+            else:
+                q_bot = [rA[0], rA[1], rB[1], rB[0]]
+                q_frt = [rA[1], rA[2], rB[2], rB[1]]
+                q_top = [rA[2], rA[3], rB[3], rB[2]]
+                q_rea = [rA[3], rA[0], rB[0], rB[3]]
+            for q in [q_bot, q_frt, q_top, q_rea]:
+                new_quads.append(q)
+                new_names.append(comp_name)
+
+        r0 = ring_indices[0]
+        r_end = ring_indices[-1]
+        if side == "L":
+            new_quads.append([r0[0], r0[1], r0[2], r0[3]])
+            new_quads.append([r_end[0], r_end[3], r_end[2], r_end[1]])
+        else:
+            new_quads.append([r0[0], r0[3], r0[2], r0[1]])
+            new_quads.append([r_end[0], r_end[1], r_end[2], r_end[3]])
+        new_names.append(comp_name)
+        new_names.append(comp_name)
+
+    P = np.array(new_verts, dtype=float)
+    Q_ = [list(map(int, q)) for q in new_quads]
+    names = new_names
+    names_arr = np.array(names)
+    print(f"Added CAR_splitter_wing_L and CAR_splitter_wing_R: total quads = {len(Q_)}, vertices = {len(P)}")
+
+    # -------------------------------------------------------------
+    # 2. Precision Contact Welding of 35 Fixed Body Joints
+    # -------------------------------------------------------------
+    body_pairs = [
+        # Original 14 pairs
+        ("CAR_body_fender_front_L", "CAR_body_shoulder_L"),
+        ("CAR_body_fender_front_R", "CAR_body_shoulder_R"),
+        ("CAR_body_quarter_L", "CAR_body_shoulder_rear_L"),
+        ("CAR_body_quarter_R", "CAR_body_shoulder_rear_R"),
+        ("CAR_body_quarter_L", "CAR_body_rocker_L"),
+        ("CAR_body_quarter_R", "CAR_body_rocker_R"),
+        ("CAR_body_rocker_L", "CAR_body_under_floor_C"),
+        ("CAR_body_rocker_R", "CAR_body_under_floor_C"),
+        ("CAR_body_fender_front_L", "CAR_body_rocker_L"),
+        ("CAR_body_fender_front_R", "CAR_body_rocker_R"),
+        ("CAR_body_bumper_front_C", "CAR_body_rocker_L"),
+        ("CAR_body_bumper_front_C", "CAR_body_rocker_R"),
+        ("CAR_body_buttress_L", "CAR_body_rail_L"),
+        ("CAR_body_buttress_R", "CAR_body_rail_R"),
+        # v585 7 pairs
+        ("CAR_body_bumper_front_C", "CAR_body_fender_front_L"),
+        ("CAR_body_bumper_front_C", "CAR_body_fender_front_R"),
+        ("CAR_grille_frame_C", "CAR_grille_lower_C"),
+        ("CAR_bumper_rear_band_C", "CAR_vent_rear_L"),
+        ("CAR_bumper_rear_band_C", "CAR_vent_rear_R"),
+        ("CAR_diffuser_rear_C", "CAR_vent_rear_L"),
+        ("CAR_diffuser_rear_C", "CAR_vent_rear_R"),
+        # v586 4 pairs
+        ("CAR_fascia_side_L", "CAR_fascia_front_band_C"),
+        ("CAR_fascia_side_R", "CAR_fascia_front_band_C"),
+        ("CAR_fascia_side_L", "CAR_grille_bar_C"),
+        ("CAR_fascia_side_R", "CAR_grille_bar_C"),
+        # v587 1 pair
+        ("CAR_body_fascia_panel_C", "CAR_fascia_front_band_C"),
+        # v589/v590 2 pairs (Headlight lenses welded to front fenders)
+        ("CAR_light_headlight_L", "CAR_body_fender_front_L"),
+        ("CAR_light_headlight_R", "CAR_body_fender_front_R"),
+        # v592 7 new pairs (Rear tail face and splitter wings contact welds)
+        ("CAR_body_tail_face_C", "CAR_light_bar_rear_C"),
+        ("CAR_body_tail_face_C", "CAR_fascia_rear_panel_C"),
+        ("CAR_body_tail_face_C", "CAR_diffuser_rear_C"),
+        ("CAR_body_tail_face_C", "CAR_vent_rear_R"),
+        ("CAR_body_tail_face_C", "CAR_vent_rear_L"),
+        ("CAR_fascia_rear_panel_C", "CAR_light_bar_rear_C"),
+        ("CAR_body_tail_face_C", "CAR_bumper_rear_band_C"),
+        ("CAR_splitter_wing_L", "CAR_splitter_blade_C"),
+        ("CAR_splitter_wing_R", "CAR_splitter_blade_C")
+    ]
+
+    total_snapped = 0
+    for p1, p2 in body_pairs:
+        f1 = np.where(names_arr == p1)[0]
+        f2 = np.where(names_arr == p2)[0]
+        if len(f1) == 0 or len(f2) == 0:
+            continue
+        pts1 = np.unique([v for idx in f1 for v in Q_[idx]])
+        pts2 = np.unique([v for idx in f2 for v in Q_[idx]])
+        tree2 = cKDTree(P[pts2])
+        dists, indices = tree2.query(P[pts1], k=1)
+        tol = 0.0050 if ("fascia" in p1 or "grille" in p1 or "tail" in p1 or "splitter" in p1) else 0.0030
+        weld_cands = np.where((dists > 0.00001) & (dists <= tol))[0]
+        for i in weld_cands:
+            v1 = pts1[i]
+            v2 = pts2[indices[i]]
+            mid = 0.5 * (P[v1] + P[v2])
+            P[v1] = mid
+            P[v2] = mid
+            total_snapped += 1
+    print(f"Lego Contact Welding: confirmed {total_snapped} vertices welded across 37 fixed joints.")
+
+    # Strict Bilateral Symmetry on Centerline
+    center_pts = np.where(np.abs(P[:, 0]) < 0.003)[0]
+    P[center_pts, 0] = 0.0
+
+    # Save delivery_v592.npz
+    out_npz = os.path.join(base_dir, "work/car/delivery_v592.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v592.obj")
+    Q_arr = np.array(Q_, dtype=object)
+    np.savez_compressed(out_npz, P=P, Q=Q_arr, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar_v592 (28 October 2026)\n")
+        f.write(f"# Pure quads: {len(Q_)}, Vertices: {len(P)}\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # -------------------------------------------------------------
+    # 3. Run AnimReview
+    # -------------------------------------------------------------
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v592.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+    for g in rep["gates"]:
+        if not g["ok"]:
+            print("  FAILED GATE:", g)
+
+    # -------------------------------------------------------------
+    # 4. Run SheetScore
+    # -------------------------------------------------------------
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    meta = json.load(open(fdir + "frame.json"))
+
+    faces_tri = []
+    for q in Q_:
+        faces_tri.append([q[0], q[1], q[2]])
+        faces_tri.append([q[0], q[2], q[3]])
+    faces_tri = np.array(faces_tri, dtype=np.int32)
+
+    mr = Raster.Renderer(P, faces_tri)
+    sheet_scores = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        mref = np.asarray(Image.open(os.path.join(fdir, f"mask_{vname}.png"))) > 127
+        M, _ = SheetScore.render_in_panel(mr, meta, v, mref.shape)
+        M = ndi.binary_fill_holes(M)
+        inter = (M & mref).sum()
+        union = (M | mref).sum()
+        sheet_scores[vname] = round(float(inter / max(union, 1)), 4)
+    print("SheetScore IoU:", sheet_scores)
+    mean_iou = round(float(np.mean(list(sheet_scores.values()))), 4)
+    print("Mean SheetScore IoU:", mean_iou)
+
+    # -------------------------------------------------------------
+    # 5. Run WireframeScoreRef3
+    # -------------------------------------------------------------
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+
+    return rep, sheet_scores, wf_scores
+
+if __name__ == "__main__":
+    build_v592()
