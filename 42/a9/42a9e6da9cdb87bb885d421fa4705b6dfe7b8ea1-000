@@ -1,0 +1,44 @@
+# 27 October 2026 14:00 Paris: move existing support behind independent panels, preserving its connectivity and both sides.
+import argparse,json,os,sys
+import numpy as np
+from scipy.interpolate import LinearNDInterpolator,NearestNDInterpolator
+from scipy.spatial import ConvexHull
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from TopoFix import save
+
+
+def main(args):
+    if args.settings:
+        settings=json.load(open(args.settings)).get('liner',{})
+        for key,value in settings.items():
+            if hasattr(args,key):setattr(args,key,value)
+    p,q,n=read_mesh(args.assembly);source,_,_=read_mesh(args.panel);nu,nv=args.grid
+    inner=source[nu*nv:nu*nv*2];yz=inner[:,args.projection];x=(np.abs(inner[:,args.normal_axis]) if args.symmetric else inner[:,args.normal_axis]*args.side);hull=ConvexHull(yz)
+    linear=LinearNDInterpolator(yz,x);near=NearestNDInterpolator(yz,x)
+    ids=sorted({v for face,name in zip(q,n) if name==args.support for v in face})
+    if not ids:raise ValueError('Missing support '+args.support)
+    used_elsewhere={v for face,name in zip(q,n) if name!=args.support for v in face}
+    if used_elsewhere.intersection(ids):raise ValueError('Support shares points with other components')
+    before=p.copy();values=p[ids];xy=values[:,args.projection];distance=np.maximum(np.max(xy@hull.equations[:,:2].T+hull.equations[:,2],axis=1),0)
+    wanted=linear(xy);outside=~np.isfinite(wanted);wanted[outside]=near(xy[outside]);wanted-=args.clearance_mm/1000
+    t=np.clip((distance-args.full_mm/1000)/((args.fade_mm-args.full_mm)/1000),0,1);weight=1-t*t*(3-2*t)
+    coordinate=(np.abs(values[:,args.normal_axis]) if args.symmetric else values[:,args.normal_axis]*args.side)
+    inset=np.maximum(coordinate-wanted,0)*weight
+    inset=np.minimum(inset,args.cap_mm/1000)
+    if args.max_slope>0:
+        # 27 October 2026 14:10 Paris: Lipschitz envelope spreads required inset over connected neighbours.
+        field=np.zeros(len(p));field[ids]=inset
+        edges=np.array([(face[k-1],face[k]) for face,name in zip(q,n) if name==args.support for k in range(len(face))],int)
+        left,right=edges[:,0],edges[:,1];cost=args.max_slope*np.linalg.norm(before[left]-before[right],axis=1)
+        for _ in range(args.passes):
+            old=field.copy();np.maximum.at(field,left,old[right]-cost);np.maximum.at(field,right,old[left]-cost)
+            if np.max(field-old)<1e-7:break
+        inset=field[ids]
+    sign=(np.sign(values[:,args.normal_axis]) if args.symmetric else args.side)
+    p[ids,args.normal_axis]=sign*(coordinate-inset)
+    save(args.output,p,q,n);m=np.linalg.norm(p-before,axis=1)*1000
+    print(json.dumps({'moved':int((m>1e-6).sum()),'max_mm':float(m.max()),'clearance_mm':args.clearance_mm,'full_mm':args.full_mm,'fade_mm':args.fade_mm,'cap_mm':args.cap_mm}))
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser();ap.add_argument('assembly');ap.add_argument('panel');ap.add_argument('output');ap.add_argument('--support',default='CAR_body_liner_C');ap.add_argument('--grid',type=int,nargs=2,default=[41,17]);ap.add_argument('--clearance-mm',type=float,default=2);ap.add_argument('--full-mm',type=float,default=8);ap.add_argument('--fade-mm',type=float,default=30);ap.add_argument('--cap-mm',type=float,default=30);ap.add_argument('--max-slope',type=float,default=0);ap.add_argument('--passes',type=int,default=60);ap.add_argument('--settings');ap.add_argument('--normal-axis',type=int,default=0);ap.add_argument('--projection',type=int,nargs=2,default=[2,1]);ap.add_argument('--symmetric',type=int,default=1);ap.add_argument('--side',type=int,default=1);main(ap.parse_args())

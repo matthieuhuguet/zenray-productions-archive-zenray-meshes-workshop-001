@@ -1,0 +1,36 @@
+# 27 October 2026 14:17 Paris: reject detected edge crossings at the bounding-box neighbours of each configured component.
+import argparse,json,os,sys
+import numpy as np
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from InterfaceCollision import mesh_for,crossing
+
+
+def main(args):
+    points,faces,names=read_mesh(args.assembly);mapping={}
+    for f,name in zip(faces,names):mapping.setdefault(name,set()).update(f)
+    bounds={name:(points[list(ids)].min(0),points[list(ids)].max(0)) for name,ids in mapping.items() if ids}
+    config=json.load(open(args.config));report={};total=0
+    parts=[name for entry in config['panels'] for name in (entry['part'],entry.get('mirror_part')) if name]
+    for name in parts:
+        lo,hi=bounds[name];subject=mesh_for(points,faces,names,name)
+        candidates=[other for other,(low,high) in bounds.items() if other!=name and np.all(high>=lo) and np.all(low<=hi)]
+        report[name]={}
+        for other in sorted(candidates):
+            neighbour=mesh_for(points,faces,names,other)
+            a=crossing(subject,neighbour,args.epsilon);b=crossing(neighbour,subject,args.epsilon)
+            contained=0
+            if subject.is_watertight:
+                centers=neighbour.triangles_center;low,high=subject.bounds
+                selected=np.flatnonzero(np.all((centers>=low)&(centers<=high),axis=1))
+                if len(selected):contained=int(subject.contains(centers[selected]).sum())
+            total+=a+b+contained
+            report[name][other]={'subject_edges_crossing':a,'neighbour_edges_crossing':b,'neighbour_triangles_inside':contained}
+    result={'date':'27 October 2026','total_crossings':total,'components':report,'epsilon_m':args.epsilon,'limitation':'Coplanar overlap and containment without a sampled triangle centre are not detected.'}
+    with open(args.output,'w') as f:json.dump(result,f,indent=2)
+    print(json.dumps({'total_crossings':total,'report':args.output}))
+    return int(total>0)
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser();ap.add_argument('assembly');ap.add_argument('config');ap.add_argument('output');ap.add_argument('--epsilon',type=float,default=1e-5)
+    sys.exit(main(ap.parse_args()))

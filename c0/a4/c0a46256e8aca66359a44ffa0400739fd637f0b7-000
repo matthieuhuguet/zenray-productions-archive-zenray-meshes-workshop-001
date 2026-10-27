@@ -1,0 +1,35 @@
+# 27 October 2026 13:33 Paris: detect crossing surface edges in either direction between named assembly components.
+import argparse,json,os,sys
+import numpy as np,trimesh
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+
+
+def mesh_for(points,polys,names,part):
+    faces=[f for f,n in zip(polys,names) if n==part]
+    if not faces:raise ValueError('Missing component: '+part)
+    faces=[(f[0],f[k],f[k+1]) for f in faces for k in range(1,len(f)-1)]
+    return trimesh.Trimesh(vertices=points,faces=faces,process=False)
+
+
+def crossing(a,b,eps):
+    edges=a.edges_unique;starts=a.vertices[edges[:,0]];vectors=a.vertices[edges[:,1]]-starts
+    lengths=np.linalg.norm(vectors,axis=1);valid=lengths>2*eps
+    starts=starts[valid];vectors=vectors[valid];lengths=lengths[valid]
+    normals=vectors/lengths[:,None]
+    locations,ray,tri=b.ray.intersects_location(starts,normals,multiple_hits=True)
+    if len(ray)==0:return 0
+    distance=np.linalg.norm(locations-starts[ray],axis=1)
+    return int(np.sum((distance>eps)&(distance<lengths[ray]-eps)))
+
+
+def main(args):
+    p,q,n=read_mesh(args.assembly);subject=mesh_for(p,q,n,args.part);result={}
+    for part in args.neighbours:
+        other=mesh_for(p,q,n,part)
+        a=crossing(subject,other,args.epsilon);b=crossing(other,subject,args.epsilon)
+        result[part]={'subject_edges_crossing':a,'neighbour_edges_crossing':b}
+    print(json.dumps({'part':args.part,'epsilon_m':args.epsilon,'crossings':result,'limitation':'Coplanar overlap and contact within epsilon are not detected.'}))
+
+if __name__=='__main__':
+    a=argparse.ArgumentParser();a.add_argument('assembly');a.add_argument('part');a.add_argument('neighbours',nargs='+');a.add_argument('--epsilon',type=float,default=1e-5);main(a.parse_args())

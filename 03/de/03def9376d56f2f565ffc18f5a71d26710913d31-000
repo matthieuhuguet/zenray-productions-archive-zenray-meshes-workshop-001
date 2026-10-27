@@ -1,0 +1,40 @@
+# 27 October 2026 13:24 Paris: a native editable NURBS surface, editable CV stage, quad conversion and closed thickness in the live scene.
+import hou
+import json
+from pathlib import Path
+config_path=globals()['GUIDES']
+data=json.loads(Path(config_path).read_text())
+root=hou.node('/obj');object_name=globals().get('OBJECT_NAME','ZRM_DoorGuides');obj=root.node(object_name) or root.createNode('geo',object_name)
+ctrl=obj.node('CTRL_guides') or obj.createNode('null','CTRL_guides')
+if not ctrl.parm('guide_file'):
+    group=ctrl.parmTemplateGroup()
+    group.append(hou.StringParmTemplate('guide_file','Guide control net',1,default_value=(config_path,),string_type=hou.stringParmType.FileReference))
+    group.append(hou.FloatParmTemplate('thickness_m','Thickness (m)',1,default_value=(data['config']['thickness_m'],),min=0.001,max=0.03))
+    ctrl.setParmTemplateGroup(group)
+ctrl.parm('guide_file').set(config_path)
+surface=obj.node('guide_surface') or obj.createNode('python','guide_surface')
+surface.parm('python').set('''# 27 October 2026 13:24 Paris: control points remain editable in the next Edit SOP.
+import hou,json
+node=hou.pwd();geo=node.geometry();d=json.load(open(node.parent().node('CTRL_guides').evalParm('guide_file')))
+c=d['controls'];s=geo.createNURBSSurface(len(c[0]),len(c))
+for i,row in enumerate(c):
+    for j,p in enumerate(row):s.vertex(i,j).point().setPosition(p)
+''')
+edit=obj.node('EDIT_control_points') or obj.createNode('edit','EDIT_control_points');edit.setInput(0,surface)
+settings=data['config']
+params=ctrl.parmTemplateGroup()
+if not ctrl.parmTuple('interface_gap_m'):
+    gaps=tuple(settings.get('interface_gap_m',[0.,0.]))
+    params.append(hou.FloatParmTemplate('interface_gap_m','Interface gap U and V (m)',2,default_value=gaps))
+for key,label,value in [('seam_depth_m','Seam depth (m)',settings.get('seam_depth_m',.012)),('seam_width_m','Support width (m)',settings.get('seam_width_m',.016)),('polish_mm','Numerical polish limit (mm)',settings.get('polish_mm',.01))]:
+    if not ctrl.parm(key): params.append(hou.FloatParmTemplate(key,label,1,default_value=(value,)))
+for key,label,value in [('segments_u','Length divisions',settings.get('segments_u',40)),('segments_v','Height divisions',settings.get('segments_v',16))]:
+    if not ctrl.parm(key): params.append(hou.IntParmTemplate(key,label,1,default_value=(value,),min=4,max=100))
+ctrl.setParmTemplateGroup(params)
+sampler=obj.node('quad_isocurves') or obj.createNode('python','quad_isocurves');sampler.setInput(0,edit)
+sample_path=settings['sample_script'];sampler.parm('python').set("exec(compile(open(%r).read(), %r, 'exec'))" % (sample_path,sample_path))
+name=obj.node('name_panel') or obj.createNode('attribwrangle','name_panel');name.setInput(0,sampler);name.parm('class').set(1);name.parm('snippet').set('s@name = "'+data['part']+'";')
+out=obj.node('OUT_panel') or obj.createNode('null','OUT_panel');out.setInput(0,name);out.setDisplayFlag(True);out.setRenderFlag(True)
+curves=obj.node('NURBS_guides') or obj.createNode('python','NURBS_guides');curves.setInput(0,edit)
+curve_script=settings['curve_script'];curves.parm('python').set("exec(compile(open(%r).read(), %r, 'exec'))" % (curve_script,curve_script))
+obj.setDisplayFlag(False);obj.layoutChildren();result={'object':obj.path(),'surface_cv':len(surface.geometry().points()),'faces':len(out.geometry().prims()),'errors':out.errors()}

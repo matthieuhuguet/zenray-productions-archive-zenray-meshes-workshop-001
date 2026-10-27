@@ -1,0 +1,42 @@
+# 27 October 2026 13:10 Paris: replace named assembly components without changing any other component.
+import argparse
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np
+from TopoFix import save
+
+
+def read_mesh(path):
+    data = np.load(path, allow_pickle=True)
+    if 'Q' in data:
+        return data['P'], [list(map(int, q)) for q in data['Q']], list(map(str, data['names']))
+    starts = np.r_[0, np.cumsum(data['C'])]
+    return data['P'], [data['I'][a:b].tolist() for a, b in zip(starts[:-1], starts[1:])], [str(data['names'][t]) for t in data['T']]
+
+
+def replace(source, replacement, output, patterns, remove=None):
+    remove = set(remove or [])
+    points, faces, names = read_mesh(source)
+    new_points, new_faces, new_names = read_mesh(replacement)
+    selected = lambda name: any(pattern in name for pattern in patterns)
+    incoming = {name for name in new_names if selected(name)}
+    existing = set(names)
+    assert incoming and incoming <= existing, 'Replacement must match existing named components'
+    keep = [i for i, name in enumerate(names) if name not in incoming and name not in remove]
+    add = [i for i, name in enumerate(new_names) if name in incoming]
+    offset = len(points)
+    result_faces = [faces[i] for i in keep] + [[v + offset for v in new_faces[i]] for i in add]
+    result_names = [names[i] for i in keep] + [new_names[i] for i in add]
+    save(output, np.vstack([points, new_points]), result_faces, result_names)
+    return {'replaced': sorted(incoming), 'removed': sorted(remove & existing), 'unchanged_faces': len(keep), 'new_faces': len(add)}
+
+
+if __name__ == '__main__':
+    import json
+    parser = argparse.ArgumentParser()
+    parser.add_argument('source'); parser.add_argument('replacement'); parser.add_argument('output')
+    parser.add_argument('--match', default=[''], nargs='+')
+    parser.add_argument('--remove', default=[], nargs='*')
+    args = parser.parse_args()
+    print(json.dumps(replace(args.source, args.replacement, args.output, args.match, args.remove)))

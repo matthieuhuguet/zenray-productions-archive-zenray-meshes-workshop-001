@@ -1,0 +1,24 @@
+# 27 October 2026 13:49 Paris: exact editable-surface isocurves, displayed as native cubic NURBS rather than sampled polylines.
+import hou,json,numpy as np
+node=hou.pwd();geo=node.geometry();source=node.inputs()[0].geometry().prims()[0];geo.clear()
+d=json.load(open(node.parent().node('CTRL_guides').evalParm('guide_file')))
+control=np.array([[source.vertex(i,j).point().position() for j in range(source.numRows())] for i in range(source.numCols())])
+def basis(value,knots,degree):
+    if value==1:value=np.nextafter(1.,0.)
+    knots=np.asarray(knots);weights=((knots[:-1]<=value)&(value<knots[1:])).astype(float)
+    for order in range(1,degree+1):
+        out=np.zeros(len(weights)-1)
+        for i in range(len(out)):
+            left=knots[i+order]-knots[i];right=knots[i+order+1]-knots[i+1]
+            if left>0:out[i]+=(value-knots[i])/left*weights[i]
+            if right>0:out[i]+=(knots[i+order+1]-value)/right*weights[i+1]
+        weights=out
+    return weights
+name=geo.addAttrib(hou.attribType.Prim,'name','')
+for axis,knots in [('u',d['knots_u']),('v',d['knots_v'])]:
+    for value in d['config'].get('guide_iso_values',[0,.25,.5,.75,1]):
+        weights=basis(value,knots,3)
+        points=np.einsum('i,ijc->jc',weights,control) if axis=='u' else np.einsum('j,ijc->ic',weights,control)
+        curve=geo.createNURBSCurve(len(points),order=4)
+        for vertex,p in zip(curve.vertices(),points):vertex.point().setPosition(p)
+        curve.setAttribValue(name,'guide_'+axis+'_'+str(value))

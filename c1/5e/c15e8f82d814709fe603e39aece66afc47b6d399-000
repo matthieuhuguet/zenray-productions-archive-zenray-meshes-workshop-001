@@ -1,0 +1,31 @@
+# 27 October 2026 13:42 Paris: remove hidden support faces crossing a separate component footprint, keeping all other faces intact.
+import argparse,json,os,sys
+import numpy as np
+from scipy.spatial import ConvexHull
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from TopoFix import save
+
+
+def main(args):
+    p,q,n=read_mesh(args.source);parts=[]
+    for part in args.parts:
+        ids=sorted({v for face,name in zip(q,n) if name==part for v in face})
+        if not ids:raise ValueError('Missing component: '+part)
+        xyz=p[ids];hull=ConvexHull(xyz[:,[2,1]]);parts.append((part,xyz[:,0].min()-args.margin,xyz[:,0].max()+args.margin,hull.equations))
+    keep=[];removed={part:0 for part in args.parts}
+    for i,(face,name) in enumerate(zip(q,n)):
+        if name!=args.support:keep.append(i);continue
+        vertices=p[face];remove=False
+        for part,xmin,xmax,eq in parts:
+            if vertices[:,0].max()<xmin or vertices[:,0].min()>xmax:continue
+            # Conservative separating test: every hull half-plane must admit at least one face vertex.
+            if np.all(np.min(vertices[:,[2,1]]@eq[:,:2].T+eq[:,2],axis=0)<=args.margin):
+                remove=True;removed[part]+=1;break
+        if not remove:keep.append(i)
+    if not sum(removed.values()):raise ValueError('No support faces removed; check the interface')
+    save(args.output,p,[q[i] for i in keep],[n[i] for i in keep])
+    print(json.dumps({'support':args.support,'removed_faces':removed,'kept_faces':len(keep),'margin_m':args.margin,'note':'Conservative projected footprint; visible score and collision require independent checks.'}))
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser();parser.add_argument('source');parser.add_argument('output');parser.add_argument('--support',required=True);parser.add_argument('--parts',nargs='+',required=True);parser.add_argument('--margin',type=float,default=.002);main(parser.parse_args())

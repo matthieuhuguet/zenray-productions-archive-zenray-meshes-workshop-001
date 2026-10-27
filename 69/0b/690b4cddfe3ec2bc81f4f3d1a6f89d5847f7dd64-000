@@ -1,0 +1,45 @@
+# 27 October 2026 13:23 Paris: project independent panel guides into the reference cameras for inspection.
+import argparse,json,os,sys
+import numpy as np
+from PIL import Image,ImageDraw
+from scipy.interpolate import BSpline
+from scipy.ndimage import distance_transform_edt
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from RowOverlay import project
+from LineScore import ref_edges
+
+
+def curves(data,count):
+    c=np.asarray(data['controls']);t=np.linspace(0,1,count)
+    u=BSpline.design_matrix(t,data['knots_u'],3).toarray()
+    v=BSpline.design_matrix(t,data['knots_v'],3).toarray()
+    return [np.einsum('ui,j,ijc->uc',u,v[k],c) for k in (0,count-1)] + [np.einsum('i,vj,ijc->vc',u[k],v,c) for k in (0,count-1)]
+
+
+def main(args):
+    data=json.load(open(args.guides));meta=json.load(open(os.path.join(args.frame,'frame.json')))
+    sheet=json.load(open(os.path.join(args.views,'sheet.json')));lines=curves(data,args.samples)
+    os.makedirs(args.out,exist_ok=True);report={}
+    for view in meta['views']:
+        panel=next(p for p in sheet['panels'] if p['name']==view['name'])
+        path=os.path.join(args.views,'%02d_%s_rgb.png'%(panel['index'],view['name']))
+        original=Image.open(path).convert('RGB');ref=np.asarray(original.convert('L'))
+        distance=distance_transform_edt(~ref_edges(ref));im=original.copy();draw=ImageDraw.Draw(im)
+        for i,line in enumerate(lines):
+            uv=project(meta,view,line)
+            draw.line([tuple(x) for x in uv],fill=(255,55,45) if i<2 else (0,220,255),width=2)
+            if view['name'] in ('left','right'):
+                ij=np.rint(uv).astype(int);valid=(ij[:,0]>=0)&(ij[:,0]<ref.shape[1])&(ij[:,1]>=0)&(ij[:,1]<ref.shape[0])
+                dist=distance[ij[valid,1],ij[valid,0]]/view['px_per_m']*1000
+                report.setdefault(view['name'],[]).append({'curve':i,'median_mm':round(float(np.median(dist)),2),'p95_mm':round(float(np.percentile(dist,95)),2)})
+        uv=np.concatenate([project(meta,view,line) for line in lines]);margin=args.margin
+        box=(max(0,int(uv[:,0].min()-margin)),max(0,int(uv[:,1].min()-margin)),min(im.width,int(uv[:,0].max()+margin)),min(im.height,int(uv[:,1].max()+margin)))
+        if box[2]>box[0] and box[3]>box[1]:
+            im.crop(box).resize(((box[2]-box[0])*args.scale,(box[3]-box[1])*args.scale),Image.Resampling.LANCZOS).save(os.path.join(args.out,view['name']+'.png'))
+    report['caveat']='Unsigned distance to nearest image edge, without visibility or semantic matching; diagnosis only.'
+    json.dump(report,open(os.path.join(args.out,'measure.json'),'w'),indent=2)
+    print(json.dumps(report))
+
+if __name__=='__main__':
+    ap=argparse.ArgumentParser();ap.add_argument('guides');ap.add_argument('frame');ap.add_argument('views');ap.add_argument('out');ap.add_argument('--samples',type=int,default=201);ap.add_argument('--margin',type=int,default=28);ap.add_argument('--scale',type=int,default=3)
+    main(ap.parse_args())

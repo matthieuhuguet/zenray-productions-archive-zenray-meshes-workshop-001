@@ -1,0 +1,49 @@
+# 27 October 2026 13:48 Paris: remove only support faces intersecting or inside an independently closed component.
+import argparse,json,os,sys
+import numpy as np,trimesh
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from TopoFix import save
+
+
+def extract(points,polys,names,name):
+    indices=[i for i,n in enumerate(names) if n==name]
+    if not indices:raise ValueError('Missing component: '+name)
+    triangles=[];owners=[]
+    for idx in indices:
+        q=polys[idx]
+        for k in range(1,len(q)-1):triangles.append([q[0],q[k],q[k+1]]);owners.append(idx)
+    return trimesh.Trimesh(vertices=points,faces=triangles,process=False),np.array(owners)
+
+
+def intersections(a,b,eps):
+    edges=a.edges_unique;start=a.vertices[edges[:,0]];direction=a.vertices[edges[:,1]]-start
+    length=np.linalg.norm(direction,axis=1);valid=length>2*eps;edge_ids=np.flatnonzero(valid)
+    start=start[valid];direction=direction[valid]/length[valid,None];length=length[valid]
+    hit,ray,tri=b.ray.intersects_location(start,direction,multiple_hits=True)
+    if len(ray)==0:return np.array([],int),np.array([],int)
+    distance=np.linalg.norm(hit-start[ray],axis=1);good=(distance>eps)&(distance<length[ray]-eps)
+    return edge_ids[ray[good]],tri[good]
+
+
+def main(args):
+    p,q,n=read_mesh(args.source);support,owners=extract(p,q,n,args.support);remove=set();report={}
+    for part in args.parts:
+        body,_=extract(p,q,n,part)
+        if not body.is_watertight:raise ValueError('Component is not closed: '+part)
+        body_edges,support_tri=intersections(body,support,args.epsilon)
+        support_edges,_=intersections(support,body,args.epsilon)
+        bad_tri=np.flatnonzero(np.isin(support.edges_unique_inverse,support_edges).reshape(-1,3).any(axis=1))
+        remove.update(owners[support_tri]);remove.update(owners[bad_tri])
+        # Catch support triangles wholly inside the closed shell, which have no intersecting edge.
+        centers=support.triangles_center;lo,hi=body.bounds
+        candidates=np.flatnonzero(np.all((centers>=lo)&(centers<=hi),axis=1))
+        contained=candidates[body.contains(centers[candidates])] if len(candidates) else []
+        remove.update(owners[contained])
+        report[part]={'crossings':len(body_edges)+len(support_edges),'contained_triangles':len(contained)}
+    if not remove:raise ValueError('No intersecting support faces found')
+    keep=[i for i in range(len(q)) if i not in remove];save(args.output,p,[q[i] for i in keep],[n[i] for i in keep])
+    print(json.dumps({'removed_faces':len(remove),'support':args.support,'parts':report,'epsilon_m':args.epsilon}))
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser();parser.add_argument('source');parser.add_argument('output');parser.add_argument('--support',required=True);parser.add_argument('--parts',nargs='+',required=True);parser.add_argument('--epsilon',type=float,default=1e-5);main(parser.parse_args())

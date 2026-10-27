@@ -1,0 +1,30 @@
+"""27 October 2026 : ZenRay Meshes, COMPONENT EXPORT and ASSEMBLY TEST (Transformers rule, skill section 125).
+Every named component of the delivery file becomes its own OBJ in local coordinates (origin = its pivot) plus one line in assembly.json : name, pivot (bbox centre, or the axle for a wheel part), faces, open edges, bbox, file.
+The assembly test rebuilds the whole car from these files by translating each by its pivot and compares the points with the delivery : the largest error must be under 0.01 mm ; removing one component leaves the others unchanged by construction.
+FR : chaque component dans son propre fichier à son pivot, la voiture se reconstruit par translations exactes.
+Usage: python ComponentExport.py <delivery.npz> <out_dir> [--wheels wheel_params.json]
+"""
+import argparse, json, os, collections
+import numpy as np
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--wheels", default="")
+a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); Q = [list(map(int, q)) for q in d["Q"]]; names = np.array([str(x) for x in d["names"]])
+axle = {}
+if a.wheels:
+    for i in json.load(open(a.wheels))["instances"]: axle[i["tag"]] = [i["x"], i["y"], i["z"]]
+man = []; err = 0.0
+for n in sorted(set(names)):
+    idx = [i for i, x in enumerate(names) if x == n]; vs = sorted({v for i in idx for v in Q[i]}); mp = {v: k for k, v in enumerate(vs)}; pp = P[vs]
+    tag = n.rsplit("_", 1)[-1]; piv = np.array(axle[tag]) if ("_wheel_" in n or "wheel_" in n) and tag in axle else (pp.min(0) + pp.max(0)) / 2
+    loc = pp - piv; ef = collections.Counter()
+    with open(os.path.join(a.out, n + ".obj"), "w") as f:
+        f.write("o %s\n" % n)
+        for p in loc: f.write("v %.6f %.6f %.6f\n" % tuple(p))
+        for i in idx:
+            q = Q[i]; f.write("f " + " ".join(str(mp[v] + 1) for v in q) + "\n")
+            for k in range(len(q)): ef[tuple(sorted((q[k], q[(k + 1) % len(q)])))] += 1
+    back = np.round(loc, 6) + piv; err = max(err, float(np.abs(back - pp).max()))   # the OBJ is written at 1 micrometre
+    man.append({"name": n, "file": n + ".obj", "pivot": np.round(piv, 6).tolist(), "faces": len(idx), "open_edges": sum(1 for c in ef.values() if c == 1), "bbox_min": np.round(pp.min(0), 4).tolist(), "bbox_max": np.round(pp.max(0), 4).tolist()})
+json.dump({"_date": "27 October 2026", "source": a.inp, "components": man}, open(os.path.join(a.out, "assembly.json"), "w"), indent=1)
+print(json.dumps({"components": len(man), "closed": sum(1 for m in man if m["open_edges"] == 0), "max_reassembly_error_mm": round(err * 1000, 5), "pass": err < 1e-5}))

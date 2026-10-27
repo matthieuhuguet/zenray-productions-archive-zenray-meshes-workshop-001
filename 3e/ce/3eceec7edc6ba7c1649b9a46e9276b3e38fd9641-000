@@ -1,0 +1,43 @@
+# 27 October 2026 14:25 Paris: fit an independent support behind neighbouring panel surfaces using rays and a bounded smooth inset.
+import argparse,json,os,sys
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from InterfaceCollision import mesh_for
+from TopoFix import save
+
+
+def main(args):
+    p,q,n=read_mesh(args.assembly);anchor,aq,an=read_mesh(args.anchor)
+    if len(p)!=len(anchor) or len(q)!=len(aq) or n!=an or any(a!=b for a,b in zip(q,aq)):raise ValueError('Anchor topology differs')
+    ids=np.array(sorted({v for face,name in zip(q,n) if name==args.support for v in face}),int)
+    others={v for face,name in zip(q,n) if name!=args.support for v in face}
+    if set(ids)&others:raise ValueError('Support shares points with other components')
+    target=np.maximum(np.abs(anchor[ids,0])-np.abs(p[ids,0]),0);hits={}
+    for part in args.parts:
+        side=1 if part.endswith('_L') else -1 if part.endswith('_R') else None
+        if side is None:raise ValueError('Panel side is required: '+part)
+        mesh=mesh_for(p,q,n,part);lo,hi=mesh.bounds
+        candidates=np.flatnonzero((p[ids,0]*side>0)&(p[ids,1]>=lo[1])&(p[ids,1]<=hi[1])&(p[ids,2]>=lo[2])&(p[ids,2]<=hi[2]))
+        origins=p[ids[candidates]].copy();origins[:,0]=0;directions=np.zeros_like(origins);directions[:,0]=side
+        loc,ray,face=mesh.ray.intersects_location(origins,directions,multiple_hits=True)
+        if len(ray):
+            desired=np.abs(anchor[ids[candidates[ray]],0])-np.abs(loc[:,0])+args.clearance_mm/1000
+            np.maximum.at(target,candidates[ray],desired)
+        hits[part]=int(len(ray))
+    # 27 October 2026: preserve bilateral symmetry and diffuse the displacement along the support graph.
+    coords=anchor[ids].copy();coords[:,0]*=-1;tree=cKDTree(anchor[ids]);distance,mirror=tree.query(coords)
+    valid=distance<args.mirror_tol_mm/1000;paired=np.maximum(target,target[mirror]);target[valid]=paired[valid]
+    field=np.zeros(len(p));field[ids]=np.clip(target,0,args.cap_mm/1000)
+    edges=np.array([(f[k-1],f[k]) for f,name in zip(q,n) if name==args.support for k in range(len(f))]);a,b=edges[:,0],edges[:,1]
+    cost=args.max_slope*np.linalg.norm(anchor[a]-anchor[b],axis=1)
+    for _ in range(args.passes):
+        old=field.copy();np.maximum.at(field,a,old[b]-cost);np.maximum.at(field,b,old[a]-cost)
+        if np.max(field-old)<1e-7:break
+    out=p.copy();out[ids,0]=np.sign(anchor[ids,0])*(np.abs(anchor[ids,0])-field[ids]);save(args.output,out,q,n)
+    movement=np.linalg.norm(out-anchor,axis=1)*1000
+    print(json.dumps({'parts':hits,'moved_points':int((movement>1e-6).sum()),'max_from_anchor_mm':float(movement.max()),'mirrored_pct':float(valid.mean()*100)}))
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('assembly');p.add_argument('anchor');p.add_argument('output');p.add_argument('--parts',nargs='+',required=True);p.add_argument('--support',default='CAR_body_liner_C');p.add_argument('--clearance-mm',type=float,default=5);p.add_argument('--cap-mm',type=float,default=60);p.add_argument('--mirror-tol-mm',type=float,default=1);p.add_argument('--max-slope',type=float,default=.2);p.add_argument('--passes',type=int,default=60);main(p.parse_args())

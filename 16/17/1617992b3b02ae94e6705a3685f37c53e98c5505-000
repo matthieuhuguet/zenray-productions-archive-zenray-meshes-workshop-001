@@ -1,0 +1,56 @@
+# 27 October 2026 13:27 Paris: propose bounded control-net corrections from measured gaps to named neighbouring components.
+import argparse,json,os,sys
+import numpy as np
+import trimesh
+from scipy.interpolate import BSpline
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+
+
+def main(args):
+    data=json.load(open(args.guides));control=np.array(data['controls']);nu,nv=control.shape[:2]
+    delivery,polys,names=read_mesh(args.assembly);panel,_,_=read_mesh(args.panel)
+    # The sampler uses 41 by 17 surface points by default, with the two ends on the support-band boundaries.
+    us,vs=args.size;assert len(panel)>=us*vs*2,'Unexpected sampled panel size'
+    grid=panel[:us*vs].reshape(us,vs,3)
+    def eval_surface(u,v):
+        bu=BSpline.design_matrix([u],data['knots_u'],3).toarray()[0]
+        bv=BSpline.design_matrix([v],data['knots_v'],3).toarray()[0]
+        return np.einsum('i,j,ijc->c',bu,bv,control)
+    width=float(data['config']['seam_width_m'])
+    def positions(count,length):
+        near=min(width/max(length,1e-8),.2)
+        return np.unique(np.r_[0,near,np.linspace(near,1-near,count-2),1-near,1])
+    uu=positions(us,np.linalg.norm(eval_surface(0,.5)-eval_surface(1,.5)))
+    vv=positions(vs,np.linalg.norm(eval_surface(.5,0)-eval_surface(.5,1)))
+    assert len(uu)==us and len(vv)==vs,'Sample divisions do not match panel'
+    edges={'u0':(grid[0],np.c_[np.zeros(vs),vv]),
+           'u1':(grid[-1],np.c_[np.ones(vs),vv]),
+           'v0':(grid[:,0],np.c_[uu,np.zeros(us)]),
+           'v1':(grid[:,-1],np.c_[uu,np.ones(us)])}
+    mappings=json.load(open(args.interfaces));design=[];delta=[];report={}
+    for side,name in mappings.items():
+        pts,uv=edges[side];faces=[f for f,n in zip(polys,names) if n==name]
+        if not faces:raise ValueError('Missing neighbour '+name)
+        triangles=[(f[0],f[k],f[k+1]) for f in faces for k in range(1,len(f)-1)]
+        target,dist,_=trimesh.proximity.closest_point(trimesh.Trimesh(vertices=delivery,faces=triangles,process=False),pts)
+        direction=(target-pts)/np.maximum(dist[:,None],1e-12)
+        move=direction*np.maximum(dist[:,None]-args.target_mm/1000,0)
+        au=BSpline.design_matrix(uv[:,0],data['knots_u'],3).toarray();av=BSpline.design_matrix(uv[:,1],data['knots_v'],3).toarray()
+        design.append(np.einsum('ki,kj->kij',au,av).reshape(len(pts),nu*nv));delta.append(move)
+        report[side]={'neighbour':name,'median_mm':round(float(np.median(dist)*1000),3),'p95_mm':round(float(np.percentile(dist,95)*1000),3),'max_mm':round(float(np.max(dist)*1000),3)}
+    A=np.vstack(design);D=np.vstack(delta)
+    result=np.linalg.solve(A.T@A+np.eye(nu*nv)*args.regularization,A.T@D).reshape(nu,nv,3)
+    norm=np.linalg.norm(result,axis=2,keepdims=True);result*=np.minimum(1,args.cap_mm/1000/np.maximum(norm,1e-12))
+    updated=control+result
+    if args.anchor:
+        original=np.array(json.load(open(args.anchor))['controls']);total=updated-original
+        magnitude=np.linalg.norm(total,axis=2,keepdims=True)
+        updated=original+total*np.minimum(1,args.cap_mm/1000/np.maximum(magnitude,1e-12))
+    data['controls']=updated.tolist();data['interface_fit']={'date':'27 October 2026','target_mm':args.target_mm,'cap_mm':args.cap_mm,'regularization':args.regularization,'baseline':report,'measurement':'Unsigned nearest surface; signed intersection is not assessed.'}
+    with open(args.output,'w') as f:json.dump(data,f,indent=2)
+    print(json.dumps({'interfaces':report,'largest_control_shift_mm':round(float(np.max(np.linalg.norm(result,axis=2))*1000),3),'output':args.output}))
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('guides');p.add_argument('panel');p.add_argument('assembly');p.add_argument('interfaces');p.add_argument('output');p.add_argument('--size',type=int,nargs=2,default=[41,17]);p.add_argument('--target-mm',type=float,default=3);p.add_argument('--cap-mm',type=float,default=8);p.add_argument('--regularization',type=float,default=.1);p.add_argument('--anchor')
+    main(p.parse_args())
