@@ -1,0 +1,90 @@
+# 27 October 2026: WireframeScoreRef2.py
+# Computes the true wireframe polygon edge recall and precision against ref2.png
+import os, sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import LineScore
+
+def compute_wireframe_score(delivery_npz):
+    d = np.load(delivery_npz, allow_pickle=True)
+    P = d["P"]
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+
+    fdir = "work/car/frame/"
+    vdir = "work/car/views_ref2/"
+    meta = json.load(open(fdir + "frame.json"))
+    sheet = json.load(open("work/car/views/sheet.json"))
+
+    results = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        pan = [p for p in sheet["panels"] if p["name"] == vname][0]
+        p_idx = pan["index"]
+        ref_wire_path = os.path.join(vdir, f"{p_idx:02d}_{vname}_wire.png")
+        ref_img = np.asarray(Image.open(ref_wire_path).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, f"mask_{vname}.png"))) > 127
+        e_ref = LineScore.ref_edges(ref_img) & mref
+
+        lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+        rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+        if vname == "top" and tz[1] < 0 or vname == "bottom" and tz[1] > 0: tz = -tz
+        a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+        umin = lo[a] if rx[a] > 0 else -hi[a]
+        vmax = hi[b] if uy[b] > 0 else -lo[b]
+        s = v["px_per_m"]; bb = v["bbox"]
+        R = int(max(mref.shape))
+        xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+        cu = umin + D[a] / 2 + (R / 2 - xc) / s
+        cv = vmax - D[b] / 2 + (yc - R / 2) / s
+        c = cu * rx + cv * uy
+
+        P_cam = P - c
+        px = np.dot(P_cam, rx) * s
+        py = np.dot(P_cam, uy) * s
+        u_px = px + R / 2
+        v_px = R / 2 - py
+
+        wire_img = np.zeros(mref.shape, bool)
+        for q in Q_:
+            pts = P[q]
+            norm = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+            l = np.linalg.norm(norm)
+            if l > 1e-8:
+                unit_n = norm / l
+                # Facing the camera
+                if np.dot(unit_n, tz) > 0.08:
+                    for k in range(4):
+                        v0, v1 = q[k], q[(k+1)%4]
+                        x0, y0 = u_px[v0], v_px[v0]
+                        x1, y1 = u_px[v1], v_px[v1]
+                        length = int(np.hypot(x1 - x0, y1 - y0) + 1)
+                        xs = np.linspace(x0, x1, length).astype(int)
+                        ys = np.linspace(y0, y1, length).astype(int)
+                        valid = (xs >= 0) & (xs < mref.shape[1]) & (ys >= 0) & (ys < mref.shape[0])
+                        wire_img[ys[valid], xs[valid]] = True
+
+        e_wire = wire_img & mref
+        dt_ref = ndi.distance_transform_edt(~e_ref)
+        dt_wire = ndi.distance_transform_edt(~e_wire)
+
+        tp_p = (e_wire & (dt_ref <= 3)).sum()
+        tp_r = (e_ref & (dt_wire <= 3)).sum()
+        prec = tp_p / max(e_wire.sum(), 1)
+        rec = tp_r / max(e_ref.sum(), 1)
+        f1 = 2 * prec * rec / max(prec + rec, 1e-12)
+        results[vname] = {"f1": round(float(f1), 4), "prec": round(float(prec), 4), "rec": round(float(rec), 4)}
+
+    print(f"True Wireframe Edge Scores for {delivery_npz} against ref2.png:")
+    for k, val in results.items():
+        print(f"  {k:7s}: Recall={val['rec']*100:.2f}%, Precision={val['prec']*100:.2f}%, F1={val['f1']:.4f}")
+    mean_rec = np.mean([val["rec"] for val in results.values()])
+    mean_prec = np.mean([val["prec"] for val in results.values()])
+    mean_f1 = np.mean([val["f1"] for val in results.values()])
+    print(f"Mean Wireframe Recall: {mean_rec*100:.2f}%, Mean Precision: {mean_prec*100:.2f}%, Mean F1: {mean_f1:.4f}")
+    return results
+
+if __name__ == "__main__":
+    compute_wireframe_score(sys.argv[1] if len(sys.argv) > 1 else "work/car/delivery_v579.npz")
