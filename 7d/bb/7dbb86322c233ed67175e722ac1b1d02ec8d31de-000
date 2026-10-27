@@ -1,0 +1,143 @@
+"""27 October 2026 : ZenRay Meshes, HILL CLIMB, a random search of small point moves with the judge as the only criterion.
+Each pass, every free point that touches a faulty face gets a random move of `sigma` mm along the surface (along its curve for a point on a crease, nothing for a corner or an open border) ;
+TopoCheck judges the whole file once ; a point keeps its move only if the faces around it have fewer faults than before, the others go back, and the guard of PlanarizeQuads then sends back every face
+that would be newly faulty. The faulty set can only shrink, the moves stay within `--max-mm` of the anchor. Same faces, same names, same point count.
+python HillClimb.py <delivery_in.npz> <delivery_out.npz> --guard topo_params.json [--anchor a.npz] [--passes 60] [--sigma-mm 3] [--max-mm 8] [--seed 1] [--obj out.obj]
+FR : recherche aléatoire de petits déplacements, le juge est le seul critère, un point garde son déplacement si les faces autour de lui ont moins de fautes.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import TopoCheck as TC  # noqa: E402
+from RelaxQuads import topology  # noqa: E402
+
+
+def vertex_normals(P, Q4, Q3, n):
+    vn = np.zeros((n, 3))
+    v = P[Q4]
+    f4 = np.cross(v[:, 2] - v[:, 0], v[:, 3] - v[:, 1])
+    f4 /= np.linalg.norm(f4, axis=1, keepdims=True) + 1e-30
+    for k in range(4):
+        np.add.at(vn, Q4[:, k], f4)
+    if len(Q3):
+        v = P[Q3]
+        f3 = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])
+        f3 /= np.linalg.norm(f3, axis=1, keepdims=True) + 1e-30
+        for k in range(3):
+            np.add.at(vn, Q3[:, k], f3)
+    return vn / (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-30)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--guard", required=True, help="topo_params.json")
+    ap.add_argument("--anchor", default="")
+    ap.add_argument("--passes", type=int, default=60)
+    ap.add_argument("--sigma-mm", type=float, default=3.0)
+    ap.add_argument("--max-mm", type=float, default=8.0)
+    ap.add_argument("--crease-deg", type=float, default=25.0)
+    ap.add_argument("--turn-deg", type=float, default=15.0)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--obj", default="")
+    a = ap.parse_args()
+    rng = np.random.default_rng(a.seed)
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = [str(x) for x in d["names"]]
+    P0 = np.load(a.anchor, allow_pickle=True)["P"].astype(float) if a.anchor else P.copy()
+    n = len(P)
+    tp = TC.load_params(a.guard)
+    N, T = np.unique(np.array(names), return_inverse=True)
+    C = np.array([len(q) for q in Q], np.int32)
+    I = np.array([v for q in Q for v in q], np.int32)
+    vf = np.repeat(np.arange(len(C)), C)
+    Q4 = np.array([q for q in Q if len(q) == 4])
+    Q3 = np.array([q for q in Q if len(q) == 3]) if any(len(q) == 3 for q in Q) else np.zeros((0, 3), int)
+    ea, eb, fixed, _, _, border, crease, (ca, cb) = topology(P, Q, a.crease_deg)
+    cn = {}
+    for x, y in zip(ca, cb):
+        cn.setdefault(int(x), set()).add(int(y))
+        cn.setdefault(int(y), set()).add(int(x))
+    sl_idx = np.array([v for v, nb in cn.items() if len(nb) == 2 and not border[v]], dtype=int)
+    sl_a = np.array([sorted(cn[v])[0] for v in sl_idx], dtype=int)
+    sl_b = np.array([sorted(cn[v])[1] for v in sl_idx], dtype=int)
+    u1, u2 = P[sl_idx] - P[sl_a], P[sl_b] - P[sl_idx]
+    keep = (u1 * u2).sum(1) / (np.linalg.norm(u1, axis=1) * np.linalg.norm(u2, axis=1) + 1e-30) >= np.cos(np.radians(a.turn_deg))
+    sl_idx, sl_a, sl_b = sl_idx[keep], sl_a[keep], sl_b[keep]
+    is_slide = np.zeros(n, bool)
+    is_slide[sl_idx] = True
+    slide_pos = -np.ones(n, int)
+    slide_pos[sl_idx] = np.arange(len(sl_idx))
+    free = ~fixed
+    cap = a.max_mm / 1000.0
+    err = TC.analyse(P, C, I, T, N, tp)[2].astype(bool)
+    start = int(err.sum())
+    t0 = time.time()
+    hist = [start]
+    for ps in range(a.passes):
+        sig = a.sigma_mm / 1000.0 * (1.0 if ps < a.passes // 2 else 0.5)
+        fv = np.unique(I[np.isin(vf, np.flatnonzero(err))])
+        cand = fv[(free[fv]) | (is_slide[fv])]
+        if not len(cand):
+            break
+        vn = vertex_normals(P, Q4, Q3, n)
+        mv = np.zeros((n, 3))
+        g = rng.normal(0.0, sig, (len(cand), 3))
+        fr = cand[free[cand]]
+        gi = np.flatnonzero(free[cand])
+        gm = g[gi] - (g[gi] * vn[fr]).sum(1)[:, None] * vn[fr]
+        mv[fr] = gm
+        sc = cand[is_slide[cand]]
+        if len(sc):
+            pos = slide_pos[sc]
+            t = P[sl_b[pos]] - P[sl_a[pos]]
+            t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-30
+            mv[sc] = rng.normal(0.0, sig, (len(sc), 1)) * t
+        Pt = P + mv
+        dlt = Pt - P0
+        nn = np.linalg.norm(dlt, axis=1)
+        over = nn > cap
+        if over.any():
+            Pt[over] = P0[over] + dlt[over] * (cap / nn[over])[:, None]
+        err2 = TC.analyse(Pt, C, I, T, N, tp)[2].astype(bool)
+        dv = np.bincount(I, weights=(err2.astype(int) - err.astype(int))[vf], minlength=n)
+        good = (dv < 0) & (np.linalg.norm(Pt - P, axis=1) > 0)
+        Pn = P.copy()
+        Pn[good] = Pt[good]
+        # the guard : a face that is faulty now and was not before sends its points (and, when it has none moved, its ring) back
+        for _ in range(8):
+            e3 = TC.analyse(Pn, C, I, T, N, tp)[2].astype(bool)
+            new = np.flatnonzero(e3 & ~err)
+            if not len(new):
+                break
+            back = np.unique(np.concatenate([I[np.flatnonzero(vf == f)] for f in new[:400]])) if len(new) < 400 else np.unique(I[np.isin(vf, new)])
+            if (np.linalg.norm(Pn[back] - P[back], axis=1) < 1e-12).all():
+                faces = np.unique(vf[np.isin(I, back)])
+                back = np.unique(I[np.isin(vf, faces)])
+            Pn[back] = P[back]
+        e3 = TC.analyse(Pn, C, I, T, N, tp)[2].astype(bool)
+        if int(e3.sum()) <= int(err.sum()) and not (e3 & ~err).any():
+            P, err = Pn, e3
+        hist.append(int(err.sum()))
+        if ps % 10 == 0:
+            print(f"pass {ps} faults {int(err.sum())} ({time.time() - t0:.0f} s)", flush=True)
+    mvd = np.linalg.norm(P - np.load(a.inp, allow_pickle=True)["P"].astype(float), axis=1)
+    np.savez(a.out, P=P.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(names))
+    print(json.dumps({"faults_before": start, "faults_after": int(err.sum()), "passes": len(hist) - 1, "points_moved": int((mvd > 1e-9).sum()), "move_max_mm": round(float(mvd.max()) * 1000, 2)}))
+    if a.obj:
+        import TopoFix
+        TopoFix.write_obj(a.obj, P, Q, names)
+        print("obj", a.obj)
+
+
+if __name__ == "__main__":
+    main()
