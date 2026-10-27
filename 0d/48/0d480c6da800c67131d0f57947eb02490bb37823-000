@@ -80,7 +80,7 @@ class Surface:
         return float(b)
 
 
-def build_rows(S, z0, z1, cell, tol, max_rows=400):
+def build_rows(S, z0, z1, cell, tol, max_rows=400, min_div=6.0):
     """Row positions along z : uniform at `cell`, then every interval whose middle sits more than `tol` above or below the chord of its ends is cut in two (adaptive)."""
     n = max(2, int(round((z1 - z0) / cell)) + 1)
     zs = list(np.linspace(z0, z1, n))
@@ -103,7 +103,7 @@ def build_rows(S, z0, z1, cell, tol, max_rows=400):
         changed = False
         new = [zs[0]]
         for a, b in zip(zs[:-1], zs[1:]):
-            if (b - a) > cell / 6.0 and sag(a + 1e-6 if a == z0 else a, b - 1e-6 if b == z1 else b) > tol:
+            if (b - a) > cell / min_div and sag(a + 1e-6 if a == z0 else a, b - 1e-6 if b == z1 else b) > tol:
                 new.append((a + b) / 2.0)
                 changed = True
             new.append(b)
@@ -122,7 +122,7 @@ def find_steps(S, z0, z1, jump=0.04, dz=0.005):
     return out
 
 
-def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
+def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04, min_div=6.0):
     """A main sheet of rows x columns across the narrow body of the floor, plus one strip of quads on each side where the outline steps out (the side extension of the middle section).
     The step edges are row edges, so no sliver is needed to follow them. Returns the faces replaced, the new points and quads, the old surface and the row positions."""
     faces = [i for i, n in enumerate(names) if str(n) == part]
@@ -135,7 +135,7 @@ def remesh(P, Q, names, part, cell, tol, cols=None, jump=0.04):
     cuts = [z0] + steps + [z1]
     zs = []
     for a, b in zip(cuts[:-1], cuts[1:]):
-        seg = build_rows(S, a, b, cell, tol)
+        seg = build_rows(S, a, b, cell, tol, min_div=min_div)
         zs += list(seg if not zs else seg[1:])
     zs = np.array(zs)
     stepz = set(round(c, 6) for c in cuts[1:-1])
@@ -227,6 +227,7 @@ def main():
     ap.add_argument("--cell", type=float, default=0.1, help="target cell size in metres")
     ap.add_argument("--tol-mm", type=float, default=2.0, help="rows are added where the surface sags more than this between two rows")
     ap.add_argument("--cols", type=int, default=0, help="columns across the widest row (0 = from the cell size)")
+    ap.add_argument("--min-div", type=float, default=6.0, help="the smallest row interval is cell / min_div (a larger value follows steep pockets more closely and raises the aspect ratio)")
     ap.add_argument("--obj", default="")
     ap.add_argument("--no-compact", action="store_true", help="keep the orphan points of the input")
     a = ap.parse_args()
@@ -234,7 +235,7 @@ def main():
     P = d["P"].astype(float)
     Q = [list(map(int, q)) for q in d["Q"]]
     names = [str(x) for x in d["names"]]
-    faces, flat, quads, S, zs, ncol = remesh(P, Q, names, a.part, a.cell, a.tol_mm / 1000.0, a.cols or None)
+    faces, flat, quads, S, zs, ncol = remesh(P, Q, names, a.part, a.cell, a.tol_mm / 1000.0, a.cols or None, min_div=a.min_div)
     dmax, dmean, miss = deviation(S, flat, quads)
     drop = set(faces)
     base = len(P)
