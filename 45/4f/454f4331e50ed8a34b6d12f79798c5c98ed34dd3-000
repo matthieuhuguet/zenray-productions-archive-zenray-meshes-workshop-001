@@ -1,0 +1,83 @@
+# 27 October 2026: BuildTailorLatticeSOP.py
+# Generates the full 3D NURBS Lattice (longitudinal + transversal ribs)
+# and builds the interactive tailor color visualization in Houdini live session.
+
+import os, sys, json
+import numpy as np
+
+def build_tailor_lattice():
+    base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+    lat_npz = f"{base_dir}/work/car/volumetric_wireframe_lattice_v580.npz"
+    curves_json = f"{base_dir}/work/car/volumetric_wireframe_curves_v580.json"
+    
+    lat = np.load(lat_npz, allow_pickle=True)["lattice_vertices"]
+    curves_data = json.load(open(curves_json))
+    long_curves = curves_data["curves"]
+    
+    # 13 Transversal Stations along Z
+    stations_z = [
+        2.15, 1.95, 1.70, 1.30, 0.85, 0.40,
+        0.00, -0.45, -0.90, -1.25, -1.67, -1.95, -2.15
+    ]
+    
+    trans_curves = {}
+    for i, zs in enumerate(stations_z):
+        # points within 75 mm of station Z
+        near = lat[np.abs(lat[:, 2] - zs) < 0.075]
+        if len(near) < 6:
+            continue
+        # Sort points in polar angle around the center of the ring (0, Y_mid, zs)
+        y_center = near[:, 1].mean()
+        angles = np.arctan2(near[:, 1] - y_center, near[:, 0])
+        sort_a = np.argsort(angles)
+        ring_pts = near[sort_a]
+        
+        # Subsample to smooth 16 points per rib
+        u_angles = np.linspace(-np.pi, np.pi, 16, endpoint=False)
+        rib_pts = []
+        for ua in u_angles:
+            diff_a = np.abs(angles - ua)
+            diff_a = np.minimum(diff_a, 2 * np.pi - diff_a)
+            best_idx = np.argmin(diff_a)
+            p = near[best_idx]
+            rib_pts.append([round(float(p[0]), 4), round(float(p[1]), 4), round(float(zs), 4)])
+            
+        trans_curves[f"rib_station_{i:02d}_z{zs:+.2f}"] = rib_pts
+        
+    curves_data["transversal_ribs"] = trans_curves
+    with open(curves_json, "w") as f:
+        json.dump(curves_data, f, indent=2)
+    print(f"Extracted {len(trans_curves)} transversal rib curves. Saved to {curves_json}")
+    
+    # Color palette per component (Tailor colors)
+    palette = {
+        "CAR_body_hood_C": [0.85, 0.20, 0.20],          # Red
+        "CAR_body_door_L": [0.20, 0.60, 0.85],          # Sky Blue
+        "CAR_body_door_R": [0.20, 0.60, 0.85],          # Sky Blue
+        "CAR_body_decklid_C": [0.30, 0.75, 0.30],       # Green
+        "CAR_body_fender_front_L": [0.90, 0.60, 0.10],  # Orange
+        "CAR_body_fender_front_R": [0.90, 0.60, 0.10],  # Orange
+        "CAR_body_roof_C": [0.60, 0.30, 0.75],          # Purple
+        "CAR_body_quarter_L": [0.85, 0.85, 0.20],       # Yellow
+        "CAR_body_quarter_R": [0.85, 0.85, 0.20],       # Yellow
+        "CAR_body_rocker_L": [0.20, 0.85, 0.85],        # Cyan
+        "CAR_body_rocker_R": [0.20, 0.85, 0.85],        # Cyan
+        "CAR_body_bumper_front_C": [0.95, 0.40, 0.40],  # Coral
+        "CAR_body_bumper_rear_C": [0.95, 0.40, 0.40],   # Coral
+        "CAR_splitter_blade_C": [0.15, 0.15, 0.15],     # Dark Carbon
+        "CAR_diffuser_rear_C": [0.15, 0.15, 0.15],      # Dark Carbon
+        "CAR_body_glass_windshield_C": [0.40, 0.70, 0.90], # Tinted Glass
+        "CAR_body_glass_door_L": [0.40, 0.70, 0.90],
+        "CAR_body_glass_door_R": [0.40, 0.70, 0.90],
+        "CAR_body_glass_rear_C": [0.40, 0.70, 0.90]
+    }
+    
+    palette_file = f"{base_dir}/work/car/tailor_palette.json"
+    with open(palette_file, "w") as f:
+        json.dump(palette, f, indent=2)
+    print(f"Saved tailor palette to {palette_file}")
+    
+    return curves_data, palette
+
+if __name__ == "__main__":
+    build_tailor_lattice()
