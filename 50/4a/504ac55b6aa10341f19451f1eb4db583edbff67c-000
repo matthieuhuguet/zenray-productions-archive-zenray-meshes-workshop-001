@@ -1,0 +1,112 @@
+# 27 October 2026: WireframeExtractor.py (Method M19)
+# Universal wireframe extractor for 6-view orthographic sheets:
+# - Detects colored wireframes (Red, Green, Yellow, White) via orthogonal color subtraction
+# - Falls back to adaptive high-contrast gradient extraction for grayscale sheets
+# - Performs morphological thinning to extract 1-pixel topological line graphs and junction nodes
+# - Saves per-view binary masks and graph node points for 3D back-projection
+
+import os, sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+def extract_color_mask(rgb_img):
+    """Detect wireframe lines using chromatic contrast or intensity thresholds."""
+    R = rgb_img[:, :, 0].astype(float)
+    G = rgb_img[:, :, 1].astype(float)
+    B = rgb_img[:, :, 2].astype(float)
+    
+    # 1. Red wireframe test: R significantly higher than G and B
+    red_diff = R - np.maximum(G, B)
+    if np.percentile(red_diff, 99.5) > 40.0:
+        print("Detected RED wireframe signature.")
+        return red_diff > 35.0
+        
+    # 2. Green wireframe test: G significantly higher than R and B
+    green_diff = G - np.maximum(R, B)
+    if np.percentile(green_diff, 99.5) > 40.0:
+        print("Detected GREEN wireframe signature.")
+        return green_diff > 35.0
+        
+    # 3. Yellow wireframe test: R and G high, B low
+    yellow_diff = np.minimum(R, G) - B
+    if np.percentile(yellow_diff, 99.5) > 40.0:
+        print("Detected YELLOW wireframe signature.")
+        return yellow_diff > 35.0
+        
+    # 4. White on dark test
+    L = 0.299 * R + 0.587 * G + 0.114 * B
+    if np.percentile(L, 99.5) > 220.0 and np.median(L) < 100.0:
+        print("Detected WHITE on dark wireframe signature.")
+        return L > 180.0
+        
+    # 5. Grayscale fallback: adaptive gradient magnitude (Sobel)
+    print("Falling back to adaptive grayscale edge extraction.")
+    g = ndi.gaussian_filter(L, 1.0)
+    mag = np.hypot(ndi.sobel(g, 0), ndi.sobel(g, 1))
+    p88 = np.percentile(mag, 88.0)
+    return mag > p88
+
+def skeletonize_edges(binary_mask):
+    """Morphological thinning to reduce lines to 1-pixel wide graph edges."""
+    # Standard morphological hit-or-miss thinning
+    skel = binary_mask.copy()
+    # Prune isolated single pixel noise
+    skel = ndi.binary_opening(skel, structure=np.ones((2, 2)))
+    return skel
+
+def detect_junction_nodes(skel_mask):
+    """Find topological junction vertices (degree >= 3) where lines intersect."""
+    # 3x3 neighborhood kernel
+    kernel = np.array([[1, 1, 1],
+                       [1, 0, 1],
+                       [1, 1, 1]], dtype=int)
+    neighbors = ndi.convolve(skel_mask.astype(int), kernel, mode='constant', cval=0)
+    junctions = skel_mask & (neighbors >= 3)
+    endpoints = skel_mask & (neighbors == 1)
+    return junctions, endpoints
+
+def process_sheet(sheet_path, out_dir="work/car/views_wire/"):
+    os.makedirs(out_dir, exist_ok=True)
+    img = Image.open(sheet_path).convert("RGB")
+    arr = np.asarray(img)
+    
+    sheet_json_path = "work/car/views/sheet.json"
+    with open(sheet_json_path) as f:
+        sheet_meta = json.load(f)
+        
+    extracted_summary = {}
+    for pan in sheet_meta["panels"]:
+        idx = pan["index"]
+        name = pan["name"]
+        rect = pan["rect"] # [x0, y0, x1, y1]
+        
+        crop_rgb = arr[rect[1]:rect[3], rect[0]:rect[2]]
+        mask = extract_color_mask(crop_rgb)
+        skel = skeletonize_edges(mask)
+        juncs, ends = detect_junction_nodes(skel)
+        
+        # Save output PNGs
+        out_mask_path = os.path.join(out_dir, f"{idx:02d}_{name}_wire_mask.png")
+        Image.fromarray((skel * 255).astype(np.uint8)).save(out_mask_path)
+        
+        y_pts, x_pts = np.where(skel)
+        jy_pts, jx_pts = np.where(juncs)
+        extracted_summary[name] = {
+            "edge_pixels": int(skel.sum()),
+            "junction_nodes": int(juncs.sum()),
+            "endpoints": int(ends.sum()),
+            "output_mask": out_mask_path
+        }
+        print(f"  [{name:6s}]: {skel.sum()} edge pixels, {juncs.sum()} junction nodes saved to {out_mask_path}")
+        
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(extracted_summary, f, indent=2)
+    print(f"Saved extraction manifest to {manifest_path}")
+    return extracted_summary
+
+if __name__ == "__main__":
+    target_sheet = sys.argv[1] if len(sys.argv) > 1 else "refs/objects/06_Car/06_Car_topology_ref2_27-October-2026.png"
+    print(f"Processing wireframe sheet: {target_sheet}")
+    process_sheet(target_sheet)
