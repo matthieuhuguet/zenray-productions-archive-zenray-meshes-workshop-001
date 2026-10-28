@@ -1,0 +1,97 @@
+"""28 October 2026, 15:40 : ZenRay Meshes, FINISH CHECK, the verifier of the finishing stage for one component (section 215 of the skill).
+Compares a candidate part with the same part of the frozen target (v644) : surface deviation both ways (mm), edge length ratio p95/p50 and p95/p5,
+quad share, cracks (coincident unwelded points), open edges, fold inside a quad (worst diagonal), valence of interior vertices.
+python FinishCheck.py <candidate.npz> <part_name> [--target work/car/target_v644.npz] [--json out.json]
+Exit code 0 when every limit of FINISH passes. FR : vérificateur de finition d'une pièce contre la cible gelée.
+"""
+import argparse
+import json
+import sys
+from collections import defaultdict
+
+import numpy as np
+import trimesh
+
+FINISH = {"dev_p95_mm": 1.0, "dev_max_mm": 3.0, "cover_max_mm": 3.0, "edge_p95_p50": 1.6, "quad_pct": 100.0,
+          "fold_max_deg": 10.0, "cracks": 0, "open_edges": 0}
+TARGET = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/target_v644.npz"
+
+
+def part(npz, name):
+    d = np.load(npz, allow_pickle=True)
+    n = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == name]
+    V = sorted({v for q in Q for v in q}); r = {v: i for i, v in enumerate(V)}
+    return d["P"][V].astype(float), [[r[v] for v in q] for q in Q]
+
+
+def tri(Q):
+    return np.array([[q[0], q[k], q[k + 1]] for q in Q for k in range(1, len(q) - 1)])
+
+
+def measure(P, Q, Pt, Qt):
+    tm = trimesh.Trimesh(Pt, tri(Qt), process=False); cm = trimesh.Trimesh(P, tri(Q), process=False)
+    s = cm.sample(20000, return_index=False) if len(Q) else P
+    d1 = np.abs(trimesh.proximity.closest_point(tm, s)[1]) * 1000
+    st = tm.sample(20000)
+    d2 = np.abs(trimesh.proximity.closest_point(cm, st)[1]) * 1000
+    E = defaultdict(int); L = []
+    for q in Q:
+        for k in range(len(q)):
+            a, b = q[k], q[(k + 1) % len(q)]; E[(min(a, b), max(a, b))] += 1
+    e = np.array(list(E)); L = np.linalg.norm(P[e[:, 0]] - P[e[:, 1]], axis=1) * 1000
+    folds = []
+    for q in Q:
+        if len(q) != 4:
+            continue
+        v = P[q]
+        worst = 0
+        for i0 in (0, 1):
+            a, b, c, dd = v[i0], v[i0 + 1], v[(i0 + 2) % 4], v[(i0 + 3) % 4]
+            n1 = np.cross(b - a, c - a); n2 = np.cross(c - a, dd - a)
+            cs = n1 @ n2 / (np.linalg.norm(n1) * np.linalg.norm(n2) + 1e-30)
+            worst = max(worst, np.degrees(np.arccos(np.clip(cs, -1, 1))))
+        folds.append(worst)
+    key = np.round(P / 1e-5).astype(np.int64)
+    _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+    return {"faces": len(Q), "dev_p95_mm": round(float(np.percentile(d1, 95)), 2), "dev_max_mm": round(float(d1.max()), 2),
+            "cover_max_mm": round(float(d2.max()), 2),
+            "edge_p5_p50_p95_mm": [round(float(x), 1) for x in np.percentile(L, [5, 50, 95])],
+            "edge_p95_p50": round(float(np.percentile(L, 95) / np.percentile(L, 50)), 2),
+            "quad_pct": round(100.0 * sum(len(q) == 4 for q in Q) / max(len(Q), 1), 2),
+            "fold_max_deg": round(float(max(folds) if folds else 0), 2), "fold_p95_deg": round(float(np.percentile(folds, 95)) if folds else 0, 2),
+            "cracks": int((cnt > 1).sum()), "open_edges": int(sum(1 for c in E.values() if c == 1))}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cand"); ap.add_argument("name")
+    ap.add_argument("--skin", type=int, default=1); ap.add_argument("--skin-sharp", type=float, default=50.0)
+    ap.add_argument("--target", default=TARGET); ap.add_argument("--json", default="")
+    a = ap.parse_args()
+    P, Q = part(a.cand, a.name); Pt, Qt = part(a.target, a.name)
+    m = measure(P, Q, Pt, Qt)
+    if a.skin:   # deviation on the visible outer skin only : the inner skin and walls are built, not copied (28 October 2026)
+        sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+        from ParamGrid import skin
+        dc = np.load(a.cand, allow_pickle=True)
+        if "skin" in dc.files:   # the builder marks its own outer skin
+            nn = np.array([str(x) for x in dc["names"]]); sel = dc["skin"][nn == a.name]
+            S = [q for q, k in zip(Q, sel) if k]
+        else:
+            S = skin(P, Q, a.skin_sharp, 1)
+        St = skin(Pt, Qt, a.skin_sharp, 1)
+        ms = measure(P, S, Pt, St)
+        for k in ("dev_p95_mm", "dev_max_mm", "cover_max_mm"):
+            m[k] = ms[k]
+        m["skin_faces"] = [len(S), len(St)]
+    ok = {k: (m[k] >= v if k == "quad_pct" else m[k] <= v) for k, v in FINISH.items()}
+    m["pass"] = ok; m["all_pass"] = all(ok.values())
+    print(json.dumps(m))
+    if a.json:
+        json.dump(m, open(a.json, "w"), indent=1)
+    sys.exit(0 if m["all_pass"] else 1)
+
+
+if __name__ == "__main__":
+    main()

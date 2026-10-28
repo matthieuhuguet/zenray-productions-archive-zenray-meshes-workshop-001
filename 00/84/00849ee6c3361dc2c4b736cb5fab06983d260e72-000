@@ -1,0 +1,129 @@
+"""28 October 2026, 15:55 : ZenRay Meshes finishing, method A : PANEL COONS, a new clean quad shell for a mostly horizontal panel (hood, roof, decklid),
+rebuilt ON TOP of the frozen target shape (section 215).
+1 outline of the upward skin of the target part (open edges of its up facing faces), smoothed and cut in four sides at its four plan corners ;
+2 Coons grid in plan (x, z), segment counts = side length / --edge-m, the same on opposite sides (even), uniform arc length sampling ;
+3 heights by vertical ray onto the target top skin ; 4 lower skin offset by --thick along the normal ; 5 walls with --support loops.
+python PanelCoons.py <target.npz> <part> <out.npz> [--edge-m 0.02] [--thick 0.012] [--support 1] [--smooth 0.0]
+FR : nouvelle coque propre d'un panneau presque horizontal, grille de Coons en plan, projetée sur la forme gelée.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+import trimesh
+
+
+def part(npz, name):
+    d = np.load(npz, allow_pickle=True); n = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == name]
+    return d["P"].astype(float), Q
+
+
+def resample(poly, n):
+    seg = np.linalg.norm(np.diff(poly, axis=0), axis=1); s = np.concatenate([[0], np.cumsum(seg)])
+    t = np.linspace(0, s[-1], n + 1)
+    return np.stack([np.interp(t, s, poly[:, k]) for k in range(poly.shape[1])], 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("target"); ap.add_argument("part"); ap.add_argument("out")
+    ap.add_argument("--edge-m", type=float, default=0.02)
+    ap.add_argument("--thick", type=float, default=0.012)
+    ap.add_argument("--support", type=int, default=1)
+    ap.add_argument("--up", type=float, default=0.5)
+    a = ap.parse_args()
+    P, Q = part(a.target, a.part)
+    up = []
+    for q in Q:
+        v = P[q]; nn = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); nn /= np.linalg.norm(nn) + 1e-12
+        if nn[1] > a.up:
+            up.append(q)
+    cnt = defaultdict(int); nxt = defaultdict(list)
+    for q in up:
+        for k in range(len(q)):
+            x, y = q[k], q[(k + 1) % len(q)]; cnt[(min(x, y), max(x, y))] += 1
+    for q in up:
+        for k in range(len(q)):
+            x, y = q[k], q[(k + 1) % len(q)]
+            if cnt[(min(x, y), max(x, y))] == 1:
+                nxt[x].append(y)
+    # boundary loops walked edge by edge (a pinch vertex has two successors) ; keep the longest in length (28 October 2026)
+    out = defaultdict(list)
+    for x, ys in nxt.items():
+        out[x] = list(ys)
+    loops = []
+    while any(out.values()):
+        s0 = next(k for k, v in out.items() if v)
+        loop = [s0]; c = out[s0].pop()
+        while c != s0 and out[c]:
+            loop.append(c); c = out[c].pop()
+        loops.append(loop)
+    loop = max(loops, key=lambda l: np.sum(np.linalg.norm(np.diff(P[l + l[:1]], axis=0), axis=1)))
+    L = P[loop][:, [0, 2]]
+    # four plan corners : extremes of x+z, x-z, -x+z, -x-z (front right, rear right, front left, rear left)
+    idx = [int(np.argmax(L @ np.array(w))) for w in ([1, 1], [1, -1], [-1, -1], [-1, 1])]
+    order = np.argsort(idx); idx_sorted = [idx[i] for i in order]
+    loopP = np.vstack([L, L[:1]])
+    sides = []
+    for k in range(4):
+        i0, i1 = idx_sorted[k], idx_sorted[(k + 1) % 4]
+        seg = loopP[i0:i1 + 1] if i1 > i0 else np.vstack([loopP[i0:len(L)], loopP[:i1 + 1]])
+        sides.append(seg)
+    lens = [np.sum(np.linalg.norm(np.diff(s, axis=0), axis=1)) for s in sides]
+    nA = max(2, int(round((lens[0] + lens[2]) / 2 / a.edge_m / 2)) * 2)
+    nB = max(2, int(round((lens[1] + lens[3]) / 2 / a.edge_m / 2)) * 2)
+    c0 = resample(sides[0], nA); c1 = resample(sides[1], nB); c2 = resample(sides[2], nA)[::-1]; c3 = resample(sides[3], nB)[::-1]
+    # Coons : bottom = c0 (u), right = c1 (v), top = c2 reversed (u), left = c3 reversed (v)
+    U = np.linspace(0, 1, nA + 1); Vv = np.linspace(0, 1, nB + 1)
+    G = np.zeros((nB + 1, nA + 1, 2))
+    p00, p10, p11, p01 = c0[0], c0[-1], c2[-1], c2[0]
+    for j, v in enumerate(Vv):
+        for i, u in enumerate(U):
+            G[j, i] = (1 - v) * c0[i] + v * c2[i] + (1 - u) * c3[j] + u * c1[j] \
+                - ((1 - u) * (1 - v) * p00 + u * (1 - v) * p10 + u * v * p11 + (1 - u) * v * p01)
+    # heights from the target top skin
+    tm = trimesh.Trimesh(P, np.array([[q[0], q[k], q[k + 1]] for q in up for k in range(1, len(q) - 1)]), process=False)
+    org = np.stack([G[..., 0].ravel(), np.full(G[..., 0].size, 5.0), G[..., 1].ravel()], 1)
+    loc, ray, _ = tm.ray.intersects_location(org, np.tile([0, -1.0, 0], (len(org), 1)), multiple_hits=False)
+    Y = np.full(len(org), np.nan); Y[ray] = loc[:, 1]
+    if np.isnan(Y).any():   # border samples that miss : nearest surface point
+        miss = np.isnan(Y)
+        cp = trimesh.proximity.closest_point(tm, np.stack([org[miss, 0], np.full(miss.sum(), 0.7), org[miss, 2]], 1))[0]
+        Y[miss] = cp[:, 1]
+    T = np.stack([G[..., 0], Y.reshape(G.shape[:2]), G[..., 1]], -1)
+    nb, na = T.shape[:2]
+    # normals of the top grid
+    du = np.gradient(T, axis=1); dv = np.gradient(T, axis=0); Nn = np.cross(dv, du)
+    Nn /= np.linalg.norm(Nn, axis=-1, keepdims=True) + 1e-12
+    Nn *= np.sign(Nn[..., 1:2] + 1e-9)
+    B = T - a.thick * Nn
+    pts = list(T.reshape(-1, 3)) + list(B.reshape(-1, 3))
+    off = nb * na
+    faces = []
+    gid = lambda j, i: j * na + i
+    for j in range(nb - 1):
+        for i in range(na - 1):
+            q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]
+            faces.append(q); faces.append([off + x for x in q[::-1]])
+    ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + \
+           [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+    # walls : top ring -> (support rings) -> bottom ring
+    layers = [ring]
+    for s in range(a.support):
+        t = (s + 1) / (a.support + 1); base = len(pts)
+        for v in ring:
+            pts.append(T.reshape(-1, 3)[v] * (1 - t) + B.reshape(-1, 3)[v] * t)
+        layers.append(list(range(base, base + len(ring))))
+    layers.append([off + v for v in ring])
+    for l0, l1 in zip(layers[:-1], layers[1:]):
+        m = len(l0)
+        for k in range(m):
+            faces.append([l0[k], l0[(k + 1) % m], l1[(k + 1) % m], l1[k]])
+    np.savez(a.out, P=np.array(pts, np.float32), Q=np.array(faces, dtype=object), names=np.array([a.part] * len(faces)))
+    print(json.dumps({"loop_pts": len(loop), "side_len_m": [round(x, 3) for x in lens], "grid": [nB, nA], "faces": len(faces)}))
+
+
+if __name__ == "__main__":
+    main()
