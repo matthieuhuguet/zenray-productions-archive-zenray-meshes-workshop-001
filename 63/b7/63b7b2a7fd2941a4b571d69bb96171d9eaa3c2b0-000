@@ -1,0 +1,70 @@
+"""28 October 2026 : ZenRay Meshes TWO VIEW VALIDATE (task KS2c). A design curve may only be snapped on a schematic line whose identity is
+validated : the nearest traced line can be another feature (the fender crease went onto the arch lip, KS2b-2). For a curve that runs along
+the car, every candidate line of the left view (its height y(z)) and of the top view (its width x(z)) that covers it within search_px is paired ;
+each pair rebuilds a 3D line (x(z), y(z), z) over the z range they share, and its distance to the sculpt is measured. The right pair lies on the
+skin (median under skin_ok_mm), a wrong pair floats. The report says, curve by curve : the skin distance of the current curve, of the pair
+made of the nearest lines, and of the best pair, and whether proximity alone would have chosen wrong.
+python TwoViewValidate.py [--rig work/car/curverig/RIG_car_hard.json] [--out work/car/schematic/two_view.json]
+FR : un appariement courbe et ligne n'est validé que si les lignes des deux vues reconstruisent une courbe posée sur la peau."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+from Schematic import view_mapper
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+# skin_ok_mm 15 (28 October 2026) : one pixel is 8 mm on these views, a two view rebuild is good to about two pixels
+PARAMS = {"search_px": 15.0, "min_cover": 0.5, "min_z_extent_m": 0.10, "min_overlap": 0.5, "skin_ok_mm": 15.0, "samples": 200, "zs": 60,
+          "construction_prefixes": ("sp", "up_", "ring_front_end", "ring_rear_end", "shelf_cut", "rad", "rear_q"), "skip_kinds": ("ring", "spoke", "bolt")}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--rig", default=W + "work/car/curverig/RIG_car_hard.json"); ap.add_argument("--out", default=W + "work/car/schematic/two_view.json"); a = ap.parse_args()
+    fr = json.load(open(W + "work/car/frame/frame.json")); lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); V = {v["name"]: v for v in fr["views"]}
+    S = np.load(W + "work/car/retopo/sculpt_v752.npz")["P"]; S = S[S[:, 0] > 0.3]; kdS = cKDTree(S)
+    lines, world = {}, {}
+    for vn in ("left", "top"):
+        v = V[vn]; rx, uy = np.array(v["rx"], float), np.array(v["uy"], float); ppm = v["px_per_m"]; b = v["bbox"]
+        amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+        Ls = [np.array(o["curve_px"]) for o in json.load(open(W + "work/car/schematic/view_%s.json" % vn))["lines"] if o.get("kind") not in PARAMS["skip_kinds"]]
+        lines[vn] = Ls; world[vn] = [np.stack([amin + (L[:, 0] - b[0]) / ppm, bmin + (b[3] - L[:, 1]) / ppm], 1) for L in Ls]   # (along rx, along uy)
+    # left : rx = -z, uy = +y  -> (-z, y) ; top : rx = -z, uy = +x -> (-z, x)
+    rig = json.load(open(a.rig)); C = np.array(rig["controls"], float); out = {}
+    for name, c in rig["curves"].items():
+        if name.startswith(PARAMS["construction_prefixes"]) or not (c.get("sharp") or c.get("fixed")): continue
+        E = RL.evaluate(C[c["cvs"]], PARAMS["samples"]); z0, z1 = E[:, 2].min(), E[:, 2].max()
+        if z1 - z0 < PARAMS["min_z_extent_m"]: out[name] = {"state": "not longitudinal"}; continue
+        cand = {}
+        for vn in ("left", "top"):
+            uv = view_mapper(V[vn], lo, hi, 1.0)(E); cs = []
+            for li, L in enumerate(lines[vn]):
+                d = cKDTree(L).query(uv)[0]; cov = float((d <= PARAMS["search_px"]).mean())
+                if cov >= PARAMS["min_cover"]: cs.append((li, cov, float(np.median(d))))
+            cand[vn] = sorted(cs, key=lambda t: t[2])
+        base = float(np.median(kdS.query(E)[0]) * 1000)
+        if not cand["left"] or not cand["top"]:
+            out[name] = {"state": "untraced in " + " and ".join(v for v in ("left", "top") if not cand[v]), "skin_mm_current": round(base, 1)}; continue
+        zz = np.linspace(z0, z1, PARAMS["zs"]); pairs = []
+        for (li, cl, dl) in cand["left"]:
+            Wl = world["left"][li]; zl = -Wl[:, 0]; ol = np.argsort(zl)
+            for (ti, ct, dt) in cand["top"]:
+                Wt = world["top"][ti]; zt = -Wt[:, 0]; ot = np.argsort(zt)
+                lo_z, hi_z = max(zl.min(), zt.min(), z0), min(zl.max(), zt.max(), z1)
+                if hi_z - lo_z < PARAMS["min_overlap"] * (z1 - z0): continue
+                zq = zz[(zz >= lo_z) & (zz <= hi_z)]; y = np.interp(zq, zl[ol], Wl[ol, 1]); x = np.interp(zq, zt[ot], Wt[ot, 1])
+                P3 = np.stack([x, y, zq], 1); sk = float(np.median(kdS.query(P3)[0]) * 1000)
+                cur = np.stack([np.interp(zq, E[np.argsort(E[:, 2]), 2], E[np.argsort(E[:, 2]), k]) for k in range(3)], 1)   # the current curve at the same z
+                mis = np.linalg.norm(cur - P3, axis=1) * 1000
+                pairs.append({"left": li, "top": ti, "skin_mm": round(sk, 1), "d2_px": round(dl + dt, 2), "offset_mm_median": round(float(np.median(mis)), 1), "offset_mm_max": round(float(mis.max()), 1)})
+        if not pairs: out[name] = {"state": "no overlapping pair", "skin_mm_current": round(base, 1)}; continue
+        best = min(pairs, key=lambda p: p["skin_mm"]); near = min(pairs, key=lambda p: p["d2_px"])
+        out[name] = {"state": "validated" if best["skin_mm"] <= PARAMS["skin_ok_mm"] else "no pair on the skin", "skin_mm_current": round(base, 1), "best": best, "nearest": near,
+                     "proximity_wrong": bool(near is not best and near["skin_mm"] > 2 * best["skin_mm"] + 2), "pairs": len(pairs)}
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); json.dump(out, open(a.out, "w"), indent=1)
+    st = {}
+    for r in out.values(): st[r["state"]] = st.get(r["state"], 0) + 1
+    print(json.dumps({"curves": len(out), "states": st, "proximity_wrong": sorted(n for n, r in out.items() if r.get("proximity_wrong"))}))
+
+
+if __name__ == "__main__":
+    main()

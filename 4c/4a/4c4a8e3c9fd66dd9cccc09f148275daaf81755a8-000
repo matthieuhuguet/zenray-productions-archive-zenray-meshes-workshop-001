@@ -37,12 +37,17 @@ PARAMS = {   # 28 October 2026 : the interface of the view trace
                 "hood": (227, 119, 194), "trunk": (188, 189, 34), "door": (23, 190, 207), "fender": (214, 39, 40), "quarter": (255, 127, 14), "bumper": (127, 127, 127),
                 "rocker": (0, 100, 0), "under": (90, 90, 160), "body": (60, 60, 60), "refused": (255, 0, 255)},
     "names": {"front": "face", "back": "arrière", "left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous"},
+    # 28 October 2026, KS2d : the topology sheet ref2 draws the soft creases as dark strokes ; its views sit on the clay views within a pixel
+    # (phase correlation, shift (row, col) added to ref2 pixels) ; a high contrast keeps the design strokes and drops the light topology grid
+    "sources": {"clay": {"dir": "views", "suffix": "", "line_contrast": None, "canny": True, "wheels": True, "shift": {}},
+                "ref2": {"dir": "views_ref2", "suffix": "_ref2", "line_contrast": 40, "canny": False, "wheels": False,
+                         "shift": {"front": (-1.1, -0.1), "back": (-0.9, -0.4), "left": (-0.5, -0.2), "right": (-0.6, -0.3), "top": (-0.3, -0.3), "bottom": (-0.5, -0.1)}}},
 }
 
 
-def load_view(view):
+def load_view(view, source="clay"):
     sheet = json.load(open(W + "work/car/views/sheet.json")); pan = [p for p in sheet["panels"] if p["name"] == view][0]
-    I = np.asarray(Image.open(W + "work/car/views/%02d_%s_rgb.png" % (pan["index"], view)).convert("L")).astype(float)
+    I = np.asarray(Image.open(W + "work/car/%s/%02d_%s_rgb.png" % (PARAMS["sources"][source]["dir"], pan["index"], view)).convert("L")).astype(float)
     M = np.asarray(Image.open(W + "work/car/views/%02d_%s_mask.png" % (pan["index"], view))) > 127
     fr = json.load(open(W + "work/car/frame/frame.json")); v = [x for x in fr["views"] if x["name"] == view][0]; return I, M, v, fr
 
@@ -238,26 +243,29 @@ def bolts(I, M, view):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("view"); ap.add_argument("--scale", type=float, default=PARAMS["scale"]); a = ap.parse_args(); vw = a.view
-    I, M, v, fr = load_view(vw); met = to_metric(v, fr); s = a.scale
+    ap = argparse.ArgumentParser(); ap.add_argument("view"); ap.add_argument("--scale", type=float, default=PARAMS["scale"]); ap.add_argument("--source", default="clay", choices=list(PARAMS["sources"]))
+    a = ap.parse_args(); vw = a.view; src = PARAMS["sources"][a.source]
+    I, M, v, fr = load_view(vw, a.source); met = to_metric(v, fr); s = a.scale
     BH = closing(I, disk(PARAMS["blackhat_r"])) - I; Mi = ndi.binary_erosion(M, iterations=PARAMS["mask_erode_px"])
-    L = (BH > PARAMS["line_contrast"]) & Mi; L = ndi.binary_opening(L, np.ones((1, 1))); skel = skeletonize(L)
+    L = (BH > (src["line_contrast"] or PARAMS["line_contrast"])) & Mi; L = ndi.binary_opening(L, np.ones((1, 1))); skel = skeletonize(L)
     lab, n = ndi.label(skel, np.ones((3, 3))); sizes = ndi.sum(skel, lab, range(1, n + 1)); skel &= np.isin(lab, np.nonzero(sizes >= PARAMS["min_branch_px"])[0] + 1)
     chains = [("joint", c) for c in branches(skel)]
-    # crease lines : brightness steps (Canny), away from the dark lines already traced (a joint gives two Canny edges, a crease one)
-    lo_, hi_ = PARAMS["canny_low_by_view"].get(vw, PARAMS["canny_low"]), PARAMS["canny_high_by_view"].get(vw, PARAMS["canny_high"])
-    E = feature.canny(I / 255.0, sigma=PARAMS["canny_sigma"], low_threshold=lo_, high_threshold=hi_) & Mi
-    if PARAMS["dark_exclude_px"] > 0: E &= ~ndi.binary_dilation(L, iterations=PARAMS["dark_exclude_px"])
-    E = skeletonize(E)
-    chains += [("crease", c) for c in branches(E)]
+    if src["canny"]:   # crease lines : brightness steps (Canny) ; off for ref2, whose topology grid would make noise
+        lo_, hi_ = PARAMS["canny_low_by_view"].get(vw, PARAMS["canny_low"]), PARAMS["canny_high_by_view"].get(vw, PARAMS["canny_high"])
+        E = feature.canny(I / 255.0, sigma=PARAMS["canny_sigma"], low_threshold=lo_, high_threshold=hi_) & Mi
+        if PARAMS["dark_exclude_px"] > 0: E &= ~ndi.binary_dilation(L, iterations=PARAMS["dark_exclude_px"])
+        E = skeletonize(E)
+        chains += [("crease", c) for c in branches(E)]
     chains = merge_fragments(chains)
-    WH = wheels(I, M, v, vw); lab, comps = part_labels(vw, v, fr, I.shape)
-    BO = [b_ for b_ in bolts(I, M, vw) if 0 <= lab[int(b_["cy"]), int(b_["cx"])] < len(comps) and comps[lab[int(b_["cy"]), int(b_["cx"])]] in PARAMS["bolt_on"]]   # bolts only on the underbody plates
+    sh_ = src["shift"].get(vw)
+    if sh_: chains = [(k_, c_ + np.array(sh_)) for k_, c_ in chains]   # onto the clay frame
+    WH = wheels(I, M, v, vw) if src["wheels"] else []; lab, comps = part_labels(vw, v, fr, I.shape)
+    BO = [] if not src["wheels"] else [b_ for b_ in bolts(I, M, vw) if 0 <= lab[int(b_["cy"]), int(b_["cx"])] < len(comps) and comps[lab[int(b_["cy"]), int(b_["cx"])]] in PARAMS["bolt_on"]]   # bolts only on the underbody plates
     # the silhouette : contour of the mask smoothed first (its pixel edge is noisy at the tail), cut only at real corners
     cont = max(measure.find_contours(ndi.gaussian_filter(M.astype(float), PARAMS["sil_sigma_px"]), 0.5), key=len)
     d_ = np.r_[0, np.cumsum(np.linalg.norm(np.diff(cont, axis=0), axis=1))]; t_ = np.arange(0, d_[-1], 1.0)   # constant 1 px step : near duplicate points made curvature spikes
     cont = np.stack([np.interp(t_, d_, cont[:, 0]), np.interp(t_, d_, cont[:, 1])], 1)
-    curves = [("silhouette", "outline", q) for c in split_at_corners(cont, PARAMS["sil_corner_deg"], PARAMS["sil_min_px"]) for q in split_at_inflections(c)]
+    curves = [] if a.source != "clay" else [("silhouette", "outline", q) for c in split_at_corners(cont, PARAMS["sil_corner_deg"], PARAMS["sil_min_px"]) for q in split_at_inflections(c)]
     for kind, ch in chains:
         if any((np.hypot(ch[:, 1] - b_["cx"], ch[:, 0] - b_["cy"]) < b_["r"] + 4).mean() > 0.7 for b_ in BO): continue   # a bolt is drawn as its circle
         # inside a wheel when most of its POINTS are (an arch lip arc has its mean inside the tyre circle but runs outside it)
@@ -325,9 +333,9 @@ def main():
     for k in cnt: d.line([lx, img.size[1] - 22, lx + 30, img.size[1] - 22], fill=PARAMS["colours"][k], width=4); d.text((lx + 36, img.size[1] - 34), k, fill=(20, 20, 20), font=fnt); lx += 36 + 11 * len(k) + 40
     d.text((12, 8), "vue %s : %d lignes lissées (%d acceptées par CurveFair) ; %s" % (PARAMS["names"][vw], len(out), nok, ", ".join("%s %d" % (k, n_) for k, n_ in cnt.items())), fill=(20, 20, 20), font=fnt)
     os.makedirs(W + "versions/views", exist_ok=True); os.makedirs(W + "work/car/schematic", exist_ok=True)
-    png = W + "versions/views/View_%s.png" % vw; img.save(png)
+    png = W + "versions/views/View_%s%s.png" % (vw, src["suffix"]); img.save(png)
     json.dump({"_doc": "28 October 2026 : ViewTrace of the %s view : smooth lines by component, in pixels and in metres (abscissa along rx, ordinate along uy)." % vw,
-               "view": vw, "rx": v["rx"], "uy": v["uy"], "lines": out}, open(W + "work/car/schematic/view_%s.json" % vw, "w"))
+               "view": vw, "source": a.source, "rx": v["rx"], "uy": v["uy"], "lines": out}, open(W + "work/car/schematic/view_%s%s.json" % (vw, src["suffix"]), "w"))
     print(json.dumps({"view": vw, "png": png, "lines": len(out), "fair": nok, "by_component": cnt, "wheels": [(round(c["cx"], 1), round(c["cy"], 1), c["rings"]) for c in WH]}))
 
 
