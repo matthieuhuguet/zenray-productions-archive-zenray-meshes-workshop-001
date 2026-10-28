@@ -1,0 +1,361 @@
+"""28 October 2026 : ZenRay Meshes RETOPO METHODS, phase 1 (raw topology) of the sixteen tournament methods, each a distinct principle.
+Every method returns (P, Q) for the test component (front fender L) ; phases 2 to 4 are in Common.py unless a method overrides them.
+Inputs : the coarse sheet (contours, shared sampling, 2 cm), the fine sheet projected on the sculpt (REG, the sculpt region, 1 cm).
+FR : la phase 1 des seize méthodes du tournoi, un principe distinct chacune."""
+import json, os, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+FD = C.RT + "fender/"; HOU_DIR = FD + "hou/"; os.makedirs(HOU_DIR, exist_ok=True)
+
+
+def grids(path):
+    """Per patch, the 2D array [column, row] of unique vertex indices, its crease row, and the unique P (not projected)."""
+    d = np.load(path); P = d["P"]; F = d["F"]; GI = d["GI"]; rm = d["rm"]
+    used, inv = np.unique(F.ravel(), return_inverse=True); m = -np.ones(len(P), np.int64); m[used] = np.arange(len(used))
+    out = []
+    for pk in sorted(set(GI[:, 0])):
+        sel = np.nonzero(GI[:, 0] == pk)[0]; ni = GI[sel, 1].max() + 1; nr = GI[sel, 4][0]; G = -np.ones((ni, nr), np.int64)
+        for o in sel: G[GI[o, 1], GI[o, 2]] = m[rm[o]]
+        out.append({"G": G, "crease": int(GI[sel, 3][0])})
+    return P[used].astype(float), out
+
+
+def quads_from_grid(G):
+    return [[int(G[i, j]), int(G[i, j + 1]), int(G[i + 1, j + 1]), int(G[i + 1, j])] for i in range(G.shape[0] - 1) for j in range(G.shape[1] - 1)]
+
+
+def reg():
+    """The fine sheet projected on the sculpt : the sculpt region with a clean boundary (input of the remeshers)."""
+    p = FD + "reg.npz"
+    if not os.path.exists(p):
+        P, gs = grids(FD + "sheet_fine.npz"); Q = [q for g in gs for q in quads_from_grid(g["G"])]
+        Pp = C.sculpt().project(P, nref=C.vnormals(P, Q)); np.savez(p, P=Pp, Q=np.array(Q)); C.write_obj(FD + "reg.obj", Pp, Q)
+        np.save(FD + "reg_crease.npy", np.unique(np.concatenate([g["G"][:, g["crease"]] for g in gs])))
+    d = np.load(p); return d["P"], d["Q"].tolist()
+
+
+def coarse():
+    P, gs = grids(FD + "sheet_coarse.npz"); return P, gs
+
+
+# ---------------- Python methods ----------------
+def coons(B0, B1, D0, D1):
+    """Transfinite (Coons) patch from four boundary polylines : B0 bottom, B1 top (along u), D0 left, D1 right (along v)."""
+    nu, nv = len(B0), len(D0); u = np.linspace(0, 1, nu)[:, None, None]; v = np.linspace(0, 1, nv)[None, :, None]
+    S = (1 - v) * B0[:, None] + v * B1[:, None] + (1 - u) * D0[None] + u * D1[None]
+    S -= (1 - u) * (1 - v) * B0[0] + u * (1 - v) * B0[-1] + (1 - u) * v * B1[0] + u * v * B1[-1]
+    return S
+
+
+def R06():
+    """Coons patches between the contours (crease row as a patch border, six sub patches), then projected on the sculpt."""
+    P, gs = coarse(); Pp = C.contours()["P"]; X = Pp.copy(); Q = []
+    for g in gs:
+        G = g["G"]; c = g["crease"]
+        for j0, j1 in ((0, c), (c, G.shape[1] - 1)):
+            H = G[:, j0:j1 + 1]; S = coons(Pp[H[:, 0]], Pp[H[:, -1]], Pp[H[0, :]], Pp[H[-1, :]])
+            inner = np.zeros(H.shape, bool); inner[1:-1, 1:-1] = True; X[H[inner]] = S[inner]
+        Q += quads_from_grid(G)
+    bnd = set(C.boundary_verts(Q)); crease = set(np.concatenate([g["G"][:, g["crease"]] for g in gs]))
+    free = np.array([i for i in range(len(X)) if i not in bnd and i not in crease]); X[free] = C.sculpt().project(X[free], nref=C.vnormals(P, Q)[free])
+    return X, Q
+
+
+def R07():
+    """Coons patches, then a GLOBAL regularized fit : minimize w |P - proj(P)|^2 + lam |L P|^2, boundary and crease fixed (no hard projection)."""
+    from scipy.sparse import identity, diags
+    from scipy.sparse.linalg import spsolve
+    X, Q = R06(); gs = coarse()[1]; S = C.sculpt(); n = len(X)
+    fix = np.zeros(n, bool); fix[C.boundary_verts(Q)] = True; fix[np.concatenate([g["G"][:, g["crease"]] for g in gs])] = True
+    Wm, deg = C.adjacency(X, Q); L = diags(1.0 / np.maximum(deg, 1)) @ Wm - identity(n); w, lam = 1.0, C.PARAMS["r07_lambda"]
+    free = np.nonzero(~fix)[0]; fx = np.nonzero(fix)[0]; LtL = (L.T @ L).tocsr()
+    Mff = (w * identity(len(free)) + lam * LtL[free][:, free]).tocsc(); Mfx = lam * LtL[free][:, fx]
+    for _ in range(C.PARAMS["r07_iter"]):
+        T = S.project(X, nref=C.vnormals(X, Q)); rhs = w * T[free] - Mfx @ X[fx]; X[free] = np.column_stack([spsolve(Mff, rhs[:, k]) for k in range(3)])
+    # support rows back at support_m from the crease, on the line toward the next row : the crease quads stay planar (28 October 2026)
+    for g in gs:
+        G = g["G"]; c = g["crease"]
+        for sgn in (-1, 1):
+            j1, j2 = c + sgn, c + 2 * sgn
+            if 0 < j1 < G.shape[1] - 1 and 0 <= j2 < G.shape[1]:
+                for i in range(1, G.shape[0] - 1):
+                    a, b = X[G[i, c]], X[G[i, j2]]; d = np.linalg.norm(b - a); X[G[i, j1]] = a + (b - a) * min(C.PARAMS["support_m"] / max(d, 1e-9), 0.45)
+    return X, Q
+
+
+def R08():
+    """Least squares B-spline surface per sub patch (cubic, 4 inner knots per direction), data = the projected fine sheet."""
+    from scipy.interpolate import LSQBivariateSpline
+    Pc, gc = coarse(); Pf, gf = grids(FD + "sheet_fine.npz"); Ff = reg()[0]; X = C.contours()["P"].copy(); Q = []
+    for g, h in zip(gc, gf):
+        G, Gf = g["G"], h["G"]
+        for (j0, j1), (k0, k1) in zip(((0, g["crease"]), (g["crease"], G.shape[1] - 1)), ((0, h["crease"]), (h["crease"], Gf.shape[1] - 1))):
+            H = G[:, j0:j1 + 1]; Hf = Gf[:, k0:k1 + 1]
+            uu, vv = np.meshgrid(np.linspace(0, 1, Hf.shape[0]), np.linspace(0, 1, Hf.shape[1]), indexing="ij")
+            tx = np.linspace(0, 1, 6)[1:-1]; ty = np.linspace(0, 1, 6)[1:-1]
+            if Hf.shape[1] < 6: ty = np.linspace(0, 1, max(Hf.shape[1] - 2, 2))[1:-1]
+            ue, ve = np.meshgrid(np.linspace(0, 1, H.shape[0]), np.linspace(0, 1, H.shape[1]), indexing="ij")
+            for k in range(3):
+                sp = LSQBivariateSpline(uu.ravel(), vv.ravel(), Ff[Hf.ravel(), k], tx, ty, kx=3, ky=min(3, Hf.shape[1] - 1))
+                val = sp.ev(ue.ravel(), ve.ravel()).reshape(H.shape); inner = np.zeros(H.shape, bool); inner[1:-1, 1:-1] = True
+                X[H[inner], k] = val[inner]
+        Q += quads_from_grid(G)
+    return X, Q
+
+
+def _cc(P, Q, sharp):
+    """One Catmull Clark step for a quad mesh with boundary and sharp edges (crease rule = boundary rule). Returns P2, Q2, map of old verts."""
+    from collections import defaultdict
+    P = np.asarray(P, float); fp = np.array([P[q].mean(0) for q in Q]); ef = defaultdict(list)
+    for i, q in enumerate(Q):
+        for k in range(4): ef[(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4]))].append(i)
+    keys = list(ef); eid = {e: i for i, e in enumerate(keys)}; ep = np.zeros((len(keys), 3)); hard = set()
+    for e, f in ef.items():
+        if len(f) == 1 or e in sharp: ep[eid[e]] = (P[e[0]] + P[e[1]]) / 2; hard.add(e)
+        else: ep[eid[e]] = (P[e[0]] + P[e[1]] + fp[f[0]] + fp[f[1]]) / 4
+    vf = defaultdict(list); ve = defaultdict(list)
+    for i, q in enumerate(Q):
+        for v in q: vf[v].append(i)
+    for e in keys: ve[e[0]].append(e); ve[e[1]].append(e)
+    NP = P.copy()
+    for v in range(len(P)):
+        if v not in vf: continue
+        he = [e for e in ve[v] if e in hard]
+        if len(he) == 2: o = [e[0] if e[1] == v else e[1] for e in he]; NP[v] = 0.75 * P[v] + 0.125 * (P[o[0]] + P[o[1]])
+        elif len(he) > 2: NP[v] = P[v]
+        else:
+            n = len(vf[v]); Fm = fp[vf[v]].mean(0); Rm = np.mean([(P[e[0]] + P[e[1]]) / 2 for e in ve[v]], 0); NP[v] = (Fm + 2 * Rm + (n - 3) * P[v]) / n
+    nv = len(P); P2 = np.vstack([NP, ep, fp]); Q2 = []
+    for i, q in enumerate(Q):
+        for k in range(4):
+            a, b_, d = q[k], q[(k + 1) % 4], q[(k - 1) % 4]
+            Q2.append([a, nv + eid[(min(a, b_), max(a, b_))], nv + len(keys) + i, nv + eid[(min(a, d), max(a, d))]])
+    sharp2 = set()
+    for e in sharp:
+        m = nv + eid[e]; sharp2.add((min(e[0], m), max(e[0], m))); sharp2.add((min(e[1], m), max(e[1], m)))
+    return P2, Q2, sharp2
+
+
+def R09():
+    """Subdivision cage fitting : a cage (every other column and row of the contours grid, crease kept), one Catmull Clark step with the
+    crease sharp, and the cage moved by the residual of its limit vertices to the sculpt, eight times (inverse subdivision)."""
+    Pc, gs = coarse(); Pp = C.contours()["P"]; S = C.sculpt(); keep = {}; Qc = []; sharp = set()
+    for g in gs:
+        G = g["G"]; c = g["crease"]; cols = sorted(set(range(0, G.shape[0], 2)) | {G.shape[0] - 1}); rows = sorted(set(range(0, G.shape[1], 2)) | {c, G.shape[1] - 1})
+        H = G[np.ix_(cols, rows)]; Qc += quads_from_grid(H); jc = rows.index(c)
+        for i in range(H.shape[0] - 1): e = (int(H[i, jc]), int(H[i + 1, jc])); sharp.add((min(e), max(e)))
+    Pcage, Qcage = C.compact(Pp, Qc); used = np.unique(np.concatenate([np.array(q) for q in Qc])); m = {int(u): i for i, u in enumerate(used)}
+    sharp = {(min(m[a], m[b]), max(m[a], m[b])) for a, b in sharp}; bnd = set(C.boundary_verts(Qcage))
+    for it in range(8):
+        P2, Q2, _ = _cc(Pcage, Qcage, sharp); lim = P2[:len(Pcage)]; tgt = S.project(lim)
+        Ct = C.contours(); d_, i_ = Ct["kd_loop"].query(lim); tb = Ct["loop_dense"][i_]
+        r = tgt - lim; rb = tb - lim; Pcage = Pcage + np.where(np.isin(np.arange(len(Pcage)), list(bnd))[:, None], rb, r)
+    P2, Q2, _ = _cc(Pcage, Qcage, sharp); return P2, Q2
+
+
+def R10():
+    """Skin (loft) between sections cut in the sculpt : the fine sheet columns projected, each resampled by arc length to the coarse rows
+    of its own patch with its crease point kept, then joined column to column."""
+    Pc, gc = coarse(); Pf, gf = grids(FD + "sheet_fine.npz"); Ff = reg()[0]; X = C.contours()["P"].copy(); Q = []
+    for g, h in zip(gc, gf):
+        G, Gf = g["G"], h["G"]; zf = Ff[Gf[:, 0], 2]
+        for i in range(1, G.shape[0] - 1):
+            fi = int(np.argmin(np.abs(zf - X[G[i, 0], 2]))); col = Ff[Gf[fi]]
+            for (j0, j1), (k0, k1) in zip(((0, g["crease"]), (g["crease"], G.shape[1] - 1)), ((0, h["crease"]), (h["crease"], Gf.shape[1] - 1))):
+                seg = col[k0:k1 + 1]; L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))]
+                t = np.linspace(0, L[-1], j1 - j0 + 1); val = np.stack([np.interp(t, L, seg[:, k]) for k in range(3)], 1)
+                for jj in range(j0 + 1, j1): X[G[i, jj]] = val[jj - j0]
+        Q += quads_from_grid(G)
+    return X, Q
+
+
+def R11():
+    """Rails sweep : one mean profile (from the projected fine columns, normalized between the bottom and top rail) swept along the two
+    rails of each patch ; the crease sits at the mean normalized arc position."""
+    Pc, gc = coarse(); Pf, gf = grids(FD + "sheet_fine.npz"); Ff = reg()[0]; X = C.contours()["P"].copy(); Q = []
+    for g, h in zip(gc, gf):
+        G, Gf = g["G"], h["G"]; prof = []
+        for fi in range(Gf.shape[0]):
+            col = Ff[Gf[fi]]; a, b = col[0], col[-1]; ax = b - a; L = np.linalg.norm(ax); ax /= L
+            nrm = np.cross(ax, np.array([0, 0, 1.0])); nrm /= np.linalg.norm(nrm) + 1e-12
+            prof.append(np.stack([(col - a) @ ax / L, (col - a) @ nrm / L], 1))
+        prof = np.mean(prof, 0)
+        for i in range(1, G.shape[0] - 1):
+            a, b = X[G[i, 0]], X[G[i, -1]]; ax = b - a; L = np.linalg.norm(ax); ax /= L; nrm = np.cross(ax, np.array([0, 0, 1.0])); nrm /= np.linalg.norm(nrm) + 1e-12
+            pts = a + L * (prof[:, :1] * ax + prof[:, 1:] * nrm)
+            for (j0, j1), (k0, k1) in zip(((0, g["crease"]), (g["crease"], G.shape[1] - 1)), ((0, h["crease"]), (h["crease"], Gf.shape[1] - 1))):
+                seg = pts[k0:k1 + 1]; Ls = np.r_[0, np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))]; t = np.linspace(0, Ls[-1], j1 - j0 + 1)
+                val = np.stack([np.interp(t, Ls, seg[:, k]) for k in range(3)], 1)
+                for jj in range(j0 + 1, j1): X[G[i, jj]] = val[jj - j0]
+        Q += quads_from_grid(G)
+    return X, Q
+
+
+def R16():
+    """Harmonic parametrization (cotangent weights) of the sculpt region, boundary on the unit square by arc length between four corners,
+    then a regular grid in the parameter plane mapped back by barycentric lookup, then projected."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import spsolve
+    Pr, Qr = reg(); T = C.tris(Qr); n = len(Pr); I, J, V = [], [], []
+    for a, b, c in T:
+        for (i, j, k) in ((a, b, c), (b, c, a), (c, a, b)):
+            u_, v_ = Pr[i] - Pr[k], Pr[j] - Pr[k]; cot = (u_ @ v_) / (np.linalg.norm(np.cross(u_, v_)) + 1e-12); I += [i, j]; J += [j, i]; V += [cot / 2, cot / 2]
+    Wm = coo_matrix((V, (I, J)), shape=(n, n)).tocsr(); Wm.data = np.maximum(Wm.data, 1e-6)
+    Ct = C.contours(); loop = Ct["P"][Ct["loop"]]; b = C.boundary_verts(Qr); kd = cKDTree(Pr[b])
+    # boundary loop of REG ordered along the contour loop by nearest contour sample
+    _, near = cKDTree(Ct["loop_dense"]).query(Pr[b]); order = np.argsort(near); bo = b[order]
+    Lb = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Pr[bo], axis=0), axis=1))]; s = Lb / (Lb[-1] + np.linalg.norm(Pr[bo[-1]] - Pr[bo[0]]))
+    corners = np.array([0, .25, .5, .75, 1.0]); sq = np.array([[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]])
+    UV = np.zeros((n, 2)); UV[bo] = np.stack([np.interp(s, corners, sq[:, 0]), np.interp(s, corners, sq[:, 1])], 1)
+    fixm = np.zeros(n, bool); fixm[bo] = True; deg = np.asarray(Wm.sum(1)).ravel(); Lap = (coo_matrix((deg, (range(n), range(n))), shape=(n, n)) - Wm).tocsr()
+    fr = np.nonzero(~fixm)[0]; fx = np.nonzero(fixm)[0]; A_ = Lap[fr][:, fr].tocsc(); B_ = Lap[fr][:, fx]
+    for k in range(2): UV[fr, k] = spsolve(A_, -B_ @ UV[fx, k])
+    Pc, gc = coarse(); nu = sum(g["G"].shape[0] for g in gc) - len(gc) + 1; nv = max(g["G"].shape[1] for g in gc)
+    gu, gv = np.meshgrid(np.linspace(0, 1, nu), np.linspace(0, 1, nv), indexing="ij"); Gp = np.stack([gu.ravel(), gv.ravel()], 1)
+    from scipy.interpolate import LinearNDInterpolator
+    Xg = LinearNDInterpolator(UV, Pr)(Gp)
+    ok = ~np.isnan(Xg).any(1); Xg[~ok] = Pr[cKDTree(UV).query(Gp[~ok])[1]]
+    idx = np.arange(len(Gp)).reshape(nu, nv); Q = quads_from_grid(idx); return C.sculpt().project(Xg), Q
+
+
+# ---------------- Houdini methods (through the bridge) ----------------
+def _hou_run(tag, body, inputs):
+    """Load OBJ inputs as File SOPs under /obj/ZRM_RetopoBench/<tag>, run body (python using `src`, `net`), save OUT to OBJ, read it back."""
+    out = HOU_DIR + tag + ".obj"
+    code = ("import hou\nnet = hou.node('/obj/ZRM_RetopoBench') or hou.node('/obj').createNode('geo','ZRM_RetopoBench')\n"
+            "old = net.node('%s')\nif old: old.destroy()\nnet = net.createNode('subnet','%s')\nsrc = {}\n" % (tag, tag))
+    for k, path in inputs.items():
+        code += "src['%s'] = net.createNode('file','IN_%s'); src['%s'].parm('file').set('%s')\n" % (k, k, k, path)
+    code += body + "\nout = net.node('OUT'); out.geometry().saveToFile('%s')\nresult = len(out.geometry().prims())\n" % out
+    C.hou(code, timeout=900); return C.read_obj(out)
+
+
+def _reg_inputs():
+    reg(); Pc, gc = coarse(); return {"reg": FD + "reg.obj"}
+
+
+def R01():
+    """Houdini Quad Remesh (Beta), curvature field only, on the sculpt region (ZRemesher without guides)."""
+    body = ("q = net.createNode('quadremesh','QR'); q.setInput(0, src['reg']); q.parm('resolution').set('quad_area'); q.parm('targetquadarea').set(0.0004)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, q)")
+    return _hou_run("R01", body, _reg_inputs())
+
+
+def _crease_group_code(node_in, name="crease"):
+    ids = np.load(FD + "reg_crease.npy").tolist()
+    return ("cg = net.createNode('python','CREASE_GROUP'); cg.setInput(0, %s)\n"
+            "cg.parm('python').set('''geo = hou.pwd().geometry()\\nids = set(%s)\\ng = geo.createEdgeGroup('%s')\\n"
+            "for pr in geo.prims():\\n    vs = pr.vertices()\\n    for k in range(len(vs)):\\n        a, b = vs[k].point(), vs[(k + 1) %% len(vs)].point()\\n"
+            "        if a.number() in ids and b.number() in ids: g.add(geo.findEdge(a, b))''')\n" % (node_in, ids, name))
+
+
+def R02():
+    """Houdini Quad Remesh with the crease as feature edges and constrained edges, guides hardened (ZRemesher with guides)."""
+    body = (_crease_group_code("src['reg']") +
+            "q = net.createNode('quadremesh','QR'); q.setInput(0, cg); q.parm('resolution').set('quad_area'); q.parm('targetquadarea').set(0.0004)\n"
+            "q.parm('featuredges').set('crease'); q.parm('constrainededgesgroup').set('crease'); q.parm('hardenguidestofeatures').set(1); q.parm('globalweight').set(1.0)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, q)")
+    return _hou_run("R02", body, _reg_inputs())
+
+
+def R03():
+    """Labs Exoside Quad Remesher (commercial algorithm), target quad count from the region area."""
+    body = ("q = net.createNode('labs::exoside_quadremesher::1.4','QR'); q.setInput(0, src['reg'])\n"
+            "names = [p.name() for p in q.parms()]\n"
+            "if 'targetquadcount' in names: q.parm('targetquadcount').set(3000)\n"
+            "q.cook(force=True)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, q)")
+    return _hou_run("R03", body, _reg_inputs())
+
+
+def R04():
+    """Labs Fast Remesh, then Labs Quadrangulate (voxel style remesh then quads)."""
+    body = ("q = net.createNode('labs::fast_remesh::1.1','FR'); q.setInput(0, src['reg'])\n"
+            "pn = [p.name() for p in q.parms()]\n"
+            "q.parm('remeshtarget').set(0); q.parm('targetedgetemp').set(0.02); q.parm('remeshiterations').set(3)\n"
+            "qd = net.createNode('labs::quadrangulate::2.0','QD'); qd.setInput(0, q)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, qd)")
+    return _hou_run("R04", body, _reg_inputs())
+
+
+def R05():
+    """Houdini isotropic Remesh (triangles, 2 cm), then greedy pairing of triangles into quads (best squareness first)."""
+    body = ("r = net.createNode('remesh::2.0','RM'); r.setInput(0, src['reg']); r.parm('targetsize').set(0.02)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, r)")
+    P, T = _hou_run("R05", body, _reg_inputs()); return pair_tris(P, T)
+
+
+def pair_tris(P, T):
+    from collections import defaultdict
+    ef = defaultdict(list)
+    for i, t in enumerate(T):
+        for k in range(3): ef[(min(t[k], t[(k + 1) % 3]), max(t[k], t[(k + 1) % 3]))].append(i)
+    cand = []
+    for e, f in ef.items():
+        if len(f) != 2: continue
+        a, b = f; o1 = [v for v in T[a] if v not in e][0]; o2 = [v for v in T[b] if v not in e][0]
+        q = [e[0], o2, e[1], o1] if True else None
+        ang = []
+        for k in range(4):
+            u, w = P[q[k - 1]] - P[q[k]], P[q[(k + 1) % 4]] - P[q[k]]; ang.append(np.degrees(np.arccos(np.clip(u @ w / (np.linalg.norm(u) * np.linalg.norm(w) + 1e-12), -1, 1))))
+        cand.append((max(abs(x - 90) for x in ang), a, b, q))
+    cand.sort(); used = set(); Q = []
+    for s, a, b, q in cand:
+        if a in used or b in used or s > 50: continue
+        used |= {a, b}; Q.append(q)
+    Q += [list(t) for i, t in enumerate(T) if i not in used]
+    # consistent winding with the first triangle of each quad
+    return P, Q
+
+
+def R12():
+    """Houdini Planar Patch from Curves on the contour loop (best fit plane), rays back onto the sculpt region, then a relax."""
+    Ct = C.contours(); loop = Ct["P"][Ct["loop"]]; C.write_obj(HOU_DIR + "loop.obj", loop, [list(range(len(loop)))])
+    body = ("cv = src['loop']\n"
+            "pp = net.createNode('planarpatchfromcurves','PP'); pp.setInput(0, cv)\n"
+            "pn = [p.name() for p in pp.parms()]\n"
+            "for nm in ('edgelength','targetedgelength','seglength'):\n    if nm in pn: pp.parm(nm).set(0.02)\n"
+            "ry = net.createNode('ray','RAY'); ry.setInput(0, pp); ry.setInput(1, src['reg']); ry.parm('method').set('minimum')\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, ry)")
+    return _hou_run("R12", body, {"loop": HOU_DIR + "loop.obj", "reg": FD + "reg.obj"})
+
+
+def R13():
+    """Houdini Topo Transfer : the clean template grid (contours sheet before projection) transferred onto the sculpt region, no landmarks."""
+    Pc, gc = coarse(); Q = [q for g in gc for q in quads_from_grid(g["G"])]; C.write_obj(HOU_DIR + "template.obj", Pc, Q)
+    body = ("t = net.createNode('topotransfer','TT'); t.setInput(0, src['tpl']); t.setInput(1, src['reg'])\n"
+            "pn = [p.name() for p in t.parms()]\n"
+            "if 'enablelandmarks' in pn: t.parm('enablelandmarks').set(0)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, t)")
+    return _hou_run("R13", body, {"tpl": HOU_DIR + "template.obj", "reg": FD + "reg.obj"})
+
+
+def R14():
+    """Houdini Topo Slide by Curve References : the template grid slid so its border and crease rows land on the contours drawn on the sculpt."""
+    Pc, gc = coarse(); Q = [q for g in gc for q in quads_from_grid(g["G"])]; C.write_obj(HOU_DIR + "template.obj", Pc, Q)
+    Ct = C.contours(); cr = Ct["crease"]; lp = Ct["loop"]
+    C.write_obj(HOU_DIR + "src_curves.obj", np.vstack([Pc[lp], Pc[cr]]), [list(range(len(lp))), list(range(len(lp), len(lp) + len(cr)))])
+    C.write_obj(HOU_DIR + "tgt_curves.obj", np.vstack([Ct["P"][lp], Ct["P"][cr]]), [list(range(len(lp))), list(range(len(lp), len(lp) + len(cr)))])
+    body = ("s = net.createNode('toposlidebycurverefs','TS'); s.setInput(0, src['tpl']); s.setInput(1, src['src']); s.setInput(2, src['tgt'])\n"
+            "ry = net.createNode('ray','RAY'); ry.setInput(0, s); ry.setInput(1, src['reg']); ry.parm('method').set('minimum')\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, ry)")
+    return _hou_run("R14", body, {"tpl": HOU_DIR + "template.obj", "src": HOU_DIR + "src_curves.obj", "tgt": HOU_DIR + "tgt_curves.obj", "reg": FD + "reg.obj"})
+
+
+def R15():
+    """Box cage conformed : every other row and column of the template, Houdini Subdivide (one level), rays onto the sculpt region, Surface Relax."""
+    Pc, gc = coarse(); Qc = []
+    for g in gc:
+        G = g["G"]; cols = sorted(set(range(0, G.shape[0], 2)) | {G.shape[0] - 1}); rows = sorted(set(range(0, G.shape[1], 2)) | {G.shape[1] - 1})
+        Qc += quads_from_grid(G[np.ix_(cols, rows)])
+    Pk, Qk = C.compact(Pc, Qc); C.write_obj(HOU_DIR + "cage.obj", Pk, Qk)
+    body = ("sd = net.createNode('subdivide','SD'); sd.setInput(0, src['cage']); sd.parm('iterations').set(1)\n"
+            "ry = net.createNode('ray','RAY'); ry.setInput(0, sd); ry.setInput(1, src['reg']); ry.parm('method').set('minimum')\n"
+            "rl = net.createNode('surfacerelax','RLX'); rl.setInput(0, ry); rl.setInput(1, src['reg']); rl.parm('iterations').set(10)\n"
+            "o = net.createNode('null','OUT'); o.setInput(0, rl)")
+    return _hou_run("R15", body, {"cage": HOU_DIR + "cage.obj", "reg": FD + "reg.obj"})
+
+
+METHODS = {k: globals()[k] for k in ("R01", "R02", "R03", "R04", "R05", "R06", "R07", "R08", "R09", "R10", "R11", "R12", "R13", "R14", "R15", "R16")}

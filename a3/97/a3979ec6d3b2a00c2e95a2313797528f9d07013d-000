@@ -1,0 +1,27 @@
+"""28 October 2026, 19:45 : ZenRay Meshes finishing, TRIS TO QUADS, pairs of triangles of the same part sharing an edge become one quad (the pair with
+the flattest dihedral first) ; a triangle left alone is split in 3 quads by its centre and its edge midpoints, the 3 neighbours that share those edges
+getting the midpoint inserted (they become 5 sided and are then split in a quad plus ... ) : only done when the neighbour is itself a triangle of the
+pool, otherwise the lone triangle is reported. FR : apparie les triangles en quads.
+python TrisToQuads.py <in.npz> <out.npz>"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+T = [i for i, q in enumerate(Q) if len(q) == 3]; E = defaultdict(list)
+for i in T:
+    q = Q[i]
+    for k in range(3): E[(min(q[k], q[(k + 1) % 3]), max(q[k], q[(k + 1) % 3]))].append(i)
+nrm = lambda q: (lambda v: v / (np.linalg.norm(v) + 1e-12))(np.cross(P[q[1]] - P[q[0]], P[q[2]] - P[q[0]]))
+cand = []
+for e, fs in E.items():
+    if len(fs) == 2 and n[fs[0]] == n[fs[1]]: cand.append((-(nrm(Q[fs[0]]) @ nrm(Q[fs[1]])), e, fs[0], fs[1]))
+cand.sort(); used = set(); drop = set(); add = []
+for _, (u, w), i, j in cand:
+    if i in used or j in used: continue
+    qi = Q[i]; k = [x for x in qi if x not in (u, w)][0]; o = [x for x in Q[j] if x not in (u, w)][0]
+    r = qi.index(k); a0, a1 = qi[(r + 1) % 3], qi[(r + 2) % 3]   # qi = k, a0, a1 ; quad k, a0, o, a1
+    add.append(([k, a0, o, a1], n[i])); used.update((i, j)); drop.update((i, j))
+NQ = [q for i, q in enumerate(Q) if i not in drop] + [q for q, _ in add]; NN = [m for i, m in enumerate(n) if i not in drop] + [m for _, m in add]
+np.savez(a.out, P=P.astype(np.float32), Q=np.array(NQ, dtype=object), names=np.array(NN))
+print(json.dumps({"tris_before": len(T), "pairs": len(add), "tris_left": sum(len(q) == 3 for q in NQ)}))

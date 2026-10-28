@@ -1,0 +1,54 @@
+"""28 October 2026 : ZenRay Meshes CURVATURE COMB board : sections of a mesh with their curvature comb (the designer's fairness tool) ; a
+fair section has a comb that grows and shrinks smoothly and changes side only at a real inflection. Red ticks mark the curvature flips that
+CurveFair counts. python CombBoard.py <mesh.npz> <out.png> --at -0.5,-0.95 [--axis z] [--scale 0.004]
+FR : coupes avec leur peigne de courbure, l'outil des designers pour juger qu'une courbe est lisse."""
+import argparse, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy.signal import savgol_filter
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import CurveFair as CF
+PARAMS = {"panel_px": 520, "cols": 3, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "comb_every": 4}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("out"); ap.add_argument("--at", required=True); ap.add_argument("--axis", default="z")
+    ap.add_argument("--scale", type=float, default=0.004); ap.add_argument("--keep-x", type=float, default=0.3); ap.add_argument("--box", default="")   # u0,u1,v0,v1 zoom
+    a = ap.parse_args(); box = [float(t) for t in a.box.split(",")] if a.box else None
+    d = np.load(a.mesh, allow_pickle=True); P, Q = d["P"].astype(float), d["Q"]; ats = [float(t) for t in a.at.split(",")]; ax = "xyz".index(a.axis)
+    u_ax, v_ax = [k for k in range(3) if k != ax]; nrm = np.eye(3)[ax]; h = CF.PARAMS["step_m"]
+    n = PARAMS["panel_px"]; cols = PARAMS["cols"]; rows = (len(ats) + cols - 1) // cols; img = Image.new("RGB", (cols * n, rows * n), (250, 250, 248)); dr = ImageDraw.Draw(img)
+    fnt = ImageFont.truetype(PARAMS["font"], 14)
+    for i, at in enumerate(ats):
+        ox, oy = (i % cols) * n, (i // cols) * n; loops = [L[L[:, 0] > a.keep_x] for L in CF.section_loops(P, Q, ax, at)]; loops = [L for L in loops if len(L) > 8]
+        if not loops: continue
+        allp = np.vstack(loops); lo, hi = allp.min(0), allp.max(0)
+        if box: lo, hi = lo.copy(), hi.copy(); lo[u_ax], hi[u_ax], lo[v_ax], hi[v_ax] = box
+        s = (n - 60) / max(hi[u_ax] - lo[u_ax], hi[v_ax] - lo[v_ax], 1e-6)
+        if box: loops = [L[(L[:, u_ax] >= lo[u_ax]) & (L[:, u_ax] <= hi[u_ax]) & (L[:, v_ax] >= lo[v_ax]) & (L[:, v_ax] <= hi[v_ax])] for L in loops]; loops = [L for L in loops if len(L) > 8]
+        def tp(p): return (ox + 30 + (p[u_ax] - lo[u_ax]) * s, oy + n - 30 - (p[v_ax] - lo[v_ax]) * s)
+        dr.rectangle([ox + 2, oy + 2, ox + n - 2, oy + n - 2], outline=(200, 200, 200))
+        for L in loops:
+            R = CF.resample(L, h); cuts, _ = CF.split_corners(R, h, nrm)
+            for c0, c1 in zip(cuts[:-1], cuts[1:]):
+                X = R[c0:c1 + 1]
+                if len(X) < 9: continue
+                wl = min(int(round(CF.PARAMS["window_m"] / h)) | 1, len(X) - (1 - len(X) % 2)); wl = max(wl, 5)
+                d1 = savgol_filter(X, wl, 3, deriv=1, delta=h, axis=0, mode="interp"); d2 = savgol_filter(X, wl, 3, deriv=2, delta=h, axis=0, mode="interp")
+                k = (np.cross(d1, d2) @ nrm) / (np.linalg.norm(d1, axis=1) ** 3 + 1e-15); t = d1 / np.linalg.norm(d1, axis=1)[:, None]; nn = np.cross(nrm, t)
+                for j in range(0, len(X), PARAMS["comb_every"]):
+                    q = X[j] - nn[j] * k[j] * a.scale * 25; dr.line([tp(X[j]), tp(q)], fill=(120, 170, 230) if k[j] > 0 else (230, 150, 90))
+                sg = np.sign(k) * (np.abs(k) > CF.PARAMS["kappa_min"])
+                last = 0
+                for j in range(len(sg)):
+                    if sg[j] != 0:
+                        if last != 0 and sg[j] != last: u = tp(X[j]); dr.ellipse([u[0] - 5, u[1] - 5, u[0] + 5, u[1] + 5], outline=(220, 0, 0), width=2)
+                        last = sg[j]
+            for j in range(len(R) - 1): dr.line([tp(R[j]), tp(R[j + 1])], fill=(30, 30, 30), width=2)
+            for c in cuts[1:-1]: u = tp(R[c]); dr.rectangle([u[0] - 4, u[1] - 4, u[0] + 4, u[1] + 4], fill=(0, 140, 0))
+        dr.text((ox + 10, oy + 8), "%s = %.2f" % (a.axis, at), fill=(20, 20, 20), font=fnt)
+    img.save(a.out); print(a.out)
+
+
+if __name__ == "__main__":
+    main()

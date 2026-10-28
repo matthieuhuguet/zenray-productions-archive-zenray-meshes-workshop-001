@@ -1,0 +1,59 @@
+"""28 October 2026 : ZenRay Meshes CURVE RIG, first instance : the front fender. Takes the FenderNet curve network (shared nodes, patches,
+solved counts), turns every curve into a clamped cubic B-spline with few control points (cv_per_m, between cv_min and cv_max : few points,
+so the curve cannot wave), makes every network node ONE shared control, fits each patch crown to the sculpt (least squares along the patch
+normal), writes the rig JSON, then lofts it with RigLib and measures it like the tournament (sculpt deviation, fold, shading noise against
+the reference, crease on an edge loop, weld ready). python MakeRigFender.py [--out work/car/curverig/RIG_fender.json]
+FR : le rig de courbes de l'aile : courbes NURBS à peu de points, nœuds partagés, bombé par patch, loft mesuré."""
+import argparse, io, contextlib, json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+import Common as C
+import FenderNet as F
+from PatchNet import Net
+
+PARAMS = {"cv_min": 4, "cv_max": 12, "fit_tol_mm": 4.0}   # 28 October 2026 : few control points per curve, the interface of the fit
+
+
+def make(out):
+    net = Net(F.PARAMS["spacing_m"], F.PARAMS["support_m"]); F.add_fender(net); net.solve_counts()
+    ctl = []; node_idx = {}
+    for name, xyz in net.nodes.items(): node_idx[name] = len(ctl); ctl.append(np.asarray(xyz, float).tolist())
+    curves = {}; fit_err = {}
+    for name, e in net.edges.items():
+        X = e["samples"] if e["locked"] else e["poly"]
+        if e["locked"]:
+            cvs = [node_idx[e["a"]], node_idx[e["b"]]]; fr = RL.arcfrac(X).tolist()
+            curves[name] = {"cvs": cvs, "fixed": e["fixed"], "sharp": e["sharp"], "fracs": fr}; fit_err[name] = 0.0; continue
+        from scipy.spatial import cKDTree   # adaptive : the fewest control points under fit_tol_mm (28 October 2026)
+        for k in range(PARAMS["cv_min"], PARAMS["cv_max"] + 1):
+            CV = RL.fit(X, k); err = float(cKDTree(RL.evaluate(CV, 600)).query(X)[0].max() * 1000)
+            if err <= PARAMS["fit_tol_mm"]: break
+        fit_err[name] = round(err, 2)
+        ids = [node_idx[e["a"]]]
+        for c in CV[1:-1]: ids.append(len(ctl)); ctl.append(c.tolist())
+        ids.append(node_idx[e["b"]]); curves[name] = {"cvs": ids, "fixed": e["fixed"], "sharp": e["sharp"]}
+    rig = {"_doc": "ZenRay Meshes curve rig, front fender L (28 October 2026). Move the controls (Houdini EDIT node), the curves and the loft follow.",
+           "controls": ctl, "nodes": node_idx, "curves": curves, "patches": [{"name": p["name"], "S": p["S"]} for p in net.patches],
+           "counts": {k: int(e["n"]) for k, e in net.edges.items()}, "crowns": {}, "fit_err_mm": fit_err}
+    # crowns : least squares bulge per patch toward the sculpt, normal oriented outward
+    P, Q, sharp, lines, grids = RL.loft(rig); S = C.sculpt(); cen = np.array([0.0, 0.6, 0.0])
+    for (name, G), pt in zip(grids, rig["patches"]):
+        X = P[G]; du = np.gradient(X, axis=0); dv = np.gradient(X, axis=1); Nn = np.cross(du, dv); Nn /= np.linalg.norm(Nn, axis=2, keepdims=True) + 1e-12
+        if ((X - cen) * Nn).sum(2).mean() < 0: pt["flip_normal"] = True; Nn = -Nn
+        nu, nv = G.shape; U, V = np.meshgrid(np.linspace(0, 1, nu), np.linspace(0, 1, nv), indexing="ij"); Wb = 16 * U * (1 - U) * V * (1 - V)
+        T = S.project(X.reshape(-1, 3), nref=Nn.reshape(-1, 3)).reshape(X.shape); r = ((T - X) * Nn).sum(2)
+        rig["crowns"][name] = round(float((Wb * r).sum() / max((Wb * Wb).sum(), 1e-12)), 4)
+    json.dump(rig, open(out, "w"), indent=1)
+    P, Q, sharp, lines, grids = RL.loft(rig)
+    with contextlib.redirect_stdout(io.StringIO()):
+        nt = Net(F.PARAMS["spacing_m"], F.PARAMS["support_m"]); F.add_fender(nt); nt.solve_counts(); nt.build(); C._CT = nt.as_contours()
+    m = C.measure(P, Q)
+    print(json.dumps({"controls": len(ctl), "curves": len(curves), "crowns": rig["crowns"], "fit_err_max_mm": max(fit_err.values()),
+                      **{k: m[k] for k in ("dev_p95_mm", "fair_p95_deg", "shading_ratio", "crease_on_edges", "weld_ready", "quads_pct", "irregular", "faces")}}))
+    np.savez(out.replace(".json", "_loft.npz"), P=P, Q=np.array(Q)); return rig
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--out", default=C.W + "curverig/RIG_fender.json"); a = ap.parse_args()
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); make(a.out)

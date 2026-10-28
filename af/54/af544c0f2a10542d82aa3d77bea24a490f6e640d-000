@@ -1,0 +1,98 @@
+# 28 October 2026 : ZenRay Meshes CURVE RIG, Houdini builder. Run inside Houdini (MCP or Python shell) :
+#   exec(open('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/curverig/HouRigBuild.py').read()); build('/obj/ZRM_CurveRig', RIG_JSON, LIB_DIR)
+# Network : CTRL (rig file, density, subdivision, one crown per patch, mirror) -> CONTROLS (the controllers, points) -> EDIT (move them with
+# the handles, like a Maya rig) -> CURVES (the NURBS, coloured : sharp red, fixed white, free blue) and LOFT (Coons patches of the curves,
+# crowns, 'sharp' edge group) -> CREASE -> MIRROR -> SUBDIVIDE (creases kept) ; CTRL_SPHERES shows the controllers ; DISPLAY merges all.
+# FR : le montage du rig de courbes dans Houdini : contrôleurs, nœud Edit, courbes NURBS, loft, symétrie, subdivision.
+import hou, json
+
+PY_HEAD = ("import sys, json, importlib\n"
+           "ctrl = hou.node('../CTRL'); lib = ctrl.parm('lib_dir').eval()\n"
+           "if lib not in sys.path: sys.path.insert(0, lib)\n"
+           "import RigLib; importlib.reload(RigLib)\n"
+           "import numpy as np\n"
+           "rig = RigLib.load(ctrl.parm('rig_json').eval())\n"
+           "node = hou.pwd(); geo = node.geometry()\n")
+
+PY_CONTROLS = PY_HEAD + (
+    "geo.clear()\n"
+    "pts = geo.createPoints([tuple(c) for c in rig['controls']])\n"
+    "geo.addAttrib(hou.attribType.Point, 'cid', 0); geo.addAttrib(hou.attribType.Point, 'role', '')\n"
+    "geo.addAttrib(hou.attribType.Point, 'Cd', (1.0, 1.0, 1.0))\n"
+    "nodes = set(rig['nodes'].values())\n"
+    "geo.setPointIntAttribValues('cid', list(range(len(pts))))\n"
+    "geo.setPointStringAttribValues('role', ['node' if i in nodes else 'cv' for i in range(len(pts))])\n"
+    "geo.setPointFloatAttribValues('Cd', [v for i in range(len(pts)) for v in ((1.0, 0.25, 0.1) if i in nodes else (1.0, 0.85, 0.1))])\n")
+
+PY_READ = ("src = node.inputs()[0].geometry()\n"
+           "C = np.array(src.pointFloatAttribValues('P'), float).reshape(-1, 3)\n"
+           "geo.clear()\n")
+
+PY_CURVES = PY_HEAD + PY_READ + (
+    "geo.addAttrib(hou.attribType.Prim, 'curve', ''); geo.addAttrib(hou.attribType.Prim, 'Cd', (1.0, 1.0, 1.0))\n"
+    "for name, c in rig['curves'].items():\n"
+    "    D = RigLib.evaluate(C[c['cvs']], 80)\n"
+    "    pts = geo.createPoints([tuple(p) for p in D])\n"
+    "    pr = geo.createPolygon(is_closed=False)\n"
+    "    for p in pts: pr.addVertex(p)\n"
+    "    pr.setAttribValue('curve', name)\n"
+    "    pr.setAttribValue('Cd', (1.0, 0.1, 0.1) if c.get('sharp') else ((0.95, 0.95, 0.95) if c.get('fixed') else (0.2, 0.55, 1.0)))\n")
+
+PY_LOFT = PY_HEAD + PY_READ + (
+    "crowns = {p['name']: (ctrl.parm('crown_' + p['name']).eval() if ctrl.parm('crown_' + p['name']) else rig['crowns'].get(p['name'], 0.0)) for p in rig['patches']}\n"
+    "P, Q, sharp, lines, grids = RigLib.loft(rig, C, ctrl.parm('density').eval(), crowns)\n"
+    "pts = geo.createPoints([tuple(p) for p in P])\n"
+    "geo.createPolygons([tuple(q) for q in Q])\n"
+    "g = geo.createEdgeGroup('sharp')\n"
+    "for a, b in sharp:\n"
+    "    e = geo.findEdge(geo.point(a), geo.point(b))\n"
+    "    if e is not None: g.add(e)\n")
+
+
+def _python_sop(parent, name, code, inp=None):
+    n = parent.createNode("python", name); n.parm("python").set(code)
+    if inp is not None: n.setInput(0, inp)
+    return n
+
+
+def build(path, rig_json, lib_dir):
+    parent_path, name = path.rsplit("/", 1); old = hou.node(path)
+    if old: old.destroy()
+    g = hou.node(parent_path).createNode("geo", name); rig = json.load(open(rig_json))
+    ctrl = g.createNode("null", "CTRL"); ptg = ctrl.parmTemplateGroup()
+    ptg.append(hou.StringParmTemplate("rig_json", "Rig file", 1, default_value=(rig_json,), string_type=hou.stringParmType.FileReference))
+    ptg.append(hou.StringParmTemplate("lib_dir", "RigLib folder", 1, default_value=(lib_dir,)))
+    ptg.append(hou.IntParmTemplate("density", "Density (x edges)", 1, default_value=(1,), min=1, max=6))
+    ptg.append(hou.IntParmTemplate("subd", "Subdivision", 1, default_value=(2,), min=0, max=4))
+    ptg.append(hou.ToggleParmTemplate("mirror", "Mirror to the right side", default_value=True))
+    ptg.append(hou.FloatParmTemplate("ctrl_size", "Controller size (m)", 1, default_value=(0.012,)))
+    f = hou.FolderParmTemplate("crowns", "Crown per patch (m)")
+    for p in rig["patches"]:
+        f.addParmTemplate(hou.FloatParmTemplate("crown_" + p["name"], "Crown " + p["name"], 1, default_value=(float(rig["crowns"].get(p["name"], 0.0)),), min=-0.05, max=0.05))
+    ptg.append(f); ctrl.setParmTemplateGroup(ptg)
+    con = _python_sop(g, "CONTROLS", PY_CONTROLS)
+    ed = g.createNode("edit", "EDIT"); ed.setInput(0, con)
+    cur = _python_sop(g, "CURVES", PY_CURVES, ed)
+    lo = _python_sop(g, "LOFT", PY_LOFT, ed)
+    cr = g.createNode("crease", "CREASE"); cr.setInput(0, lo)
+    try:
+        cr.parm("group").set("sharp"); cr.parm("grouptype").set("edges")
+    except Exception:
+        pass
+    for pn, val in (("crease", 10.0), ("creaseweight", 10.0)):
+        if cr.parm(pn): cr.parm(pn).set(val)
+    mi = g.createNode("mirror", "MIRROR"); mi.setInput(0, cr)
+    for pn, val in (("dir", (1, 0, 0)),):
+        if mi.parmTuple(pn): mi.parmTuple(pn).set(val)
+    sw = g.createNode("switch", "MIRROR_ON"); sw.setInput(0, cr); sw.setInput(1, mi); sw.parm("input").setExpression('ch("../CTRL/mirror")')
+    sd = g.createNode("subdivide", "SUBDIVIDE"); sd.setInput(0, sw); sd.parm("iterations").setExpression('ch("../CTRL/subd")')
+    sph = g.createNode("sphere", "CTRL_SHAPE"); sph.parm("type").set("polymesh") if sph.parm("type") else None
+    for pn in ("radx", "rady", "radz"):
+        if sph.parm(pn): sph.parm(pn).setExpression('ch("../CTRL/ctrl_size")')
+    if sph.parmTuple("rad"): [sph.parmTuple("rad")[k].setExpression('ch("../CTRL/ctrl_size")') for k in range(3)]
+    cp = g.createNode("copytopoints::2.0", "CTRL_SPHERES"); cp.setInput(0, sph); cp.setInput(1, ed)
+    mg = g.createNode("merge", "DISPLAY"); mg.setInput(0, sd); mg.setInput(1, cur); mg.setInput(2, cp)
+    out = g.createNode("null", "OUT_surface"); out.setInput(0, sd)
+    mg.setDisplayFlag(True); out.setRenderFlag(True); g.layoutChildren()
+    return {"loft_prims": len(lo.geometry().prims()), "subd_prims": len(sd.geometry().prims()), "curves": len(cur.geometry().prims()),
+            "controls": len(con.geometry().points()), "errors": [n.name() + ": " + "; ".join(n.errors()) for n in g.children() if n.errors()]}

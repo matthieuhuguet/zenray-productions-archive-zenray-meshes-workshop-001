@@ -1,0 +1,38 @@
+"""28 October 2026, 18:20 : ZenRay Meshes finishing, ORIENT PARTS, consistent winding inside each connected component of the listed parts (BFS over
+manifold edges : a neighbour sharing an edge in the SAME direction is flipped), then each closed component oriented outward by signed volume.
+python OrientParts.py <in.npz> <out.npz> --parts A,B   FR : orientation cohérente des faces de chaque morceau, puis vers l'extérieur."""
+import argparse, json
+from collections import defaultdict, deque
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", required=True); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+rep = {}
+for p in a.parts.split(","):
+    idx = [i for i, m in enumerate(n) if m == p]; E = defaultdict(list)
+    for i in idx:
+        q = Q[i]
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+    def dirs(i, e):
+        q = Q[i]
+        for k in range(len(q)):
+            if (q[k], q[(k + 1) % len(q)]) == e: return 1
+        return -1
+    seen = set(); flips = 0; comps = 0
+    for s in idx:
+        if s in seen: continue
+        comps += 1; comp = [s]; seen.add(s); dq = deque([s])
+        while dq:
+            f = dq.popleft(); q = Q[f]
+            for k in range(len(q)):
+                e = (min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))
+                fs = E[e]
+                if len(fs) != 2: continue
+                g = fs[0] if fs[1] == f else fs[1]
+                if g in seen: continue
+                if dirs(f, e) == dirs(g, e): Q[g] = Q[g][::-1]; flips += 1
+                seen.add(g); comp.append(g); dq.append(g)
+        vol = sum(np.dot(P[Q[f][0]], np.cross(P[Q[f][k]], P[Q[f][k + 1]])) for f in comp for k in range(1, len(Q[f]) - 1))
+        if vol < 0:
+            for f in comp: Q[f] = Q[f][::-1]
+    rep[p] = {"components": comps, "flipped_faces": flips}
+np.savez(a.out, P=P.astype(np.float32), Q=np.array(Q, dtype=object), names=d["names"]); print(json.dumps(rep))

@@ -1,0 +1,74 @@
+"""28 October 2026, 17:30 : ZenRay Meshes finishing, FENDER REBUILD, the front fender rebuilt from its design lines (rule 223, every line ONE arc) :
+a quad grid in the side view plane (z, y) between the door cut (z_rear) and the nose (z_front), from the bottom line up to the hood side edge
+(the hood weld, read on the hood and fitted as one arc) ; the wheel arch is a circle fitted on the old arch ring (its cells removed) ; x(z, y) is
+made of two facets split at the crease arc (reference side view) : the upper facet leans from the hood edge out to the crease, the lower facet
+falls from the crease to the bottom line, each edge x an arc fitted on the old fender. 12 mm shell, mirrored to the right.
+python FenderRebuild.py <delivery.npz> <out.npz> [--crease z0,y0,z1,y1,sag]   FR : l'aile avant refaite depuis ses lignes."""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+from RearBlueprint import shell_holed
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--z-rear", type=float, default=0.70); ap.add_argument("--z-front", type=float, default=2.06)
+ap.add_argument("--y-bottom", type=float, default=0.30)
+ap.add_argument("--crease", default="0.70,0.75,2.06,0.56,0.02", help="z0,y0,z1,y1,sag : the crease arc (reference side view), sag > 0 bows up")
+ap.add_argument("--top-curve", default="", help="npy (x, y, z) : the fender top edge = the hood side edge where it exists, blended over 15 cm into the old fender top behind it (28 October 2026)"); ap.add_argument("--arch-pad", type=float, default=0.012); ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--thick", type=float, default=0.012)
+a = ap.parse_args()
+H, _ = part(a.npz, "CAR_body_hood_C"); Fo, _ = part(a.npz, "CAR_body_fender_front_L"); Ar, _ = part(a.npz, "CAR_arch_front_L")
+H = H[H[:, 0] > 0]
+zz = np.linspace(a.z_rear, a.z_front, int((a.z_front - a.z_rear) / a.edge_m) + 1)
+# hood side edge : outermost hood point per z, fitted as one arc in y(z) and x(z)
+he = []   # top edge of the old fender per z (the hood exists only from the cowl forward, 28 October 2026)
+for z in zz:
+    s = Fo[np.abs(Fo[:, 2] - z) < 0.012]
+    he.append(s[s[:, 1].argmax()] if len(s) else [np.nan] * 3)
+he = np.array(he, float); ok = ~np.isnan(he[:, 0])
+ytop = np.polyval(np.polyfit(zz[ok], he[ok, 1], 2), zz); xtop = np.polyval(np.polyfit(zz[ok], he[ok, 0], 2), zz)
+if a.top_curve:
+    TC = np.load(a.top_curve); TC = TC[np.argsort(TC[:, 2])]; zc0 = TC[0, 2]
+    behind = ok & (zz < zc0); cx = np.polyfit(zz[behind], he[behind, 0], 2) if behind.sum() > 5 else None
+    w = np.clip((zz - zc0) / 0.15, 0, 1); w = w * w * (3 - 2 * w)
+    xo = np.polyval(cx, np.minimum(zz, zc0)) if cx is not None else np.full(len(zz), TC[0, 0]); yo = np.polyval(np.polyfit(zz[behind], he[behind, 1], 2), np.minimum(zz, zc0)) if behind.sum() > 5 else np.full(len(zz), TC[0, 1])
+    # C0 at zc0 : shift the behind curve so it meets the hood curve
+    xo += TC[0, 0] - np.polyval(cx, zc0) if cx is not None else 0; yo += TC[0, 1] - yo[np.argmin(np.abs(zz - zc0))]
+    xtop = xo * (1 - w) + np.interp(zz, TC[:, 2], TC[:, 0]) * w; ytop = yo * (1 - w) + np.interp(zz, TC[:, 2], TC[:, 1]) * w
+z0, y0, z1, y1, sag = (float(t) for t in a.crease.split(",")); t = (zz - z0) / (z1 - z0)
+yc = y0 + (y1 - y0) * t + sag * 4 * t * (1 - t)
+
+
+def xarc(yline):
+    xs = []
+    for z, y in zip(zz, yline):
+        s = Fo[(np.abs(Fo[:, 2] - z) < 0.015) & (np.abs(Fo[:, 1] - y) < 0.03)]
+        xs.append(s[:, 0].max() if len(s) else np.nan)
+    xs = np.array(xs); k = ~np.isnan(xs)
+    return np.polyval(np.polyfit(zz[k], xs[k], 2), zz)
+
+
+xc = xarc(yc); xb = xarc(np.full(len(zz), a.y_bottom + 0.03))
+# arch circle in (z, y) : fitted on the old arch ring (algebraic fit)
+A_ = np.stack([Ar[:, 2], Ar[:, 1], np.ones(len(Ar))], 1); bb = Ar[:, 2] ** 2 + Ar[:, 1] ** 2
+cz2, cy2, cc = np.linalg.lstsq(A_, bb, rcond=None)[0]; cz, cy = cz2 / 2, cy2 / 2; R = np.sqrt(cc + cz * cz + cy * cy)
+# rows in y : from y_bottom to the crease, then the crease to the top (same counts on every column, per column heights)
+nlow = max(2, int((np.max(yc) - a.y_bottom) / a.edge_m)); nup = max(2, int(np.max(ytop - yc) / a.edge_m))
+G = np.zeros((nlow + nup + 1, len(zz), 3))
+for j in range(nlow + 1):
+    s = j / nlow; G[j, :, 1] = a.y_bottom + (yc - a.y_bottom) * s; G[j, :, 0] = xb + (xc - xb) * s
+for j in range(1, nup + 1):
+    s = j / nup; G[nlow + j, :, 1] = yc + (ytop - yc) * s; G[nlow + j, :, 0] = xc + (xtop - xc) * s
+G[..., 2] = zz[None, :]
+keep = np.ones((G.shape[0] - 1, G.shape[1] - 1), bool)
+for j in range(G.shape[0] - 1):
+    for i in range(G.shape[1] - 1):
+        cz_, cy_ = G[j:j + 2, i:i + 2, 2].mean(), G[j:j + 2, i:i + 2, 1].mean()
+        if np.hypot(cz_ - cz, cy_ - cy) < R + a.arch_pad:
+            keep[j, i] = False
+Rz = lambda P: np.stack([P[..., 2], P[..., 1], -P[..., 0]], -1); Ri = lambda P: np.stack([-P[..., 2], P[..., 1], P[..., 0]], -1)
+Pp, Fp, Sp = shell_holed(Rz(G), keep, a.thick, "CAR_body_fender_front_L")
+Pp = Ri(np.array(Pp)); PR = Pp * np.array([-1, 1, 1]); FR = [[v + len(Pp) for v in f[::-1]] for f in Fp]
+np.savez(a.out, P=np.vstack([Pp, PR]).astype(np.float32), Q=np.array(list(Fp) + FR, dtype=object),
+         names=np.array(["CAR_body_fender_front_L"] * len(Fp) + ["CAR_body_fender_front_R"] * len(FR)))
+print(json.dumps({"grid": list(G.shape[:2]), "arch": [round(float(cz), 3), round(float(cy), 3), round(float(R), 3)], "faces_per_side": len(Fp),
+                  "x_top": [round(float(xtop.min()), 3), round(float(xtop.max()), 3)], "x_crease": [round(float(xc.min()), 3), round(float(xc.max()), 3)]}))

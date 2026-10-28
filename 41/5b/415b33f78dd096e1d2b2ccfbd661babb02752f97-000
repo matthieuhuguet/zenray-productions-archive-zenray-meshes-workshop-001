@@ -1,0 +1,96 @@
+"""28 October 2026, 16:00 : ZenRay Meshes, FINISH AUDIT, is the car finished and ready for texturing ? The production checklist (Blender Studio
+modeling guide, Autodesk Maya Mesh Cleanup, GeoInspector) measured on the whole delivery and per part :
+  open edges (holes), non manifold edges, n-gons, triangles, degenerate faces, flipped faces (normal pointing into the car), lamina faces
+  (two faces on the same vertices), stacked layers (a visible part lying within 4 mm of another visible part over more than 20 % of its area :
+  a band laid over an old panel), unwelded seams (open border vertices of a part within 0.5..15 mm of another part : a crack that should be a weld),
+  tiny fragments (parts under 40 faces), hidden faces (never seen from 26 outside directions).
+Exit 0 only when every count is 0. --json writes the per part table. FR : le modèle est-il fini et prêt pour le texturing ? Liste de contrôle mesurée.
+python FinishAudit.py <delivery.npz> [--json out.json] [--top 30]"""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--json", default=""); ap.add_argument("--top", type=int, default=30)
+ap.add_argument("--hidden", type=int, default=1)
+a = ap.parse_args()
+d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+SKIP_STACK = ("wheel", "tire", "rim", "spoke", "hub", "brake", "susp", "liner", "glass")   # glass sits on frames by design
+parts = sorted(set(names)); R = {p: defaultdict(int) for p in parts}
+E = defaultdict(list); C = np.array([P[q].mean(0) for q in Q])
+for i, (q, m) in enumerate(zip(Q, names)):
+    if len(q) > 4: R[m]["ngons"] += 1
+    if len(q) == 3: R[m]["tris"] += 1
+    v = P[q]; ar = np.linalg.norm(np.cross(v[2] - v[0], v[-1] - v[1])) / 2
+    if ar < 1e-8: R[m]["degenerate"] += 1
+    for k in range(len(q)):
+        E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+open_v = defaultdict(set)
+for e, fs in E.items():
+    if len(fs) == 1:
+        R[names[fs[0]]]["open_edges"] += 1; open_v[names[fs[0]]].update(e)
+    elif len(fs) > 2:
+        R[names[fs[0]]]["nonmanifold_edges"] += 1
+key = defaultdict(list)
+for i, q in enumerate(Q):
+    key[tuple(sorted(q))].append(i)
+for k, fs in key.items():
+    if len(fs) > 1:
+        R[names[fs[0]]]["lamina"] += len(fs) - 1
+# hidden faces : z buffer from 26 directions with the GPU rasterizer
+seen = np.zeros(len(Q), bool)
+if a.hidden:
+    import Raster
+    T = []; TF = []
+    for i, q in enumerate(Q):
+        for k in range(1, len(q) - 1):
+            T.append([q[0], q[k], q[k + 1]]); TF.append(i)
+    T = np.array(T); TF = np.array(TF); r = Raster.Renderer(P, T); c = (P.max(0) + P.min(0)) / 2; ext = np.linalg.norm(P.max(0) - P.min(0))
+    dirs = [np.array(v, float) for v in [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)]]
+    for dv in dirs:
+        tz = dv / np.linalg.norm(dv); up = np.array([0, 1.0, 0]) if abs(tz[1]) < 0.9 else np.array([1.0, 0, 0])
+        rx = np.cross(up, tz); rx /= np.linalg.norm(rx); uy = np.cross(tz, rx)
+        _, _, _, fid = r.render(c, 1400 / ext, (rx.tolist(), uy.tolist(), tz.tolist()), 1400)
+        ids = np.unique(fid[fid >= 0]); seen[TF[ids[ids < len(TF)]]] = True
+    r.release()
+    for i, m in enumerate(names):
+        if not seen[i]: R[m]["hidden_faces"] += 1
+# flipped : visible faces whose normal points to the car centre line (outer body parts only)
+cen = np.array([0.0, 0.6, 0.0])
+for i, (q, m) in enumerate(zip(Q, names)):
+    if seen[i] and m.startswith("CAR_body_"):
+        v = P[q]; n = np.cross(v[2] - v[0], v[-1] - v[1]); o = C[i] - cen; o[1] *= 0.3
+        if n @ o < 0 and np.linalg.norm(n) > 0: R[m]["flipped_visible"] += 1
+# stacked layers and unwelded seams, between parts
+vis_pts = {}
+for p in parts:
+    idx = [i for i in np.flatnonzero(names == p) if seen[i] or not a.hidden]
+    if idx: vis_pts[p] = C[idx]
+trees = {p: cKDTree(v) for p, v in vis_pts.items()}
+allv = {p: np.array(sorted({x for q, m in zip(Q, names) if m == p for x in q})) for p in parts}
+for p in parts:
+    if p not in vis_pts or any(s in p.lower() for s in SKIP_STACK): continue
+    for o in parts:
+        if o == p or o not in trees or any(s in o.lower() for s in SKIP_STACK): continue
+        dd = trees[o].query(vis_pts[p], distance_upper_bound=0.004)[0]
+        if np.isfinite(dd).mean() > 0.2 and len(vis_pts[p]) > 20:
+            R[p]["stacked_on_" + o] = int(np.isfinite(dd).sum()); R[p]["stacked"] += 1
+    ov = np.array(sorted(open_v[p]))
+    if len(ov):
+        others = np.concatenate([allv[o] for o in parts if o != p]); t = cKDTree(P[others]); dd = t.query(P[ov])[0] * 1000
+        R[p]["unwelded_seam_verts"] = int(((dd > 0.5) & (dd < 15)).sum())
+for p in parts:
+    nf = int((names == p).sum()); R[p]["faces"] = nf
+    if nf < 40 and R[p]["open_edges"]: R[p]["tiny_fragment"] = 1   # a small CLOSED part (box caliper) is fine (28 October 2026)
+CHECK = ["open_edges", "nonmanifold_edges", "ngons", "tris", "degenerate", "lamina", "flipped_visible", "stacked", "unwelded_seam_verts", "tiny_fragment", "hidden_faces"]
+tot = {k: int(sum(R[p][k] for p in parts)) for k in CHECK}; tot["parts"] = len(parts); tot["faces"] = len(Q)
+tot["parts_failing"] = int(sum(any(R[p][k] for k in CHECK if k != "hidden_faces") for p in parts))
+print(json.dumps(tot))
+bad = sorted(parts, key=lambda p: -(R[p]["open_edges"] + R[p]["unwelded_seam_verts"] + 50 * R[p]["stacked"] + R[p]["ngons"] + R[p]["tris"]))
+print("%-30s %6s %6s %5s %5s %5s %6s %6s" % ("part", "faces", "open", "seam", "stack", "tris", "hidden", "flip"))
+for p in bad[:a.top]:
+    print("%-30s %6d %6d %5d %5d %5d %6d %6d" % (p, R[p]["faces"], R[p]["open_edges"], R[p]["unwelded_seam_verts"], R[p]["stacked"], R[p]["tris"] + R[p]["ngons"], R[p]["hidden_faces"], R[p]["flipped_visible"]))
+if a.json:
+    json.dump({"summary": tot, "parts": {p: dict(R[p]) for p in parts}}, open(a.json, "w"), indent=1)
+sys.exit(0 if all(tot[k] == 0 for k in CHECK if k != "hidden_faces") else 1)

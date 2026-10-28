@@ -1,0 +1,127 @@
+"""28 October 2026, 23:00 : ZenRay Meshes finishing, FENDER PATCH 3, the front fender as THREE four sided patches (section 225, GrabCAD : supporting
+curves from the arch to the upper surface) split by two vertical curves at the arch ends z = cz -+ R : REAR (door cut to arch), OVER THE ARCH,
+FRONT (arch to nose). Every column of every patch has the same R rows from the arch level yk up to the top (lower facet, support, crease, support,
+upper facet) ; the side patches have --rows-sill extra rows from the sill up to yk, ending on the vertical arch flank. Shared columns are computed with
+the same formula, welded, and the single sheet is solidified (Solidify logic). Curves : arch circle (fitted on the arch part), sill y, crease (reference
+side view, one arc, lifted over the arch), top (hood side edge, old top behind the cowl) ; x of each curve one arc on the frozen fender.
+python FenderPatch3.py <delivery.npz> <out.npz>   FR : l'aile en trois patchs à quatre côtés, soudés par construction."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--target", default=W + "target_v644.npz")
+ap.add_argument("--crease", default="0.70,0.75,2.06,0.56,0.02"); ap.add_argument("--rows-low", type=int, default=6); ap.add_argument("--rows-up", type=int, default=10)
+ap.add_argument("--rows-sill", type=int, default=4); ap.add_argument("--crown-m", type=float, default=0.010); ap.add_argument("--edge-m", type=float, default=0.02)
+ap.add_argument("--y-bottom", type=float, default=0.30); ap.add_argument("--pad", type=float, default=0.015); ap.add_argument("--thick", type=float, default=0.012)
+ap.add_argument("--support-m", type=float, default=0.012); ap.add_argument("--snap-mm", type=float, default=40.0, help="sheet border vertices land on the nearest neighbour surface within this distance (weld, 28 October 2026)"); ap.add_argument("--keep-top", type=int, default=1); ap.add_argument("--z0-grow", type=float, default=0.0); ap.add_argument("--top-part", default=""); ap.add_argument("--top-lift", default=""); ap.add_argument("--sheet-out", default=""); ap.add_argument("--front-no-sill", type=int, default=0); ap.add_argument("--top-overlap", type=float, default=0.0)
+a = ap.parse_args()
+TP, _ = part(a.target, "CAR_body_fender_front_L"); Ar, _ = part(a.npz, "CAR_arch_front_L"); HC = np.load(W + "finish/hood_side_L.npy"); HC = HC[np.argsort(HC[:, 2])]
+M = np.stack([Ar[:, 2], Ar[:, 1], np.ones(len(Ar))], 1); s2, s1, cc = np.linalg.lstsq(M, Ar[:, 2] ** 2 + Ar[:, 1] ** 2, rcond=None)[0]
+cz, cy = s2 / 2, s1 / 2; R = np.sqrt(cc + cz * cz + cy * cy) + a.pad; xarch = float(np.percentile(Ar[:, 0], 90))
+Z0, Z1 = TP[:, 2].min() + 0.01 - a.z0_grow, TP[:, 2].max() - 0.002; ze0, ze1 = cz - R, cz + R   # z0_grow : the rear edge reaches the door cut and the vent (28 October 2026)
+zfine = np.linspace(Z0, Z1, 400)
+def fit(zs, v): return np.polyfit(zs, v, 2)
+tops = np.array([TP[np.abs(TP[:, 2] - z) < 0.012][:, 1].max() for z in zfine]); xtops = np.array([TP[np.abs(TP[:, 2] - z) < 0.012][TP[np.abs(TP[:, 2] - z) < 0.012][:, 1].argmax(), 0] for z in zfine])
+beh = zfine < HC[0, 2]; cyt, cxt = fit(zfine[beh], tops[beh]), fit(zfine[beh], xtops[beh])
+if a.top_part:   # shared side : behind the cowl the top edge is the LOWER edge of the shoulder, one arc, so the two meet (28 October 2026)
+    SP, _ = part(a.npz, a.top_part); SP = SP[SP[:, 0] > 0.3]; zs_, ys_, xs_ = [], [], []
+    for z in zfine[beh]:
+        sl = SP[np.abs(SP[:, 2] - z) < 0.012]
+        if len(sl): k = sl[:, 1].argmin(); zs_.append(z); ys_.append(sl[k, 1] - a.top_overlap); xs_.append(sl[k, 0])
+    if len(zs_) > 5:
+        zs_ = np.array(zs_); ys_ = np.array(ys_); xs_ = np.array(xs_)
+        w_ = np.clip((zs_ - (HC[0, 2] - 0.25)) / 0.25, 0, 1); w_ = w_ * w_ * (3 - 2 * w_)   # blend to the hood curve start over the last 25 cm
+        ys_ = ys_ * (1 - w_) + HC[0, 1] * w_; xs_ = xs_ * (1 - w_) + HC[0, 0] * w_
+        cyt, cxt = fit(zs_, ys_), fit(zs_, xs_)
+_ytop0 = lambda z: np.where(z < HC[0, 2], np.polyval(cyt, z), np.interp(z, HC[:, 2], HC[:, 1]))
+def _lift(z):   # --top-lift z0,z1,dy : the top edge rises by dy inside [z0, z1], smoothstep ends 5 cm, so it meets the shoulder (28 October 2026)
+    if not a.top_lift: return 0 * np.asarray(z, float)
+    l0, l1, dy = (float(t) for t in a.top_lift.split(",")); z = np.asarray(z, float)
+    w = np.clip((z - l0) / 0.05, 0, 1) * np.clip((l1 - z) / 0.05, 0, 1); return dy * w * w * (3 - 2 * w)
+ytop = lambda z: _ytop0(z) + _lift(z)
+xtop = lambda z: np.where(z < HC[0, 2], np.polyval(cxt, z), np.interp(z, HC[:, 2], HC[:, 0]))
+yarc = lambda z: np.where(np.abs(z - cz) < R, cy + np.sqrt(np.clip(R * R - (z - cz) ** 2, 0, None)), cy)   # arch level yk (cy on the side patches)
+c0, cy0, c1, cy1, sag = (float(t) for t in a.crease.split(","))
+def ycr(z):
+    t = (z - c0) / (c1 - c0); y = cy0 + (cy1 - cy0) * t + sag * 4 * t * (1 - t); yk = yarc(z); yt = ytop(z)
+    return np.minimum(np.maximum(y, yk + 0.35 * (yt - yk)), yt - 0.25 * (yt - yk))
+def xat(ys):
+    xs = []
+    for z, y in zip(zfine, ys):
+        s = TP[(np.abs(TP[:, 2] - z) < 0.015) & (np.abs(TP[:, 1] - y) < 0.02)]; xs.append(s[:, 0].max() if len(s) else np.nan)
+    xs = np.array(xs); k = ~np.isnan(xs); return fit(zfine[k], xs[k])
+cxc = xat(ycr(zfine)); cxb = xat(np.full(len(zfine), a.y_bottom + 0.02))
+xcr = lambda z: np.polyval(cxc, z); xsill = lambda z: np.polyval(cxb, z)
+cxk = xat(np.full(len(zfine), cy))   # body width at the arch level, one arc
+def xkz(z):   # = xarch at the arch ends, the body width away from them (smoothstep over 15 cm) : no spike at the nose (28 October 2026)
+    d_ = max(abs(z - cz) - R, 0); w = min(d_ / 0.15, 1); w = w * w * (3 - 2 * w)
+    return xarch * (1 - w) + float(np.polyval(cxk, z)) * w
+def column(z, sill):
+    yk, yc, yt = float(yarc(z)), float(ycr(z)), float(ytop(z)); xk, xc, xt = xkz(z), float(xcr(z)), float(xtop(z)); pts = []
+    if sill:
+        xb = float(xsill(z))
+        for s in np.linspace(0, 1, a.rows_sill + 1)[:-1]: pts.append([xb + (xk - xb) * s, a.y_bottom + (yk - a.y_bottom) * s, z])
+    K, C, T = np.array([xk, yk, z]), np.array([xc, yc, z]), np.array([xt, yt, z])
+    for s in np.linspace(0, 1, a.rows_low + 1)[:-1]: pts.append(list(K + (C - K) * s))
+    d = np.linalg.norm(C - K); pts.append(list(K + (C - K) * (1 - a.support_m / d))); pts.append(list(C))
+    d = np.linalg.norm(T - C); pts.append(list(C + (T - C) * (a.support_m / d)))
+    for s in np.linspace(0, 1, a.rows_up + 1)[1:]:
+        cr = a.crown_m * 4 * s * (1 - s); pts.append(list(C + (T - C) * s + np.array([cr, cr * 0.5, 0])))
+    return pts
+def zones(lo, hi):
+    n = max(2, int(round((hi - lo) / a.edge_m))); return np.linspace(lo, hi, n + 1)
+P = []; F = []; GI = []   # GI : (patch, column, row, crease row, rows) per vertex, for the retopology bench (28 October 2026)
+def grid(zs, sill):
+    cols = [column(z, sill) for z in zs]; nr = len(cols[0]); base = len(P); pk = len({g[0] for g in GI}); cr = (a.rows_sill if sill else 0) + a.rows_low + 1
+    for i, c in enumerate(cols):
+        P.extend(c); GI.extend([(pk, i, j, cr, nr) for j in range(len(c))])
+    gid = lambda i, j: base + i * nr + j
+    for i in range(len(zs) - 1):
+        for j in range(nr - 1): F.append([gid(i, j), gid(i, j + 1), gid(i + 1, j + 1), gid(i + 1, j)])
+grid(zones(Z0, ze0), True); grid(zones(ze0, ze1), False); grid(zones(ze1, Z1), not a.front_no_sill)   # front_no_sill : the front patch stops at the wheel centre height, where the bumper corner starts (28 October 2026)
+P = np.array(P); t = cKDTree(P); rm = np.arange(len(P))
+for i, j in sorted(t.query_pairs(1e-6)): rm[max(i, j)] = rm[min(i, j)]
+for k in range(len(rm)):
+    while rm[rm[k]] != rm[k]: rm[k] = rm[rm[k]]
+F = [[int(rm[v]) for v in q] for q in F]
+if a.sheet_out:   # the welded sheet before any snap or solidify, with its grid indices (28 October 2026)
+    np.savez(a.sheet_out, P=np.array(P), F=np.array(F), GI=np.array(GI), rm=rm, arch=np.array([cz, cy, R, xarch]))
+if a.snap_mm > 0:
+    import trimesh
+    d0 = np.load(a.npz, allow_pickle=True); n0 = np.array([str(x) for x in d0["names"]]); P0 = d0["P"].astype(float)
+    NQ = [list(map(int, q)) for q, m in zip(d0["Q"], n0) if m.startswith("CAR_") and "fender_front" not in m and m.endswith(("_L", "_C")) and "wheel" not in m and "liner" not in m and "glass" not in m]
+    tm = trimesh.Trimesh(P0, np.array([[q[0], q[k], q[k + 1]] for q in NQ for k in range(1, len(q) - 1)]), process=False)
+    Eb = defaultdict(int)
+    for q in F:
+        for k in range(4): Eb[(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4]))] += 1
+    bv = np.array(sorted({v for e, c in Eb.items() if c == 1 for v in e}))
+    if a.keep_top:   # the top row already lies on the hood curve
+        yt_ = ytop(P[bv, 2]); bv = bv[np.abs(P[bv, 1] - yt_) > 0.003]
+    cp, dist, _ = trimesh.proximity.closest_point(tm, P[bv]); m_ = dist * 1000 < a.snap_mm; P[bv[m_]] = cp[m_]
+    print(json.dumps({"border_snapped": int(m_.sum()), "of": len(bv), "gap_mm_p50": round(float(np.median(dist) * 1000), 1)}))
+# solidify the sheet : vertex normals, inner copy, walls on open edges, outward by signed volume
+vn = defaultdict(lambda: np.zeros(3))
+for q in F:
+    nrm = np.cross(P[q[2]] - P[q[0]], P[q[3]] - P[q[1]])
+    for v in q: vn[v] += nrm
+if np.mean([vn[v][0] for v in vn]) < 0: F = [q[::-1] for q in F]; vn = {v: -n_ for v, n_ in vn.items()}
+used = sorted(vn); off = {}; PL = list(P)
+for v in used: off[v] = len(PL); PL.append(P[v] - a.thick * vn[v] / (np.linalg.norm(vn[v]) + 1e-12))
+S = F + [[off[v] for v in q[::-1]] for q in F]; E = defaultdict(int); D = set()
+for q in F:
+    for k in range(4): E[(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4]))] += 1; D.add((q[k], q[(k + 1) % 4]))
+for (u, w), c in E.items():
+    if c == 1:
+        if (u, w) not in D: u, w = w, u
+        S.append([w, u, off[u], off[w]])
+PL = np.array(PL); vol = sum(np.dot(PL[q[0]], np.cross(PL[q[k]], PL[q[k + 1]])) for q in S for k in (1, 2))
+if vol < 0: S = [q[::-1] for q in S]
+E2 = defaultdict(int)
+for q in S:
+    for k in range(4): E2[(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4]))] += 1
+PR = PL * np.array([-1, 1, 1]); SR = [[v + len(PL) for v in q[::-1]] for q in S]
+np.savez(a.out, P=np.vstack([PL, PR]).astype(np.float32), Q=np.array(S + SR, dtype=object), names=np.array(["CAR_body_fender_front_L"] * len(S) + ["CAR_body_fender_front_R"] * len(SR)))
+print(json.dumps({"arch": [round(float(cz), 3), round(float(cy), 3), round(float(R), 3)], "faces_per_side": len(S), "open": sum(c == 1 for c in E2.values()), "nonmanifold": sum(c > 2 for c in E2.values())}))

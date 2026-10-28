@@ -1,0 +1,320 @@
+"""28 October 2026 : ZenRay Meshes CAR NET, the curve network of the whole body, section by section, all in ONE PatchNet so that every
+curve between two panels exists once (welded by construction). Section 1 is the front fender (FenderNet.add_fender). Section 2 (task C2a)
+is the door section : DOOR (rocker crease to shoulder crease), DOOR_SB (shoulder crease to belt), ROCKER_D (sill bottom to rocker crease,
+under the door), ROCKER_F (under the fender, up to the front arch) and RING_LOW (the arch ring from the fender down to the sill bottom).
+Lines come from DesignLines.json (one arc each, measured on the reference side view), the rear door cut from the reference (a slanted
+line, measured on the left view), x from the sculpt skin. FR : le réseau de courbes de la caisse, section par section, un seul réseau."""
+import json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import Common as C
+import FenderNet as F
+
+PARAMS = {   # 28 October 2026 : the interface of the door section (side view z, y in metres)
+    "rear_cut_bottom": (-0.498, 0.318), "rear_cut_top": (-0.725, 0.875),   # measured on the reference left view (4x crop)
+    "sill_bottom_y": 0.1237, "front_cut_z": None,   # None : the fender door cut
+    # windshield base / A pillar line seen from the top, (z, x), measured on the reference top view by intensity profiles (28 October 2026)
+    "apillar_line_top": [(0.68, 0.930), (0.85, 0.930), (1.00, 0.930), (1.05, 0.926), (1.10, 0.900), (1.15, 0.886), (1.20, 0.857), (1.25, 0.826),
+                         (1.30, 0.793), (1.35, 0.756), (1.40, 0.718), (1.45, 0.676)],
+    "belt_join_z": 1.0,   # where the belt meets the A pillar line on the top view (the 0.956 belt edge fades between z 0.95 and 1.0)
+    # quarter section (28 October 2026), read on the reference left view : the shoulder line goes on behind z -1.2 and rises to the rear
+    "rear_arch_pad": 0.015, "quarter_end_z": -2.12, "q_spoke_deg": (55.0, 125.0),
+    "shoulder_rear_points": [(-1.2, 0.9226), (-1.94, 1.011), (-2.29, 0.986)],   # (z, y), reference left view, 28 October 2026
+    # quarter band v1 (28 October 2026, reference left view) : belt end, quarter window rear corner, C pillar line ; replaced the same day by v2
+    "belt_end": (-1.133, 1.061), "window_corner": (-1.19, 1.15), "buttress_end": (-1.94, 1.011), "band_rear_z": -1.75,
+    # quarter band v2 (28 October 2026) : the haunch top faces up, so its lines are read on the reference TOP view (z, x) and their height
+    # is taken by a vertical ray on the sculpt ; each line is then one smooth curve (Matthieu's rule : no staircase from the pixels).
+    "ridge_top": [(-0.6, 0.977), (-0.77, 0.977), (-0.95, 0.986), (-1.13, 1.002), (-1.2, 1.002), (-1.3, 0.998), (-1.5, 0.994), (-1.75, 0.969), (-1.9, 0.952)],
+    "diag_top": [(-0.6, 0.901), (-0.77, 0.876), (-0.95, 0.850), (-1.13, 0.825), (-1.2, 0.808), (-1.3, 0.791), (-1.5, 0.749), (-1.75, 0.681), (-1.9, 0.630)],
+    "glass_top": [(-0.6, 0.850), (-0.77, 0.825), (-0.95, 0.782), (-1.13, 0.723), (-1.2, 0.681)], "window_tip": (-1.23, 0.646),
+    "finbase_top": [(-1.23, 0.660), (-1.25, 0.655), (-1.3, 0.646), (-1.4, 0.635), (-1.5, 0.622), (-1.6, 0.607), (-1.75, 0.586)],   # fin base x : foot of the wall on the sculpt sections (28 October 2026, was the v752 buttress part, 2.6 cm out at z -1.75)
+    # C pillar crease (top of the fin wall) read on the reference LEFT view, where the wall faces the camera : (z, y), a thin dark line (28 October 2026)
+    "cpillar_side": [(-1.25, 1.171), (-1.3, 1.163), (-1.4, 1.138), (-1.5, 1.113)], "cp_deg": 1, "cp_below_m": 0.01,
+    "qband_z1": -1.133, "qband_z3": -1.75, "top_y_radius": 0.008, "top_dx": {"ridge": -0.008, "diag": 0.0, "glass": 0.008, "finbase": 0.02},   # finbase 2 cm out : a vertical ray beside a wall hits the wall (F2 was 4 cm up it)
+    "line_deg": 3, "ridge_blend_m": 0.15, "wall_guard_m": 0.02,
+}
+
+
+def design_line(name):
+    d = json.load(open(C.W + "finish/DesignLines.json"))[name]; return lambda z: np.polyval(d["coef"], np.asarray(z, float))
+
+
+def add_door_section(net, fx):
+    """fx : the helpers returned by FenderNet.add_fender (side_x, door, ...)."""
+    side_x = fx["side_x"]; cz, cy, R = fx["arch"]; w = F.PARAMS["ring_w"]; sm = F.PARAMS["support_m"]
+    rc, sc, belt = design_line("rocker_crease"), design_line("shoulder_crease"), design_line("belt"); yb = PARAMS["sill_bottom_y"]
+    (zb, yb0), (zt, yt0) = PARAMS["rear_cut_bottom"], PARAMS["rear_cut_top"]; dzdy = (zt - zb) / (yt0 - yb0)
+    def cut_z(y): return zb + dzdy * (y - yb0)
+    def meet(line):   # the rear cut line against a design line y(z)
+        y = yb0
+        for _ in range(60): y = float(line(cut_z(y)))
+        return cut_z(y), y
+    def pt(z, y): return np.array([side_x([y], [z])[0], y, z])
+    def run(z0, z1, line, n=80):   # a design line from z0 to z1, x on the skin
+        z = np.linspace(z0, z1, n); y = line(z); return np.stack([side_x(y, z), y, z], 1)
+    def seg(a, b, n=40):   # straight in the side view, x on the skin
+        z = np.linspace(a[2], b[2], n); y = np.linspace(a[1], b[1], n); return np.stack([side_x(y, z), y, z], 1)
+    N, E = net.node, net.edge; zf = float(net.nodes["dc_sill"][2])
+    # 28 October 2026 : the rear of the fender redrawn from the reference lines : the old sheet took it from the frozen target, where the
+    # old shoulder hid the top of the fender (top 0.68 instead of the belt 0.89, crease 0.61 instead of 0.75)
+    N("dc_crease", pt(zf, float(sc(zf)))); N("belt_fdc", pt(zf, float(belt(zf))))
+    AP = np.array(PARAMS["apillar_line_top"]); zJ = PARAMS["belt_join_z"]
+    zA = float(net.nodes["XA"][2]); cr_f = fx["crease"]
+    zz = np.linspace(zf, zA, 80); s_ = np.clip((zz - zf) / (zA - zf), 0, 1); s_ = s_ * s_ * (3 - 2 * s_)
+    yy = (1 - s_) * sc(zz) + s_ * np.interp(zz, cr_f[:, 2], cr_f[:, 1]); E("crease1", "dc_crease", "XA", np.stack([side_x(yy, zz), yy, zz], 1), fixed=True, sharp=True)
+    # 28 October 2026 : the fender top as the reference top view draws it : the belt runs on along the fender (belt_f) and meets the A
+    # pillar line at zJ (node BJ) ; then the A pillar line to the hood corner (cowl), then the hood edge. Every bend of that top border is
+    # a patch corner joined to the crease by a spoke (a bend hidden inside a Coons side folds the patch : 34 degrees measured at belt_fdc)
+    yJ = float(belt(min(zJ, 0.82))); N("BJ", np.array([float(np.interp(zJ, AP[:, 0], AP[:, 1])), yJ, zJ]))
+    cw = net.nodes["cowl"]; zz = np.linspace(zJ, cw[2], 80); xx = np.interp(zz, np.r_[AP[:, 0], cw[2]], np.r_[AP[:, 1], cw[0]]); yy = yJ + (cw[1] - yJ) * (zz - zJ) / (cw[2] - zJ)
+    E("top_rear2", "BJ", "cowl", np.stack([xx, yy, zz], 1), fixed=True)
+    t_ = np.linspace(0, 1, 40)[:, None]; E("belt_f", "belt_fdc", "BJ", net.nodes["belt_fdc"] + (net.nodes["BJ"] - net.nodes["belt_fdc"]) * t_, fixed=True)
+    c2 = net.edges["crease2"]["poly"]; on_c2 = lambda z: np.array([np.interp(z, c2[:, 2], c2[:, k]) for k in range(3)])
+    N("K", on_c2(zJ)); N("K2", on_c2(cw[2])); zXC = float(net.nodes["XC"][2])
+    piece = lambda z0, z1: c2[(c2[:, 2] > z0) & (c2[:, 2] < z1)]
+    E("crease2a", "XA", "K", np.vstack([net.nodes["XA"], piece(zA, zJ), net.nodes["K"]]), fixed=True, sharp=True)
+    E("crease2b", "K", "K2", np.vstack([net.nodes["K"], piece(zJ, cw[2]), net.nodes["K2"]]), fixed=True, sharp=True)
+    E("crease2c", "K2", "XC", np.vstack([net.nodes["K2"], piece(cw[2], zXC), net.nodes["XC"]]), fixed=True, sharp=True)
+    E("spK", "K", "BJ", net.nodes["K"] + (net.nodes["BJ"] - net.nodes["K"]) * t_); E("spK2", "K2", "cowl", net.nodes["K2"] + (cw - net.nodes["K2"]) * t_)
+    del net.edges["crease2"]; del net.edges["top_rear"]; del net.nodes["dc_top"]
+    E("dc_lower", "dc_sill", "dc_crease", seg(net.nodes["dc_sill"], net.nodes["dc_crease"]), fixed=True)
+    E("dc_upper", "dc_crease", "belt_fdc", seg(net.nodes["dc_crease"], net.nodes["belt_fdc"]), fixed=True)
+    net.patches = [p_ for p_ in net.patches if p_["name"] != "D"]
+    for p_ in net.patches:
+        if p_["name"] == "RING_T": p_["S"][2] = ["crease2a", "crease2b", "crease2c"]
+    net.patch("D_R", ["crease1", "crease2a"], ["spK"], ["belt_f"], ["dc_upper"])
+    net.patch("D_F1", ["crease2b"], ["spK2"], ["top_rear2"], ["spK"])
+    net.patch("D_F2", ["crease2c", "crease3"], ["fr_upper"], ["top_front"], ["spK2"])
+    z, y = meet(rc); N("rdc_rc", pt(z, y)); z, y = meet(sc); N("rdc_sc", pt(z, y)); z, y = meet(belt); N("rdc_belt", pt(z, y))
+    zr = float(net.nodes["rdc_rc"][2]); N("sb_rear", pt(zr, yb)); N("sb_front", pt(zf, yb))
+    zsa = cz - np.sqrt((R + w) ** 2 - (cy - yb) ** 2); zlb = cz - np.sqrt(R ** 2 - (cy - yb) ** 2)
+    N("sb_arch", pt(zsa, yb)); N("lip_bot", np.array([F_lipx(fx, yb, zlb), yb, zlb]))
+    # edges
+    E("rc_door", "rdc_rc", "dc_sill", run(zr, zf, rc), fixed=True, sharp=True)
+    E("sc_door", "rdc_sc", "dc_crease", run(float(net.nodes["rdc_sc"][2]), zf, sc), fixed=True, sharp=True)
+    E("belt_door", "rdc_belt", "belt_fdc", run(float(net.nodes["rdc_belt"][2]), zf, belt), fixed=True)
+    E("rdc_lower", "rdc_rc", "rdc_sc", seg(net.nodes["rdc_rc"], net.nodes["rdc_sc"]), fixed=True)
+    E("rdc_upper", "rdc_sc", "rdc_belt", seg(net.nodes["rdc_sc"], net.nodes["rdc_belt"]), fixed=True)
+    E("sb_door", "sb_rear", "sb_front", run(zr, zf, lambda z: np.full_like(z, yb)), fixed=True)
+    E("rk_rear", "sb_rear", "rdc_rc", seg(net.nodes["sb_rear"], net.nodes["rdc_rc"]), fixed=True)
+    E("rk_front", "sb_front", "dc_sill", seg(net.nodes["sb_front"], net.nodes["dc_sill"]))
+    E("sb_fender", "sb_front", "sb_arch", run(zf, zsa, lambda z: np.full_like(z, yb)), fixed=True)
+    ph0 = np.arctan2(yb - cy, zsa - cz); ph1 = np.pi + np.arcsin((cy - F.PARAMS["y_sill"]) / (R + w))
+    ph = np.linspace(ph0 + 2 * np.pi if ph0 < 0 else ph0, ph1, 60); zz, yy = cz + (R + w) * np.cos(ph), cy + (R + w) * np.sin(ph)
+    E("out_low", "sb_arch", "rr_out", np.stack([side_x(yy, zz), yy, zz], 1))
+    ph0 = np.arctan2(yb - cy, zlb - cz); ph1 = np.pi + np.arcsin((cy - F.PARAMS["y_sill"]) / R)
+    ph = np.linspace(ph0 + 2 * np.pi if ph0 < 0 else ph0, ph1, 60); zz, yy = cz + R * np.cos(ph), cy + R * np.sin(ph)
+    E("lip_low", "lip_bot", "rr_in", np.stack([F_lipx(fx, yy, zz), yy, zz], 1), fixed=True, sharp=True)
+    rb = np.array([net.nodes["sb_arch"] + (net.nodes["lip_bot"] - net.nodes["sb_arch"]) * s for s in (0, 1 - sm / w, 1)])
+    E("ring_bot", "sb_arch", "lip_bot", rb, fixed=True, samples=rb)
+    net.edges["sill"]["sharp"] = True; net.edges["sill"]["fixed"] = True   # the fender bottom edge is the rocker crease : sharp, now interior
+    # patches : S0 bottom (left to right), S1 right (bottom to top), S2 top (left to right), S3 left (bottom to top) ; u along +z
+    net.patch("DOOR", ["rc_door"], ["dc_lower"], ["sc_door"], ["rdc_lower"])
+    net.patch("DOOR_SB", ["sc_door"], ["dc_upper"], ["belt_door"], ["rdc_upper"])
+    net.patch("ROCKER_D", ["sb_door"], ["rk_front"], ["rc_door"], ["rk_rear"])
+    net.patch("ROCKER_F", ["sb_fender"], ["out_low"], ["sill"], ["rk_front"])
+    net.patch("RING_LOW", ["ring_bot"], ["lip_low"], ["ring_rear_end"], ["out_low"])
+
+
+def add_quarter_section(net, fx):
+    """The quarter and the rear arch (plates between curves, every bend a corner) : RING_LOWQ, ROCKER_Q, RINGQ_F, RINGQ_T, RINGQ_B,
+    Q_A1, Q_A2 (between the rear door cut and the ring), Q_T (over the arch, up to the shoulder line), Q_B (behind the arch, to the rear end)."""
+    side_x = fx["side_x"]; w = F.PARAMS["ring_w"]; sm = F.PARAMS["support_m"]
+    ra = json.load(open(C.RT + "rear_arch.json")); cz, cy, R = ra["cz"], ra["cy"], ra["R"] + PARAMS["rear_arch_pad"]
+    rc, sc = design_line("rocker_crease"), design_line("shoulder_crease"); yb = PARAMS["sill_bottom_y"]; zE = PARAMS["quarter_end_z"]
+    SQP = np.array(PARAMS["shoulder_rear_points"])   # measured on the reference left view : the line peaks near z -1.94 and drops to the rear corner
+    def sq(z):
+        z = np.asarray(z, float); return np.where(z >= -1.2, sc(np.maximum(z, -1.2)), np.interp(z, SQP[::-1, 0], SQP[::-1, 1]))
+    N, E = net.node, net.edge
+    def pt(z, y): return np.array([side_x([y], [z])[0], y, z])
+    def ring(r, ph): return cz + r * np.cos(ph), cy + r * np.sin(ph)
+    def arc(r, p0, p1, n=120):
+        ph = np.linspace(p0, p1, n); z, y = ring(r, ph); return np.stack([side_x(y, z), y, z], 1)
+    def liparc(p0, p1, n=120):
+        ph = np.linspace(p0, p1, n); z, y = ring(R, ph); zz, yy = ring(R + 0.01, ph); return np.stack([side_x(yy, zz), y, z], 1)
+    def line3(a, b, n=40): return a + (b - a) * np.linspace(0, 1, n)[:, None]
+    def side_line(z0, z1, f, n=80):
+        z = np.linspace(z0, z1, n); y = f(z); return np.stack([side_x(y, z), y, z], 1)
+    def meet_rc(r):
+        ph = 0.0
+        for _ in range(60): z, _y = ring(r, ph); ph = float(np.arcsin(np.clip((float(rc(z)) - cy) / r, -1, 1)))
+        return ph
+    phF_in, phF_out = meet_rc(R), meet_rc(R + w); phA, phB = np.radians(PARAMS["q_spoke_deg"])
+    phE_out = float(np.arccos(np.clip((zE - cz) / (R + w), -1, 1))); phE_in = phE_out   # the ring ends on a clean radial where its outer border meets the rear ; the lip below belongs to the rear bumper (a lip meeting the rear edge almost tangentially made a 7 degree corner : 117 degree fold)
+    phL_in = -float(np.arcsin((cy - yb) / R)); phL_out = -float(np.arcsin((cy - yb) / (R + w)))
+    def lip_node(nm, ph):
+        z, y = ring(R, ph); zz, yy = ring(R + 0.01, ph); N(nm, np.array([side_x([yy], [zz])[0], y, z]))
+    def out_node(nm, ph):
+        z, y = ring(R + w, ph); N(nm, pt(z, y))
+    lip_node("LQF", phF_in); out_node("RCQ", phF_out); lip_node("LQA", phA); out_node("OQA", phA); lip_node("LQB", phB); out_node("OQB", phB)
+    lip_node("LQE", phE_in); out_node("OQE", phE_out); lip_node("LQL", phL_in); out_node("OQL", phL_out)
+    zA_ = float(net.nodes["OQA"][2]); zB_ = float(net.nodes["OQB"][2])
+    N("SQA", pt(zA_, float(sq(zA_)))); N("SQB", pt(zB_, float(sq(zB_)))); N("SQE", pt(zE, float(sq(zE))))
+    (zb, yb0), (zt, yt0) = PARAMS["rear_cut_bottom"], PARAMS["rear_cut_top"]; yD = float(net.nodes["OQA"][1]); zD = zb + (zt - zb) / (yt0 - yb0) * (yD - yb0)
+    N("QD1", pt(zD, yD)); rcn, scn = net.nodes["rdc_rc"], net.nodes["rdc_sc"]
+    E("rdc_lower_a", "rdc_rc", "QD1", line3(rcn, net.nodes["QD1"]), fixed=True); E("rdc_lower_b", "QD1", "rdc_sc", line3(net.nodes["QD1"], scn), fixed=True)
+    del net.edges["rdc_lower"]
+    for p_ in net.patches:
+        if p_["name"] == "DOOR": p_["S"][3] = ["rdc_lower_a", "rdc_lower_b"]
+    net.edges["rk_rear"]["fixed"] = False
+    E("rc_quarter", "RCQ", "rdc_rc", side_line(float(net.nodes["RCQ"][2]), float(rcn[2]), rc), fixed=True, sharp=True)
+    E("sc_qa", "SQA", "rdc_sc", side_line(zA_, float(scn[2]), sq), fixed=True, sharp=True)
+    E("sc_qt", "SQB", "SQA", side_line(zB_, zA_, sq), fixed=True, sharp=True); E("sc_qb", "SQE", "SQB", side_line(zE, zB_, sq), fixed=True, sharp=True)
+    def skin(a, b, n=40):   # straight in the side view, x on the skin (a 3D chord between two skin points cuts under a bulged panel : a groove)
+        z = np.linspace(net.nodes[a][2], net.nodes[b][2], n); y = np.linspace(net.nodes[a][1], net.nodes[b][1], n); return np.stack([side_x(y, z), y, z], 1)
+    E("oa_d1", "OQA", "QD1", skin("OQA", "QD1")); E("spQA", "OQA", "SQA", skin("OQA", "SQA")); E("spQB", "OQB", "SQB", skin("OQB", "SQB"))
+    E("rear_q", "OQE", "SQE", line3(net.nodes["OQE"], net.nodes["SQE"]), fixed=True)
+    E("outq_f", "OQA", "RCQ", arc(R + w, phA, phF_out)); E("outq_t", "OQB", "OQA", arc(R + w, phB, phA)); E("outq_b", "OQE", "OQB", arc(R + w, phE_out, phB))
+    E("lipq_f", "LQA", "LQF", liparc(phA, phF_in), fixed=True, sharp=True); E("lipq_t", "LQB", "LQA", liparc(phB, phA), fixed=True, sharp=True)
+    E("lipq_b", "LQE", "LQB", liparc(phE_in, phB), fixed=True, sharp=True)
+    E("lip_lowq", "LQL", "LQF", liparc(phL_in, phF_in), fixed=True, sharp=True); E("out_lowq", "OQL", "RCQ", arc(R + w, phL_out, phF_out))
+    E("sb_q", "OQL", "sb_rear", side_line(float(net.nodes["OQL"][2]), float(net.nodes["sb_rear"][2]), lambda z: np.full_like(z, yb)), fixed=True)
+    def radial(nm, a, b, fixed=False):
+        A_, B_ = net.nodes[a], net.nodes[b]; d_ = np.linalg.norm(B_ - A_); sp = np.array([A_ + (B_ - A_) * t_ for t_ in (0.0, min(sm / max(d_, 1e-6), 0.45), 1.0)])
+        E(nm, a, b, sp, fixed=fixed, samples=sp)
+    radial("radQA", "LQA", "OQA"); radial("radQB", "LQB", "OQB"); radial("ring_frontq", "LQF", "RCQ"); radial("rear_ring", "LQE", "OQE", True); radial("ring_botq", "LQL", "OQL", True)
+    net.patch("RING_LOWQ", ["ring_botq"], ["out_lowq"], ["ring_frontq"], ["lip_lowq"])
+    net.patch("ROCKER_Q", ["sb_q"], ["rk_rear"], ["rc_quarter"], ["out_lowq"])
+    net.patch("RINGQ_F", ["lipq_f"], ["ring_frontq"], ["outq_f"], ["radQA"])
+    net.patch("RINGQ_T", ["lipq_t"], ["radQA"], ["outq_t"], ["radQB"])
+    net.patch("RINGQ_B", ["lipq_b"], ["radQB"], ["outq_b"], ["rear_ring"])
+    net.patch("Q_A1", ["rc_quarter"], ["rdc_lower_a"], ["oa_d1"], ["-outq_f"])
+    net.patch("Q_A2", ["oa_d1"], ["rdc_lower_b"], ["sc_qa"], ["spQA"])
+    net.patch("Q_T", ["outq_t"], ["spQA"], ["sc_qt"], ["spQB"])
+    net.patch("Q_B", ["outq_b"], ["spQB"], ["sc_qb"], ["rear_q"])
+
+
+def make_top_y():
+    """Height of the sculpt under a vertical ray at (x, z) : the highest skin point within top_y_radius (widened if empty), 28 October 2026."""
+    from scipy.spatial import cKDTree
+    S = C.sculpt(); m = S.P[:, 0] > 0.3; kd = cKDTree(S.P[m][:, [0, 2]]); SY = S.P[m][:, 1]
+    def top_y(x, z):
+        out = []
+        for xx, zz in zip(np.atleast_1d(x), np.atleast_1d(z)):
+            r = PARAMS["top_y_radius"]; k = []
+            for _ in range(4):
+                k = kd.query_ball_point([xx, zz], r)
+                if k: break
+                r *= 2
+            if not k: raise ValueError("top_y : no sculpt skin under x %.3f z %.3f" % (xx, zz))
+            out.append(SY[k].max())
+        return np.array(out)
+    return top_y
+
+
+def add_quarter_band(net, fx):
+    """The quarter band v2 (task K1c2, 28 October 2026). Behind the door, the top of the rear haunch faces up and carries three lines read on
+    the TOP view : the ridge R (outer edge of the up facing part, x near 1.0), the diagonal crease D (between two facets) and the glass edge G,
+    which ends at the window tip WT where the fin base FB goes on to the rear. Rows : H1 between the shoulder line S and R, H2 between R and D,
+    H3 between D and G then FB. Every line is ONE smooth curve fitted to the pixel readings (no staircase) ; heights by a vertical ray on the
+    sculpt, which is well conditioned on a surface that faces up (v1 placed these lines from the side view and landed 30 cm inboard)."""
+    side_x = fx["side_x"]; top_y = make_top_y(); SQP = np.array(PARAMS["shoulder_rear_points"]); sc = design_line("shoulder_crease"); dg = PARAMS["line_deg"]
+    def sq(z): return float(sc(z)) if z >= -1.2 else float(np.interp(z, SQP[::-1, 0], SQP[::-1, 1]))
+    N, E = net.node, net.edge
+    def pt(z, y): return np.array([side_x([y], [z])[0], y, z])
+    def on_line(z0, z1, f, n=60):
+        z = np.linspace(z0, z1, n); y = np.array([f(v) for v in z]); return np.stack([side_x(y, z), y, z], 1)
+    def xfit(key):   # one smooth curve x(z) through the top view readings
+        a = np.array(PARAMS[key]); return np.polyfit(a[:, 0], a[:, 1], min(dg, len(a) - 1))
+    zd = float(net.nodes["rdc_belt"][2]); z1 = PARAMS["qband_z1"]; z2 = float(net.nodes["SQA"][2]); z3 = PARAMS["qband_z3"]; zW, xW = PARAMS["window_tip"]
+    def line3(key, za, zb, n=80, start=None):
+        """The 3D line : x(z) from the top view fit, y by a vertical ray dx beside it, y(z) smoothed by one cubic ; start blends to a node."""
+        z = np.linspace(za, zb, n); x = np.polyval(xfit(key + "_top"), z)
+        if start is not None:
+            w = np.clip(1 - np.abs(z - za) / PARAMS["ridge_blend_m"], 0, 1); x = x + (start[0] - x[0]) * w
+        y = top_y(x + PARAMS["top_dx"][key], z); y = np.polyval(np.polyfit(z, y, 3), z)
+        if start is not None: y = y + (start[1] - y[0]) * np.clip(1 - np.abs(z - za) / PARAMS["ridge_blend_m"], 0, 1)
+        return np.stack([x, y, z], 1)
+    Rl = line3("ridge", zd, z3, start=net.nodes["rdc_belt"]); Dl = line3("diag", zd, z3); Gl = line3("glass", zd, zW); Fl = line3("finbase", zW, z3)
+    def at(L, z): return np.array([np.interp(-z, -L[:, 2], L[:, k]) for k in range(3)])
+    def sub(L, za, zb):   # the part of a line between za and zb (za > zb, front to rear), ends exact
+        k = (L[:, 2] < za) & (L[:, 2] > zb); return np.vstack([at(L, za), L[k], at(L, zb)])
+    WALL = {"WT", "F2", "F3"}   # nodes at the foot of a wall : the rays stay wall_guard_m away from them (no step up the wall, 28 October 2026)
+    def across(a, b, n=40):   # a spoke at constant z, height by vertical rays (the skin, not a chord)
+        A, B = net.nodes[a], net.nodes[b]; x = np.linspace(A[0], B[0], n); z = np.linspace(A[2], B[2], n); xr = x.copy(); g = PARAMS["wall_guard_m"]
+        if b in WALL: xr = np.where(B[0] < A[0], np.maximum(x, B[0] + g), np.minimum(x, B[0] - g))
+        if a in WALL: xr = np.where(A[0] < B[0], np.maximum(xr, A[0] + g), np.minimum(xr, A[0] - g))
+        y = top_y(xr, z); y = y + (A[1] - y[0]) * np.linspace(1, 0, n) + (B[1] - y[-1]) * np.linspace(0, 1, n); return np.stack([x, y, z], 1)
+    # nodes (28 October 2026)
+    N("SBQ", pt(z1, sq(z1))); N("STQ", pt(z3, sq(z3)))
+    for nm, L, z in (("R1", Rl, z1), ("R2", Rl, z2), ("R3", Rl, z3), ("RD", Dl, zd), ("D1", Dl, z1), ("DW", Dl, zW), ("D2", Dl, z2), ("D3", Dl, z3),
+                     ("RG", Gl, zd), ("WT", Gl, zW), ("F2", Fl, z2), ("F3", Fl, z3)): N(nm, at(L, z))
+    zsc = float(net.nodes["rdc_sc"][2]); zB_ = float(net.nodes["SQB"][2])
+    E("sc_qa1", "SQA", "SBQ", on_line(z2, z1, sq), fixed=True, sharp=True); E("sc_qa2", "SBQ", "rdc_sc", on_line(z1, zsc, sq), fixed=True, sharp=True)
+    E("sc_qt1", "SQB", "STQ", on_line(zB_, z3, sq), fixed=True, sharp=True); E("sc_qt2", "STQ", "SQA", on_line(z3, z2, sq), fixed=True, sharp=True)
+    del net.edges["sc_qa"]; del net.edges["sc_qt"]
+    for p_ in net.patches:
+        if p_["name"] == "Q_A2": p_["S"][2] = ["sc_qa1", "sc_qa2"]
+        if p_["name"] == "Q_T": p_["S"][2] = ["sc_qt1", "sc_qt2"]
+    # lines, rear to front like the shoulder line (u runs to the front, v from the outside in)
+    E("R_a", "R1", "rdc_belt", sub(Rl, zd, z1)[::-1], fixed=True, sharp=True); E("R_b", "R2", "R1", sub(Rl, z1, z2)[::-1], fixed=True, sharp=True)
+    E("R_c", "R3", "R2", sub(Rl, z2, z3)[::-1], fixed=True, sharp=True)
+    E("D_a", "D1", "RD", sub(Dl, zd, z1)[::-1], fixed=True, sharp=True); E("D_b2", "DW", "D1", sub(Dl, z1, zW)[::-1], fixed=True, sharp=True)
+    E("D_b1", "D2", "DW", sub(Dl, zW, z2)[::-1], fixed=True, sharp=True); E("D_c", "D3", "D2", sub(Dl, z2, z3)[::-1], fixed=True, sharp=True)
+    E("G_q", "WT", "RG", Gl[::-1], fixed=True); E("FB_a", "F2", "WT", sub(Fl, zW, z2)[::-1], fixed=True, sharp=True); E("FB_b", "F3", "F2", sub(Fl, z2, z3)[::-1], fixed=True, sharp=True)
+    E("shelf_cut_a", "rdc_belt", "RD", across("rdc_belt", "RD"), fixed=True); E("shelf_cut_b", "RD", "RG", across("RD", "RG"), fixed=True)
+    for a, b in (("SBQ", "R1"), ("SQA", "R2"), ("STQ", "R3"), ("R1", "D1"), ("R2", "D2"), ("R3", "D3"), ("DW", "WT"), ("D2", "F2"), ("D3", "F3")):
+        E("sp_%s_%s" % (a, b), a, b, across(a, b), fixed=(a, b) in (("STQ", "R3"), ("R3", "D3"), ("D3", "F3")))
+    P_ = net.patch
+    P_("H1a", ["sc_qa2"], ["rdc_upper"], ["R_a"], ["sp_SBQ_R1"]); P_("H1b", ["sc_qa1"], ["sp_SBQ_R1"], ["R_b"], ["sp_SQA_R2"]); P_("H1c", ["sc_qt2"], ["sp_SQA_R2"], ["R_c"], ["sp_STQ_R3"])
+    P_("H2a", ["R_a"], ["shelf_cut_a"], ["D_a"], ["sp_R1_D1"]); P_("H2b", ["R_b"], ["sp_R1_D1"], ["D_b1", "D_b2"], ["sp_R2_D2"]); P_("H2c", ["R_c"], ["sp_R2_D2"], ["D_c"], ["sp_R3_D3"])
+    P_("H3a", ["D_b2", "D_a"], ["shelf_cut_b"], ["G_q"], ["sp_DW_WT"]); P_("H3b", ["D_b1"], ["sp_DW_WT"], ["FB_a"], ["sp_D2_F2"]); P_("H3c", ["D_c"], ["sp_D2_F2"], ["FB_b"], ["sp_D3_F3"])
+
+
+def make_wall_x():
+    """Horizontal ray onto a wall : the outermost skin x at (y, z) among the points inboard of xmax, so a ray climbing the fin is not caught by
+    the haunch bump in front of its foot (28 October 2026)."""
+    from scipy.spatial import cKDTree
+    S = C.sculpt(); m = S.P[:, 0] > 0.3; kd = cKDTree(S.P[m][:, 1:3]); SX = S.P[m][:, 0]
+    def wall_x(y, z, xmax):
+        out = []
+        for yy, zz, xm in zip(np.atleast_1d(y), np.atleast_1d(z), np.broadcast_to(xmax, np.shape(np.atleast_1d(y)))):
+            r = PARAMS["top_y_radius"]; v = np.array([])
+            for _ in range(4):
+                k = kd.query_ball_point([yy, zz], r); v = SX[k][SX[k] < xm] if k else np.array([])
+                if len(v): break
+                r *= 2
+            if not len(v): raise ValueError("wall_x : no wall skin at y %.3f z %.3f inboard of x %.3f" % (yy, zz, xm))
+            out.append(v.max())
+        return np.array(out)
+    return wall_x
+
+
+def add_quarter_fin(net, fx):
+    """The fin (buttress wall) of the quarter, task K1c2 (28 October 2026) : a near vertical wall from its foot FB (shared with the band H3)
+    up to the C pillar crease CP, from the window tip WT back to the band end. CP is read on the LEFT view (the wall faces the camera there)
+    as ONE straight line y(z), its x by a horizontal ray on the sculpt 1 cm under the crease ; the spokes climb the wall by horizontal rays.
+    The wall in front of the tip (under the rising glass edge) belongs to the window frame, not to this row."""
+    wall_x = make_wall_x(); N, E = net.node, net.edge; fb = np.array(PARAMS["finbase_top"]); fbx = np.polyfit(fb[:, 0], fb[:, 1], min(PARAMS["line_deg"], len(fb) - 1))
+    cs = np.array(PARAMS["cpillar_side"]); cpy = np.polyfit(cs[:, 0], cs[:, 1], PARAMS["cp_deg"]); zW = PARAMS["window_tip"][0]; z2 = float(net.nodes["SQA"][2]); z3 = PARAMS["qband_z3"]
+    z = np.linspace(zW, z3, 80); y = np.polyval(cpy, z); x = wall_x(y - PARAMS["cp_below_m"], z, np.polyval(fbx, z) + PARAMS["wall_guard_m"] / 2)
+    x = np.polyval(np.polyfit(z, x, 3), z); CP = np.stack([x, y, z], 1)
+    def at(L, zz): return np.array([np.interp(-zz, -L[:, 2], L[:, k]) for k in range(3)])
+    def sub(L, za, zb):
+        k = (L[:, 2] < za) & (L[:, 2] > zb); return np.vstack([at(L, za), L[k], at(L, zb)])
+    N("CW", at(CP, zW)); N("C2", at(CP, z2)); N("C3", at(CP, z3))
+    def up(a, b, n=30):   # the wall is flat on every section (28 October 2026) : its spokes are straight between their skin ends ; following
+        A, B = net.nodes[a], net.nodes[b]; return A + (B - A) * np.linspace(0, 1, n)[:, None]   # the skin at the window tip bent the front one by 1.5 cm
+    E("CP_a", "C2", "CW", sub(CP, zW, z2)[::-1], fixed=True, sharp=True); E("CP_b", "C3", "C2", sub(CP, z2, z3)[::-1], fixed=True, sharp=True)
+    E("up_WT", "WT", "CW", up("WT", "CW"), fixed=True); E("up_F2", "F2", "C2", up("F2", "C2")); E("up_F3", "F3", "C3", up("F3", "C3"), fixed=True)
+    net.patch("FIN_a", ["FB_a"], ["up_WT"], ["CP_a"], ["up_F2"]); net.patch("FIN_b", ["FB_b"], ["up_F2"], ["CP_b"], ["up_F3"])
+
+
+def F_lipx(fx, y, z):
+    """The fender skin 1 cm outside the front arch lip (same rule as FenderNet)."""
+    cz, cy, R = fx["arch"]; ph = np.arctan2(np.asarray(y, float) - cy, np.asarray(z, float) - cz)
+    zz, yy = cz + (R + 0.01) * np.cos(ph), cy + (R + 0.01) * np.sin(ph); v = fx["side_x"](np.atleast_1d(yy), np.atleast_1d(zz))
+    return v if np.ndim(y) else float(v[0])
+
+
+SECTIONS = ["fender", "door", "quarter", "qband", "qfin"]
+
+
+def build_net(sections=SECTIONS):
+    from PatchNet import Net
+    net = Net(F.PARAMS["spacing_m"], F.PARAMS["support_m"]); fx = F.add_fender(net)
+    if "door" in sections: add_door_section(net, fx)
+    if "quarter" in sections: add_quarter_section(net, fx)
+    if "qband" in sections: add_quarter_band(net, fx)
+    if "qfin" in sections: add_quarter_fin(net, fx)
+    return net

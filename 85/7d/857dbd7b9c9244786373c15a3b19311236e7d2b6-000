@@ -1,0 +1,31 @@
+"""28 October 2026, 14:00 : ZenRay Meshes finishing, EDGE TO LINE, move the top (or bottom) edge of parts in y onto a reference line y(z) (read on the
+side view), the vertices below following with a smoothstep falloff over --falloff-m, only inside --z-range ; applied the same to the L and R parts,
+so the symmetry is kept. FR : amène le bord haut d'une pièce sur une ligne de la vue de côté, fondu vers le bas.
+python EdgeToLine.py <in.npz> <out.npz> <line.npy (x, y, z)> --parts A_L,A_R [--end max] [--z-range 0.0,0.9] [--falloff-m 0.08] [--max-mm 50]"""
+import argparse, json
+import numpy as np
+from scipy.interpolate import UnivariateSpline
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("line")
+ap.add_argument("--parts", required=True); ap.add_argument("--end", default="max"); ap.add_argument("--z-range", default="0.0,0.9")
+ap.add_argument("--falloff-m", type=float, default=0.08); ap.add_argument("--max-mm", type=float, default=50.0); ap.add_argument("--fade-m", type=float, default=0.10)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+L = np.load(a.line); L = L[np.argsort(L[:, 2])]; z0, z1 = (float(t) for t in a.z_range.split(","))
+k = (L[:, 2] >= z0 - 0.05) & (L[:, 2] <= z1 + 0.05); sl = UnivariateSpline(L[k, 2], L[k, 1], k=3, s=k.sum() * 0.004 ** 2)
+sg = 1 if a.end == "max" else -1; rep = {}
+for part in a.parts.split(","):
+    V = np.array(sorted({x for q, m in zip(d["Q"], n) if m == part for x in q})); X = P[V]
+    zs = np.arange(z0, z1 + 1e-9, 0.01); ez = []; ey = []
+    for z in zs:
+        s = X[np.abs(X[:, 2] - z) < 0.006]
+        if len(s):
+            ez.append(z); ey.append((s[:, 1] * sg).max() * sg)
+    ez, ey = np.array(ez), np.array(ey)
+    gap = np.clip(sl(ez) - ey, -a.max_mm / 1000, a.max_mm / 1000)
+    gz = np.interp(X[:, 2], ez, gap)
+    wz = np.clip(np.minimum(X[:, 2] - z0, z1 - X[:, 2]) / a.fade_m, 0, 1); wz = wz * wz * (3 - 2 * wz)
+    edge = np.interp(X[:, 2], ez, ey); r = np.abs(edge - X[:, 1]); wy = np.clip(1 - r / a.falloff_m, 0, 1); wy = wy * wy * (3 - 2 * wy)
+    P[V, 1] += gz * wz * wy
+    rep[part] = {"gap_mm_p50_max": [round(float(np.median(np.abs(gap)) * 1000), 1), round(float(np.abs(gap).max() * 1000), 1)]}
+np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+print(json.dumps(rep))

@@ -1,0 +1,102 @@
+"""28 October 2026, 09:30 : ZenRay Meshes finishing, REAR LOWER, the lower rear (under the ledge) rebuilt from the reference back view lines :
+a lower panel on the same designed surface as RearBlueprint.py (it meets the frame bottom at frame_y0 exactly), with two trapezoid cutouts (vents)
+and the central plate (diffuser) recessed behind 18 mm bevel rings. The grid columns follow the slanted cutout edges (guide lines x_k(y)), so every
+hole is a block of whole cells with straight edges, never a staircase. Values in LOW (JSON --params overrides), measured on the reference back view.
+python RearLower.py <delivery.npz> <out.npz> [--params file.json]   FR : le bas de l'arrière, découpes et plaque, d'après la vue arrière.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from RearBlueprint import PAR, shell_holed
+
+LOW = {   # 28 October 2026, reference back view x3 crop / 3 / 172.44 ; x = -(u - 312.5) / ppm, y = (323 - v) / ppm
+    "low_y0": 0.162, "plate_y1": 0.375, "cut_y0": 0.327, "cut_y1": 0.433,
+    "plate_x": 0.465, "cut_in_top": 0.449, "cut_in_bot": 0.594, "cut_out_top": 0.913, "cut_out_bot": 0.875,
+    "low_x_bot": 0.88, "cut_recess_m": 0.030,   # outer edge narrows to the ground (reference back view), clear of the rear arch (28 October 2026)
+     "plate_recess_m": 0.018, "bevel_m": 0.014, "low_thick": 0.030, "edge_m": 0.02,
+}
+
+
+def zf(p):
+    def f(x, y):
+        x, y = np.asarray(x, float), np.asarray(y, float); t = (y - p["frame_y0"]) / (p["frame_y1"] - p["frame_y0"])
+        return p["z_at_y0"] + (p["z_at_y1"] - p["z_at_y0"]) * t + p["c4"] * x ** 4
+    return f
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--params", default="")
+    a = ap.parse_args(); p = dict(PAR); p.update(LOW)
+    if a.params:
+        p.update(json.load(open(a.params)))
+    z = zf(p); e = p["edge_m"]
+    # rows : break values on every design height
+    hy = sorted({p["low_y0"], p["cut_y0"], p["plate_y1"], p["cut_y1"], p["frame_y0"]})
+    ys = []
+    for y0, y1 in zip(hy[:-1], hy[1:]):
+        n = max(1, int(round((y1 - y0) / e))); ys += list(np.linspace(y0, y1, n + 1))[:-1]
+    ys.append(hy[-1]); ys = np.array(ys)
+    # guide lines on the right half (x > 0), mirrored : 0, plate edge, cutout inner (slanted), cutout outer (slanted), panel edge
+    def cin(y):
+        y = min(max(y, p["cut_y0"]), p["cut_y1"])   # slanted only along the cutout, vertical above and below (no squeezed cells, 28 October 2026)
+        return p["cut_in_top"] + (p["cut_in_bot"] - p["cut_in_top"]) * (p["cut_y1"] - y) / (p["cut_y1"] - p["cut_y0"])
+    def cout(y):
+        y = min(max(y, p["cut_y0"]), p["cut_y1"])
+        return p["cut_out_top"] + (p["cut_out_bot"] - p["cut_out_top"]) * (p["cut_y1"] - y) / (p["cut_y1"] - p["cut_y0"])
+    def guides(y):
+        xo = p["low_x_bot"] + (p["frame_x"] - p["low_x_bot"]) * (y - p["low_y0"]) / (p["frame_y0"] - p["low_y0"])
+        return [0.0, p["plate_x"], max(cin(y), p["plate_x"] + 0.03), min(cout(y), xo - 0.03), xo]
+    gm = [guides(y) for y in (p["low_y0"], p["frame_y0"])]
+    nseg = [max(1, int(round(max(g[k + 1] - g[k] for g in gm) / e))) for k in range(4)]
+    cols_half = []   # per row, x values of the right half
+    for y in ys:
+        g = guides(y); xr = []
+        for k in range(4):
+            xr += list(np.linspace(g[k], g[k + 1], nseg[k] + 1))[:-1]
+        xr.append(g[4]); cols_half.append(xr)
+    cols_half = np.array(cols_half)
+    X = np.concatenate([-cols_half[:, :0:-1], cols_half], 1)     # full row, symmetric, x = 0 once
+    na = X.shape[1]; Y = np.repeat(ys[:, None], na, 1); T = np.stack([X, Y, z(X, Y)], -1)
+    ic = na // 2                                                  # column index of x = 0
+    k_plate, k_cin, k_cout = ic + nseg[0], ic + nseg[0] + nseg[1], ic + nseg[0] + nseg[1] + nseg[2]
+    jy = lambda v: int(np.argmin(np.abs(ys - v)))
+    blocks = {"CAR_diffuser_rear_C": (jy(p["low_y0"]), jy(p["plate_y1"]), na - 1 - k_plate, k_plate, p["plate_recess_m"]),
+              "CAR_vent_rear_L": (jy(p["cut_y0"]), jy(p["cut_y1"]), k_cin, k_cout, p["cut_recess_m"]),
+              "CAR_vent_rear_R": (jy(p["cut_y0"]), jy(p["cut_y1"]), na - 1 - k_cout, na - 1 - k_cin, p["cut_recess_m"])}
+    keep = np.ones((len(ys) - 1, na - 1), bool)
+    for j0, j1, i0, i1, _ in blocks.values():
+        keep[j0:j1, i0:i1] = False
+    Pf, Ff, Sf = shell_holed(T, keep, p["low_thick"], "CAR_body_tail_lower_C")
+    Pf = list(Pf); Ff = list(Ff); Sf = list(Sf); parts = []
+    for name, (j0, j1, i0, i1, back) in blocks.items():
+        G = T[j0:j1 + 1, i0:i1 + 1].copy(); c = G[..., :2].reshape(-1, 2).mean(0)
+        # bevel : the block outline pulled inward by bevel_m (towards its centre, in x and y), and set back
+        Gi = G.copy(); h = np.array([abs(G[..., 0]).max() - abs(G[..., 0]).min(), G[..., 1].max() - G[..., 1].min()])
+        sx = max(0.5, 1 - 2 * p["bevel_m"] / max(np.ptp(G[..., 0]), 1e-6)); sy = max(0.5, 1 - 2 * p["bevel_m"] / max(np.ptp(G[..., 1]), 1e-6))
+        Gi[..., 0] = c[0] + (G[..., 0] - c[0]) * sx; Gi[..., 1] = c[1] + (G[..., 1] - c[1]) * sy
+        Gi[..., 2] = z(Gi[..., 0], Gi[..., 1]) + back
+        Pp, Fp, Sp = shell_holed(Gi, np.ones((Gi.shape[0] - 1, Gi.shape[1] - 1), bool), 0.012, name)
+        parts.append((Pp, Fp, Sp, name))
+        # bevel ring, part of the lower panel : outer loop on G (frame hole edge), inner loop on Gi
+        lo = [G[0, i] for i in range(G.shape[1])] + [G[j, -1] for j in range(1, G.shape[0])] + [G[-1, i] for i in range(G.shape[1] - 2, -1, -1)] + [G[j, 0] for j in range(G.shape[0] - 2, 0, -1)]
+        li = [Gi[0, i] for i in range(G.shape[1])] + [Gi[j, -1] for j in range(1, G.shape[0])] + [Gi[-1, i] for i in range(G.shape[1] - 2, -1, -1)] + [Gi[j, 0] for j in range(G.shape[0] - 2, 0, -1)]
+        m = len(lo); base = len(Pf); Pf += lo + li
+        for k in range(m):
+            q = [base + k, base + (k + 1) % m, base + m + (k + 1) % m, base + m + k]
+            P_ = np.array(Pf); nq = np.cross(P_[q[1]] - P_[q[0]], P_[q[2]] - P_[q[0]])
+            Ff.append(q if nq[2] < 0 else q[::-1]); Sf.append(True)
+    parts.insert(0, (np.array(Pf), Ff, Sf, "CAR_body_tail_lower_C"))
+    allP, allQ, allN, allS = [], [], [], []
+    for Pp, Fp, Sp, name in parts:
+        base = len(allP); allP += list(Pp); allQ += [[base + v for v in f] for f in Fp]; allN += [name] * len(Fp); allS += list(Sp)
+    np.savez(a.out, P=np.array(allP, np.float32), Q=np.array(allQ, dtype=object), names=np.array(allN), skin=np.array(allS))
+    print(json.dumps({"grid": [len(ys), na], "faces": {n: allN.count(n) for n in set(allN)}}))
+
+
+if __name__ == "__main__":
+    main()

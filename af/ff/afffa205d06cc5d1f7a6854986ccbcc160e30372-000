@@ -1,0 +1,53 @@
+"""28 October 2026, 06:40 : ZenRay Meshes finishing, PILLAR BAR, the B pillar (window support between the door glass and the quarter glass)
+rebuilt as a closed quad bar : at each row of the old strip, the section spans from the door glass rear edge to the quarter glass front edge, its
+outer face --proud-m outside the glass, its inner face --depth-m inside, along the local glass normal ; rows resampled to --rows, ends capped.
+Built on the left, mirrored to the right. FR : montant B refait en barre fermée qui remplit le jour entre les deux vitres.
+python PillarBar.py <delivery.npz> <out_part.npz> [--rows 12] [--proud-m 0.003] [--depth-m 0.015]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--rows", type=int, default=12); ap.add_argument("--proud-m", type=float, default=0.003); ap.add_argument("--depth-m", type=float, default=0.015)
+a = ap.parse_args()
+S, _ = part(a.npz, "CAR_pillar_b_L"); Gd, _ = part(a.npz, "CAR_body_glass_door_L"); Gq, _ = part(a.npz, "CAR_body_glass_quarter_L")
+# old strip : pairs of points per row (sorted by y), centre line
+C = np.array([(S[i] + S[i + 1]) / 2 for i in range(0, len(S), 2)]); C = C[np.argsort(C[:, 1])]
+# keep only the rows where both glasses exist (the bar spans the window height)
+y0 = max(Gd[:, 1].min(), Gq[:, 1].min()); y1 = min(Gd[:, 1].max(), Gq[:, 1].max())
+yy = np.linspace(max(C[:, 1].min(), y0), min(C[:, 1].max(), y1), a.rows + 1)
+cx = np.interp(yy, C[:, 1], C[:, 0]); cz = np.interp(yy, C[:, 1], C[:, 2])
+secs = []
+for y, x, z in zip(yy, cx, cz):
+    c = np.array([x, y, z])
+    d = Gd[np.abs(Gd[:, 1] - y) < 0.01]; q = Gq[np.abs(Gq[:, 1] - y) < 0.01]
+    df = d[d[:, 2].argmin()] if len(d) else c + [0, 0, 0.012]     # door glass rear edge (smallest z)
+    qf = q[q[:, 2].argmax()] if len(q) else c - [0, 0, 0.012]     # quarter glass front edge (largest z)
+    zf, zr = max(df[2], qf[2]) + 0.004, min(df[2], qf[2]) - 0.004
+    xo = max(df[0], qf[0]) + a.proud_m                             # outer face just proud of the glass
+    n = np.array([1.0, 0.0, 0.0])
+    secs.append([xo, zf, zr])
+# the per row glass edges are noisy : each of the three section values is a degree 2 polynomial of y (28 October 2026)
+secs = np.array(secs); fit = [np.polyval(np.polyfit(yy, secs[:, k], 2), yy) for k in range(3)]
+secs = np.array([[[xo, y, zf], [xo, y, zr], [xo - a.depth_m, y, zr], [xo - a.depth_m, y, zf]] for y, xo, zf, zr in zip(yy, *fit)])  # rows x 4 x 3
+P = secs.reshape(-1, 3); Q = []
+for j in range(len(secs) - 1):
+    for k in range(4):
+        a0, a1 = j * 4 + k, j * 4 + (k + 1) % 4
+        Q.append([a0, a1, a1 + 4, a0 + 4])
+Q.append([3, 2, 1, 0]); last = (len(secs) - 1) * 4; Q.append([last, last + 1, last + 2, last + 3])
+# outward winding check : the outer face (k = 0) normal must point to +x
+f = Q[0]; nrm = np.cross(P[f[1]] - P[f[0]], P[f[2]] - P[f[0]])
+if nrm[0] < 0:
+    Q = [q[::-1] for q in Q]
+names = ["CAR_pillar_b_L"] * len(Q)
+PR = P * np.array([-1, 1, 1]); QR = [[v + len(P) for v in q[::-1]] for q in Q]
+np.savez(a.out, P=np.vstack([P, PR]).astype(np.float32), Q=np.array(Q + QR, dtype=object), names=np.array(names + ["CAR_pillar_b_R"] * len(QR)))
+print(json.dumps({"rows": len(secs), "faces_per_side": len(Q), "y": [round(float(yy[0]), 3), round(float(yy[-1]), 3)]}))

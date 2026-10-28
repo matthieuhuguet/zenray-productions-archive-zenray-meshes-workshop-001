@@ -1,0 +1,90 @@
+"""28 October 2026, 12:00 : ZenRay Meshes finishing, RAIL LOFT, the roof rail (side hinge of the greenhouse, from the rear deck over the roof
+edge and down the windshield pillar) rebuilt as one smooth quad band : per z slice of the old rail, its inner top edge (side of roof and glass) and
+its outer edge (side of the side windows), each smoothed by a least squares cubic spline in z ; a ruled band between them with --cols columns
+and a crown of --crown-m outward at mid width ; 12 mm shell. Mirrored to the right. FR : le rail du pavillon refait en une bande lisse.
+python RailLoft.py <delivery.npz> <out.npz> [--knots 8] [--cols 4] [--crown-m 0.006] [--edge-m 0.02]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.interpolate import LSQUnivariateSpline
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--knots", type=int, default=8); ap.add_argument("--cols", type=int, default=4); ap.add_argument("--crown-m", type=float, default=0.006)
+ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--outer-curve", default="", help="npy (x, y, z) replacing the outer edge inside its z range, faded over 5 cm (the reference window top line, 28 October 2026)"); ap.add_argument("--thick", type=float, default=0.012); ap.add_argument("--arc-cuts", default="-1.2,0.5,1.0", help="z where one design line ends and the next begins (design corners)"); ap.add_argument("--arc", type=int, default=0, help="1 : each edge is ONE arc, degree 2 in z per coordinate (rule 223, 28 October 2026) instead of the spline")
+a = ap.parse_args()
+R, _ = part(a.npz, "CAR_body_rail_L")
+zs = np.arange(R[:, 2].min() + 0.01, R[:, 2].max() - 0.01, 0.01); I, O, Z = [], [], []
+for z in zs:
+    S = R[np.abs(R[:, 2] - z) < 0.005]
+    if len(S) < 3:
+        continue
+    top = S[S[:, 1] > S[:, 1].max() - 0.03]; I.append(top[top[:, 0].argmin()]); O.append(S[S[:, 0].argmax()]); Z.append(z)
+I, O, Z = np.array(I), np.array(O), np.array(Z)
+
+
+def smooth(E):
+    k = np.ones(len(E), bool)
+    for _ in range(4):
+        t = np.linspace(Z[k].min(), Z[k].max(), a.knots + 2)[1:-1]
+        sx = LSQUnivariateSpline(Z[k], E[k, 0], t); sy = LSQUnivariateSpline(Z[k], E[k, 1], t)
+        r = np.hypot(sx(Z) - E[:, 0], sy(Z) - E[:, 1]); k = r < max(0.004, np.percentile(r, 90))
+    return sx, sy, float(np.median(r) * 1000)
+
+
+six, siy, ri = smooth(I); sox, soy, ro = smooth(O)
+if a.arc:   # ONE arc per design line : degree 2 per coordinate between design corners, joined without a step (C0) (28 October 2026)
+    cuts = [Z.min() - 1] + [float(c) for c in a.arc_cuts.split(",")] + [Z.max() + 1]
+    def arc(fx, fy):
+        segs = []
+        for lo, hi in zip(cuts[:-1], cuts[1:]):
+            m = (Z >= lo) & (Z < hi); segs.append((lo, hi, np.polyfit(Z[m], fx(Z[m]), 2), np.polyfit(Z[m], fy(Z[m]), 2)))
+        def ev(z, k):
+            z = np.atleast_1d(np.asarray(z, float)); out = np.zeros_like(z)
+            for lo, hi, cx, cy in segs:
+                m = (z >= lo) & (z < hi); out[m] = np.polyval(cx if k == 0 else cy, z[m])
+            # C0 : at each corner, both arcs meet at their mean, the difference faded over 4 cm on each side
+            for (lo, hi, cx, cy), (lo2, hi2, cx2, cy2) in zip(segs[:-1], segs[1:]):
+                c = hi; va = np.polyval(cx if k == 0 else cy, c); vb = np.polyval(cx2 if k == 0 else cy2, c); mid = (va + vb) / 2
+                wa = np.clip(1 - (c - z) / 0.04, 0, 1) * (z < c); wb = np.clip(1 - (z - c) / 0.04, 0, 1) * (z >= c)
+                out += wa * (mid - va) + wb * (mid - vb)
+            return out
+        r = float(np.hypot(ev(Z, 0) - fx(Z), ev(Z, 1) - fy(Z)).max() * 1000)
+        return (lambda z: ev(z, 0)), (lambda z: ev(z, 1)), r
+    six, siy, ri = arc(six, siy); sox, soy, ro = arc(sox, soy)
+zz = np.linspace(Z.min(), Z.max(), max(2, int((Z.max() - Z.min()) / a.edge_m)) + 1)
+Ci = np.stack([six(zz), siy(zz), zz], 1); Co = np.stack([sox(zz), soy(zz), zz], 1)
+if a.outer_curve:
+    OC = np.load(a.outer_curve); OC = OC[np.argsort(OC[:, 2])]
+    w = np.clip(np.minimum(zz - OC[0, 2], OC[-1, 2] - zz) / 0.05, 0, 1); w = w * w * (3 - 2 * w)
+    for k in (0, 1):
+        Co[:, k] = Co[:, k] * (1 - w) + np.interp(zz, OC[:, 2], OC[:, k]) * w
+t = np.linspace(0, 1, a.cols + 1)
+G = Ci[:, None, :] * (1 - t)[None, :, None] + Co[:, None, :] * t[None, :, None]
+# crown : outward (away from the car axis, up) at mid width
+nb, na = G.shape[:2]; du = np.gradient(G, axis=1); dv = np.gradient(G, axis=0); N = np.cross(du, dv); N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+ref = np.array([1.0, 1.0, 0.0]) / np.sqrt(2)
+if (N @ ref).mean() < 0:
+    N = -N
+G = G + (a.crown_m * 4 * t * (1 - t))[None, :, None] * N
+B = G - a.thick * N
+gid = lambda j, i: j * na + i; off = nb * na; pts = list(G.reshape(-1, 3)) + list(B.reshape(-1, 3)); F = []
+for j in range(nb - 1):
+    for i in range(na - 1):
+        q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]; F.append(q); F.append([off + x for x in q[::-1]])
+ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+m = len(ring)
+for k in range(m):
+    F.append([ring[k], off + ring[k], off + ring[(k + 1) % m], ring[(k + 1) % m]])
+P = np.array(pts); f0 = F[0]; n0 = np.cross(P[f0[1]] - P[f0[0]], P[f0[2]] - P[f0[0]])
+if n0 @ ref < 0:
+    F = [f[::-1] for f in F]
+PR = P * np.array([-1, 1, 1]); FR = [[v + len(P) for v in f[::-1]] for f in F]
+np.savez(a.out, P=np.vstack([P, PR]).astype(np.float32), Q=np.array(F + FR, dtype=object), names=np.array(["CAR_body_rail_L"] * len(F) + ["CAR_body_rail_R"] * len(FR)))
+print(json.dumps({"rows": nb, "cols": na, "inner_resid_mm": round(ri, 1), "outer_resid_mm": round(ro, 1)}))

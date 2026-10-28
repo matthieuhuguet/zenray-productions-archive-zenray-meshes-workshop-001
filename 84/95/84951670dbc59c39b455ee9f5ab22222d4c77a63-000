@@ -1,0 +1,128 @@
+"""28 October 2026 : ZenRay Meshes CURVE RIG LIBRARY (pure numpy : the same code runs in Houdini's Python SOPs and in the bench).
+A rig is a JSON : controls (the controllers, 3D points ; a node shared by several curves is ONE control), curves (B-spline of degree 3
+through clamped knots, its control indices, flags fixed and sharp, optional locked sample fractions), patches (four sides, each a chain of
+curves ; '-' reverses), counts (intervals per curve, opposite sides equal) and crowns (one bulge per patch, metres). The surface is a
+loft of the curves only : every patch is a Coons patch of its four sampled sides plus its crown along the patch normal ; curves shared by
+two patches are sampled once, so the panels are welded by construction. Moving a control moves its curves, which moves the loft.
+FR : la bibliothèque du rig de courbes : contrôleurs, courbes NURBS, loft de Coons avec bombé, soudé par construction."""
+import json
+import numpy as np
+
+
+# ---------- B-spline ----------
+def knots(k, p):
+    """Clamped uniform knot vector for k control points of degree p."""
+    inner = np.linspace(0, 1, k - p + 1)[1:-1]
+    return np.r_[np.zeros(p + 1), inner, np.ones(p + 1)]
+
+
+def basis(t, k, p):
+    """Basis matrix (len(t), k) by de Boor's recursion."""
+    U = knots(k, p); t = np.clip(np.asarray(t, float), 0, 1 - 1e-12); B = np.zeros((len(t), len(U) - 1))
+    for i in range(len(U) - 1): B[:, i] = (U[i] <= t) & (t < U[i + 1])
+    B[t >= 1 - 1e-12, k - 1] = 1.0
+    for d in range(1, p + 1):
+        Bn = np.zeros((len(t), len(U) - 1 - d))
+        for i in range(len(U) - 1 - d):
+            a = U[i + d] - U[i]; b = U[i + d + 1] - U[i + 1]
+            if a > 0: Bn[:, i] += (t - U[i]) / a * B[:, i]
+            if b > 0: Bn[:, i] += (U[i + d + 1] - t) / b * B[:, i + 1]
+        B = Bn
+    return B[:, :k]
+
+
+def fit(X, k, p=3):
+    """Control points of a clamped B-spline through X[0] and X[-1], least squares on the arc length parameter (end points exact)."""
+    X = np.asarray(X, float); p = min(p, k - 1); L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]; t = L / L[-1]
+    B = basis(t, k, p); CV = np.zeros((k, 3)); CV[0], CV[-1] = X[0], X[-1]
+    if k > 2:
+        A = B[:, 1:-1]; rhs = X - np.outer(B[:, 0], X[0]) - np.outer(B[:, -1], X[-1]); CV[1:-1] = np.linalg.lstsq(A, rhs, rcond=None)[0]
+    return CV
+
+
+def fit_robust(X, k, p=3, iters=4):
+    """Hard surface fit (28 October 2026) : few control points, ends exact, Cauchy weights so that bumps of the source are IGNORED,
+    not followed (a hard surface modeler draws the clean line through a dirty scan)."""
+    X = np.asarray(X, float); p = min(p, k - 1); L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]; t = L / L[-1]
+    B = basis(t, k, p); w = np.ones(len(X)); CV = np.zeros((k, 3)); CV[0], CV[-1] = X[0], X[-1]
+    for _ in range(iters):
+        if k > 2:
+            A = B[:, 1:-1] * w[:, None]; rhs = (X - np.outer(B[:, 0], X[0]) - np.outer(B[:, -1], X[-1])) * w[:, None]
+            CV[1:-1] = np.linalg.lstsq(A, rhs, rcond=None)[0]
+        r = np.linalg.norm(B @ CV - X, axis=1); s = 1.4826 * np.median(r) + 1e-4; w = np.sqrt(1.0 / (1.0 + (r / (2.5 * s)) ** 2))
+    return CV
+
+
+def turning_deg(X):
+    """Total turning of a polyline (degrees), on a light smoothing : decides how many control points an arc needs."""
+    X = np.asarray(X, float); d = np.diff(X, axis=0); d = d[np.linalg.norm(d, axis=1) > 1e-9]
+    if len(d) < 3: return 0.0
+    k = max(1, len(d) // 12); d = np.array([d[i:i + k].sum(0) for i in range(0, len(d) - k + 1, k)]); d /= np.linalg.norm(d, axis=1, keepdims=True)
+    return float(np.degrees(np.arccos(np.clip((d[:-1] * d[1:]).sum(1), -1, 1))).sum())
+
+
+def evaluate(CV, n=200, p=3):
+    CV = np.asarray(CV, float); p = min(p, len(CV) - 1); return basis(np.linspace(0, 1, n), len(CV), p) @ CV
+
+
+def sample(CV, n_int, fracs=None, p=3):
+    """n_int + 1 points along the curve, equal arc length (or at the locked arc length fractions)."""
+    D = evaluate(CV, 400, p); L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(D, axis=0), axis=1))]
+    s = (np.asarray(fracs, float) if fracs is not None else np.linspace(0, 1, n_int + 1)) * L[-1]
+    return np.stack([np.interp(s, L, D[:, k]) for k in range(3)], 1)
+
+
+# ---------- loft ----------
+def arcfrac(X):
+    L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]; return L / max(L[-1], 1e-12)
+
+
+def loft(rig, controls=None, density=1, crowns=None):
+    """Quads of the whole rig. Returns P (n,3), Q (list of quads), sharp edges (pairs), curve polylines {name: (m,3)}, patch grids."""
+    C = np.asarray(controls if controls is not None else rig["controls"], float); crowns = crowns or rig.get("crowns", {})
+    P = []; ids = {}
+    def add(x): P.append(np.asarray(x, float)); return len(P) - 1
+    node_ids = {}
+    for name, c in rig["curves"].items():
+        a, b = c["cvs"][0], c["cvs"][-1]
+        for v in (a, b):
+            if v not in node_ids: node_ids[v] = add(C[v])
+    lines = {}
+    for name, c in rig["curves"].items():
+        CV = C[c["cvs"]]; n = int(rig["counts"][name]) * (1 if c.get("fracs") else int(density))
+        S = sample(CV, n, c.get("fracs")); lines[name] = evaluate(CV, 120)
+        ids[name] = [node_ids[c["cvs"][0]]] + [add(x) for x in S[1:-1]] + [node_ids[c["cvs"][-1]]]
+    def chain(side):
+        out = []
+        for s in side:
+            v = ids[s.lstrip("-")]; v = v[::-1] if s.startswith("-") else v; out += v if not out else v[1:]
+        return out
+    Q = []; grids = []
+    for pt in rig["patches"]:
+        B0, R1, T2, L3 = [chain(s) for s in pt["S"]]
+        if not (B0[0] == L3[0] and B0[-1] == R1[0] and T2[0] == L3[-1] and T2[-1] == R1[-1]):
+            raise ValueError("patch %s : its four sides do not meet at the corners" % pt["name"])
+        nu, nv = len(B0), len(L3)
+        if len(T2) != nu or len(R1) != nv: raise ValueError("patch %s : opposite sides differ (%d/%d, %d/%d)" % (pt["name"], nu, len(T2), nv, len(R1)))
+        X = np.array(P); Bp, Tp, Lp, Rp = X[B0], X[T2], X[L3], X[R1]; u = (arcfrac(Bp) + arcfrac(Tp)) / 2; v = (arcfrac(Lp) + arcfrac(Rp)) / 2
+        U, V = np.meshgrid(u, v, indexing="ij")
+        S = ((1 - V)[..., None] * Bp[:, None] + V[..., None] * Tp[:, None] + (1 - U)[..., None] * Lp[None] + U[..., None] * Rp[None]
+             - ((1 - U) * (1 - V))[..., None] * Bp[0] - (U * (1 - V))[..., None] * Bp[-1] - ((1 - U) * V)[..., None] * Tp[0] - (U * V)[..., None] * Tp[-1])
+        cr = float(crowns.get(pt["name"], 0.0))
+        if cr != 0.0:   # crown : bulge along the patch normal, zero on the border, maximum at the middle
+            du = np.gradient(S, axis=0); dv = np.gradient(S, axis=1); Nn = np.cross(du, dv); Nn /= np.linalg.norm(Nn, axis=2, keepdims=True) + 1e-12
+            if pt.get("flip_normal"): Nn = -Nn
+            S = S + cr * (16 * U * (1 - U) * V * (1 - V))[..., None] * Nn
+        G = -np.ones((nu, nv), np.int64); G[:, 0] = B0; G[:, -1] = T2; G[0, :] = L3; G[-1, :] = R1
+        for i in range(1, nu - 1):
+            for j in range(1, nv - 1): G[i, j] = add(S[i, j])
+        Q += [[int(G[i, j]), int(G[i + 1, j]), int(G[i + 1, j + 1]), int(G[i, j + 1])] for i in range(nu - 1) for j in range(nv - 1)]
+        grids.append((pt["name"], G))
+    sharp = set()
+    for name, c in rig["curves"].items():
+        if c.get("sharp"):
+            v = ids[name]; sharp |= {(min(a, b), max(a, b)) for a, b in zip(v[:-1], v[1:])}
+    return np.array(P), Q, sorted(sharp), lines, grids
+
+
+def load(path): return json.load(open(path))

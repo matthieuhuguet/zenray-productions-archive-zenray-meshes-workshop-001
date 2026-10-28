@@ -1,0 +1,31 @@
+"""28 October 2026, 11:00 : ZenRay Meshes finishing, TRIM BEHIND, delete the faces of old parts that lie outward of a new facet (in the x, z plane of
+each height : outward of the line from the facet inner edge to its outer edge) and behind --z-max, so the facet shows. Mirrored by |x|.
+python TrimBehind.py <in.npz> <facet.npz> <facet_part_L> <out.npz> --parts A_L,B_L,... [--z-max -1.85] [--margin-m 0.003]
+FR : supprime les faces des vieilles pièces qui passent devant une nouvelle facette, pour qu'elle se voie."""
+import argparse, json
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("facet"); ap.add_argument("fname"); ap.add_argument("out")
+ap.add_argument("--parts", required=True); ap.add_argument("--z-max", type=float, default=-1.85); ap.add_argument("--margin-m", type=float, default=0.003)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = list(d["Q"])
+f = np.load(a.facet, allow_pickle=True); FP = f["P"].astype(float); fn = np.array([str(x) for x in f["names"]])
+V = np.array(sorted({v for q, m in zip(f["Q"], fn) if m == a.fname for v in q})); X = FP[V]
+ys = np.unique(np.round(X[:, 1], 4)); inner = []; outer = []
+for y in ys:
+    s = X[np.abs(X[:, 1] - y) < 1e-3]; inner.append(s[s[:, 0].argmin()]); outer.append(s[s[:, 0].argmax()])
+inner, outer = np.array(inner), np.array(outer)
+targets = set()
+for base in a.parts.split(","):
+    targets |= {base, base[:-2] + "_R"} if base.endswith("_L") else {base}
+keep = []; removed = {}
+for q, m in zip(Q, n):
+    if m in targets:
+        c = P[list(q)].mean(0); ax = abs(c[0]); y = np.clip(c[1], ys.min(), ys.max())
+        ix, iz = np.interp(y, ys, inner[:, 0]), np.interp(y, ys, inner[:, 2]); ox, oz = np.interp(y, ys, outer[:, 0]), np.interp(y, ys, outer[:, 2])
+        # outward side of the line inner -> outer in (x, z) : the side away from the car centre
+        side = (ox - ix) * (c[2] - iz) - (oz - iz) * (ax - ix)
+        if c[2] < a.z_max and ys.min() - 0.02 < c[1] < ys.max() + 0.02 and side < -a.margin_m:
+            removed[m] = removed.get(m, 0) + 1; continue
+    keep.append((q, m))
+np.savez(a.out, P=d["P"], Q=np.array([q for q, _ in keep], dtype=object), names=np.array([m for _, m in keep]))
+print(json.dumps(removed))

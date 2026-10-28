@@ -1,0 +1,46 @@
+"""28 October 2026, 15:20 : ZenRay Meshes finishing, BELT BAND, the light band under the side windows, between the belt line (top) and the shoulder
+crease (bottom) of DesignLines.json, each ONE arc in y(z) (reference side view) ; x of each edge read on the old shoulder at that height and fitted
+as one arc too ; ruled quad band (--cols), proud of the old surface by --proud-m, 12 mm shell, mirrored. FR : la bande de ceinture tendue entre deux arcs.
+python BeltBand.py <delivery.npz> <out.npz> [--lines DesignLines.json] [--cols 4] [--proud-m 0.002] [--edge-m 0.02]"""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--lines", default=W + "work/car/finish/DesignLines.json")
+ap.add_argument("--cols", type=int, default=4); ap.add_argument("--top", default="belt"); ap.add_argument("--bottom", default="shoulder_crease"); ap.add_argument("--source", default="CAR_body_shoulder_L"); ap.add_argument("--name", default="CAR_body_belt"); ap.add_argument("--proud-m", type=float, default=0.002); ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--thick", type=float, default=0.012)
+a = ap.parse_args(); L = json.load(open(a.lines)); S, _ = part(a.npz, a.source)
+top, bot = L[a.top], L[a.bottom]; z0, z1 = max(top["z0"], bot["z0"]), min(top["z1"], bot["z1"])
+zz = np.linspace(z0, z1, max(2, int((z1 - z0) / a.edge_m)) + 1)
+yt, yb = np.polyval(top["coef"], zz), np.polyval(bot["coef"], zz)
+
+
+def xarc(yline):
+    xs = []
+    for z, y in zip(zz, yline):
+        s = S[(np.abs(S[:, 2] - z) < 0.012) & (np.abs(S[:, 1] - y) < 0.015)]
+        xs.append(s[:, 0].max() if len(s) else np.nan)
+    xs = np.array(xs); ok = ~np.isnan(xs); c = np.polyfit(zz[ok], xs[ok], 2)
+    return np.polyval(c, zz) + a.proud_m, float(np.abs(np.polyval(c, zz[ok]) - xs[ok]).max() * 1000)
+
+
+xt, et = xarc(yt); xb, eb = xarc(yb)
+t = np.linspace(0, 1, a.cols + 1)
+Ct = np.stack([xt, yt, zz], 1); Cb = np.stack([xb, yb, zz], 1)
+G = Ct[:, None, :] * (1 - t)[None, :, None] + Cb[:, None, :] * t[None, :, None]
+nb, na = G.shape[:2]; du = np.gradient(G, axis=1); dv = np.gradient(G, axis=0); N = np.cross(du, dv); N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+if N[..., 0].mean() < 0:
+    N = -N
+B = G - a.thick * N; gid = lambda j, i: j * na + i; off = nb * na; pts = list(G.reshape(-1, 3)) + list(B.reshape(-1, 3)); F = []
+for j in range(nb - 1):
+    for i in range(na - 1):
+        q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]; F.append(q); F.append([off + x for x in q[::-1]])
+ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+for k in range(len(ring)):
+    F.append([ring[k], off + ring[k], off + ring[(k + 1) % len(ring)], ring[(k + 1) % len(ring)]])
+P = np.array(pts); f0 = F[0]
+if np.cross(P[f0[1]] - P[f0[0]], P[f0[2]] - P[f0[0]])[0] < 0:
+    F = [f[::-1] for f in F]
+PR = P * np.array([-1, 1, 1]); FR = [[v + len(P) for v in f[::-1]] for f in F]
+np.savez(a.out, P=np.vstack([P, PR]).astype(np.float32), Q=np.array(F + FR, dtype=object), names=np.array([a.name + "_L"] * len(F) + [a.name + "_R"] * len(FR)))
+print(json.dumps({"z": [round(z0, 3), round(z1, 3)], "rows": nb, "x_arc_err_mm": [round(et, 1), round(eb, 1)]}))

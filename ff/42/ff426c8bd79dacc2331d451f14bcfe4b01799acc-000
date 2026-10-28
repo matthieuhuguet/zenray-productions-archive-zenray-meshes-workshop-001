@@ -1,0 +1,34 @@
+"""28 October 2026, 06:00 : ZenRay Meshes finishing, FACING EDGE, the edge of a frame part that faces an edge of a panel, as one smooth curve :
+per z slice, the panel edge point (max or min along --axis) and the frame vertex nearest to it ; outliers out, LSQ cubic spline with --knots knots
+on x(z) and y(z). Saves the curve and its x mirror (_R). FR : le bord d'un cadre qui fait face au bord d'une pièce, lissé en une courbe.
+python FacingEdge.py <delivery.npz> <panel> <frame> <out_L.npy> --axis 1 --end max [--z-range lo,hi] [--knots 4]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.interpolate import LSQUnivariateSpline
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("panel"); ap.add_argument("frame"); ap.add_argument("out")
+ap.add_argument("--axis", type=int, default=1); ap.add_argument("--end", default="max"); ap.add_argument("--z-range", default=""); ap.add_argument("--knots", type=int, default=4)
+a = ap.parse_args()
+G, _ = part(a.npz, a.panel); Fr, _ = part(a.npz, a.frame); sg = 1 if a.end == "max" else -1
+lo, hi = (float(v) for v in a.z_range.split(",")) if a.z_range else (G[:, 2].min() + 0.01, G[:, 2].max() - 0.01)
+E = []
+for z in np.arange(lo, hi, 0.01):
+    S = G[np.abs(G[:, 2] - z) < 0.005]; f = Fr[np.abs(Fr[:, 2] - z) < 0.006]
+    if len(S) and len(f):
+        e = S[np.argmax(S[:, a.axis] * sg)]; fv = f[np.linalg.norm(f - e, axis=1).argmin()].copy(); fv[2] = z; E.append(fv)   # slice z keeps z strictly increasing
+E = np.array(E); z = E[:, 2]; k = np.ones(len(E), bool)
+for _ in range(4):
+    t = np.linspace(z[k].min(), z[k].max(), a.knots + 2)[1:-1]
+    sx = LSQUnivariateSpline(z[k], E[k, 0], t); sy = LSQUnivariateSpline(z[k], E[k, 1], t)
+    r = np.hypot(sx(z) - E[:, 0], sy(z) - E[:, 1]); k = r < max(0.004, np.percentile(r, 90))
+zz = np.linspace(z.min(), z.max(), 300); C = np.stack([sx(zz), sy(zz), zz], 1)
+np.save(a.out, C); np.save(a.out.replace("_L.npy", "_R.npy"), C * np.array([-1, 1, 1]))
+print(json.dumps({"pts": len(E), "resid_mm_p50_p95": [round(float(np.median(r) * 1000), 1), round(float(np.percentile(r, 95) * 1000), 1)]}))

@@ -1,0 +1,30 @@
+"""28 October 2026 : ZenRay Meshes FOLD LOCATOR : on a subdivided mesh (npz P, Q) and its rig (sharp curves exempt), the non design
+folds (dihedral between neighbour faces, edges farther than 12 mm from a sharp curve) : p50, p99, max, and the worst ones clustered with
+their nearest rig nodes. It says WHERE a pinch is, so the curve network is fixed there instead of guessed.
+python FoldLocate.py <mesh.npz> <rig.json> [--k 4] [--top 60]   FR : localise les plis hors arêtes de design et les nœuds voisins."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import RigLib as RL
+ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("rig"); ap.add_argument("--k", type=int, default=4); ap.add_argument("--top", type=int, default=60); a = ap.parse_args()
+d = np.load(a.mesh); P = d["P"]; Q = d["Q"]; rig = json.load(open(a.rig)); C = np.array(rig["controls"])
+kds = cKDTree(np.vstack([RL.evaluate(C[c["cvs"]], 300) for c in rig["curves"].values() if c.get("sharp")]))
+fn = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]); fn /= np.linalg.norm(fn, axis=1, keepdims=True) + 1e-12; ef = defaultdict(list)
+for i, q in enumerate(Q):
+    for k in range(4): ef[(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4]))].append(i)
+A, M = [], []
+for e, f in ef.items():
+    if len(f) == 2:
+        m = (P[e[0]] + P[e[1]]) / 2
+        if kds.query(m)[0] > 0.012: A.append(np.degrees(np.arccos(np.clip(fn[f[0]] @ fn[f[1]], -1, 1)))); M.append(m)
+A = np.array(A); M = np.array(M); o = np.argsort(-A)[:a.top]; out = {"p50": round(float(np.median(A)), 2), "p99": round(float(np.percentile(A, 99)), 2), "max": round(float(A.max()), 2), "clusters": []}
+from scipy.cluster.vq import kmeans2
+cent, lab = kmeans2(M[o], a.k, seed=1, minit="++"); nodes = {n: C[i] for n, i in rig["nodes"].items()}
+for k in range(a.k):
+    sel = lab == k
+    if not sel.any(): continue
+    c = M[o][sel].mean(0); near = sorted((float(np.linalg.norm(v - c)), n) for n, v in nodes.items())[:3]
+    out["clusters"].append({"n": int(sel.sum()), "xyz": np.round(c, 3).tolist(), "max_deg": round(float(A[o][sel].max()), 1), "near_nodes": [(n, round(dd * 100, 1)) for dd, n in near]})
+print(json.dumps(out, indent=1))

@@ -1,0 +1,51 @@
+"""28 October 2026, 14:40 : ZenRay Meshes finishing, LINE AUDIT, the rule of Matthieu : a body line is ONE segment, a straight line or an arc whose
+curvature keeps its sign, never a wave. For every long body part, its edge lines per 2 cm slice along z (top edge in the side view : y max ; bottom
+edge : y min ; outer edge in the top view : |x| max), each line is checked : inflections (sign changes of the second difference after a 3 point
+smoothing, ignoring changes below --tol-mm) and wave amplitude (max deviation from the best degree 2 arc, mm). Sorted worst first, --json out.
+python LineAudit.py <delivery.npz> [--min-len 0.6] [--tol-mm 1.0] [--json out.json]   FR : compte les vagues de chaque ligne de la carrosserie."""
+import argparse, json
+import numpy as np
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--min-len", type=float, default=0.6); ap.add_argument("--tol-mm", type=float, default=1.0)
+ap.add_argument("--json", default=""); ap.add_argument("--top", type=int, default=25)
+a = ap.parse_args()
+d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+SKIP = ("wheel", "tire", "rim", "liner", "closer", "susp", "bolt", "under", "brake", "hub", "spoke")
+
+
+def check(z, v):
+    if len(z) < 8:
+        return None
+    s = np.convolve(v, np.ones(3) / 3, mode="valid"); zz = z[1:-1]
+    d2 = np.diff(s, 2); sig = np.where(np.abs(d2) * 1000 > a.tol_mm / 10, np.sign(d2), 0); sig = sig[sig != 0]
+    infl = int((np.diff(sig) != 0).sum()) if len(sig) > 1 else 0
+    c = np.polyfit(z, v, 2); wave = float(np.abs(np.polyval(c, z) - v).max() * 1000)
+    return infl, wave
+
+
+rows = []
+for part in sorted(set(n)):
+    if any(s in part.lower() for s in SKIP) or part.endswith("_R"):
+        continue
+    V = np.array(sorted({x for q, m in zip(d["Q"], n) if m == part for x in q})); X = P[V]
+    if np.ptp(X[:, 2]) < a.min_len:
+        continue
+    zs = np.arange(X[:, 2].min() + 0.01, X[:, 2].max() - 0.01, 0.02); L = {"side_top": [], "side_bottom": [], "top_outer": []}; Z = []
+    for z in zs:
+        s = X[np.abs(X[:, 2] - z) < 0.01]
+        if len(s) < 2:
+            continue
+        Z.append(z); L["side_top"].append(s[:, 1].max()); L["side_bottom"].append(s[:, 1].min()); L["top_outer"].append(np.abs(s[:, 0]).max())
+    Z = np.array(Z)
+    for k, v in L.items():
+        r = check(Z, np.array(v))
+        if r:
+            rows.append({"part": part, "line": k, "inflections": r[0], "wave_mm": round(r[1], 1), "len_m": round(float(np.ptp(Z)), 2)})
+rows.sort(key=lambda r: (-r["inflections"], -r["wave_mm"]))
+print("%-30s %-12s %5s %8s %6s" % ("part", "line", "infl", "wave_mm", "len"))
+for r in rows[:a.top]:
+    print("%-30s %-12s %5d %8.1f %6.2f" % (r["part"], r["line"], r["inflections"], r["wave_mm"], r["len_m"]))
+tot = {"lines": len(rows), "with_inflection": sum(r["inflections"] > 0 for r in rows), "inflections_total": sum(r["inflections"] for r in rows)}
+print(json.dumps(tot))
+if a.json:
+    json.dump({"summary": tot, "lines": rows}, open(a.json, "w"), indent=1)

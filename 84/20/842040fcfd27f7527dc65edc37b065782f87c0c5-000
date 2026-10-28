@@ -1,0 +1,35 @@
+"""28 October 2026, 05:00 : ZenRay Meshes finishing, SNAP END, like SnapSide.py but for the end of a part along z (the top edge of the windshield
+against the roof) : per x slice, the vertices within --edge-band-m of the part's z extreme (--end min or max) move onto the nearest point of the
+neighbour surface, the rest follows with a smoothstep falloff. FR : soude l'extrémité en z d'une pièce propre sur sa voisine, lissage autour.
+python SnapEnd.py <in.npz> <out.npz> --part CAR_body_glass_windshield_C --onto CAR_body_roof_C --end min [--max-mm 20] [--falloff-m 0.06]
+"""
+import argparse
+import json
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out")
+ap.add_argument("--part", required=True); ap.add_argument("--onto", required=True); ap.add_argument("--end", default="min")
+ap.add_argument("--max-mm", type=float, default=20.0); ap.add_argument("--edge-band-m", type=float, default=0.012); ap.add_argument("--falloff-m", type=float, default=0.06)
+ap.add_argument("--axis", type=int, default=2, help="axis of the end (2 = z ; 1 = y for the top or bottom edge of a side window, 28 October 2026)")
+ap.add_argument("--slice-axis", type=int, default=0, help="axis along which the edge runs")
+ap.add_argument("--range", default="", help="lo,hi on the slice axis")
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+V = np.array(sorted({v for q, m in zip(Q, names) if m == a.part for v in q})); X = P[V]
+F = [q for q, m in zip(Q, names) if m == a.onto]
+tm = trimesh.Trimesh(P, np.array([[q[0], q[k], q[k + 1]] for q in F for k in range(1, len(q) - 1)]), process=False)
+sg = 1.0 if a.end == "max" else -1.0; seam = []
+lo, hi = (float(v) for v in a.range.split(",")) if a.range else (X[:, a.slice_axis].min(), X[:, a.slice_axis].max())
+for xc in np.arange(lo, hi, 0.004):
+    sl = np.nonzero(np.abs(X[:, a.slice_axis] - xc) < 0.002)[0]
+    if len(sl):
+        s = X[sl, a.axis] * sg; seam.extend(sl[s > s.max() - a.edge_band_m])
+seam = np.unique(seam)
+cp, dist, _ = trimesh.proximity.closest_point(tm, X[seam]); ok = dist * 1000 < a.max_mm; seam, cp, dist = seam[ok], cp[ok], dist[ok]
+g = cp - X[seam]; r, k = cKDTree(X[seam]).query(X); w = np.clip(1 - r / a.falloff_m, 0, 1); w = w * w * (3 - 2 * w)
+P[V] = X + w[:, None] * g[k]
+np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+print(json.dumps({"seam_verts": int(len(seam)), "gap_mm_p50_max": [round(float(np.median(dist) * 1000), 1), round(float(dist.max() * 1000), 1)]}))

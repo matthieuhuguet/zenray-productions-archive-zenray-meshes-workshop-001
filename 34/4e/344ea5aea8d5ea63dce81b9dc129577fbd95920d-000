@@ -1,0 +1,49 @@
+"""28 October 2026 : ZenRay Meshes RETOPO, SCULPT OUTER SKIN. The body parts of a delivery, inflated by c through an unsigned distance field
+(Houdini /obj/ZRM_Retopo, INFLATE then KEEP_OUTER), are one surface that still joins the outer and the inner skin through the panel gaps.
+Keep only the faces SEEN FROM OUTSIDE (GPU face id renders from --dirs directions on a sphere), keep the largest seen piece, then move every
+vertex back along its normal by c (a morphological closing : gaps narrower than 2c stay bridged, convex creases stay sharp), then Taubin
+smoothing (--smooth iterations, no shrink). The result is the sculpt, the frozen target of the retopology ; it is never edited afterwards.
+python SculptOuter.py <inflate.npz> <out sculpt.npz> [--dirs 162] [--res 2048] [--smooth 4]
+FR : la peau extérieure du sculpt, faces vues de l'extérieur seulement, dégonflée de c, lissée sans rétrécir."""
+import argparse, json, os, sys, time
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import Raster
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--dirs", type=int, default=162)
+ap.add_argument("--res", type=int, default=2048); ap.add_argument("--smooth", type=int, default=4); ap.add_argument("--c", type=float, default=-1.0)
+a = ap.parse_args(); t0 = time.time()
+d = np.load(a.inp); P = d["P"].astype(float); F = d["F"].astype(np.int64); c = float(d["c"]) if a.c < 0 else a.c
+T = np.vstack([F[:, [0, 1, 2]], F[:, [0, 2, 3]]]); r = Raster.Renderer(P, T)
+# directions : Fibonacci sphere, orthographic views covering the whole car
+k = np.arange(a.dirs) + 0.5; phi = np.arccos(1 - 2 * k / a.dirs); th = np.pi * (1 + 5 ** 0.5) * k
+D = np.stack([np.cos(th) * np.sin(phi), np.cos(phi), np.sin(th) * np.sin(phi)], 1)
+cen = (P.max(0) + P.min(0)) / 2; ext = np.linalg.norm(P.max(0) - P.min(0)); seen = np.zeros(len(T), bool)
+for dz in D:
+    tz = -dz; up = np.array([0, 1, 0.0]) if abs(tz[1]) < 0.9 else np.array([1, 0, 0.0]); rx = np.cross(up, tz); rx /= np.linalg.norm(rx); uy = np.cross(tz, rx)
+    _, _, _, fid = r.render(cen, a.res / (ext * 1.02), (rx.tolist(), uy.tolist(), tz.tolist()), a.res); ids = np.unique(fid[fid >= 0]); seen[ids] = True
+r.release()
+nq = len(F); sq = seen[:nq] | seen[nq:]; Fs = F[sq]
+# largest connected piece of the seen faces (shared vertices)
+nf = len(Fs); rows = np.repeat(np.arange(nf), 4); A = coo_matrix((np.ones(nf * 4), (rows, Fs.ravel())), shape=(nf, len(P))).tocsr()
+G = (A @ A.T); ncomp, lab = connected_components(G, directed=False); big = np.argmax(np.bincount(lab)); Fs = Fs[lab == big]
+used, inv = np.unique(Fs.ravel(), return_inverse=True); Ps = P[used]; Fs = inv.reshape(-1, 4)
+def vnormals(Pv, Fv):
+    n = np.cross(Pv[Fv[:, 2]] - Pv[Fv[:, 0]], Pv[Fv[:, 3]] - Pv[Fv[:, 1]]); vn = np.zeros_like(Pv)
+    for j in range(4): np.add.at(vn, Fv[:, j], n)
+    return vn / (np.linalg.norm(vn, axis=1, keepdims=True) + 1e-12)
+vn = vnormals(Ps, Fs)
+# outward : the seen skin faces away from the centre on average
+if ((Ps - cen) * vn).sum(1).mean() < 0: Fs = Fs[:, ::-1].copy(); vn = -vn
+Ps = Ps - c * vn
+# Taubin smoothing (lambda, mu), umbrella over the quad edges
+E = np.vstack([Fs[:, [0, 1]], Fs[:, [1, 2]], Fs[:, [2, 3]], Fs[:, [3, 0]]]); E = np.unique(np.sort(E, 1), axis=0)
+nv = len(Ps); W = coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(nv, nv)).tocsr()
+deg = np.asarray(W.sum(1)).ravel(); bnd_e = None
+for it in range(a.smooth):
+    for lam in (0.5, -0.53):
+        L = (W @ Ps) / np.maximum(deg, 1)[:, None] - Ps; Ps = Ps + lam * L
+np.savez(a.out, P=Ps.astype(np.float32), F=Fs.astype(np.int32))
+np.savez(a.out.replace(".npz", "_render.npz"), P=Ps.astype(np.float32), F=np.vstack([Fs[:, [0, 1, 2]], Fs[:, [0, 2, 3]]]).astype(np.int32))
+print(json.dumps({"faces_in": nq, "seen": int(sq.sum()), "kept": len(Fs), "pieces": int(ncomp), "c": c, "sec": round(time.time() - t0, 1)}))

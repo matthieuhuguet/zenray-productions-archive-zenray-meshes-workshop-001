@@ -1,0 +1,29 @@
+"""28 October 2026, 20:00 : ZenRay Meshes finishing, BOLT REBUILD, each connected component of the bolt part is rebuilt as a clean all quad bolt head :
+an octagonal prism (centre, radius and height from the old component, axis = the component's thinnest direction), side quads, caps as 4 quad fans,
+closed and outward. FR : chaque boulon refait en prisme octogonal tout en quads, fermé.
+python BoltRebuild.py <in.npz> <out.npz> [--part CAR_under_bolt_C] [--sides 8]"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", default="CAR_under_bolt_C"); ap.add_argument("--sides", type=int, default=8); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = list(d["P"].astype(float)); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+idx = [i for i, m in enumerate(n) if m == a.part]; V = sorted({v for i in idx for v in Q[i]}); par = {v: v for v in V}
+def f(x):
+    while par[x] != x: par[x] = par[par[x]]; x = par[x]
+    return x
+for i in idx:
+    for v in Q[i][1:]: par[f(v)] = f(Q[i][0])
+comps = defaultdict(list)
+for v in V: comps[f(v)].append(v)
+NQ = [q for i, q in enumerate(Q) if n[i] != a.part]; NN = [m for m in n if m != a.part]; S = a.sides
+for vs in comps.values():
+    X = np.array([P[v] for v in vs]); c = X.mean(0); w, U = np.linalg.eigh(np.cov((X - c).T)); ax = U[:, 0]; e1 = U[:, 2]; e2 = np.cross(ax, e1)
+    h = np.ptp((X - c) @ ax); r = np.percentile(np.hypot((X - c) @ e1, (X - c) @ e2), 90)
+    ring = lambda t: [c + ax * t + r * (np.cos(2 * np.pi * k / S) * e1 + np.sin(2 * np.pi * k / S) * e2) for k in range(S)]
+    b = len(P); P += ring(-h / 2) + ring(h / 2); cb = len(P); P += [c - ax * h / 2, c + ax * h / 2]
+    F = [[b + k, b + (k + 1) % S, b + S + (k + 1) % S, b + S + k] for k in range(S)]
+    F += [[b + k, cb, b + (k + 2) % S, b + (k + 1) % S] for k in range(0, S, 2)] + [[b + S + k, b + S + (k + 1) % S, b + S + (k + 2) % S, cb + 1] for k in range(0, S, 2)]
+    Pa = np.array(P); vol = sum(np.dot(Pa[q[0]], np.cross(Pa[q[j]], Pa[q[j + 1]])) for q in F for j in (1, 2))
+    if vol < 0: F = [q[::-1] for q in F]
+    NQ += F; NN += [a.part] * len(F)
+np.savez(a.out, P=np.array(P, np.float32), Q=np.array(NQ, dtype=object), names=np.array(NN)); print(json.dumps({"bolts": len(comps), "faces_each": 3 * S // 2 * 1 + S}))

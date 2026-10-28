@@ -1,0 +1,28 @@
+"""28 October 2026, 16:20 : ZenRay Meshes finishing, MERGE COINCIDENT, inside each part, vertices closer than --tol-mm become one (faces re indexed),
+degenerate faces (a vertex repeated, or area 0) are removed. Nothing moves more than tol. Same names. FR : soude les sommets confondus dans chaque pièce.
+python MergeCoincident.py <in.npz> <out.npz> [--tol-mm 0.1]"""
+import argparse, json
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--tol-mm", type=float, default=0.1); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+remap = np.arange(len(P)); merged = 0
+for p in sorted(set(n)):
+    V = np.array(sorted({x for q, m in zip(Q, n) if m == p for x in q})); t = cKDTree(P[V])
+    for i, j in sorted(t.query_pairs(a.tol_mm / 1000)):
+        ri, rj = remap[V[i]], remap[V[j]]
+        while remap[ri] != ri: ri = remap[ri]
+        while remap[rj] != rj: rj = remap[rj]
+        if ri != rj: remap[max(ri, rj)] = min(ri, rj); merged += 1
+for k in range(len(remap)):
+    r = remap[k]
+    while remap[r] != r: r = remap[r]
+    remap[k] = r
+NQ, NN = [], []; dropped = 0
+for q, m in zip(Q, n):
+    q2 = [int(remap[x]) for x in q]; q3 = [x for i, x in enumerate(q2) if x != q2[i - 1]]
+    if len(set(q3)) < 3: dropped += 1; continue
+    v = P[q3]; ar = np.linalg.norm(np.cross(v[2] - v[0], v[-1] - v[1]))
+    if ar < 1e-10: dropped += 1; continue
+    NQ.append(q3); NN.append(m)
+np.savez(a.out, P=P.astype(np.float32), Q=np.array(NQ, dtype=object), names=np.array(NN)); print(json.dumps({"merged": merged, "faces_dropped": dropped}))

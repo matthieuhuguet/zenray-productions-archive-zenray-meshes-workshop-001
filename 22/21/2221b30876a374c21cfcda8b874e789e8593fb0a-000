@@ -1,36 +1,87 @@
-# 27 October 2026 14:17 Paris: reject detected edge crossings at the bounding-box neighbours of each configured component.
-import argparse,json,os,sys
+"""28 October 2026 : ZenRay Meshes ASSEMBLY CHECK (task KA, Procedura, SKILL section 230). Reads the assembly graph (named parts, typed
+mates with tolerances) and checks it on a delivery : every part closed (no open edge) ; concentric (wheel centre on the arch centre in the
+side view, tyre to arch clearance in range) ; contact (share of the part touching its housing within tol) ; gap (panel gap in range along
+the shared band) ; hinge (axis defined ; the opening test comes with K3). A part is ADMITTED only if it is closed and all its mates pass.
+Writes a JSON report ; exit 0 only when every part is admitted.
+python AssemblyCheck.py <delivery.npz> [--graph templates/car/assembly.json] [--out report.json] [--selftest]
+FR : le vérificateur du graphe d'assemblage : pièces fermées, liaisons typées mesurées, pièce admise seulement si tout passe."""
+import argparse, fnmatch, json, os, sys
+from collections import defaultdict
 import numpy as np
-sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
-from ReplaceComponents import read_mesh
-from InterfaceCollision import mesh_for,crossing
+from scipy.spatial import cKDTree
+GRAPH = "/Users/zenray/.claude/skills/zenray-meshes/templates/car/assembly.json"
 
 
-def main(args):
-    points,faces,names=read_mesh(args.assembly);mapping={}
-    for f,name in zip(faces,names):mapping.setdefault(name,set()).update(f)
-    bounds={name:(points[list(ids)].min(0),points[list(ids)].max(0)) for name,ids in mapping.items() if ids}
-    config=json.load(open(args.config));report={};total=0
-    parts=[name for entry in config['panels'] for name in (entry['part'],entry.get('mirror_part')) if name]
-    for name in parts:
-        lo,hi=bounds[name];subject=mesh_for(points,faces,names,name)
-        candidates=[other for other,(low,high) in bounds.items() if other!=name and np.all(high>=lo) and np.all(low<=hi)]
-        report[name]={}
-        for other in sorted(candidates):
-            neighbour=mesh_for(points,faces,names,other)
-            a=crossing(subject,neighbour,args.epsilon);b=crossing(neighbour,subject,args.epsilon)
-            contained=0
-            if subject.is_watertight:
-                centers=neighbour.triangles_center;low,high=subject.bounds
-                selected=np.flatnonzero(np.all((centers>=low)&(centers<=high),axis=1))
-                if len(selected):contained=int(subject.contains(centers[selected]).sum())
-            total+=a+b+contained
-            report[name][other]={'subject_edges_crossing':a,'neighbour_edges_crossing':b,'neighbour_triangles_inside':contained}
-    result={'date':'27 October 2026','total_crossings':total,'components':report,'epsilon_m':args.epsilon,'limitation':'Coplanar overlap and containment without a sampled triangle centre are not detected.'}
-    with open(args.output,'w') as f:json.dump(result,f,indent=2)
-    print(json.dumps({'total_crossings':total,'report':args.output}))
-    return int(total>0)
+def load(npz):
+    d = np.load(npz, allow_pickle=True); return d["P"].astype(float), [list(map(int, q)) for q in d["Q"]], np.array([str(x) for x in d["names"]])
 
-if __name__=='__main__':
-    ap=argparse.ArgumentParser();ap.add_argument('assembly');ap.add_argument('config');ap.add_argument('output');ap.add_argument('--epsilon',type=float,default=1e-5)
-    sys.exit(main(ap.parse_args()))
+
+def part_faces(Q, names, pats):
+    sel = [i for i, n in enumerate(names) if any(fnmatch.fnmatch(n, p) for p in pats)]; return [Q[i] for i in sel]
+
+
+def open_edges(QQ):
+    E = defaultdict(int)
+    for q in QQ:
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))] += 1
+    return sum(c == 1 for c in E.values())
+
+
+def circle_yz(X):
+    M = np.stack([X[:, 2], X[:, 1], np.ones(len(X))], 1); s2, s1, c = np.linalg.lstsq(M, X[:, 2] ** 2 + X[:, 1] ** 2, rcond=None)[0]
+    cz, cy = s2 / 2, s1 / 2; return cz, cy, float(np.sqrt(c + cz * cz + cy * cy))
+
+
+def check(P, Q, names, graph):
+    parts = {}
+    for pn, spec in graph["parts"].items():
+        QQ = part_faces(Q, names, spec["names"]); V = P[np.unique(np.concatenate([np.array(q) for q in QQ]))] if QQ else np.zeros((0, 3))
+        parts[pn] = {"faces": QQ, "V": V, "present": bool(QQ), "open_edges": open_edges(QQ) if QQ else None, "fails": []}
+        if not QQ: parts[pn]["fails"].append("absent")
+        elif parts[pn]["open_edges"]: parts[pn]["fails"].append("open (%d edges)" % parts[pn]["open_edges"])
+    mates = []
+    for m in graph["mates"]:
+        a = parts[m["a"]]; rec = {"type": m["type"], "a": m["a"], "b": m.get("b"), "ok": False}
+        if not a["present"]: rec["why"] = "part a absent"; mates.append(rec); a["fails"].append(m["type"] + " : absent"); continue
+        if m["type"] == "concentric":
+            T = P[np.unique(np.concatenate([np.array(q) for q in part_faces(Q, names, [m["tyre_part"]])]))]; b = parts[m["b"]]
+            if not b["present"]: rec["why"] = "arch absent"
+            else:
+                tc = T.mean(0); tr = float(np.percentile(np.hypot(T[:, 1] - tc[1], T[:, 2] - tc[2]), 99)); cz, cy, ar = circle_yz(b["V"])
+                dc = float(np.hypot(cz - tc[2], cy - tc[1])); cl = ar - tr
+                rec.update({"centre_offset_m": round(dc, 4), "clearance_m": round(cl, 4)}); rec["ok"] = dc <= m["center_tol"] and m["clearance"][0] <= cl <= m["clearance"][1]
+        elif m["type"] == "contact":
+            bs = [parts[b] for b in m["b"] if parts[b]["present"]]
+            if not bs: rec["why"] = "housing absent"
+            else:
+                d = cKDTree(np.vstack([b["V"] for b in bs])).query(a["V"])[0]; share = float((d <= m["tol"]).mean())
+                rec.update({"contact_share": round(share, 3), "min_gap_mm": round(float(d.min() * 1000), 2)}); rec["ok"] = share >= m["min_share"]
+        elif m["type"] == "gap":
+            b = parts[m["b"]]
+            if not b["present"]: rec["why"] = "part b absent"
+            else:
+                d = cKDTree(b["V"]).query(a["V"])[0]; band = d[d <= m["band"]]
+                if not len(band): rec["why"] = "no shared border within %.0f mm" % (m["band"] * 1000)
+                else:
+                    g = float(np.percentile(band, 10)); rec.update({"gap_p10_mm": round(g * 1000, 2)}); rec["ok"] = m["range"][0] <= g <= m["range"][1]
+        elif m["type"] == "hinge":
+            rec["why"] = "pivot absent" if m.get("axis") is None else "opening test not written yet (K3)"; rec["ok"] = False
+        if not rec["ok"]:
+            a["fails"].append("%s %s : %s" % (m["type"], m.get("b") or "", rec.get("why", json.dumps({k: v for k, v in rec.items() if k.endswith(("_m", "_mm", "_share"))}))))
+        mates.append(rec)
+    report = {"parts": {pn: {"admitted": not p["fails"], "fails": p["fails"]} for pn, p in parts.items()}, "mates": mates}
+    report["admitted"] = sum(v["admitted"] for v in report["parts"].values()); report["of"] = len(report["parts"]); return report
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--graph", default=GRAPH); ap.add_argument("--out", default=""); ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args(); P, Q, names = load(a.npz); graph = json.load(open(a.graph))
+    if a.selftest:   # the verifier both ways : the kept wheel FL against its arch, then the same wheel moved 5 cm forward must fail
+        g1 = {"parts": {k: graph["parts"][k] for k in ("wheel_FL", "arch_FL")}, "mates": [graph["mates"][0]]}; r1 = check(P, Q, names, g1)
+        sel = np.unique(np.concatenate([np.array(q) for q in part_faces(Q, names, graph["parts"]["wheel_FL"]["names"])])); P2 = P.copy(); P2[sel, 2] += 0.05
+        r2 = check(P2, Q, names, g1); ok = r1["mates"][0]["ok"] and not r2["mates"][0]["ok"]
+        print(json.dumps({"kept": r1["mates"][0], "moved_5cm": r2["mates"][0], "selftest": "PASS" if ok else "FAIL"})); sys.exit(0 if ok else 1)
+    rep = check(P, Q, names, graph)
+    if a.out: json.dump(rep, open(a.out, "w"), indent=1, ensure_ascii=False)
+    for pn, v in rep["parts"].items(): print("%-14s %s %s" % (pn, "ADMIS " if v["admitted"] else "REFUSÉ", "; ".join(v["fails"])[:150]))
+    print("admitted %d / %d" % (rep["admitted"], rep["of"])); sys.exit(0 if rep["admitted"] == rep["of"] else 1)

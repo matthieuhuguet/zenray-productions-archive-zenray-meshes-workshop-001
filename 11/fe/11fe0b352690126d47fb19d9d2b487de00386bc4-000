@@ -1,0 +1,86 @@
+"""28 October 2026, 22:40 : ZenRay Meshes finishing, FENDER PATCH, the front fender as patches between design curves (section 225 : patch layout first,
+four sided sections from the arch to the upper surface), nothing projected on the crumpled frozen shape :
+three boundary curves per column z (one arc each) : BOTTOM (the arch circle over the wheel, the sill line elsewhere), CREASE (the shoulder crease of the
+reference side view, lifted over the arch so it never crosses it), TOP (the hood side edge, the old fender top behind the cowl) ; x of each curve is one
+arc fitted on the frozen fender at that height ; the lower facet is ruled bottom to crease, the upper facet ruled crease to top with a light crown ;
+the crease row is shared (a crisp edge with one support row each side) ; closed 12 mm shell, mirrored. FR : l'aile en patchs tendus entre courbes de design.
+python FenderPatch.py <delivery.npz> <out.npz> [--crease z0,y0,z1,y1,sag] [--rows-low 8] [--rows-up 10] [--crown-m 0.01]"""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--target", default=W + "target_v644.npz")
+ap.add_argument("--crease", default="0.70,0.75,2.06,0.56,0.02"); ap.add_argument("--rows-low", type=int, default=8); ap.add_argument("--rows-up", type=int, default=10)
+ap.add_argument("--crown-m", type=float, default=0.010); ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--y-bottom", type=float, default=0.30)
+ap.add_argument("--pad", type=float, default=0.015); ap.add_argument("--thick", type=float, default=0.012); ap.add_argument("--support-m", type=float, default=0.006); ap.add_argument("--coons", type=int, default=1, help="1 : columns by ARC LENGTH along each boundary chain (sill, arch, sill), not by z : no jump at the arch ends (28 October 2026)")
+a = ap.parse_args()
+TP, _ = part(a.target, "CAR_body_fender_front_L"); Ar, _ = part(a.npz, "CAR_arch_front_L"); HC = np.load(W + "finish/hood_side_L.npy"); HC = HC[np.argsort(HC[:, 2])]
+M = np.stack([Ar[:, 2], Ar[:, 1], np.ones(len(Ar))], 1); s2, s1, cc = np.linalg.lstsq(M, Ar[:, 2] ** 2 + Ar[:, 1] ** 2, rcond=None)[0]
+cz, cy = s2 / 2, s1 / 2; R = np.sqrt(cc + cz * cz + cy * cy) + a.pad
+z0, z1 = TP[:, 2].min() + 0.01, TP[:, 2].max() - 0.02; zz = np.linspace(z0, z1, int((z1 - z0) / a.edge_m) + 1)
+arc = lambda zs, v: np.polyval(np.polyfit(zs, v, 2), zz)
+def xat(y, band=0.02):   # outermost frozen fender x at height y per column, then one arc
+    xs = []
+    for z, yy in zip(zz, y):
+        s = TP[(np.abs(TP[:, 2] - z) < 0.015) & (np.abs(TP[:, 1] - yy) < band)]; xs.append(s[:, 0].max() if len(s) else np.nan)
+    xs = np.array(xs); k = ~np.isnan(xs); return arc(zz[k], xs[k])
+# TOP
+tops = np.array([TP[np.abs(TP[:, 2] - z) < 0.012][:, 1].max() for z in zz]); beh = zz < HC[0, 2]
+yt = np.where(beh, np.polyval(np.polyfit(zz[beh], tops[beh], 2), zz), np.interp(zz, HC[:, 2], HC[:, 1]))
+xt_beh = np.array([TP[(np.abs(TP[:, 2] - z) < 0.012)][TP[(np.abs(TP[:, 2] - z) < 0.012)][:, 1].argmax(), 0] for z in zz])
+xt = np.where(beh, np.polyval(np.polyfit(zz[beh], xt_beh[beh], 2), zz), np.interp(zz, HC[:, 2], HC[:, 0]))
+jc = np.argmin(np.abs(zz - HC[0, 2])); yt[beh] += yt[jc] - np.polyval(np.polyfit(zz[beh], tops[beh], 2), zz[jc]) if False else 0
+# BOTTOM
+dz = np.abs(zz - cz); yb = np.where(dz < R, cy + np.sqrt(np.clip(R * R - dz * dz, 0, None)), a.y_bottom); yb = np.maximum(yb, a.y_bottom)
+xb = np.where(dz < R, np.percentile(Ar[:, 0], 90), np.nan); out = np.isnan(xb)
+if out.any(): xb[out] = xat(yb + 0.02)[out]
+# CREASE (lifted over the arch : at least 35 % of the way from bottom to top)
+c0, cy0, c1, cy1, sag = (float(t) for t in a.crease.split(",")); t = (zz - c0) / (c1 - c0); yc = cy0 + (cy1 - cy0) * t + sag * 4 * t * (1 - t)
+yc = np.maximum(yc, yb + 0.35 * (yt - yb)); yc = np.minimum(yc, yt - 0.25 * (yt - yb)); xc = xat(yc)
+ok = (yt - yb) > 0.05; zz, yt, xt, yb, xb, yc, xc = zz[ok], yt[ok], xt[ok], yb[ok], xb[ok], yc[ok], xc[ok]
+if a.coons:
+    # bottom chain with the vertical arch flanks : sill -> down the rear flank of the arch is replaced by the full circle where it is below the column grid
+    xarch = np.percentile(Ar[:, 0], 90)
+    zs_ = np.linspace(zz[0], zz[-1], 4000); ch = []
+    for z in zs_:
+        d_ = abs(z - cz)
+        ch.append([xarch if d_ < R else np.interp(z, zz, xb), max(cy + np.sqrt(max(R * R - d_ * d_, 0)), a.y_bottom) if d_ < R else a.y_bottom, z])
+    ch = np.array(ch)
+    # insert the vertical flanks : at z = cz -+ R the chain drops from cy to the sill
+    for sgn in (-1, 1):
+        ze = cz + sgn * R; k = np.searchsorted(ch[:, 2], ze)
+        if 0 < k < len(ch) and ch[k - 1, 1] != ch[k, 1]:
+            ys = np.linspace(ch[k - 1, 1], ch[k, 1], 40)[1:-1]; ins = np.stack([np.full(len(ys), xarch), ys, np.full(len(ys), ze)], 1)
+            ch = np.vstack([ch[:k], ins, ch[k:]])
+    def resample(C, m):
+        L = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(C, axis=0), axis=1))]); u = np.linspace(0, L[-1], m)
+        return np.stack([np.interp(u, L, C[:, j]) for j in range(3)], 1)
+    m_ = len(zz); Bc = resample(ch, m_); Cc = resample(np.stack([xc, yc, zz], 1), m_); Tc = resample(np.stack([xt, yt, zz], 1), m_)
+    xb, yb, zb_ = Bc[:, 0], Bc[:, 1], Bc[:, 2]; xc, yc, zc_ = Cc[:, 0], Cc[:, 1], Cc[:, 2]; xt, yt, zt_ = Tc[:, 0], Tc[:, 1], Tc[:, 2]
+else:
+    zb_ = zc_ = zt_ = zz
+# rows : lower facet, support row, crease, support row, upper facet
+tl = np.linspace(0, 1, a.rows_low + 1); tu = np.linspace(0, 1, a.rows_up + 1); rows = []
+Bp, Cp, Tp = np.stack([xb, yb, zb_], 1), np.stack([xc, yc, zc_], 1), np.stack([xt, yt, zt_], 1)
+for s in tl[:-1]: rows.append(Bp + (Cp - Bp) * s)
+dlo = np.linalg.norm(Cp - Bp, axis=1); sl = (1 - a.support_m / np.maximum(dlo, 1e-6))[:, None]; rows.append(Bp + (Cp - Bp) * sl)
+rows.append(Cp)
+dup = np.linalg.norm(Tp - Cp, axis=1); su = (a.support_m / np.maximum(dup, 1e-6))[:, None]; rows.append(Cp + (Tp - Cp) * su)
+for s in tu[1:]:
+    cr = a.crown_m * 4 * s * (1 - s); rows.append(Cp + (Tp - Cp) * s + np.array([cr, cr * 0.5, 0]))
+G = np.array(rows); nb, na = G.shape[:2]
+du = np.gradient(G, axis=1); dv = np.gradient(G, axis=0); N = np.cross(du, dv); N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+if N[..., 0].mean() < 0: N = -N
+B = G - a.thick * N; gid = lambda j, i: j * na + i; off = nb * na; P = np.vstack([G.reshape(-1, 3), B.reshape(-1, 3)]); F = []
+for j in range(nb - 1):
+    for i in range(na - 1):
+        q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]; F.append(q); F.append([off + x for x in q[::-1]])
+ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+for k in range(len(ring)): F.append([ring[k], off + ring[k], off + ring[(k + 1) % len(ring)], ring[(k + 1) % len(ring)]])
+vol = sum(np.dot(P[q[0]], np.cross(P[q[k]], P[q[k + 1]])) for q in F for k in (1, 2))
+if vol < 0: F = [q[::-1] for q in F]
+PR = P * np.array([-1, 1, 1]); FR = [[v + len(P) for v in q[::-1]] for q in F]
+np.savez(a.out, P=np.vstack([P, PR]).astype(np.float32), Q=np.array(F + FR, dtype=object), names=np.array(["CAR_body_fender_front_L"] * len(F) + ["CAR_body_fender_front_R"] * len(FR)))
+print(json.dumps({"grid": [nb, na], "arch": [round(float(cz), 3), round(float(cy), 3), round(float(R), 3)], "x_top": [round(float(xt.min()), 3), round(float(xt.max()), 3)],
+                  "x_crease": [round(float(xc.min()), 3), round(float(xc.max()), 3)], "x_bottom": [round(float(xb.min()), 3), round(float(xb.max()), 3)]}))

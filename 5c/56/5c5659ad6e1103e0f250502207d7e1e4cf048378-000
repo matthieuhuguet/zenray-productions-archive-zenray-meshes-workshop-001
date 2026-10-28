@@ -1,0 +1,37 @@
+"""28 October 2026, 18:50 : ZenRay Meshes finishing, FILL HOLES, every closed boundary loop (open edges) of a part with an EVEN number of vertices
+(up to --max-n) is capped by quads around a new centre vertex (centroid, pushed along the loop normal by --dome of the loop radius), winding taken
+from the neighbour faces so the cap is consistent ; odd loops and loops that do not close are reported. FR : bouche les trous par des quads en éventail.
+python FillHoles.py <in.npz> <out.npz> [--max-n 400] [--dome 0.0]"""
+import argparse, json
+from collections import defaultdict, Counter
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--max-n", type=int, default=400); ap.add_argument("--dome", type=float, default=0.0); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]; P = list(d["P"].astype(float))
+filled = Counter(); skipped = Counter(); NQ, NN = [], []
+for part in sorted(set(n)):   # per part : a border vertex shared with another part must not branch the walk (28 October 2026)
+    E = defaultdict(list); D = set()
+    for i, q in enumerate(Q):
+        if n[i] != part: continue
+        for k in range(len(q)):
+            u, w = q[k], q[(k + 1) % len(q)]; E[(min(u, w), max(u, w))].append(i); D.add((u, w))
+    nxt = defaultdict(list)
+    for (u, w), f in E.items():
+        if len(f) == 1:
+            s_, t_ = (u, w) if (u, w) in D else (w, u); nxt[t_].append(s_)
+    left = {(v, x) for v, xs in nxt.items() for x in xs}
+    while left:
+        v0, x0 = next(iter(left)); L = [v0]; prev = v0; c = x0; left.discard((v0, x0)); ok = True
+        while c != v0:
+            L.append(c); cands = [x for x in nxt.get(c, []) if (c, x) in left]
+            if not cands: ok = False; break
+            if len(cands) > 1:   # pinch : smallest turn
+                d0 = P[c] - P[prev]; cands.sort(key=lambda x: -np.dot(d0 / (np.linalg.norm(d0) + 1e-12), (P[x] - P[c]) / (np.linalg.norm(P[x] - P[c]) + 1e-12)))
+            nx_ = cands[0]; left.discard((c, nx_)); prev, c = c, nx_
+            if len(L) > a.max_n: ok = False; break
+        if not ok or len(L) % 2:
+            skipped["open" if not ok else "odd"] += 1; continue
+        X = np.array([P[v] for v in L]); cen = X.mean(0); ci = len(P); P.append(cen)
+        for k in range(0, len(L), 2): NQ.append([L[k], L[k + 1], L[(k + 2) % len(L)], ci]); NN.append(part)
+        filled[part] += 1
+np.savez(a.out, P=np.array(P, np.float32), Q=np.array(Q + NQ, dtype=object), names=np.array(n + NN))
+print(json.dumps({"loops_filled": sum(filled.values()), "cap_quads": len(NQ), "skipped": dict(skipped), "by_part": dict(filled)}))

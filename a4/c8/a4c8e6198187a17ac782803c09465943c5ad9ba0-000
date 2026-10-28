@@ -1,0 +1,66 @@
+"""28 October 2026 : ZenRay Meshes RETOPO TOURNAMENT, runs the four phases of each method on the test component and writes the measures
+(results/<id>.json) and one board per phase (boards/<id>_P<k>.png). P1 raw topology (Methods.py), P2 boundary on the shared contours,
+P3 fairing with the fit weight, P4 closed 2.5 mm shell (audit of the solid). Then `sheet` builds the contact sheet and the table.
+python Tournament.py run R06 R07 ...        python Tournament.py sheet
+FR : le lanceur du tournoi, quatre phases par méthode, mesures et planches."""
+import json, os, sys, time, traceback
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+import RetopoMethods as M
+OUT = C.RT + "fender/"; os.makedirs(OUT + "results", exist_ok=True); os.makedirs(OUT + "boards", exist_ok=True); os.makedirs(OUT + "meshes", exist_ok=True)
+
+
+def run(mid):
+    res = {"id": mid, "doc": (M.METHODS[mid].__doc__ or "").strip(), "phases": {}}
+    try:
+        t0 = time.time(); P, Q = M.METHODS[mid](); P = np.asarray(P, float); Q = [list(map(int, q)) for q in Q]; P, Q = C.compact(P, Q)
+        res["p1_sec"] = round(time.time() - t0, 1)
+        stages = [("P1", lambda P, Q: (P, Q)), ("P2", lambda P, Q: (C.p2_conform(P, Q), Q)), ("P3", lambda P, Q: (C.p3_fair(P, Q), Q))]
+        for name, f in stages:
+            t1 = time.time(); P, Q = f(P, Q); m = C.measure(P, Q); m["sec"] = round(time.time() - t1, 1); res["phases"][name] = m
+            C.save_cand(OUT + "meshes/%s_%s.npz" % (mid, name), P, Q); C.board(P, Q, OUT + "boards/%s_%s.png" % (mid, name), "%s %s" % (mid, name))
+        t1 = time.time(); PS, QS = C.p4_shell(P, Q)
+        from Bench import topology
+        m = topology(QS, PS); m["crease_on_edges"] = res["phases"]["P3"]["crease_on_edges"]; m["sec"] = round(time.time() - t1, 1); res["phases"]["P4"] = m
+        C.save_cand(OUT + "meshes/%s_P4.npz" % mid, PS, QS); C.board(PS, QS, OUT + "boards/%s_P4.png" % mid, "%s P4" % mid)
+    except Exception as e:
+        res["error"] = "%s: %s" % (type(e).__name__, str(e)[:600]); res["trace"] = traceback.format_exc()[-1500:]
+    json.dump(res, open(OUT + "results/%s.json" % mid, "w"), indent=1); print(mid, "error" if "error" in res else "ok", res.get("error", ""))
+
+
+def sheet():
+    from PIL import Image, ImageDraw
+    rows = []; ids = sorted(M.METHODS)
+    for mid in ids:
+        p = OUT + "results/%s.json" % mid
+        if not os.path.exists(p): continue
+        r = json.load(open(p)); rows.append(r)
+    keys = ["dev_p50_mm", "dev_p95_mm", "fair_p95_deg", "edge_mm", "crease_on_edges", "boundary_p95_mm", "weld_ready", "outline_top_mm", "shading_ratio", "quads_pct", "irregular", "min_angle_p5"]
+    lines = ["| id | phase | " + " | ".join(keys) + " | open (P4) | nonmanifold (P4) |", "|" + "---|" * (len(keys) + 4)]
+    for r in rows:
+        if "error" in r: lines.append("| %s | error | %s |" % (r["id"], r["error"][:120].replace("|", "/"))); continue
+        for ph in ("P1", "P3"):
+            m = r["phases"][ph]; lines.append("| %s | %s | " % (r["id"], ph) + " | ".join(str(m.get(k)) for k in keys) + " | %s | %s |" % (r["phases"]["P4"]["open_edges"], r["phases"]["P4"]["nonmanifold"]))
+    open(OUT + "Table.md", "w").write("\n".join(lines) + "\n"); print("\n".join(lines))
+    tiles = []
+    for r in rows:
+        row = []
+        for ph in ("P1", "P2", "P3", "P4"):
+            p = OUT + "boards/%s_%s.png" % (r["id"], ph)
+            im = Image.open(p).convert("RGB").resize((420, 210)) if os.path.exists(p) else Image.new("RGB", (420, 210), (60, 0, 0))
+            row.append(im)
+        tiles.append(row)
+    if tiles:
+        for half, part in enumerate((tiles[:8], tiles[8:])):
+            if not part: continue
+            S = Image.new("RGB", (420 * 4, 210 * len(part)), (40, 40, 40))
+            for i, row in enumerate(part):
+                for j, im in enumerate(row): S.paste(im, (j * 420, i * 210))
+            S.save(OUT + "Contact_%d.png" % half)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "run":
+        for mid in sys.argv[2:]: run(mid)
+    else: sheet()

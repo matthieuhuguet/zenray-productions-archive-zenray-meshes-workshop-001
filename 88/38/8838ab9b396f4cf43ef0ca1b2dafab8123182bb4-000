@@ -1,0 +1,26 @@
+"""28 October 2026 : ZenRay Meshes CURVE RIG preview : loft of a rig JSON, two Catmull Clark levels (design edges sharp), smooth shaded
+render (three quarter front and side) and a ZEBRA render (reflection stripes : a wrinkle bends the stripes, a clean class A surface keeps
+them smooth), one board. python RenderRig.py <rig.json> <out.png> [title]   FR : aperçu du rig, rendu lissé et rayures zébrées."""
+import os, subprocess, sys, json
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo")); sys.path.insert(0, os.path.dirname(HERE))
+import RigLib as RL, Common as C, RetopoMethods as M, Raster
+from PIL import Image, ImageDraw
+rig_path, out = sys.argv[1], sys.argv[2]; title = sys.argv[3] if len(sys.argv) > 3 else os.path.basename(rig_path)
+if rig_path.endswith(".npz"):   # 28 October 2026 : an already subdivided mesh (CageFit output : P, Q)
+    d = np.load(rig_path); P = d["P"]; Q = d["Q"].tolist()
+else:
+    rig = json.load(open(rig_path)); P, Q, sharp, lines, grids = RL.loft(rig); sh = set(map(tuple, sharp))
+    P, Q, sh = M._cc(P, Q, sh); P, Q, _ = M._cc(P, Q, sh)
+T = C.tris(Q)
+V = P; c = (V.max(0) + V.min(0)) / 2; ext = np.linalg.norm(V.max(0) - V.min(0)); res = 640; r = Raster.Renderer(P.astype(np.float32), T, smooth_deg=89.0); tiles = []
+for rx, uy in (((0.70, 0, -0.71), (-0.25, 0.94, -0.25)), ((0, 0, -1), (0, 1, 0))):
+    rx = np.array(rx, float); rx /= np.linalg.norm(rx); uy = np.array(uy, float); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
+    Mk, _, N, _ = r.render(c, res / (ext * 1.05), (rx.tolist(), uy.tolist(), tz.tolist()), res)
+    L = np.array([0.30, 0.55, 0.78]); L /= np.linalg.norm(L); sh_ = np.clip(0.18 + 0.82 * np.clip((N * L).sum(-1), 0, 1), 0, 1)
+    tiles.append(np.where(Mk, sh_ * 235, 92).astype(np.uint8))
+    Rf = N - 2 * (N[..., 2:3]) * np.array([0, 0, 1.0]); zeb = (np.sin(Rf[..., 1] * 28.0) > 0)   # stripes of the reflected direction
+    tiles.append(np.where(Mk, np.where(zeb, 230, 40), 92).astype(np.uint8))
+r.release()
+im = Image.fromarray(np.concatenate([np.concatenate(tiles[:2], 1), np.concatenate(tiles[2:], 1)], 0)).convert("RGB")
+ImageDraw.Draw(im).text((10, 10), title, fill=(255, 255, 0)); im.save(out); print(out)

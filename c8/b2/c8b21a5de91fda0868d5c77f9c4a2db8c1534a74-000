@@ -1,0 +1,41 @@
+"""28 October 2026 : ZenRay Meshes CAR, the algorithm in one command (task K0, SKILL section 229). The stages live in a JSON
+(work/car/pipeline.json, the interface) ; each stage is a script with its parameters, run in order, timed, stopped at the first failure.
+The car being built is work/car/delivery_pipe.npz. Stage 'checkpoint' starts from the kept car for every component no stage rebuilds yet ;
+each validated component stage (K1 body cage, K2 panels, ...) is appended and replaces its parts, until the checkpoint is no longer needed
+and the whole car comes from the reference sheet. The agent builds and improves stages ; it never models the car by hand.
+python ZenRayMeshesCar.py run [--from NAME] [--to NAME]     python ZenRayMeshesCar.py list
+FR : l'algorithme en une commande : des étages scriptés et paramétrés, enchaînés, mesurés."""
+import json, os, shutil, subprocess, sys, time
+A = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"; PIPE = A + "work/car/pipeline.json"
+SUBST = {"{A}": A, "{PY}": "/Users/zenray/.venvs/zenray-meshes/bin/python"}
+
+
+def sub(x):
+    for k, v in SUBST.items(): x = x.replace(k, v)
+    return x
+
+
+def run(frm=None, to=None):
+    cfg = json.load(open(PIPE)); log = []; on = frm is None
+    for st in cfg["stages"]:
+        if not on and st["name"] == frm: on = True
+        if not on: continue
+        t0 = time.time(); rec = {"stage": st["name"]}
+        if st.get("kind") == "copy":
+            shutil.copyfile(sub(st["src"]), sub(st["dst"])); rec["ok"] = True
+        else:
+            r = subprocess.run([sub(c) for c in st["cmd"]], cwd=A, capture_output=True, text=True)
+            rec["ok"] = r.returncode == 0 or st.get("allow_fail", False); rec["tail"] = (r.stdout or "").strip().splitlines()[-1:] + (r.stderr or "").strip().splitlines()[-2:] if not r.returncode == 0 else (r.stdout or "").strip().splitlines()[-1:]
+        rec["sec"] = round(time.time() - t0, 1); log.append(rec); print(json.dumps(rec, ensure_ascii=False), flush=True)
+        if not rec["ok"]: break
+        if to and st["name"] == to: break
+    json.dump({"pipeline": PIPE, "stages": log}, open(A + "versions/Pipeline_last.json", "w"), indent=1, ensure_ascii=False)
+    return all(r["ok"] for r in log)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "list":
+        for st in json.load(open(PIPE))["stages"]: print("%-12s %s" % (st["name"], st.get("doc", "")))
+    else:
+        a = sys.argv[2:]; frm = a[a.index("--from") + 1] if "--from" in a else None; to = a[a.index("--to") + 1] if "--to" in a else None
+        sys.exit(0 if run(frm, to) else 1)

@@ -1,0 +1,147 @@
+"""28 October 2026 : ZenRay Meshes SCHEMATIC, the blueprint sheet that makes the truth (Matthieu's rule : the schematics are checked first,
+the 3D follows ; a schematic is faster to correct than a component). One sheet with the six reference views (left, right, top, bottom,
+front, back), each at its calibrated scale (work/car/frame/frame.json), and on every view : every NURBS curve of the rig, coloured by the
+component it belongs to (left side as built, right side mirrored), thick when it is a sharp crease, medium for a design or border line,
+thin for a spoke ; the nodes (named on the left and top views) ; the measured points (pixel readings, crosses) and the ONE smooth curve
+fitted through them (purple), so each reading and its smoothing are checked side by side. Also writes points.json : every node with its
+world matrix (tangent, binormal, normal, position, like a Maya controller), and every measured line with its points, its smooth fit and
+the residual of each point to the fit.
+python Schematic.py [--rig work/car/curverig/RIG_car_hard.json] [--cage work/car/curverig/cage_side.npz] [--out versions/Schematic_car.png]
+FR : la planche des schémas, les six vues de la ref et toutes les courbes NURBS dessinées dessus ; elle fait foi avant la 3D."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {   # 28 October 2026 : the interface of the schematic sheet
+    "scale": 2, "fade": 0.45, "margin": 40, "title_h": 34,
+    "layout": [["left", "right"], ["top", "bottom"], ["front", "back"]],
+    "images": {"front": "00_front", "back": "01_back", "left": "02_left", "right": "03_right", "top": "04_top", "bottom": "05_bottom"},
+    "label_views": ["left", "top"],
+    "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf",
+    "components": {   # patch name prefix -> component, first match wins (the order of the curve rig sections)
+        "door": ["DOOR", "ROCKER_D", "ROCKER_F", "RING_LOW"], "quarter": ["RING_LOWQ", "ROCKER_Q", "RINGQ", "Q_"],
+        "band": ["H1", "H2", "H3"], "fin": ["FIN"], "fender": [""]},
+    "colours": {"fender": (214, 39, 40), "door": (31, 119, 180), "quarter": (44, 160, 44), "band": (148, 103, 189), "fin": (255, 127, 14)},
+    "width": {"sharp": 3, "fixed": 2, "spoke": 1}, "measure_colour": (160, 0, 160),
+}
+
+
+def component_of(patch):
+    for comp, pre in PARAMS["components"].items():
+        if any(patch.startswith(p) for p in pre if p) or pre == [""]: return comp
+    return "fender"
+
+
+def view_mapper(v, lo, hi, s):
+    """World point -> sheet pixel for one calibrated orthographic view (u along rx, v up along uy), at sheet scale s."""
+    rx, uy = np.array(v["rx"], float), np.array(v["uy"], float); b = v["bbox"]; ppm = v["px_per_m"] * s
+    amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+    def m(P):
+        P = np.atleast_2d(P); return np.stack([b[0] * s + (P @ rx - amin) * ppm, b[3] * s - (P @ uy - bmin) * ppm], 1)
+    return m
+
+
+def measured_lines():
+    """The pixel readings of the rig and their smooth fits : (name, view, readings [(z, value)], fit poly, axis of the value)."""
+    import CarNet as CN
+    P = CN.PARAMS; out = []
+    for key, deg in (("ridge_top", P["line_deg"]), ("diag_top", P["line_deg"]), ("glass_top", P["line_deg"]), ("finbase_top", P["line_deg"]), ("apillar_line_top", 3)):
+        a = np.array(P[key], float); out.append((key, "top", a, np.polyfit(a[:, 0], a[:, 1], min(deg, len(a) - 1)), 0))
+    for key, deg in (("cpillar_side", P["cp_deg"]), ("shoulder_rear_points", 2)):
+        a = np.array(P[key], float); out.append((key, "left", a, np.polyfit(a[:, 0], a[:, 1], min(deg, len(a) - 1)), 1))
+    d = json.load(open(W + "work/car/finish/DesignLines.json"))
+    for k, v in d.items():
+        if k.startswith("_"): continue
+        out.append(("design_" + k, "left", np.zeros((0, 2)), np.array(v["coef"], float), 1, (v["z0"], v["z1"])))
+    return out
+
+
+def node_frames(rig, cage):
+    """A world matrix per node : tangent of its first curve, surface normal of the cage limit, binormal ; columns t, b, n, p."""
+    C = np.array(rig["controls"], float); S = np.load(cage); P, Q = S["P"].astype(float), np.asarray(S["Q"])
+    N = np.zeros_like(P)
+    for q in Q:
+        a, b, c = P[q[0]], P[q[1]], P[q[2]]; n = np.cross(b - a, c - a); N[q] += n
+    N /= np.linalg.norm(N, axis=1)[:, None] + 1e-15; kd = cKDTree(P); out = {}
+    for name, idx in rig["nodes"].items():
+        p = C[idx]; t = None; on = []
+        for cn, c in rig["curves"].items():
+            if idx in (c["cvs"][0], c["cvs"][-1]):
+                on.append(cn)
+                if t is None:
+                    E = RL.evaluate(C[c["cvs"]], 50); t = (E[1] - E[0]) if c["cvs"][0] == idx else (E[-2] - E[-1])
+        n = N[kd.query(p)[1]]
+        if t is None: t = np.array([0, 0, 1.0])
+        t = t - n * (t @ n); t /= np.linalg.norm(t) + 1e-15; b = np.cross(n, t)
+        M = np.eye(4); M[:3, 0], M[:3, 1], M[:3, 2], M[:3, 3] = t, b, n, p
+        out[name] = {"p": [round(float(v), 4) for v in p], "matrix": np.round(M, 4).tolist(), "curves": on}
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--rig", default=W + "work/car/curverig/RIG_car_hard.json"); ap.add_argument("--cage", default=W + "work/car/curverig/cage_side.npz")
+    ap.add_argument("--out", default=W + "versions/Schematic_car.png"); ap.add_argument("--points", default=W + "work/car/schematic/points.json"); ap.add_argument("--scale", type=float, default=PARAMS["scale"])
+    a = ap.parse_args(); s = a.scale
+    fr = json.load(open(W + "work/car/frame/frame.json")); lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); views = {v["name"]: v for v in fr["views"]}
+    rig = json.load(open(a.rig)); C = np.array(rig["controls"], float)
+    comp_of_curve = {}
+    for p in rig["patches"]:
+        for side in p["S"]:
+            for e in side: comp_of_curve.setdefault(e.lstrip("-"), component_of(p["name"]))
+    curves = []
+    for name, c in rig["curves"].items():
+        E = RL.evaluate(C[c["cvs"]], 160); kind = "sharp" if c.get("sharp") else ("fixed" if c.get("fixed") else "spoke")
+        curves.append((name, comp_of_curve.get(name, "fender"), kind, E, C[c["cvs"]]))
+    meas = measured_lines(); fnt = ImageFont.truetype(PARAMS["font"], int(13 * s / 2) + 6); sm = ImageFont.truetype(PARAMS["font"], int(9 * s / 2) + 4)
+    imgs = {k: Image.open(W + "work/car/views/%s_rgb.png" % f).convert("L") for k, f in PARAMS["images"].items()}
+    col_w = [max(imgs[r[c]].size[0] for r in PARAMS["layout"]) * s for c in range(2)]; row_h = [max(imgs[v].size[1] for v in r) * s for r in PARAMS["layout"]]
+    Wd = int(sum(col_w) + 3 * PARAMS["margin"]); Hd = int(sum(row_h) + len(row_h) * PARAMS["title_h"] + (len(row_h) + 1) * PARAMS["margin"] + 70)
+    sheet = Image.new("RGB", (Wd, Hd), (250, 250, 248)); dr = ImageDraw.Draw(sheet)
+    y0 = PARAMS["margin"]; mirror = np.array([-1.0, 1.0, 1.0])
+    for ri, row in enumerate(PARAMS["layout"]):
+        x0 = PARAMS["margin"]
+        for ci, vn in enumerate(row):
+            im = imgs[vn]; im = im.resize((int(im.size[0] * s), int(im.size[1] * s)), Image.LANCZOS)
+            base = Image.blend(im.convert("RGB"), Image.new("RGB", im.size, (255, 255, 255)), PARAMS["fade"]); panel = base.copy(); pd = ImageDraw.Draw(panel)
+            m = view_mapper(views[vn], lo, hi, s)
+            for name, comp, kind, E, CV in curves:   # left side as built, right side mirrored
+                for sgn in (1, -1):
+                    if vn == "left" and sgn < 0 or vn == "right" and sgn > 0: continue
+                    if vn in ("top", "bottom", "front", "back") or True:
+                        uv = m(E * (mirror if sgn < 0 else 1)); pd.line([tuple(p) for p in uv], fill=PARAMS["colours"][comp], width=PARAMS["width"][kind])
+            for name, idx in rig["nodes"].items():
+                for sgn in (1, -1):
+                    if vn == "left" and sgn < 0 or vn == "right" and sgn > 0: continue
+                    p = C[idx] * (mirror if sgn < 0 else 1); u = m(p)[0]; r = 2 + s
+                    pd.ellipse([u[0] - r, u[1] - r, u[0] + r, u[1] + r], fill=(20, 20, 20))
+                    if vn in PARAMS["label_views"] and sgn > 0: pd.text((u[0] + r + 1, u[1] - r - 9), name, fill=(60, 60, 60), font=sm)
+            for item in meas:   # the readings (crosses) and the smooth curve through them (purple)
+                key, view, pts, poly, ax = item[:5]
+                if view != vn and not (view == "left" and vn == "right"): continue
+                z0, z1 = (pts[:, 0].min(), pts[:, 0].max()) if len(pts) else item[5]; zz = np.linspace(z0, z1, 120); vv = np.polyval(poly, zz)
+                def to3(z, val): return np.stack([val if ax == 0 else 0.9 + 0 * z, val if ax == 1 else 0.9 + 0 * z, z], 1)
+                pd.line([tuple(p) for p in m(to3(zz, vv))], fill=PARAMS["measure_colour"], width=1)
+                for z, val in pts:
+                    u = m(to3(np.array([z]), np.array([val])))[0]; pd.line([u[0] - 4, u[1] - 4, u[0] + 4, u[1] + 4], fill=PARAMS["measure_colour"], width=1); pd.line([u[0] - 4, u[1] + 4, u[0] + 4, u[1] - 4], fill=PARAMS["measure_colour"], width=1)
+            sheet.paste(panel, (int(x0), int(y0 + PARAMS["title_h"]))); dr.text((x0, y0 + 4), {"left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous", "front": "face", "back": "arrière"}[vn], fill=(20, 20, 20), font=fnt)
+            x0 += col_w[ci] + PARAMS["margin"]
+        y0 += row_h[ri] + PARAMS["title_h"] + PARAMS["margin"]
+    lx = PARAMS["margin"]; ly = Hd - 60
+    for comp, colr in PARAMS["colours"].items(): dr.line([lx, ly + 10, lx + 40, ly + 10], fill=colr, width=3); dr.text((lx + 48, ly), comp, fill=(20, 20, 20), font=fnt); lx += 190
+    dr.text((lx, ly), "épais : arête vive ; moyen : ligne de design ou bord ; fin : rayon ; croix et violet : relevés et courbe lissée", fill=(20, 20, 20), font=fnt)
+    dr.text((PARAMS["margin"], 8), "ZenRay Meshes, schémas de la voiture (28 October 2026) : %d courbes NURBS, %d noeuds, %d patchs" % (len(curves), len(rig["nodes"]), len(rig["patches"])), fill=(20, 20, 20), font=fnt)
+    sheet.save(a.out)
+    os.makedirs(os.path.dirname(a.points), exist_ok=True); res = {}
+    for item in meas:
+        key, view, pts, poly, ax = item[:5]
+        if len(pts): res[key] = {"view": view, "readings_z_value": pts.tolist(), "fit": np.round(poly, 6).tolist(), "resid_mm": np.round((pts[:, 1] - np.polyval(poly, pts[:, 0])) * 1000, 1).tolist()}
+    json.dump({"_doc": "28 October 2026 : nodes of the car curve rig with their world matrices (columns tangent, binormal, normal, position) and the measured lines with their smooth fits. Generated by Schematic.py.",
+               "nodes": node_frames(rig, a.cage), "measured": res}, open(a.points, "w"), indent=1)
+    print(json.dumps({"sheet": a.out, "points": a.points, "curves": len(curves), "nodes": len(rig["nodes"]), "size": sheet.size}))
+
+
+if __name__ == "__main__":
+    main()

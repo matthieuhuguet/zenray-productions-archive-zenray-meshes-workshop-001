@@ -1,0 +1,32 @@
+"""28 October 2026, 13:20 : ZenRay Meshes finishing, DLO FROM SHEET, read the side window opening (daylight opening) of the reference side view :
+per column, below the roof edge, the dark line under the rail (window top) and the start of the light belt band (window bottom) ; y in metres per z,
+then compared with the model side glasses (top and bottom per z). Saves dlo_top_L.npy, dlo_bot_L.npy (x taken from the model glass edges).
+python DloFromSheet.py <delivery.npz> [--z-range -1.3,1.0]   FR : relève l'ouverture des vitres sur la vue de côté de la ref."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--z-range", default="-1.25,0.95"); a = ap.parse_args()
+fr = json.load(open(W + "work/car/frame/frame.json")); v = [x for x in fr["views"] if x["name"] == "left"][0]; ppm = v["px_per_m"]; b = v["bbox"]
+im = np.array(Image.open(W + "work/car/views/02_left_rgb.png").convert("L")).astype(int); m = np.array(Image.open(W + "work/car/frame/mask_left.png").convert("L")) > 127
+G = np.vstack([part(a.npz, n)[0] for n in ("CAR_body_glass_door_L", "CAR_body_glass_quarter_L")])
+z0, z1 = (float(t) for t in a.z_range.split(",")); cu = (b[0] + b[2]) / 2; rows = []
+for z in np.arange(z0, z1, 0.02):
+    u = int(round(cu - z * ppm)); top = np.nonzero(m[:, u])[0].min(); col = im[top:top + int(0.7 * ppm), u]
+    k0 = next((i for i in range(2, len(col)) if col[i] < 115), None)          # dark line under the rail
+    if k0 is None:
+        continue
+    k1 = next((i for i in range(k0 + 3, len(col)) if col[i] > 168), None)    # light belt band
+    if k1 is None:
+        continue
+    s = G[np.abs(G[:, 2] - z) < 0.012]
+    if not len(s):
+        continue
+    rows.append([z, (b[3] - (top + k0)) / ppm, (b[3] - (top + k1)) / ppm, s[:, 1].max(), s[:, 1].min(), s[s[:, 1].argmax(), 0], s[s[:, 1].argmin(), 0]])
+R = np.array(rows)
+np.save(W + "work/car/finish/dlo_top_L.npy", np.stack([R[:, 5], R[:, 1], R[:, 0]], 1)); np.save(W + "work/car/finish/dlo_bot_L.npy", np.stack([R[:, 6], R[:, 2], R[:, 0]], 1))
+for r in R[::5]:
+    print("z %+.2f  ref top %.3f bot %.3f | model top %.3f bot %.3f | top %+4.0f mm bot %+4.0f mm" % (r[0], r[1], r[2], r[3], r[4], (r[3] - r[1]) * 1000, (r[4] - r[2]) * 1000))
+print(json.dumps({"n": len(R), "top_mm_p50": round(float(np.median(np.abs(R[:, 3] - R[:, 1])) * 1000), 1), "bot_mm_p50": round(float(np.median(np.abs(R[:, 4] - R[:, 2])) * 1000), 1)}))

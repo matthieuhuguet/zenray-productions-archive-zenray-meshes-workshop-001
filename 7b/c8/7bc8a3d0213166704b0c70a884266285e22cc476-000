@@ -1,0 +1,97 @@
+"""28 October 2026 : ZenRay Meshes COMPONENT SHEET, the car as a game car is judged (Forza, GTA) : component by component. Groups the parts
+of a delivery into real car components (PARAMS["components"]), audits each one by script (closed shells, non manifold edges, quads, folded
+quads, openable without its inner panel, pivot), lists the components a game car has and this one lacks, renders every component alone
+(three quarter front, auto framed) on one sheet with its status line, and writes the table. Nothing is judged by eye here.
+python ComponentSheet.py <delivery.npz> <out.png>   FR : la planche des composants de la voiture, chacun isolé, avec son état mesuré."""
+import json, os, re, sys
+from collections import defaultdict
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import Raster
+
+PARAMS = {   # 28 October 2026 : one place for the component map ; a part goes to the first component whose pattern matches its name
+    "components": [
+        ("Capot", r"CAR_body_hood"), ("Toit et rails", r"CAR_body_(roof|rail)"), ("Coffre", r"CAR_body_decklid"), ("Face arrière", r"CAR_body_rear_C"),
+        ("Bouclier avant", r"CAR_(body_bumper_front|body_fascia|fascia|bumper_corner|splitter)"), ("Calandre", r"CAR_grille"),
+        ("Phares", r"CAR_light"), ("Aile avant", r"CAR_(body_fender_front|vent_fender)"), ("Porte", r"CAR_body_door_"),
+        ("Vitres", r"CAR_body_glass"), ("Montants", r"CAR_(pillar|body_buttress)"), ("Custode", r"CAR_body_(quarter|shoulder_rear)"),
+        ("Flanc haut (épaule, ceinture)", r"CAR_body_(shoulder|belt)_"), ("Bas de caisse", r"CAR_(body_rocker|body_sill|rocker_line)"),
+        ("Arches et passages de roue", r"CAR_(arch|wheelwell)"), ("Roue avant gauche", r"CAR_wheel_.*_FL$"), ("Roues (3 autres)", r"CAR_wheel_"),
+        ("Suspension", r"CAR_susp"), ("Soubassement", r"CAR_(body_under_floor|under_)"), ("Habitacle (garniture)", r"CAR_liner"),
+        ("Fermetures de jours", r"CAR_closer"),
+    ],
+    "openable": ["Capot", "Coffre", "Porte"],
+    "game_car_expected": ["Rétroviseurs", "Feux arrière", "Intérieur (sièges, volant, tableau de bord)", "Panneaux intérieurs des ouvrants (porte, capot, coffre)",
+                          "Compartiment moteur", "Essuie-glaces", "Échappement", "Poignées de porte", "Plaques d'immatriculation"],
+    "show_side": "L", "tile": 300, "cols": 6, "fold_deg": 20.0, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "font_px": 13,
+}
+
+
+def audit(P, Q):
+    E = defaultdict(int); n4 = 0; folds = 0
+    for q in Q:
+        n4 += len(q) == 4
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))] += 1
+        if len(q) == 4:
+            a, b, c, d = (P[i] for i in q); n1 = np.cross(b - a, c - a); n2 = np.cross(c - a, d - a)
+            den = np.linalg.norm(n1) * np.linalg.norm(n2)
+            if den > 1e-18 and np.degrees(np.arccos(np.clip(n1 @ n2 / den, -1, 1))) > PARAMS["fold_deg"]: folds += 1
+    return {"faces": len(Q), "open": sum(c == 1 for c in E.values()), "nonmanifold": sum(c > 2 for c in E.values()),
+            "quads_pct": round(100.0 * n4 / max(len(Q), 1), 1), "folds": folds}
+
+
+def _font():
+    try: return ImageFont.truetype(PARAMS["font"], PARAMS["font_px"])
+    except Exception: return ImageFont.load_default()
+
+
+def main(npz, out):
+    FT = _font()
+    d = np.load(npz, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+    comp_of = {}
+    for nm in sorted(set(names)):
+        for cname, pat in PARAMS["components"]:
+            if re.search(pat, nm): comp_of[nm] = cname; break
+        else: comp_of[nm] = "Autres"
+    rows = []; tiles = []; T = PARAMS["tile"]
+    for cname in [c for c, _ in PARAMS["components"]] + ["Autres"]:
+        parts = sorted(n for n, c in comp_of.items() if c == cname)
+        if not parts: continue
+        a = {"faces": 0, "open": 0, "nonmanifold": 0, "folds": 0}; q4 = 0; show = []
+        for nm in parts:
+            QQ = [q for q, k in zip(Q, names) if k == nm]; r = audit(P, QQ)
+            for k in a: a[k] += r[k]
+            q4 += r["quads_pct"] * r["faces"] / 100.0
+            if not nm.endswith("_R") and not re.search(r"_(FR|RL|RR)$", nm) or cname == "Roues (3 autres)": show += QQ
+        flags = []
+        if a["open"]: flags.append("ouvert (%d arêtes)" % a["open"])
+        if a["nonmanifold"]: flags.append("non manifold %d" % a["nonmanifold"])
+        if a["folds"]: flags.append("%d quads pliés" % a["folds"])
+        if cname in PARAMS["openable"]: flags += ["pas de pivot", "pas de panneau intérieur"]
+        status = "OK" if not flags else " ; ".join(flags)
+        rows.append({"component": cname, "parts": len(parts), "faces": a["faces"], "quads_pct": round(100.0 * q4 / max(a["faces"], 1), 1), "status": status})
+        # tile : the component alone, three quarter front, auto framed
+        V = P[np.unique(np.concatenate([np.array(q) for q in show]))] if show else P[:1]
+        tri = np.array([[q[0], q[k], q[k + 1]] for q in show for k in range(1, len(q) - 1)], np.int64)
+        img = np.full((T, T), 92, np.uint8)
+        if len(tri):
+            r_ = Raster.Renderer(P.astype(np.float32), tri, smooth_deg=35.0)
+            rx = np.array([0.70, 0, -0.71]); rx /= np.linalg.norm(rx); uy = np.array([-0.25, 0.94, -0.25]); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
+            ext = max(np.ptp(V @ rx), np.ptp(V @ uy)) + 1e-3; c = (V.max(0) + V.min(0)) / 2
+            Mk, _, N, _ = r_.render(c, T / (ext * 1.15), (rx.tolist(), uy.tolist(), tz.tolist()), T); r_.release()
+            L = np.array([0.30, 0.55, 0.78]); L /= np.linalg.norm(L); img = np.where(Mk, (np.clip(0.18 + 0.82 * np.clip((N * L).sum(-1), 0, 1), 0, 1) * 235), 92).astype(np.uint8)
+        tim = Image.fromarray(img).convert("RGB"); dr = ImageDraw.Draw(tim)
+        dr.text((6, 6), cname, fill=(255, 255, 0), font=FT); dr.text((6, T - 34), ("OK" if status == "OK" else status)[:44], fill=(120, 255, 120) if status == "OK" else (255, 120, 120), font=FT)
+        dr.text((6, T - 18), ("" if status == "OK" else status[44:88]), fill=(255, 120, 120), font=FT); tiles.append(tim)
+    for miss in PARAMS["game_car_expected"]:
+        tim = Image.new("RGB", (T, T), (60, 30, 30)); dr = ImageDraw.Draw(tim); dr.text((6, 6), miss[:40], fill=(255, 200, 0), font=FT); dr.text((6, 26), "ABSENT", fill=(255, 90, 90), font=FT); tiles.append(tim)
+        rows.append({"component": miss, "parts": 0, "faces": 0, "quads_pct": 0, "status": "absent"})
+    cols = PARAMS["cols"]; nr = (len(tiles) + cols - 1) // cols; S = Image.new("RGB", (cols * T, nr * T), (30, 30, 30))
+    for i, t in enumerate(tiles): S.paste(t, ((i % cols) * T, (i // cols) * T))
+    S.save(out); json.dump(rows, open(out.replace(".png", ".json"), "w"), indent=1, ensure_ascii=False)
+    for r in rows: print("%-38s parts %3d faces %6d quads %5.1f  %s" % (r["component"], r["parts"], r["faces"], r["quads_pct"], r["status"]))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])

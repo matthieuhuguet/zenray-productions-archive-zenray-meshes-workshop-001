@@ -1,0 +1,64 @@
+"""28 October 2026, 16:50 : ZenRay Meshes finishing, FACET FAIR, a faceted panel (front fender) made taut facet by facet : the faces are grouped in
+facets bounded by creases sharper than --crease-deg (region growing on face normals), each facet with enough faces is refitted along its own mean
+normal as one degree 2 surface (local frame), the move fades to 0 within --fade-m of the facet outline, so creases and welds stay ; L and R.
+python FacetFair.py <in.npz> <out.npz> --part CAR_body_fender_front_L [--crease-deg 20] [--min-faces 40] [--fade-m 0.03]
+FR : tend un panneau à facettes facette par facette, arêtes gardées."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", required=True)
+ap.add_argument("--crease-deg", type=float, default=20.0); ap.add_argument("--min-faces", type=int, default=40); ap.add_argument("--fade-m", type=float, default=0.03)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+
+
+def run(part):
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == part]
+    N = []
+    for q in Q:
+        v = P[q]; nn = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); N.append(nn / (np.linalg.norm(nn) + 1e-12))
+    N = np.array(N); ef = defaultdict(list)
+    for i, q in enumerate(Q):
+        for k in range(len(q)):
+            ef[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+    cs = np.cos(np.radians(a.crease_deg)); lab = -np.ones(len(Q), int); c = 0
+    for s in range(len(Q)):
+        if lab[s] >= 0:
+            continue
+        st = [s]; lab[s] = c
+        while st:
+            f = st.pop(); q = Q[f]
+            for k in range(len(q)):
+                for g in ef[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))]:
+                    if lab[g] < 0 and N[f] @ N[g] > cs:
+                        lab[g] = c; st.append(g)
+        c += 1
+    moved = 0.0; used = 0
+    for r in range(c):
+        F = [Q[i] for i in np.flatnonzero(lab == r)]
+        if len(F) < a.min_faces:
+            continue
+        nr = N[lab == r].mean(0); nr /= np.linalg.norm(nr)
+        V = np.array(sorted({x for q in F for x in q})); X = P[V]; o = X.mean(0)
+        e1 = np.cross(nr, [0, 1, 0] if abs(nr[1]) < 0.9 else [1, 0, 0]); e1 /= np.linalg.norm(e1); e2 = np.cross(nr, e1)
+        u, w, h = (X - o) @ e1, (X - o) @ e2, (X - o) @ nr; us, ws = u.std() + 1e-9, w.std() + 1e-9
+        A = np.stack([np.ones_like(u), u / us, w / ws, (u / us) ** 2, (u / us) * (w / ws), (w / ws) ** 2], 1)
+        co = np.linalg.lstsq(A, h, rcond=None)[0]; dh = A @ co - h
+        # facet outline : vertices shared with another facet or on an open edge
+        cnt = defaultdict(int)
+        for q in F:
+            for k in range(len(q)):
+                cnt[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))] += 1
+        rim = np.array(sorted({x for e, k in cnt.items() if k == 1 for x in e}))
+        wt = np.clip(cKDTree(P[rim]).query(X)[0] / a.fade_m, 0, 1) if len(rim) else np.ones(len(V)); wt = wt * wt * (3 - 2 * wt)
+        P[V] += (dh * wt)[:, None] * nr[None, :]; moved = max(moved, float(np.abs(dh * wt).max() * 1000)); used += 1
+    return {"facets": int(c), "refitted": used, "move_mm_max": round(moved, 1)}
+
+
+rep = {}
+for part in a.part.split(","):
+    rep[part] = run(part)
+    if part.endswith("_L") and part[:-2] + "_R" in set(n):
+        rep[part[:-2] + "_R"] = run(part[:-2] + "_R")
+np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"]); print(json.dumps(rep))

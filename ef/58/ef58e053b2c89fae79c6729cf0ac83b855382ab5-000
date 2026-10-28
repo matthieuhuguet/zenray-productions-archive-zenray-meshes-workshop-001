@@ -1,0 +1,22 @@
+"""28 October 2026, 16:40 : ZenRay Meshes finishing, DROP NON MANIFOLD, where an edge is used by 3 or more faces of one part (a wall built on a hole
+edge that a bevel ring also uses), remove the faces that are perpendicular to the part's main skin (walls) on those edges, until each edge has 2.
+python DropNonManifold.py <in.npz> <out.npz> --parts A,B   FR : supprime les murs en trop sur les arêtes partagées par 3 faces."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", required=True); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+drop = set(); rep = {}
+for p in a.parts.split(","):
+    idx = [i for i, m in enumerate(n) if m == p]; E = defaultdict(list); N = {}
+    for i in idx:
+        q = Q[i]; v = P[q]; nn = np.cross(v[2] - v[0], v[-1] - v[1]); N[i] = nn / (np.linalg.norm(nn) + 1e-12)
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+    main = np.array([N[i] for i in idx]).mean(0); main /= np.linalg.norm(main) + 1e-12; c = 0
+    for e, fs in E.items():
+        fs = [f for f in fs if f not in drop]
+        while len(fs) > 2:
+            w = min(fs, key=lambda f: abs(N[f] @ main)); drop.add(w); fs.remove(w); c += 1
+    rep[p] = c
+keep = [i for i in range(len(Q)) if i not in drop]
+np.savez(a.out, P=P.astype(np.float32), Q=np.array([Q[i] for i in keep], dtype=object), names=n[keep]); print(json.dumps(rep))

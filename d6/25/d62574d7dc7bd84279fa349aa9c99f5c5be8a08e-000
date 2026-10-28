@@ -1,0 +1,74 @@
+"""28 October 2026, 22:00 : ZenRay Meshes finishing, PAIR ODD LOOPS, an odd boundary loop cannot be capped with quads only. From an edge of an odd loop,
+walk the quad strip across the part (enter the face by that edge, leave by the opposite edge) until the strip reaches another open edge ; every crossed
+quad is split in two by the midpoints of its entry and exit edges (an edge loop insertion), so both end loops gain one vertex : two odd loops of the
+same part become even. Tries every edge of the loop and keeps the shortest strip that ends on another ODD loop. Then run FillHoles.py.
+python PairOddLoops.py <in.npz> <out.npz>   FR : rend paires deux boucles impaires d'une pièce en insérant une boucle d'arêtes entre elles."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--max-strip", type=int, default=400); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = list(d["P"].astype(float)); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+key = lambda u, w: (min(u, w), max(u, w)); pairs = 0; rep = defaultdict(int)
+
+
+def build(part):
+    E = defaultdict(list); D = set()
+    for i, q in enumerate(Q):
+        if n[i] != part: continue
+        for k in range(len(q)): E[key(q[k], q[(k + 1) % len(q)])].append(i); D.add((q[k], q[(k + 1) % len(q)]))
+    nxt = defaultdict(list)
+    for e, f in E.items():
+        if len(f) == 1:
+            s, t = e if e in D else e[::-1]; nxt[t].append(s)
+    loops = []; seen = set()
+    for v0 in list(nxt):
+        if v0 in seen or len(nxt[v0]) != 1: continue
+        L = [v0]; c = nxt[v0][0]; ok = True
+        while c != v0:
+            if c in L or len(nxt.get(c, [])) != 1: ok = False; break
+            L.append(c); c = nxt[c][0]
+        seen.update(L)
+        if ok: loops.append(L)
+    lid = {}
+    for k, L in enumerate(loops):
+        for i in range(len(L)): lid[key(L[i], L[(i + 1) % len(L)])] = k
+    return E, loops, lid
+
+
+def strip(E, e, lid, start):
+    path = []; cur = e
+    for _ in range(a.max_strip):
+        fs = [f for f in E[cur] if not path or f != path[-1][0]]
+        if not fs: return None
+        f = fs[0]; q = Q[f]
+        if len(q) != 4: return None
+        k = [i for i in range(4) if key(q[i], q[(i + 1) % 4]) == cur][0]; opp = key(q[(k + 2) % 4], q[(k + 3) % 4])
+        path.append((f, cur, opp))
+        if len(E[opp]) == 1:
+            return path, lid.get(opp)
+        cur = opp
+    return None
+
+
+for part in sorted(set(n)):
+    for _ in range(20):
+        E, loops, lid = build(part); odd = [k for k, L in enumerate(loops) if len(L) % 2]
+        if len(odd) < 2: break
+        best = None
+        for k in odd:
+            L = loops[k]
+            for i in range(len(L)):
+                r = strip(E, key(L[i], L[(i + 1) % len(L)]), lid, k)
+                if r and r[1] is not None and r[1] != k and r[1] in odd and (best is None or len(r[0]) < len(best)):
+                    best = r[0]
+        if best is None: break
+        mid = {}
+        def m(e):
+            if e not in mid: mid[e] = len(P); P.append((P[e[0]] + P[e[1]]) / 2)
+            return mid[e]
+        for f, ein, eout in best:
+            q = Q[f]; k = [i for i in range(4) if key(q[i], q[(i + 1) % 4]) == ein][0]
+            a0, a1, a2, a3 = q[k], q[(k + 1) % 4], q[(k + 2) % 4], q[(k + 3) % 4]; mi, mo = m(key(a0, a1)), m(key(a2, a3))
+            Q[f] = [a0, mi, mo, a3]; Q.append([mi, a1, a2, mo]); n.append(part)
+        pairs += 1; rep[part] += 1
+np.savez(a.out, P=np.array(P, np.float32), Q=np.array(Q, dtype=object), names=np.array(n)); print(json.dumps({"pairs": pairs, "by_part": dict(rep)}))

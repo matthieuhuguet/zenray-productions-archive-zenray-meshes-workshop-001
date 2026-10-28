@@ -1,0 +1,59 @@
+"""28 October 2026, 16:10 : ZenRay Meshes finishing, SIDE FAIR, a side panel as ONE taut surface (rule 223 : no wave) : the outward facing vertices
+(normal x > --out) of the part are refitted by x = f(y, z), a polynomial of total degree --deg (2 = one bend each way, no inflection), each moved in x
+by --blend of the gap ; the rest of the shell follows its nearest outer vertex (thickness kept) ; the move fades to 0 within --fade-m of the part's
+open border (welds) and of its outline in (y, z). Applied to the L part and mirrored onto the R part when the topology matches, else computed on R too.
+python SideFair.py <in.npz> <out.npz> --part CAR_body_quarter_L [--deg 2] [--blend 1.0] [--fade-m 0.05] [--out 0.5]"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", required=True)
+ap.add_argument("--deg", type=int, default=2); ap.add_argument("--blend", type=float, default=1.0); ap.add_argument("--fade-m", type=float, default=0.05); ap.add_argument("--out-n", type=float, default=0.5)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+
+
+def fair(part, sgn):
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == part]
+    vn = defaultdict(lambda: np.zeros(3)); cnt = defaultdict(int)
+    for q in Q:
+        v = P[q]; nn = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); nn /= np.linalg.norm(nn) + 1e-12
+        for x in q:
+            vn[x] = vn[x] + nn
+        for k in range(len(q)):
+            e = (min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)])); cnt[e] += 1
+    V = np.array(sorted(vn)); N = np.array([vn[v] / (np.linalg.norm(vn[v]) + 1e-12) for v in V])
+    outer = V[N[:, 0] * sgn > a.out_n]
+    if len(outer) < 20:
+        return 0.0
+    y, z = P[outer, 1], P[outer, 2]; ym, zm, ys, zs = y.mean(), z.mean(), y.std() + 1e-9, z.std() + 1e-9
+    terms = [(i, j) for i in range(a.deg + 1) for j in range(a.deg + 1) if i + j <= a.deg]
+    A = np.stack([((y - ym) / ys) ** i * ((z - zm) / zs) ** j for i, j in terms], 1)
+    co = np.linalg.lstsq(A, P[outer, 0], rcond=None)[0]; dx = a.blend * (A @ co - P[outer, 0])
+    border = np.array(sorted({v for e, c in cnt.items() if c == 1 for v in e}))
+    # fade : near open borders, and near the outline of the outer skin in (y, z)
+    from scipy.spatial import ConvexHull
+    w = np.ones(len(outer))
+    if len(border):
+        w *= np.clip(cKDTree(P[border]).query(P[outer])[0] / a.fade_m, 0, 1)
+    nb = defaultdict(set)
+    for q in Q:
+        for k in range(len(q)):
+            nb[q[k]].add(q[(k + 1) % len(q)]); nb[q[(k + 1) % len(q)]].add(q[k])
+    os_ = set(outer.tolist()); rim = [v for v in outer if any(u not in os_ for u in nb[v])]
+    if rim:
+        w *= np.clip(cKDTree(P[rim][:, 1:]).query(P[outer][:, 1:])[0] / a.fade_m, 0, 1)
+    w = w * w * (3 - 2 * w); dx *= w
+    k = cKDTree(P[outer]).query(P[V])[1]; P[V, 0] += dx[k] * (np.linalg.norm(P[V] - P[outer][k], axis=1) < 0.03)
+    return float(np.abs(dx).max() * 1000)
+
+
+rep = {}
+for part in a.part.split(","):
+    rep[part] = round(fair(part, 1.0), 1)
+    rp = part[:-2] + "_R"
+    if rp in set(n):
+        rep[rp] = round(fair(rp, -1.0), 1)
+np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+print(json.dumps({"move_mm_max": rep}))

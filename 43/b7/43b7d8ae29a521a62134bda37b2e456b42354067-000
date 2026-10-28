@@ -1,0 +1,55 @@
+"""28 October 2026, 12:40 : ZenRay Meshes finishing, PROFILE FIT, bring the centre line of the greenhouse onto the top silhouette of the reference side
+view : per z, the gap between the reference top (mask_left, frame.json) and the model top near x = 0, smoothed (LSQ spline), applied in y to the chosen
+parts with a weight that is 1 at the centre and fades to 0 at --x-edge (cos^2), and fades to 0 outside --z-range, so the side welds (rail) and the
+hinge do not move. FR : ramène la ligne centrale du vitrage sur la silhouette haute de la vue de côté de la référence, sans toucher aux soudures.
+python ProfileFit.py <in.npz> <out.npz> [--parts roof,windshield] [--z-range -0.4,1.35] [--x-edge 0.55] [--knots 6]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy.interpolate import LSQUnivariateSpline
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out")
+ap.add_argument("--parts", default="CAR_body_roof_C,CAR_body_glass_windshield_C"); ap.add_argument("--z-range", default="-0.4,1.35")
+ap.add_argument("--x-edge", type=float, default=0.55); ap.add_argument("--knots", type=int, default=6); ap.add_argument("--fade-m", type=float, default=0.15); ap.add_argument("--gap-x", type=float, default=0.15, help="the model top is taken over |x| < gap-x (0.5 : the whole width, the true side silhouette)")
+ap.add_argument("--arc-cuts", default="", help="z of design corners : the target top line is the reference silhouette fitted as ONE arc per segment, and the gap is applied raw so the centre line lands ON the arcs (rule 223, 28 October 2026)")
+ap.add_argument("--self", type=int, default=0, help="1 : the target is the model own centre line made into arcs (no image noise), used with --arc-cuts")
+ap.add_argument("--target", default="", help="npy (z, y) : the centre line target (a concave fit with no inflection, 28 October 2026)")
+a = ap.parse_args()
+fr = json.load(open(W + "work/car/frame/frame.json")); v = [x for x in fr["views"] if x["name"] == "left"][0]; ppm = v["px_per_m"]; b = v["bbox"]
+m = np.array(Image.open(W + "work/car/frame/mask_left.png").convert("L")) > 127
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); parts = set(a.parts.split(","))
+V = np.array(sorted({x for q, nm in zip(d["Q"], n) if nm in parts for x in q})); X = P[V]
+z0, z1 = (float(t) for t in a.z_range.split(","))
+zs = np.arange(z0, z1, 0.02); gap = []; zk = []
+for z in zs:
+    u = int(round((b[0] + b[2]) / 2 - z * ppm)) if v["rx"][2] < 0 else int(round((b[0] + b[2]) / 2 + z * ppm))
+    col = np.nonzero(m[:, u])[0]; s = X[(np.abs(X[:, 2] - z) < 0.012) & (np.abs(X[:, 0]) < a.gap_x)]
+    if len(col) and len(s):
+        gap.append((b[3] - col.min()) / ppm - s[:, 1].max()); zk.append(z)
+zk, gap = np.array(zk), np.array(gap)
+if a.target:
+    TG = np.load(a.target); mod = np.array([X[(np.abs(X[:, 2] - z) < 0.012) & (np.abs(X[:, 0]) < a.gap_x)][:, 1].max() for z in zk])
+    gap = np.interp(zk, TG[:, 0], TG[:, 1]) - mod; sp = lambda z: np.interp(z, zk, gap)
+elif a.arc_cuts:
+    mod = np.array([X[(np.abs(X[:, 2] - z) < 0.012) & (np.abs(X[:, 0]) < a.gap_x)][:, 1].max() for z in zk])
+    ref = mod if a.self else gap + mod   # reference top per z (or the model itself)
+    gap = ref - mod
+    cuts = [zk.min() - 1] + [float(c) for c in a.arc_cuts.split(",")] + [zk.max() + 1]; tgt = np.zeros_like(ref)
+    for lo, hi in zip(cuts[:-1], cuts[1:]):
+        m = (zk >= lo) & (zk < hi); tgt[m] = np.polyval(np.polyfit(zk[m], ref[m], 2), zk[m])
+    gap = tgt - mod; print(json.dumps({"target_arc_resid_mm_max": round(float(np.abs(tgt - ref).max() * 1000), 1)}))
+    sp = lambda z: np.interp(z, zk, gap)
+else:
+    t = np.linspace(zk.min(), zk.max(), a.knots + 2)[1:-1]; sp = LSQUnivariateSpline(zk, gap, t)
+wz = np.clip(np.minimum(X[:, 2] - z0, z1 - X[:, 2]) / a.fade_m, 0, 1); wz = wz * wz * (3 - 2 * wz)
+wx = np.cos(np.clip(np.abs(X[:, 0]) / a.x_edge, 0, 1) * np.pi / 2) ** 2
+dy = sp(np.clip(X[:, 2], zk.min(), zk.max())) * wz * wx
+P[V, 1] += dy
+np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+print(json.dumps({"gap_mm_before_p50_max": [round(float(np.median(np.abs(gap)) * 1000), 1), round(float(np.abs(gap).max() * 1000), 1)], "move_mm_max": round(float(np.abs(dy).max() * 1000), 1)}))

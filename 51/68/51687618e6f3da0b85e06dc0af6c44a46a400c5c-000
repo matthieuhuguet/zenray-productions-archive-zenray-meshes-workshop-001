@@ -1,0 +1,43 @@
+"""28 October 2026, 10:30 : ZenRay Meshes finishing, REAR CORNER, the cut corner facets of the reference back view : on each side, a ruled quad
+facet from the outer edge of the rebuilt rear (tail frame and lower panel, its outermost vertex per height) to the body side line at z = --side-z
+(outermost x of the quarter, shoulder and rocker at that depth, smoothed). Mirrored to the right. FR : facettes d'angle arrière, du bord de l'arrière au flanc.
+python RearCorner.py <delivery.npz> <out.npz> [--side-z -1.85] [--cols 4] [--y0 0.17] [--y1 0.95]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+from RearBlueprint import shell_holed
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--side-z", type=float, default=-1.85); ap.add_argument("--cols", type=int, default=4)
+ap.add_argument("--y0", type=float, default=0.17); ap.add_argument("--y1", type=float, default=0.95); ap.add_argument("--edge-m", type=float, default=0.02)
+ap.add_argument("--thick", type=float, default=0.012)
+a = ap.parse_args()
+R = np.vstack([part(a.npz, n)[0] for n in ("CAR_body_tail_face_C", "CAR_body_tail_lower_C")]); R = R[R[:, 0] > 0]
+B = np.vstack([part(a.npz, n)[0] for n in ("CAR_body_quarter_L", "CAR_body_shoulder_rear_L", "CAR_body_rocker_L")])
+ys = np.linspace(a.y0, a.y1, max(2, int(round((a.y1 - a.y0) / a.edge_m))) + 1)
+inn, out = [], []
+for y in ys:
+    s = R[np.abs(R[:, 1] - y) < 0.012]; e = s[s[:, 0].argmax()]; inn.append([e[0], y, e[2]])
+    b = B[(np.abs(B[:, 1] - y) < 0.02) & (np.abs(B[:, 2] - a.side_z) < 0.03)]
+    out.append([b[:, 0].max() if len(b) else np.nan, y, a.side_z])
+inn, out = np.array(inn), np.array(out)
+ok = ~np.isnan(out[:, 0]); out[:, 0] = np.interp(ys, ys[ok], out[ok, 0])
+for C in (inn, out):   # smooth both edges : degree 3 in y
+    for k in (0, 2):
+        C[:, k] = np.polyval(np.polyfit(ys, C[:, k], 3), ys)
+t = np.linspace(0, 1, a.cols + 1)
+G = inn[:, None, :] * (1 - t)[None, :, None] + out[:, None, :] * t[None, :, None]   # rows x cols x 3
+# outward is +x for the left facet ; shell_holed assumes -z outward, so build with a rotated copy then rotate back
+Rz = lambda P: np.stack([P[..., 2], P[..., 1], -P[..., 0]], -1); Ri = lambda P: np.stack([-P[..., 2], P[..., 1], P[..., 0]], -1)
+Pp, Fp, Sp = shell_holed(Rz(G), np.ones((G.shape[0] - 1, G.shape[1] - 1), bool), a.thick, "CAR_body_corner_rear_L")
+Pp = Ri(np.array(Pp)); PR = Pp * np.array([-1, 1, 1]); FR = [[v + len(Pp) for v in f[::-1]] for f in Fp]
+np.savez(a.out, P=np.vstack([Pp, PR]).astype(np.float32), Q=np.array(list(Fp) + FR, dtype=object),
+         names=np.array(["CAR_body_corner_rear_L"] * len(Fp) + ["CAR_body_corner_rear_R"] * len(FR)))
+print(json.dumps({"rows": len(ys), "inner_x": [round(float(inn[:, 0].min()), 3), round(float(inn[:, 0].max()), 3)], "outer_x": [round(float(out[:, 0].min()), 3), round(float(out[:, 0].max()), 3)]}))

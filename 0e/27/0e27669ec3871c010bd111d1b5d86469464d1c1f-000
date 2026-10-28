@@ -1,0 +1,32 @@
+"""28 October 2026 : ZenRay Meshes finishing, TRIM UNDER, delete the faces of an old part that lie UNDER a new panel : centroid within --dist-m of the
+panel, inside the panel z span, and below the panel top edge (max y of the panel in that z slice minus --below-m) ; both sides (x > 0 with the _L panel,
+mirrored on _R). Then run FinishAudit ; open edges on the cut are closed by FillHoles or welded to the panel.
+python TrimUnder.py <in.npz> <out.npz> --old CAR_body_shoulder --panel CAR_body_fender_front [--dist-m 0.05] [--below-m 0.005]
+FR : rogne les faces d'une vieille pièce cachées sous un panneau neuf."""
+import argparse, json
+import numpy as np, trimesh
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--old", required=True); ap.add_argument("--panel", required=True)
+ap.add_argument("--dist-m", type=float, default=0.05); ap.add_argument("--below-m", type=float, default=0.005); ap.add_argument("--sym", type=int, default=1); ap.add_argument("--keep-circle", default=""); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = list(d["Q"]); drop = set(); rep = {}
+for side in ("_L", "_R"):
+    pi = [i for i, m in enumerate(n) if m == a.panel + side]; oi = [i for i, m in enumerate(n) if m == a.old + side]
+    if not pi or not oi: continue
+    tri = [[q[0], q[k], q[k + 1]] for i in pi for q in [list(map(int, Q[i]))] for k in range(1, len(q) - 1)]
+    pm = trimesh.Trimesh(P, np.array(tri), process=False); PV = P[np.unique(np.array(tri))]
+    C = np.array([P[list(map(int, Q[i]))].mean(0) for i in oi]); _, dist, _ = trimesh.proximity.closest_point(pm, C)
+    z0, z1 = PV[:, 2].min(), PV[:, 2].max(); top = np.full(len(C), -9.0)
+    for k, c in enumerate(C):
+        s = PV[np.abs(PV[:, 2] - c[2]) < 0.015]
+        if len(s): top[k] = s[:, 1].max()
+    m = (dist < a.dist_m) & (C[:, 2] > z0) & (C[:, 2] < z1) & (C[:, 1] < top - a.below_m)
+    if a.keep_circle:   # keep the faces near a circle (y, z, radius) : the arch ring gate counts them (28 October 2026)
+        ky, kz, kr = (float(t) for t in a.keep_circle.split(",")); m &= np.hypot(C[:, 1] - ky, C[:, 2] - kz) > kr
+    drop |= {oi[k] for k in np.nonzero(m)[0]}; rep[a.old + side] = int(m.sum())
+if a.sym:   # symmetric by construction : the _R choice is the mirror of the _L choice (centroids within 5 mm), 28 October 2026
+    from scipy.spatial import cKDTree
+    oL = [i for i, m in enumerate(n) if m == a.old + "_L"]; oR = [i for i, m in enumerate(n) if m == a.old + "_R"]
+    cL = np.array([P[list(map(int, Q[i]))].mean(0) for i in oL]); cR = np.array([P[list(map(int, Q[i]))].mean(0) for i in oR]) * [-1, 1, 1]
+    dd, jj = cKDTree(cL).query(cR); dL = {i for i in oL if i in drop}
+    drop -= set(oR); drop |= {oR[k] for k in range(len(oR)) if dd[k] < 0.005 and oL[jj[k]] in dL}; rep[a.old + "_R"] = len([i for i in oR if i in drop])
+keep = [i for i in range(len(Q)) if i not in drop]
+np.savez(a.out, P=P.astype(np.float32), Q=np.array([Q[i] for i in keep], dtype=object), names=n[keep]); print(json.dumps({"dropped": rep}))

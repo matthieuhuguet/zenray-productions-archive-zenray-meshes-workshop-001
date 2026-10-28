@@ -1,0 +1,153 @@
+"""28 October 2026, 08:00 : ZenRay Meshes finishing, REAR BLUEPRINT, the rear (coffre) rebuilt from the lines of the reference back view.
+The tail face is a smooth symmetric surface z(x, y) fitted on the old tail face (polynomial in x^2 and y, robust), so the waves go ; on it, a quad frame
+with the recess hole of the reference (x +-hole_x, y hole_y0..hole_y1) ; the top rows roll over onto the decklid edge ; inside the hole, the recess
+panel and the light bar strip as clean grids set back by --recess-m. Every value is a parameter (JSON --params overrides), measured on the
+reference back view (frame.json : 172.44 px per m, axis u 312.5, ground v 323). FR : l'arrière refait d'après les lignes de la vue arrière.
+python RearBlueprint.py <delivery.npz> <out.npz> [--params file.json]
+"""
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+import ParamGrid as PG
+
+PAR = {   # 28 October 2026, read on refs back view x3 crop (native px / 172.44)
+    "frame_x": 0.975, "frame_y0": 0.49, "frame_y1": 0.95, "deck_y": 0.99, "deck_z": -2.10, "roll_rows": 4,
+    "hole_x": 0.93, "hole_y0": 0.54, "hole_y1": 0.887, "bar_y": 0.80,
+    "recess_m": 0.020, "bar_recess_m": 0.010, "frame_thick": 0.030, "panel_thick": 0.012,
+    "edge_m": 0.02, "fit_deg_x2": 3, "fit_deg_y": 3,
+    # designed surface, read on the reference side and top silhouettes (28 October 2026) : z = z(y) linear + c4 * x^4 (flat centre, sides forward)
+    "bevel_m": 0.018, "bar_bevel_m": 0.008,   # slanted strip at the light bar line, it draws that line (28 October 2026)
+      # 45 degree chamfer ring between the frame and the recessed panels, it draws the frame line of the reference (28 October 2026)
+    "design": 1, "z_at_y0": -2.215, "z_at_y1": -2.285, "c4": 0.22,
+}
+
+
+def fit_surface(P, Q, deg_x2, deg_y):
+    N = np.array([PG.fnormal(P, q) for q in Q]); C = np.array([P[q].mean(0) for q in Q]); b = N[:, 2] < -0.7
+    C = C[b]; terms = [(i, j) for i in range(deg_x2 + 1) for j in range(deg_y + 1)]
+    A = lambda X: np.stack([(X[:, 0] ** 2) ** i * X[:, 1] ** j for i, j in terms], 1)
+    k = np.ones(len(C), bool)
+    for _ in range(4):   # robust : drop the 15 % farthest (recess, lips) each pass
+        co = np.linalg.lstsq(A(C[k]), C[k, 2], rcond=None)[0]
+        r = np.abs(A(C) @ co - C[:, 2]); k = r < np.percentile(r[k], 85) + 0.002
+    return lambda x, y: (A(np.stack([np.ravel(x), np.ravel(y)], 1)) @ co).reshape(np.shape(x)), float(np.median(r[k]) * 1000)
+
+
+def breaks(a, b, step):
+    n = max(1, int(round((b - a) / step))); return list(np.linspace(a, b, n + 1))
+
+
+def shell_holed(T, keep, thick, name):
+    """T rows x cols x 3 outer skin, keep[j, i] tells which cells exist ; inner skin offset along the normal, walls on every boundary edge."""
+    nb, na = T.shape[:2]; du = np.gradient(T, axis=1); dv = np.gradient(T, axis=0); N = np.cross(du, dv)
+    N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+    if N[..., 2].mean() > 0:
+        N = -N   # outward = -z
+    B = T - thick * N
+    gid = lambda j, i: j * na + i; off = nb * na
+    pts = list(T.reshape(-1, 3)) + list(B.reshape(-1, 3)); faces = []; skin = []; E = defaultdict(int); D = {}
+    for j in range(nb - 1):
+        for i in range(na - 1):
+            if not keep[j, i]:
+                continue
+            q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]
+            faces.append(q); skin.append(True); faces.append([off + x for x in q[::-1]]); skin.append(False)
+            for k in range(4):
+                a, b = q[k], q[(k + 1) % 4]; E[(min(a, b), max(a, b))] += 1; D[(a, b)] = True
+    for (a, b), c in E.items():
+        if c == 1:
+            if (a, b) not in D:
+                a, b = b, a
+            faces.append([b, a, off + a, off + b]); skin.append(False)
+    P = np.array(pts)
+    f0 = faces[0]; n0 = np.cross(P[f0[1]] - P[f0[0]], P[f0[2]] - P[f0[0]])
+    if n0[2] > 0:
+        faces = [f[::-1] for f in faces]
+    return P, faces, skin
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--params", default="")
+    a = ap.parse_args(); p = dict(PAR)
+    if a.params:
+        p.update(json.load(open(a.params)))
+    P, Q = part(a.npz, "CAR_body_tail_face_C")
+    if p["design"]:
+        def zf(x, y):
+            x, y = np.asarray(x, float), np.asarray(y, float)
+            t = (y - p["frame_y0"]) / (p["frame_y1"] - p["frame_y0"])
+            return p["z_at_y0"] + (p["z_at_y1"] - p["z_at_y0"]) * t + p["c4"] * x ** 4
+        res = 0.0
+    else:
+        zf, res = fit_surface(P, Q, p["fit_deg_x2"], p["fit_deg_y"])
+    # frame grid : x and y break lines include the hole edges so the hole is whole cells
+    xs = sorted(set(np.round(breaks(-p["frame_x"], -p["hole_x"], p["edge_m"]) + breaks(-p["hole_x"], p["hole_x"], p["edge_m"]) + breaks(p["hole_x"], p["frame_x"], p["edge_m"]), 6)))
+    ys = sorted(set(np.round(breaks(p["frame_y0"], p["hole_y0"], p["edge_m"]) + breaks(p["hole_y0"], p["hole_y1"], p["edge_m"]) + breaks(p["hole_y1"], p["frame_y1"], p["edge_m"]), 6)))
+    X, Y = np.meshgrid(xs, ys); Z = zf(X, Y)
+    T = np.stack([X, Y, Z], -1)
+    # roll over : extra rows from the frame top to the deck edge (quarter ellipse in y, z)
+    ztop = T[-1, :, 2]; rows = []
+    for k in range(1, p["roll_rows"] + 1):
+        t = k / p["roll_rows"]; th = t * np.pi / 2
+        yk = p["frame_y1"] + (p["deck_y"] - p["frame_y1"]) * np.sin(th)
+        zk = p["deck_z"] + (ztop - p["deck_z"]) * np.cos(th)
+        rows.append(np.stack([np.array(xs), np.full(len(xs), yk), zk], -1))
+    T = np.concatenate([T, np.array(rows)], 0)
+    xa, ya = np.array(xs), np.array(ys)
+    keep = np.ones((T.shape[0] - 1, T.shape[1] - 1), bool)
+    for j in range(len(ys) - 1):
+        for i in range(len(xs) - 1):
+            cx, cy = (xa[i] + xa[i + 1]) / 2, (ya[j] + ya[j + 1]) / 2
+            if abs(cx) < p["hole_x"] and p["hole_y0"] < cy < p["hole_y1"]:
+                keep[j, i] = False
+    Pf, Ff, Sf = shell_holed(T, keep, p["frame_thick"], "CAR_body_tail_face_C")
+    # bevel ring : outer loop on the frame surface at the hole edge, inner loop shrunk by bevel_m at the panel depth
+    b = p["bevel_m"]; hx, h0, h1 = p["hole_x"], p["hole_y0"], p["hole_y1"]
+    nx_, ny_ = max(2, int(2 * hx / p["edge_m"])), max(2, int((h1 - h0) / p["edge_m"]))   # the same counts on both loops
+    def loop(x, y0, y1):
+        u = lambda n: np.linspace(0, 1, n + 1)[:-1]
+        pts = [(-x + t * 2 * x, y0) for t in u(nx_)] + [(x, y0 + t * (y1 - y0)) for t in u(ny_)]
+        pts += [(x - t * 2 * x, y1) for t in u(nx_)] + [(-x, y1 - t * (y1 - y0)) for t in u(ny_)]
+        return np.array(pts)
+    Lo = loop(hx, h0, h1); Li = loop(hx - b, h0 + b, h1 - b)
+    assert len(Lo) == len(Li)
+    depth = lambda y: np.where(y > p["bar_y"], p["bar_recess_m"], p["recess_m"])
+    Ro = np.stack([Lo[:, 0], Lo[:, 1], zf(Lo[:, 0], Lo[:, 1])], 1); Ri = np.stack([Li[:, 0], Li[:, 1], zf(Li[:, 0], Li[:, 1]) + depth(Li[:, 1])], 1)
+    m = len(Lo); base = len(Pf); Pf = np.vstack([Pf, Ro, Ri]); Ff = list(Ff); Sf = list(Sf)
+    for k in range(m):
+        q = [base + k, base + (k + 1) % m, base + m + (k + 1) % m, base + m + k]
+        nq = np.cross(Pf[q[1]] - Pf[q[0]], Pf[q[2]] - Pf[q[0]])
+        Ff.append(q if nq[2] < 0 else q[::-1]); Sf.append(True)
+    parts = [(Pf, Ff, Sf, "CAR_body_tail_face_C")]
+    # recess panel and light bar : grids on the same surface, set back, inside the bevel
+    for name, y0, y1, back in (("CAR_fascia_rear_panel_C", h0 + b, p["bar_y"] - p["bar_bevel_m"], p["recess_m"]), ("CAR_light_bar_rear_C", p["bar_y"], h1 - b, p["bar_recess_m"])):
+        gx = np.array(breaks(-(hx - b), hx - b, p["edge_m"])); gy = np.array(breaks(y0, y1, p["edge_m"]))
+        GX, GY = np.meshgrid(gx, gy); G = np.stack([GX, GY, zf(GX, GY) + back], -1)
+        Pp, Fp, Sp = shell_holed(G, np.ones((G.shape[0] - 1, G.shape[1] - 1), bool), p["panel_thick"], name)
+        parts.append((Pp, Fp, Sp, name))
+    # light bar line : one strip of quads from the panel top row to the bar bottom row (same columns)
+    gx = np.array(breaks(-(hx - b), hx - b, p["edge_m"])); ya_, yb_ = p["bar_y"] - p["bar_bevel_m"], p["bar_y"]
+    A_ = np.stack([gx, np.full(len(gx), ya_), zf(gx, np.full(len(gx), ya_)) + p["recess_m"]], 1)
+    B_ = np.stack([gx, np.full(len(gx), yb_), zf(gx, np.full(len(gx), yb_)) + p["bar_recess_m"]], 1)
+    Pb, Fb, Sb, _nm = parts[-1]; Pb = list(Pb); Fb = list(Fb); Sb = list(Sb); base = len(Pb); Pb += list(A_) + list(B_); n_ = len(gx)
+    for i in range(n_ - 1):
+        q = [base + i, base + i + 1, base + n_ + i + 1, base + n_ + i]
+        P_ = np.array(Pb); nq = np.cross(P_[q[1]] - P_[q[0]], P_[q[2]] - P_[q[0]])
+        Fb.append(q if nq[2] < 0 else q[::-1]); Sb.append(True)
+    parts[-1] = (np.array(Pb), Fb, Sb, "CAR_light_bar_rear_C")
+    allP, allQ, allN, allS = [], [], [], []
+    for Pp, Fp, Sp, name in parts:
+        base = len(allP); allP += list(Pp); allQ += [[base + v for v in f] for f in Fp]; allN += [name] * len(Fp); allS += Sp
+    np.savez(a.out, P=np.array(allP, np.float32), Q=np.array(allQ, dtype=object), names=np.array(allN), skin=np.array(allS))
+    print(json.dumps({"fit_resid_mm_p50": round(res, 2), "frame_grid": list(T.shape[:2]), "faces": {n: sum(1 for x in allN if x == n) for n in set(allN)}}))
+
+
+if __name__ == "__main__":
+    main()

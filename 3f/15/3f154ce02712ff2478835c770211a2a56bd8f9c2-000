@@ -1,0 +1,76 @@
+"""28 October 2026 : ZenRay Meshes CURVE RIG of the body (generalizes MakeRigFender). The CarNet network (fender, door section, ...) is
+solved, built and fitted once (R07 : the curves that are not design lines relax with the surface), then every curve becomes a clamped
+cubic B-spline fitted to its FITTED vertex chain (adaptive, fewest control points under fit_tol_mm), every node one shared control, and
+every patch crown fitted to the fitted surface : the rig reproduces the fit, then the designer edits the controls. Writes the rig JSON and
+the loft, and measures it. python MakeRigCar.py [--sections fender,door] [--out work/car/curverig/RIG_car.json]
+FR : le rig de courbes de la caisse : réseau ajusté une fois, courbes NURBS prises sur la surface ajustée, bombés ajustés."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+import Common as C
+import CarNet as CN
+
+PARAMS = {"mode": "hard", "hard_cv_line": 4, "hard_cv_arc": 6, "hard_arcs": ["lip", "lip_r", "lip_t", "lip_f", "lip_low", "out_rear", "out_front", "out_low", "crease2", "crease2a", "crease2b", "crease2c", "lipq_f", "lipq_t", "lipq_b", "lip_lowq", "outq_f", "outq_t", "outq_b", "out_lowq"], "crown_robust": True,   # 28 October 2026 : hard surface mode (default)
+          "cv_min": 4, "cv_max": 12, "fit_tol_mm": 4.0, "lambda": 8.0, "iters": 5,
+          "free_edges": ["dc_lower", "dc_upper"]}   # 28 October 2026 : panel cuts inside the network relax with the surface
+
+
+def make(out, sections):
+    net = CN.build_net(sections)
+    for k in PARAMS["free_edges"]:
+        if k in net.edges and all(k not in p for p in ()): net.edges[k]["fixed"] = False
+    net.solve_counts(); P0, Q = net.build()
+    hard = PARAMS["mode"] == "hard"
+    X = P0.copy() if hard else net.fit(PARAMS["lambda"], PARAMS["iters"])   # hard : no fit of the surface to the sculpt, the curves alone
+    ctl = []; node_idx = {}; nid = {}
+    for name in net.nodes:
+        v = net.evid[[k for k, e in net.edges.items() if e["a"] == name or e["b"] == name][0]]
+        e0 = [k for k, e in net.edges.items() if e["a"] == name or e["b"] == name][0]; vid = net.evid[e0][0] if net.edges[e0]["a"] == name else net.evid[e0][-1]
+        node_idx[name] = len(ctl); ctl.append(X[vid].tolist())
+    curves = {}; fit_err = {}
+    for name, e in net.edges.items():
+        chain = e["poly"] if (hard and not e["locked"]) else X[net.evid[name]]
+        if e["locked"]:
+            curves[name] = {"cvs": [node_idx[e["a"]], node_idx[e["b"]]], "fixed": e["fixed"], "sharp": e["sharp"], "fracs": RL.arcfrac(chain).tolist()}; fit_err[name] = 0.0; continue
+        dense = np.vstack([np.linspace(a, b, 6, endpoint=False) for a, b in zip(chain[:-1], chain[1:])] + [chain[-1:]])
+        if hard:   # few points, robust : one clean line through the dirty source
+            k = PARAMS["hard_cv_arc"] if name in PARAMS["hard_arcs"] else PARAMS["hard_cv_line"]   # by curve type, never by the noise of the source
+            CV = RL.fit_robust(dense, k); err = float(np.median(cKDTree(RL.evaluate(CV, 800)).query(chain)[0]) * 1000)
+        else:
+            for k in range(PARAMS["cv_min"], PARAMS["cv_max"] + 1):
+                CV = RL.fit(dense, k); err = float(cKDTree(RL.evaluate(CV, 800)).query(chain)[0].max() * 1000)
+                if err <= PARAMS["fit_tol_mm"]: break
+        fit_err[name] = round(err, 2); ids = [node_idx[e["a"]]]
+        for c in CV[1:-1]: ids.append(len(ctl)); ctl.append(c.tolist())
+        ids.append(node_idx[e["b"]]); curves[name] = {"cvs": ids, "fixed": e["fixed"], "sharp": e["sharp"]}
+    rig = {"_doc": "ZenRay Meshes curve rig of the body, sections %s (28 October 2026). Move the controls (Houdini EDIT), curves and loft follow." % ",".join(sections),
+           "controls": ctl, "nodes": node_idx, "curves": curves, "patches": [{"name": p["name"], "S": p["S"]} for p in net.patches],
+           "counts": {k: int(e["n"]) for k, e in net.edges.items()}, "crowns": {}, "fit_err_mm": fit_err}
+    # crowns : the bulge that brings each Coons patch onto the fitted surface (same grid as the fit)
+    P, Qr, sharp, lines, grids = RL.loft(rig); cen = np.array([0.0, 0.6, 0.0])
+    for (name, G), pt, g in zip(grids, rig["patches"], net.grids):
+        Xg = P[G]; du = np.gradient(Xg, axis=0); dv = np.gradient(Xg, axis=1); Nn = np.cross(du, dv); Nn /= np.linalg.norm(Nn, axis=2, keepdims=True) + 1e-12
+        if ((Xg - cen) * Nn).sum(2).mean() < 0: pt["flip_normal"] = True; Nn = -Nn
+        nu, nv = G.shape; U, V = np.meshgrid(np.linspace(0, 1, nu), np.linspace(0, 1, nv), indexing="ij"); Wb = 16 * U * (1 - U) * V * (1 - V)
+        if hard:   # crown toward the sculpt, robust (Cauchy) : the old steps and vents do not pull the panel
+            T = C.sculpt().project(Xg.reshape(-1, 3), nref=Nn.reshape(-1, 3)).reshape(Xg.shape); r = ((T - Xg) * Nn).sum(2); b = 0.0
+            for _ in range(5):
+                res = r - b * Wb; sg = 1.4826 * np.median(np.abs(res)) + 1e-4; ww = 1.0 / (1.0 + (res / (2.5 * sg)) ** 2)
+                b = float((ww * Wb * r).sum() / max((ww * Wb * Wb).sum(), 1e-12))
+            rig["crowns"][name] = round(b, 4)
+        else:
+            T = X[g["G"]] if g["G"].shape == G.shape else Xg; r = ((T - Xg) * Nn).sum(2)
+            rig["crowns"][name] = round(float((Wb * r).sum() / max((Wb * Wb).sum(), 1e-12)), 4)
+    json.dump(rig, open(out, "w"), indent=1)
+    P, Qr, sharp, lines, grids = RL.loft(rig); C._CT = net.as_contours(); m = C.measure(P, Qr)
+    dfit = cKDTree(X).query(P)[0] * 1000
+    print(json.dumps({"controls": len(ctl), "curves": len(curves), "patches": len(rig["patches"]), "faces": len(Qr), "fit_err_med_max_mm": max(fit_err.values()),
+                      "rig_to_fit_p95_mm": round(float(np.percentile(dfit, 95)), 2), **{k: m[k] for k in ("dev_p95_mm", "fair_p95_deg", "shading_ratio", "quads_pct", "irregular", "min_angle_p5")}}))
+    np.savez(out.replace(".json", "_loft.npz"), P=P, Q=np.array(Qr), sharp=np.array(sharp)); return rig
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--sections", default="fender,door,quarter,qband,qfin"); ap.add_argument("--out", default=C.W + "curverig/RIG_car.json")
+    a = ap.parse_args(); make(a.out, a.sections.split(","))

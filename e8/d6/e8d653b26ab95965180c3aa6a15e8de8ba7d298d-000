@@ -1,0 +1,120 @@
+"""28 October 2026 : ZenRay Meshes PATCHNET, the generic retopology builder of the winning method (R07, SKILL section 227).
+A curve network : nodes (3D points), edges (3D polylines between two nodes, flags fixed and sharp, optional locked samples), and four
+sided patches whose sides are chains of edges (S0 bottom left to right, S1 right bottom to top, S2 top left to right, S3 left bottom to
+top ; a leading '-' reverses an edge). solve_counts() gives every edge its number of intervals so that opposite sides match (only the
+smaller side grows), build() samples every edge once (neighbours share the samples : welded by construction) and fills each patch with a
+Coons grid (arc length parameters), fit() is R07 : global fit to the sculpt with a bending energy, fixed edges held, then the support
+rows next to every sharp side pinned at support_m. An instance script (FenderNet.py, then the whole body) only draws the curves.
+FR : le constructeur générique de la retopologie : réseau de courbes, patchs à quatre côtés, Coons soudés, ajustement R07."""
+import numpy as np
+from scipy.sparse import identity, diags
+from scipy.sparse.linalg import spsolve
+import Common as C
+
+
+def resample(poly, n_int):
+    poly = np.asarray(poly, float); L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(poly, axis=0), axis=1))]
+    t = np.linspace(0, L[-1], n_int + 1); return np.stack([np.interp(t, L, poly[:, k]) for k in range(3)], 1)
+
+
+def arcfrac(X):
+    L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]; return L / max(L[-1], 1e-12)
+
+
+class Net:
+    def __init__(self, spacing=0.025, support_m=0.012):
+        self.nodes = {}; self.edges = {}; self.patches = []; self.spacing = spacing; self.support_m = support_m
+
+    def node(self, name, xyz):
+        self.nodes[name] = np.asarray(xyz, float); return name
+
+    def edge(self, name, a, b, poly, fixed=False, sharp=False, samples=None):
+        poly = np.asarray(poly, float).copy(); poly[0] = self.nodes[a]; poly[-1] = self.nodes[b]
+        L = float(np.linalg.norm(np.diff(poly, axis=0), axis=1).sum())
+        e = dict(a=a, b=b, poly=poly, fixed=fixed, sharp=sharp, L=L, n=max(1, int(round(L / self.spacing))), locked=samples is not None, samples=None)
+        if samples is not None:
+            s = np.asarray(samples, float).copy(); s[0] = self.nodes[a]; s[-1] = self.nodes[b]; e["samples"] = s; e["n"] = len(s) - 1
+        self.edges[name] = e
+
+    def patch(self, name, S0, S1, S2, S3): self.patches.append(dict(name=name, S=[S0, S1, S2, S3]))
+
+    def _n(self, side): return sum(self.edges[e.lstrip("-")]["n"] for e in side)
+
+    def solve_counts(self, min_across_sharp=3, max_iter=5000):
+        """Opposite sides of every patch get the same number of intervals ; a side facing a sharp side keeps at least min_across_sharp."""
+        for p in self.patches:
+            for s, o in ((0, 1), (2, 1), (1, 0), (3, 0)):
+                if all(self.edges[e.lstrip("-")]["sharp"] for e in p["S"][s]):
+                    side = p["S"][o]; free = [e.lstrip("-") for e in side if not self.edges[e.lstrip("-")]["locked"]]
+                    while self._n(side) < min_across_sharp and free: self.edges[max(free, key=lambda k: self.edges[k]["L"])]["n"] += 1
+        for it in range(max_iter):
+            changed = False
+            for p in self.patches:
+                for a, b in ((0, 2), (1, 3)):
+                    na, nb = self._n(p["S"][a]), self._n(p["S"][b])
+                    if na == nb: continue
+                    small = p["S"][a] if na < nb else p["S"][b]; cand = [e.lstrip("-") for e in small if not self.edges[e.lstrip("-")]["locked"]]
+                    if not cand: raise ValueError("patch %s : sides %d and %d cannot match, every edge of the smaller side is locked" % (p["name"], a, b))
+                    k = max(cand, key=lambda q: self.edges[q]["L"] / self.edges[q]["n"]); self.edges[k]["n"] += 1; changed = True
+            if not changed: return it
+        raise ValueError("edge counts did not converge : the network asks a side to be both longer and shorter")
+
+    def build(self):
+        P = []
+        def add(x): P.append(np.asarray(x, float)); return len(P) - 1
+        nid = {k: add(v) for k, v in self.nodes.items()}; self.evid = {}
+        for k, e in self.edges.items():
+            pts = e["samples"] if e["locked"] else resample(e["poly"], e["n"])
+            self.evid[k] = [nid[e["a"]]] + [add(x) for x in pts[1:-1]] + [nid[e["b"]]]
+        def chain(side):
+            out = []
+            for s in side:
+                ids = self.evid[s.lstrip("-")]; ids = ids[::-1] if s.startswith("-") else ids; out += ids if not out else ids[1:]
+            return out
+        Q = []; self.grids = []
+        for p in self.patches:
+            B0, R1, T2, L3 = [chain(s) for s in p["S"]]
+            if not (B0[0] == L3[0] and B0[-1] == R1[0] and T2[0] == L3[-1] and T2[-1] == R1[-1]):
+                raise ValueError("patch %s : the four sides do not meet at its corners" % p["name"])
+            nu, nv = len(B0), len(L3); G = -np.ones((nu, nv), np.int64); G[:, 0] = B0; G[:, -1] = T2; G[0, :] = L3; G[-1, :] = R1
+            X = np.array(P); Bp, Tp, Lp, Rp = X[B0], X[T2], X[L3], X[R1]; u = (arcfrac(Bp) + arcfrac(Tp)) / 2; v = (arcfrac(Lp) + arcfrac(Rp)) / 2
+            for i in range(1, nu - 1):
+                for j in range(1, nv - 1):
+                    uu, vv = u[i], v[j]
+                    S = (1 - vv) * Bp[i] + vv * Tp[i] + (1 - uu) * Lp[j] + uu * Rp[j] - ((1 - uu) * (1 - vv) * Bp[0] + uu * (1 - vv) * Bp[-1] + (1 - uu) * vv * Tp[0] + uu * vv * Tp[-1])
+                    G[i, j] = add(S)
+            Q += [[int(G[i, j]), int(G[i + 1, j]), int(G[i + 1, j + 1]), int(G[i, j + 1])] for i in range(nu - 1) for j in range(nv - 1)]
+            self.grids.append(dict(name=p["name"], G=G, sharp=[all(self.edges[e.lstrip("-")]["sharp"] for e in s) for s in p["S"]]))
+        self.P = np.array(P); self.Q = Q
+        self.fixed = np.array(sorted({v for k, e in self.edges.items() if e["fixed"] for v in self.evid[k]}), np.int64)
+        self.sharp_ids = np.array(sorted({v for k, e in self.edges.items() if e["sharp"] for v in self.evid[k]}), np.int64)
+        return self.P, self.Q
+
+    def fit(self, lam=8.0, iters=5, w=1.0):
+        """R07 : minimize w |X - proj(X)|^2 + lam |L X|^2 over the free vertices, fixed edges held ; then the support rows pinned."""
+        X = self.P.copy(); Q = self.Q; S = C.sculpt(); n = len(X); fix = np.zeros(n, bool); fix[self.fixed] = True
+        Wm, deg = C.adjacency(X, Q); L = diags(1.0 / np.maximum(deg, 1)) @ Wm - identity(n); LtL = (L.T @ L).tocsr()
+        free = np.nonzero(~fix)[0]; fx = np.nonzero(fix)[0]; Mff = (w * identity(len(free)) + lam * LtL[free][:, free]).tocsc(); Mfx = lam * LtL[free][:, fx]
+        for _ in range(iters):
+            T = S.project(X, nref=C.vnormals(X, Q)); rhs = w * T[free] - Mfx @ X[fx]
+            X[free] = np.column_stack([spsolve(Mff, rhs[:, k]) for k in range(3)])
+        for g in self.grids:
+            G = g["G"]; nu, nv = G.shape; sm = self.support_m
+            def pin(a, b, c):
+                for t in range(len(a)):
+                    if fix[b[t]]: continue
+                    d = np.linalg.norm(X[c[t]] - X[a[t]]); X[b[t]] = X[a[t]] + (X[c[t]] - X[a[t]]) * min(sm / max(d, 1e-9), 0.45)
+            if g["sharp"][0] and nv >= 3: pin(G[1:-1, 0], G[1:-1, 1], G[1:-1, 2])
+            if g["sharp"][2] and nv >= 3: pin(G[1:-1, -1], G[1:-1, -2], G[1:-1, -3])
+            if g["sharp"][3] and nu >= 3: pin(G[0, 1:-1], G[1, 1:-1], G[2, 1:-1])
+            if g["sharp"][1] and nu >= 3: pin(G[-1, 1:-1], G[-2, 1:-1], G[-3, 1:-1])
+        self.X = X; return X
+
+    def as_contours(self):
+        """The network as the bench reference (Common._CT) : boundary samples, crease samples, for the weld and crease measures."""
+        from scipy.spatial import cKDTree
+        b = C.boundary_verts(self.Q); cr = self.sharp_ids[~np.isin(self.sharp_ids, b)] if len(self.sharp_ids) else self.sharp_ids
+        crd = np.vstack([C.densify(self.P[self.evid[k]], 0.002) for k, e in self.edges.items() if e["sharp"]])
+        bd = np.vstack([C.densify(self.P[self.evid[k]], 0.002) for k, e in self.edges.items() if set(self.evid[k]) <= set(b.tolist())])
+        ct = {"P": self.P, "Q": self.Q, "bnd": b, "loop_dense": bd, "crease_dense": crd}; ct["kd_loop"] = cKDTree(bd); ct["kd_crease"] = cKDTree(crd)
+        return ct

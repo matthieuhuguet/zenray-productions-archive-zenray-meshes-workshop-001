@@ -1,0 +1,174 @@
+"""28 October 2026 : ZenRay Meshes CURVE FAIRNESS, Matthieu's rule made a verifier : no zigzag, no staircase edge, no Z segment ; every
+curve is smoothed for a motion pleasant to the eye ; only a truly straight line (glass, table) stays straight, and then perfectly straight.
+A polyline is resampled by arc length, split at true corners (turn above corner_deg concentrated within corner_win_m), and each piece is
+compared with its local cubic fit (Savitzky Golay over window_m, which keeps arcs and S curves exact) :
+  lobes    = sign changes of the distance to that fit where it exceeds lobe_tol_mm (a zigzag or a staircase alternates at every step ; a tight
+             but taut fillet only leaves one or two lobes, so it is NOT refused : correction of 28 October 2026, the first version refused fillets) ;
+  flips    = sign changes of the curvature of the fit, counted only where |curvature| > kappa_min (a wave longer than the window shows here) ;
+  waviness = largest distance to the fit, reported only.
+A piece passes when lobes <= lobes_max and flips <= allowed (1 for a rig curve : an arc or one S ; 2 for a mesh section, which may cross a
+soft concave valley between two convex areas). Two opposite corners closer than z_gap_m are a Z segment, a piece shorter than min_piece_m
+between two corners is a stair step ; with --rig, a section corner farther than crease_tol_m from every sharp rig curve is a fold (a corner is
+allowed only on a design crease). A curve declared straight must stay within straight_tol_mm of its chord.
+python CurveFair.py rig <rig.json> [--json out]                curves of a curve rig (clamped B-splines)
+python CurveFair.py section <mesh.npz> --axis z --at -1.13,-0.95 [--keep-x 0.3]   sections of a mesh (P, Q), every crossing loop checked
+python CurveFair.py selftest                                     green on an arc, an S and a straight line ; red on a zigzag, a staircase, a wave, a bowed 'straight' line
+Exit 0 only if everything passes.  FR : vérificateur de la règle des courbes lisses (aucun zigzag, escalier ni segment en Z)."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.signal import savgol_filter
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+PARAMS = {"step_m": 0.002, "window_m": 0.06, "kappa_min": 0.8, "corner_deg": 5.0, "corner_win_m": 0.01, "corner_concentration": 0.6, "lobe_tol_mm": 0.25, "lobes_max": 4,
+          "allowed_flips_rig": 1, "allowed_flips_section": 2, "straight_tol_mm": 0.5, "min_piece_m": 0.04, "z_gap_m": 0.08, "crease_tol_m": 0.015}
+
+
+def resample(P, h):
+    P = np.asarray(P, float); d = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+    keep = np.r_[True, np.diff(d) > 1e-9]; P, d = P[keep], d[keep]
+    if d[-1] < h * 3: return P
+    s = np.linspace(0, d[-1], int(np.ceil(d[-1] / h)) + 1); return np.stack([np.interp(s, d, P[:, k]) for k in range(3)], 1)
+
+
+def split_corners(P, h, normal):
+    """Indices where the polyline turns more than corner_deg within corner_win_m : true creases, kept as corners ; with the sign of each
+    turn about the normal, so two opposite corners close together (a Z segment) can be refused."""
+    w = max(1, int(round(PARAMS["corner_win_m"] / h))); W = 3 * w; n = len(P); t1 = np.zeros(n); t3 = np.zeros(n)
+    def turn(i, k):
+        a, b = P[i] - P[max(i - k, 0)], P[min(i + k, n - 1)] - P[i]; c = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-15); return np.degrees(np.arccos(np.clip(c, -1, 1)))
+    for i in range(w, n - w): t1[i] = turn(i, w); t3[i] = turn(i, W)
+    # a corner turns most of its angle within corner_win_m (a crease or a fold) ; a tight fillet spreads it (28 October 2026 : a 5 cm fillet is not a corner)
+    cand = (t1 > PARAMS["corner_deg"]) & (t1 >= PARAMS["corner_concentration"] * t3); cuts, signs = [0], []
+    for i in np.nonzero(cand)[0]:
+        if t1[i] < t1[max(i - 2 * w, 0):i + 2 * w + 1].max() or i - cuts[-1] <= 2 * w or i >= n - 1 - w: continue
+        a, b = P[i] - P[i - w], P[i + w] - P[i]; cuts.append(int(i)); signs.append(float(np.sign(np.cross(a, b) @ normal)))
+    cuts.append(n - 1); return cuts, signs
+
+
+def piece_stats(P, h, normal=None):
+    n = len(P); L = h * (n - 1)
+    if L < PARAMS["min_piece_m"] or n < 7: return {"length_m": round(L, 3), "waviness_mm": 0.0, "lobes": 0, "flips": 0, "short": True}
+    w = int(round(PARAMS["window_m"] / h)) | 1; w = min(w, n - (1 - n % 2)); w = max(w, 5)
+    S = savgol_filter(P, w, 3, axis=0, mode="interp"); d1 = savgol_filter(P, w, 3, deriv=1, delta=h, axis=0, mode="interp")
+    d2 = savgol_filter(P, w, 3, deriv=2, delta=h, axis=0, mode="interp"); wav = float(np.linalg.norm(P - S, axis=1).max() * 1000)
+    if normal is None:   # sign of curvature in the best fit plane of the piece
+        _, _, vt = np.linalg.svd(P - P.mean(0)); normal = vt[2]
+    cr = np.cross(d1, d2) @ np.asarray(normal, float); sp = np.linalg.norm(d1, axis=1) ** 3 + 1e-15; k = cr / sp
+    sig = np.sign(k) * (np.abs(k) > PARAMS["kappa_min"]); s = sig[sig != 0]; flips = int((s[1:] != s[:-1]).sum()) if len(s) > 1 else 0
+    t = d1 / (np.linalg.norm(d1, axis=1)[:, None] + 1e-15); rn = ((P - S) * np.cross(np.asarray(normal, float), t)).sum(1) * 1000
+    lo = np.sign(rn) * (np.abs(rn) > PARAMS["lobe_tol_mm"]); lo = lo[lo != 0]; lobes = int((lo[1:] != lo[:-1]).sum()) if len(lo) > 1 else 0
+    return {"length_m": round(L, 3), "waviness_mm": round(wav, 3), "lobes": lobes, "flips": flips, "kappa_max": round(float(np.abs(k).max()), 2)}
+
+
+def check_polyline(P, allowed, normal=None, straight=False, creases=None):
+    h = PARAMS["step_m"]; R = resample(P, h)
+    if straight:
+        a, b = R[0], R[-1]; u = (b - a) / (np.linalg.norm(b - a) + 1e-15); dev = np.linalg.norm((R - a) - np.outer((R - a) @ u, u), axis=1).max() * 1000
+        return {"straight": True, "deviation_mm": round(float(dev), 3), "ok": bool(dev <= PARAMS["straight_tol_mm"])}
+    if normal is None:
+        _, _, vt = np.linalg.svd(R - R.mean(0)); normal = vt[2]
+    cuts, signs = split_corners(R, h, normal); pieces = [piece_stats(R[cuts[i]:cuts[i + 1] + 1], h, normal) for i in range(len(cuts) - 1)]
+    steps = sum(1 for p in pieces[1:-1] if p.get("short"))   # a piece shorter than min_piece_m between two corners : a stair step
+    zs = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1] and (cuts[i + 1] - cuts[i]) * h < PARAMS["z_gap_m"])   # opposite corners close together : a Z
+    folds = [] if creases is None else [[round(float(v), 3) for v in R[c]] for c in cuts[1:-1] if creases.query(R[c])[0] > PARAMS["crease_tol_m"]]
+    ok = steps == 0 and zs == 0 and not folds and all(p.get("short") or (p["lobes"] <= PARAMS["lobes_max"] and p["flips"] <= allowed) for p in pieces)
+    for i, p in enumerate(pieces): p["at"] = [round(float(v), 3) for v in R[(cuts[i] + cuts[i + 1]) // 2]]   # where the piece is
+    worst = max(pieces, key=lambda p: (p["lobes"] > PARAMS["lobes_max"] or p["flips"] > allowed, p["lobes"], p["flips"]))
+    return {"corners": len(cuts) - 2, "stair_steps": steps, "z_segments": zs, "fold_corners": folds, "worst": worst,
+            "flips_max": max(p["flips"] for p in pieces), "lobes_max": max(p["lobes"] for p in pieces), "ok": bool(ok)}
+
+
+def section_loops(P, Q, axis, at):
+    """Ordered polylines where the mesh (P, Q) crosses the plane P[:, axis] = at ; every crossing point keyed by its mesh edge."""
+    Q = np.asarray(Q); A = P[:, axis]; keyp = {}; adj = defaultdict(list)
+    lo, hi = A[Q].min(1), A[Q].max(1)
+    for f in Q[(lo < at) & (hi > at)]:
+        ks = []
+        for k in range(len(f)):
+            i, j = int(f[k]), int(f[(k + 1) % len(f)])
+            if (A[i] - at) * (A[j] - at) < 0:
+                e = (min(i, j), max(i, j))
+                if e not in keyp: t = (at - A[e[0]]) / (A[e[1]] - A[e[0]]); keyp[e] = P[e[0]] + t * (P[e[1]] - P[e[0]])
+                ks.append(e)
+        if len(ks) == 2: adj[ks[0]].append(ks[1]); adj[ks[1]].append(ks[0])
+    seen, loops = set(), []
+    for s in list(adj):
+        if s in seen or len(adj[s]) == 2 and any(len(adj[t]) != 2 for t in adj): pass
+        if s in seen: continue
+        ends = [s]; cur, prev = s, None
+        while True:   # walk to one end of the chain
+            nx = [t for t in adj[cur] if t != prev]
+            if not nx or nx[0] == s: break
+            prev, cur = cur, nx[0]
+            if cur in ends: break
+            ends.append(cur)
+            if len(ends) > len(adj) + 1: break
+        start = cur; chain = [start]; seen.add(start); prev = None; cur = start
+        while True:
+            nx = [t for t in adj[cur] if t != prev and t not in seen]
+            if not nx: break
+            prev, cur = cur, nx[0]; chain.append(cur); seen.add(cur)
+        if len(chain) > 3: loops.append(np.array([keyp[k] for k in chain]))
+    return loops
+
+
+def run_rig(path):
+    import RigLib as RL
+    rig = json.load(open(path)); C = np.array(rig["controls"], float); out = {}
+    for name, c in rig["curves"].items():
+        P = RL.evaluate(C[c["cvs"]], 400); out[name] = check_polyline(P, PARAMS["allowed_flips_rig"], straight=bool(c.get("straight")))
+    return out
+
+
+def crease_tree(rig_path):
+    """KD tree of the sharp curves of a rig : the only places where a section may turn a corner."""
+    import RigLib as RL
+    from scipy.spatial import cKDTree
+    rig = json.load(open(rig_path)); C = np.array(rig["controls"], float)
+    pts = [RL.evaluate(C[c["cvs"]], 400) for c in rig["curves"].values() if c.get("sharp")]; return cKDTree(np.vstack(pts)) if pts else None
+
+
+def run_section(path, axis, ats, keep_x, rig=None):
+    d = np.load(path, allow_pickle=True); P, Q = d["P"].astype(float), d["Q"]; out = {}; ax = "xyz".index(axis); nrm = np.eye(3)[ax]; ct = crease_tree(rig) if rig else None
+    for at in ats:
+        for i, L in enumerate(section_loops(P, Q, ax, at)):
+            L = L[L[:, 0] > keep_x] if keep_x is not None else L
+            if len(L) < 8: continue
+            r = check_polyline(L, PARAMS["allowed_flips_section"], normal=nrm, creases=ct); r["at"] = at; r["mid"] = [round(float(v), 3) for v in L[len(L) // 2]]
+            out["%s=%.3f #%d" % (axis, at, i)] = r
+    return out
+
+
+def selftest():
+    t = np.linspace(0, np.pi / 2, 400); arc = np.stack([np.cos(t), np.sin(t), 0 * t], 1)
+    xs = np.linspace(0, 1, 400); S = np.stack([xs, 0.05 * np.sin(2 * np.pi * xs), 0 * xs], 1)   # one smooth S, a single inflection
+    nrm = arc / np.linalg.norm(arc, axis=1)[:, None]; zz = arc + nrm * (0.002 * np.where((np.arange(400) // 6) % 2, 1, -1))[:, None]   # +-2 mm every ~2.4 cm
+    u = np.arange(0, 1.0, 0.0085); stair = np.stack([np.repeat(u, 2)[1:], np.repeat(0.4 * u, 2)[:-1], 0 * np.repeat(u, 2)[1:]], 1)   # pixel steps of a diagonal
+    x = np.linspace(0, 1, 400); wave = np.stack([x, 0.003 * np.sin(2 * np.pi * x / 0.2), 0 * x], 1); line = np.stack([x, 0.3 * x, 0 * x], 1)
+    bow = np.stack([x, 0.3 * x + 0.003 * np.sin(np.pi * x), 0 * x], 1)
+    a1 = np.stack([np.linspace(-0.4, 0, 200), 0 * np.ones(200), 0 * np.ones(200)], 1); tt = np.linspace(-np.pi / 2, 0, 60)   # line, 5 cm fillet, line
+    fil = np.vstack([a1, np.stack([0.05 * np.cos(tt), 0.05 + 0.05 * np.sin(tt), 0 * tt], 1)[1:], np.stack([0.05 * np.ones(200), np.linspace(0.05, 0.45, 200), 0 * np.ones(200)], 1)[1:]])
+    xc = np.linspace(-0.3, 0.3, 300); kink = np.stack([xc, np.where(xc < 0, 0.0, np.tan(np.radians(25)) * xc), 0 * xc], 1)   # a 25 deg corner at the origin
+    from scipy.spatial import cKDTree
+    on = cKDTree(np.array([[0.0, 0.0, 0.0]])); off = cKDTree(np.array([[0.0, 0.2, 0.0]]))
+    cases = {"arc": (arc, True, False, None), "s_curve": (S, True, False, None), "straight": (line, True, True, None), "fillet_5cm": (fil, True, False, None),
+             "corner_on_crease": (kink, True, False, on), "zigzag": (zz, False, False, None), "staircase": (stair, False, False, None),
+             "wave": (wave, False, False, None), "bowed_straight": (bow, False, True, None), "corner_off_crease": (kink, False, False, off)}
+    res, good = {}, True
+    for k, (P, expect, st, ct) in cases.items():
+        r = check_polyline(P, PARAMS["allowed_flips_rig"], normal=np.array([0, 0, 1.0]) if ct is not None else None, straight=st, creases=ct); res[k] = r; good &= r["ok"] == expect
+    res["selftest"] = "PASS" if good else "FAIL"; return res, good
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("mode", choices=["rig", "section", "selftest"]); ap.add_argument("path", nargs="?")
+    ap.add_argument("--axis", default="z"); ap.add_argument("--at", default=""); ap.add_argument("--keep-x", type=float, default=None); ap.add_argument("--json", default="")
+    ap.add_argument("--rig", default="")   # sections : corners allowed only on the sharp curves of this rig
+    a = ap.parse_args()
+    if a.mode == "selftest":
+        r, g = selftest(); print(json.dumps(r, indent=1)); sys.exit(0 if g else 1)
+    r = run_rig(a.path) if a.mode == "rig" else run_section(a.path, a.axis, [float(v) for v in a.at.split(",")], a.keep_x, a.rig or None)
+    if a.json: json.dump(r, open(a.json, "w"), indent=1)
+    bad = {k: v for k, v in r.items() if not v["ok"]}
+    for k, v in list(bad.items())[:25]: print("REFUSED", k, json.dumps(v))
+    print("fair %d / %d" % (len(r) - len(bad), len(r))); sys.exit(0 if not bad else 1)

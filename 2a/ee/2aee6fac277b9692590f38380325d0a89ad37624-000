@@ -1,0 +1,27 @@
+"""28 October 2026, 19:30 : ZenRay Meshes finishing, FIX DEGENERATE, faces of zero area (or a repeated vertex) are removed by collapsing their
+shortest edge (both ends to the midpoint, within the part), repeated until none is left ; faces that lose a vertex become triangles only if a quad
+cannot be kept, and are then reported. FR : supprime les faces d'aire nulle en écrasant leur plus courte arête.
+python FixDegenerate.py <in.npz> <out.npz> [--min-area 1e-8]"""
+import argparse, json
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--min-area", type=float, default=1e-8); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+area = lambda q: np.linalg.norm(np.cross(P[q[2]] - P[q[0]], P[q[-1]] - P[q[1]])) / 2
+remap = list(range(len(P))); root = lambda v: v if remap[v] == v else root(remap[v]); fixed = 0
+for it in range(20):
+    bad = [i for i, q in enumerate(Q) if len(set(q)) < len(q) or area(q) < a.min_area]
+    if not bad: break
+    for i in bad:
+        q = [root(v) for v in Q[i]]
+        if len(set(q)) < 2: continue
+        e = min(((q[k], q[(k + 1) % len(q)]) for k in range(len(q)) if q[k] != q[(k + 1) % len(q)]), key=lambda e: np.linalg.norm(P[e[0]] - P[e[1]]))
+        u, w = root(e[0]), root(e[1])
+        if u == w: continue
+        P[u] = (P[u] + P[w]) / 2; remap[w] = u; fixed += 1
+    NQ, NN = [], []
+    for q, m in zip(Q, n):
+        q2 = [root(v) for v in q]; q3 = [x for k, x in enumerate(q2) if x != q2[k - 1]]
+        if len(set(q3)) >= 3: NQ.append(q3); NN.append(m)
+    Q, n = NQ, NN
+tri = sum(len(q) == 3 for q in Q)
+np.savez(a.out, P=P.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(n)); print(json.dumps({"collapsed_edges": fixed, "tris": tri, "faces": len(Q)}))
