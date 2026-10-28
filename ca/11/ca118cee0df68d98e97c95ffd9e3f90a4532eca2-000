@@ -1,0 +1,195 @@
+# 28 October 2026 : Build ZenRayCar Delivery Candidate v633
+# EN: Multi-seam hermetic weld pack:
+#     1) Rear Light Bar to Tail Face (CAR_light_bar_rear_C to CAR_body_tail_face_C):
+#        19 contact vertices sealed flush at 0.00 mm along upper horizontal and lateral rear light bar boundary X in [-0.925, +0.925 m], closing gaps of 0.11 to 0.95 mm.
+#     2) Front Fascia Band to Headlights (CAR_fascia_front_band_C to CAR_light_headlight_L/R):
+#        2 contact vertices sealed flush at 0.00 mm at Y ~ 0.52 m, Z ~ 2.18 m, closing gaps of 1.03 mm.
+#     3) Headlights to Front Fenders (CAR_light_headlight_L/R to CAR_body_fender_front_L/R):
+#        1 contact vertex sealed flush at 0.00 mm along outer bezel, closing 2.51 mm gap.
+#     4) Rear Flying Buttress to Quarter Glass (CAR_body_buttress_L/R to CAR_body_glass_quarter_L/R):
+#        6 contact vertices sealed flush at 0.00 mm along quarter window aerodynamic shutline, closing gaps of 2.96 to 4.07 mm.
+#     5) Underbody Structural Bolts to Front Floor Plate (CAR_under_bolt_C to CAR_under_plate_front_C):
+#        2 contact vertices sealed flush at 0.00 mm at Z ~ 1.4 m, closing gaps of 2.25 to 4.09 mm.
+#     6) Rear Floor Plate to Rear Structural Rib (CAR_under_plate_rear_C to CAR_under_rib_rear_b_C):
+#        1 contact vertex sealed flush at 0.00 mm, closing 3.36 mm gap.
+#     7) Front Bumper Corner R to Front Fender R (CAR_bumper_corner_R to CAR_body_fender_front_R):
+#        1 contact vertex sealed flush at 0.00 mm, closing 0.15 mm gap to restore bilateral symmetry.
+#     Total: 32 contact vertices sealed flush at 0.00 mm.
+# FR : Pack multi-coutures de soudures hermetiques (bandeau de feux arriere sur face arriere, phares avant sur calandre et ailes, vitres de custode sur arcs-boutants, boulons et nervures de plancher, coin de bouclier avant) soudant 32 sommets a 0,00 mm.
+# Verification:
+#   - 100.000% pure quads (90,269 quads, 0 tris, 0 ngons)
+#   - 21 / 21 AnimReview gates passed (all_pass=True, 0 cracks, 0 flipped faces)
+#   - SheetScore IoU: 0.9715 record consolidated
+#   - Wireframe Recall ref3: 99.84%, Precision: 76.09% (flanc gauche a 79.04%, avant a 79.91%), F1: 0.8623
+
+import os, sys, json
+import numpy as np
+
+base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+sys.path.insert(0, os.path.join(base_dir, "Scripts"))
+
+import SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v633():
+    in_npz = os.path.join(base_dir, "work/car/delivery_v632.npz")
+    out_npz = os.path.join(base_dir, "work/car/delivery_v633.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v633.obj")
+
+    data = np.load(in_npz, allow_pickle=True)
+    P = data["P"].copy()
+    Q_ = data["Q"]
+    names_arr = data["names"]
+
+    print(f"Loaded v632 base: {len(P)} vertices, {len(Q_)} quads.")
+
+    comp_map = {}
+    for q, n in zip(Q_, names_arr):
+        if n not in comp_map:
+            comp_map[n] = set()
+        comp_map[n].update(q)
+
+    # 1. Light bar to tail face (19 vertices, threshold 1.5 mm, safe set)
+    lb_v = sorted(list(comp_map["CAR_light_bar_rear_C"]))
+    tf_v = sorted(list(comp_map["CAR_body_tail_face_C"]))
+    Ptf = P[tf_v]
+    safe_lb = [35851, 35921, 35932, 35943, 35967, 35977, 35998, 36011, 36044, 36251, 36284, 36293, 36316, 36328, 36348, 36359, 36370, 36439, 36440]
+    w_lb = 0
+    for v in safe_lb:
+        d = np.linalg.norm(Ptf - P[v], axis=1)
+        mi = np.argmin(d)
+        if d[mi] <= 0.0015:
+            P[v] = Ptf[mi]
+            w_lb += 1
+
+    # 2. Front band to headlights (2 vertices)
+    w_hl = 0
+    fb_v = sorted(list(comp_map["CAR_fascia_front_band_C"]))
+    Pfb = P[fb_v]
+    for side in ["L", "R"]:
+        hl_v = sorted(list(comp_map[f"CAR_light_headlight_{side}"]))
+        for v in hl_v:
+            d = np.linalg.norm(Pfb - P[v], axis=1)
+            mi = np.argmin(d)
+            if 0.0001 < d[mi] <= 0.0020:
+                P[v] = Pfb[mi]
+                w_hl += 1
+
+    # 3. Headlights to front fenders (1 vertex)
+    w_hlf = 0
+    for side in ["L", "R"]:
+        ff_v = sorted(list(comp_map[f"CAR_body_fender_front_{side}"]))
+        hl_v = sorted(list(comp_map[f"CAR_light_headlight_{side}"]))
+        Pff = P[ff_v]
+        for v in hl_v:
+            d = np.linalg.norm(Pff - P[v], axis=1)
+            mi = np.argmin(d)
+            if 0.0001 < d[mi] <= 0.0045:
+                P[v] = Pff[mi]
+                w_hlf += 1
+
+    # 4. Buttress to quarter glass (6 vertices)
+    w_bqg = 0
+    for side in ["L", "R"]:
+        qg_v = sorted(list(comp_map[f"CAR_body_glass_quarter_{side}"]))
+        bv = sorted(list(comp_map[f"CAR_body_buttress_{side}"]))
+        Pb = P[bv]
+        for v in qg_v:
+            d = np.linalg.norm(Pb - P[v], axis=1)
+            mi = np.argmin(d)
+            if 0.0001 < d[mi] <= 0.0045:
+                P[v] = Pb[mi]
+                w_bqg += 1
+
+    # 5. Underbolt to underplate front (2 vertices)
+    w_ub = 0
+    ub_v = sorted(list(comp_map["CAR_under_bolt_C"]))
+    upf_v = sorted(list(comp_map["CAR_under_plate_front_C"]))
+    Pupf = P[upf_v]
+    for v in ub_v:
+        d = np.linalg.norm(Pupf - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0045:
+            P[v] = Pupf[mi]
+            w_ub += 1
+
+    # 6. Underplate rear to under rib rear b (1 vertex)
+    w_ur = 0
+    upr_v = sorted(list(comp_map["CAR_under_plate_rear_C"]))
+    urb_v = sorted(list(comp_map["CAR_under_rib_rear_b_C"]))
+    Purb = P[urb_v]
+    for v in upr_v:
+        d = np.linalg.norm(Purb - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0045:
+            P[v] = Purb[mi]
+            w_ur += 1
+
+    # 7. Bumper corner R to fender front R (1 vertex)
+    w_bc = 0
+    bcr_v = sorted(list(comp_map["CAR_bumper_corner_R"]))
+    ffr_v = sorted(list(comp_map["CAR_body_fender_front_R"]))
+    Pffr = P[ffr_v]
+    for v in bcr_v:
+        d = np.linalg.norm(Pffr - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0010:
+            P[v] = Pffr[mi]
+            w_bc += 1
+
+    w_total = w_lb + w_hl + w_hlf + w_bqg + w_ub + w_ur + w_bc
+    print(f"Quintuple weld pack: light_bar={w_lb}, headlights_band={w_hl}, headlights_fender={w_hlf}, buttress_qglass={w_bqg}, underbolts={w_ub}, under_rib={w_ur}, bumper_corner={w_bc} (Total {w_total} vertices welded at 0.00 mm).")
+
+    # Centerline snapping
+    center_mask = np.abs(P[:, 0]) < 0.003
+    P[center_mask, 0] = 0.0
+    print(f"Centerline: snapped {int(center_mask.sum())} vertices to X=0.000 mm.")
+
+    # Save npz
+    np.savez_compressed(out_npz, P=P, Q=Q_, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar v633 (28 October 2026)\n")
+        f.write("# Pure quads, multi-seam weld pack (light-bar, headlights, buttress-qglass, underbolts, under-rib, bumper-corner)\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names_arr):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # Run AnimReview
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v633.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+
+    # Run SheetScore & Board
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    vdir = os.path.join(base_dir, "work/car/views/")
+    board_path = os.path.join(base_dir, "versions/SheetScore_v633_board.png")
+    SheetScore.main(fdir, vdir, out_obj, board_path)
+
+    # Run WireframeScoreRef3
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+    mean_rec = np.mean([val["rec"] for val in wf_scores.values()])
+    mean_prec = np.mean([val["prec"] for val in wf_scores.values()])
+    mean_f1 = np.mean([val["f1"] for val in wf_scores.values()])
+    print(f"Wireframe Recall ref3: mean={mean_rec*100:.2f}%, prec={mean_prec*100:.2f}%, f1={mean_f1:.4f}")
+
+    return rep["all_pass"]
+
+if __name__ == "__main__":
+    ok = build_v633()
