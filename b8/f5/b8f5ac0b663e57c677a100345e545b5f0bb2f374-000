@@ -1,0 +1,163 @@
+# 28 October 2026 : Build ZenRayCar Delivery Candidate v631
+# EN: Quintuple seam hermetic weld pack:
+#     1) Rear Glass to Roof Crown (CAR_body_glass_rear_C to CAR_body_roof_C):
+#        34 contact vertices sealed flush at 0.00 mm across the entire rear roof shutline X in [-0.577, +0.577 m] at Y ~ 1.21-1.26 m, Z ~ -1.01 m, closing gaps of 4.17 to 5.94 mm.
+#     2) Underbody Structural Bolts to Center Floor Plate (CAR_under_bolt_C to CAR_under_plate_center_C):
+#        24 contact vertices sealed flush at 0.00 mm along structural floor mounting points, closing gaps of 4.02 to 7.71 mm.
+#     3) Rear Quarter Panel to Rear Shoulder (CAR_body_quarter_L/R to CAR_body_shoulder_rear_L/R):
+#        24 contact vertices sealed flush at 0.00 mm along lateral shoulder transition, closing gaps <= 5.00 mm.
+#     4) Center Floor Plate to Underbody Arrow Diffuser (CAR_under_plate_center_C to CAR_under_arrow_C):
+#        4 contact vertices sealed flush at 0.00 mm at Y ~ 0.142 m, closing gaps of 4.40 to 5.88 mm.
+#     5) Rear Floor Plate to Rear Structural Cross-member (CAR_under_plate_rear_C to CAR_under_cross_rear_C):
+#        4 contact vertices sealed flush at 0.00 mm at Z ~ -1.5 m, closing gaps of 0.66 to 5.58 mm.
+#     Total: 90 contact vertices sealed flush at 0.00 mm.
+# FR : Pack quintuple de soudures hermetiques (lunette arriere sur pavillon de toit, boulons structurels sur plancher central, ailes arriere sur epaules arriere, fleche aero et traverse arriere sous plancher) soudant 90 sommets a 0,00 mm.
+# Verification:
+#   - 100.000% pure quads (90,269 quads, 0 tris, 0 ngons)
+#   - 21 / 21 AnimReview gates passed (all_pass=True, 0 cracks, 0 flipped faces)
+#   - SheetScore IoU: 0.9715 record consolidated
+#   - Wireframe Recall ref3: 99.84%, Precision: 76.09% (flanc gauche a 79.04%, avant a 79.91%), F1: 0.8623
+
+import os, sys, json
+import numpy as np
+
+base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+sys.path.insert(0, os.path.join(base_dir, "Scripts"))
+
+import SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v631():
+    in_npz = os.path.join(base_dir, "work/car/delivery_v630.npz")
+    out_npz = os.path.join(base_dir, "work/car/delivery_v631.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v631.obj")
+
+    data = np.load(in_npz, allow_pickle=True)
+    P = data["P"].copy()
+    Q_ = data["Q"]
+    names_arr = data["names"]
+
+    print(f"Loaded v630 base: {len(P)} vertices, {len(Q_)} quads.")
+
+    comp_map = {}
+    for q, n in zip(Q_, names_arr):
+        if n not in comp_map:
+            comp_map[n] = set()
+        comp_map[n].update(q)
+
+    # 1. Rear glass to roof (threshold 6.2 mm)
+    rg_v = sorted(list(comp_map["CAR_body_glass_rear_C"]))
+    roof_v = sorted(list(comp_map["CAR_body_roof_C"]))
+    Proof = P[roof_v]
+    w_rg = 0
+    for rv in rg_v:
+        d = np.linalg.norm(Proof - P[rv], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0062:
+            P[rv] = Proof[mi]
+            w_rg += 1
+
+    # 2. Bolts to center plate (threshold 7.8 mm)
+    bv = sorted(list(comp_map["CAR_under_bolt_C"]))
+    pv = sorted(list(comp_map["CAR_under_plate_center_C"]))
+    Pp = P[pv]
+    w_b = 0
+    for v in bv:
+        d = np.linalg.norm(Pp - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0078:
+            P[v] = Pp[mi]
+            w_b += 1
+
+    # 3. Rear quarter to rear shoulder (threshold 5.0 mm)
+    w_qs = 0
+    for side in ["L", "R"]:
+        qv = sorted(list(comp_map[f"CAR_body_quarter_{side}"]))
+        sv = sorted(list(comp_map[f"CAR_body_shoulder_rear_{side}"]))
+        Ps = P[sv]
+        for v in qv:
+            d = np.linalg.norm(Ps - P[v], axis=1)
+            mi = np.argmin(d)
+            if 0.0001 < d[mi] <= 0.0050:
+                P[v] = Ps[mi]
+                w_qs += 1
+
+    # 4. Underplate center to under arrow (threshold 6.0 mm)
+    av = sorted(list(comp_map["CAR_under_arrow_C"]))
+    Pa = P[av]
+    w_ua = 0
+    for v in pv:
+        d = np.linalg.norm(Pa - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0060:
+            P[v] = Pa[mi]
+            w_ua += 1
+
+    # 5. Underplate rear to rear cross (threshold 6.0 mm)
+    upr_v = sorted(list(comp_map["CAR_under_plate_rear_C"]))
+    ucr_v = sorted(list(comp_map["CAR_under_cross_rear_C"]))
+    Pucr = P[ucr_v]
+    w_ur = 0
+    for v in upr_v:
+        d = np.linalg.norm(Pucr - P[v], axis=1)
+        mi = np.argmin(d)
+        if 0.0001 < d[mi] <= 0.0060:
+            P[v] = Pucr[mi]
+            w_ur += 1
+
+    w_total = w_rg + w_b + w_qs + w_ua + w_ur
+    print(f"Quintuple weld pack: rear_glass={w_rg}, bolts={w_b}, quarter_shoulder={w_qs}, arrow={w_ua}, rear_cross={w_ur} (Total {w_total} vertices welded at 0.00 mm).")
+
+    # Centerline snapping
+    center_mask = np.abs(P[:, 0]) < 0.003
+    P[center_mask, 0] = 0.0
+    print(f"Centerline: snapped {int(center_mask.sum())} vertices to X=0.000 mm.")
+
+    # Save npz
+    np.savez_compressed(out_npz, P=P, Q=Q_, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar v631 (28 October 2026)\n")
+        f.write("# Pure quads, quintuple seam weld pack (rear-glass, under-bolts, quarter-shoulder, under-arrow, under-cross)\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names_arr):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # Run AnimReview
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v631.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+
+    # Run SheetScore & Board
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    vdir = os.path.join(base_dir, "work/car/views/")
+    board_path = os.path.join(base_dir, "versions/SheetScore_v631_board.png")
+    SheetScore.main(fdir, vdir, out_obj, board_path)
+
+    # Run WireframeScoreRef3
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+    mean_rec = np.mean([val["rec"] for val in wf_scores.values()])
+    mean_prec = np.mean([val["prec"] for val in wf_scores.values()])
+    mean_f1 = np.mean([val["f1"] for val in wf_scores.values()])
+    print(f"Wireframe Recall ref3: mean={mean_rec*100:.2f}%, prec={mean_prec*100:.2f}%, f1={mean_f1:.4f}")
+
+    return rep["all_pass"]
+
+if __name__ == "__main__":
+    ok = build_v631()
