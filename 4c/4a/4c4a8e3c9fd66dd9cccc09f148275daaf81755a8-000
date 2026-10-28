@@ -1,0 +1,335 @@
+"""28 October 2026 : ZenRay Meshes VIEW TRACE, the schematic of ONE reference view, done individually (Matthieu's rule : each of the six views
+is traced on its own, every visible line of every component, each line smoothed ; the sheet is assembled only after the six). It assembles
+the priority methods already proven in this workshop, nothing new :
+  silhouette   : the contour of the calibrated mask (frame masks) ;
+  design lines : thin dark lines of the clay reference (black hat), thinned to a skeleton and split at its junctions (the graph of
+                 WireframeExtractor, M19), branches that go straight through a junction merged back into one line ;
+  wheels       : Hough circles on the edges (CarPrep), kept as exact circles, the lines inside a wheel belong to the wheel ;
+  glass        : the dark regions inside the silhouette (side and top views), their border lines belong to the glass ;
+  smoothing    : every line becomes ONE smoothing spline through its pixels (sections 60 and 223 of the skill) and must pass CurveFair
+                 (no zigzag, stair, Z or wave) ; a refused line is smoothed more, up to smooth_sigmas, and stays flagged if it still fails.
+Writes versions/views/View_<view>.png (the view alone, curves coloured by component) and work/car/schematic/view_<view>.json : every
+line with its pixels, its smooth curve and its spline control points in metres (abscissa, ordinate of the view : M20 matrix of points).
+python ViewTrace.py <view> [--scale 3]     views : front back left right top bottom
+FR : le schéma d'UNE vue, fait seul : toutes les lignes visibles, lissées, par composant ; la planche s'assemble après les six vues."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from scipy.interpolate import splprep, splev
+from skimage import feature, measure, transform
+from skimage.morphology import skeletonize, disk, closing
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE))
+import CurveFair as CF
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {   # 28 October 2026 : the interface of the view trace
+    "blackhat_r": 2, "line_contrast": 14, "mask_erode_px": 2, "min_branch_px": 10, "merge_deg": 28, "tangent_px": 6,
+    "smooth_sigmas": [0.6, 1.0, 1.6, 2.4], "wheel_radii_m": (0.22, 0.42), "wheel_views": ["left", "right"], "bolt_views": ["bottom"], "bolt_radii_px": (3, 8), "bolt_max": 80, "bolt_acc": 0.6, "bolt_on": ["under"], "wheel_count": 2,
+    "wheel_rings": 4, "wheel_margin_px": 2, "wheel_share": 0.8, "glass_dark": 22, "glass_views": ["left", "right", "top", "front", "back"], "glass_min_px": 300,
+    "scale": 3, "fade": 0.5, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf",
+    "canny_sigma": 1.5, "canny_low": 0.03, "canny_high": 0.08, "canny_low_by_view": {}, "canny_high_by_view": {}, "dark_exclude_px": 0, "dup_px": 5.0, "dup_share": 0.7, "groove_dark": 4, "same_px": 2.0, "corner_deg": 35.0, "corner_win_px": 4, "sil_sigma_px": 2.0, "sil_corner_deg": 50.0, "sil_min_px": 15, "inflect_win_px": 25, "inflect_kmin_px": 0.01, "inflect_min_run_px": 20, "inflect_fallback_run_px": 8, "gap_px": 14, "merge_gap_deg": 20.0, "spoke_resid_px": 1.5,
+    "splat_max": 12, "view_dir": {"front": (0, 0, 1), "back": (0, 0, -1), "left": (1, 0, 0), "right": (-1, 0, 0), "top": (0, 1, 0), "bottom": (0, -1, 0)}, "label_band_px": 2, "delivery": "work/car/delivery_v752.npz",
+    "groups": {   # delivery part name pattern -> schematic component (first match wins)
+        "glass": ["*glass*"], "wheel": ["*wheel*", "*tyre*"], "light": ["*light*"], "roof": ["*roof*", "*rail*"], "pillar": ["*pillar*", "*buttress*"],
+        "hood": ["*hood*"], "trunk": ["*decklid*"], "door": ["*door*"], "fender": ["*fender*", "*vent*", "*arch_front*"], "quarter": ["*quarter*", "*shoulder*", "*arch_rear*", "*belt*"],
+        "bumper": ["*bumper*", "*fascia*", "*grille*", "*splitter*", "*rear_C*"], "rocker": ["*rocker*", "*sill*"], "under": ["*under*", "*susp*", "*wheelwell*"]},
+    "colours": {"silhouette": (30, 30, 30), "glass": (31, 119, 180), "wheel": (44, 160, 44), "light": (255, 187, 0), "roof": (148, 103, 189), "pillar": (140, 86, 75),
+                "hood": (227, 119, 194), "trunk": (188, 189, 34), "door": (23, 190, 207), "fender": (214, 39, 40), "quarter": (255, 127, 14), "bumper": (127, 127, 127),
+                "rocker": (0, 100, 0), "under": (90, 90, 160), "body": (60, 60, 60), "refused": (255, 0, 255)},
+    "names": {"front": "face", "back": "arrière", "left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous"},
+}
+
+
+def load_view(view):
+    sheet = json.load(open(W + "work/car/views/sheet.json")); pan = [p for p in sheet["panels"] if p["name"] == view][0]
+    I = np.asarray(Image.open(W + "work/car/views/%02d_%s_rgb.png" % (pan["index"], view)).convert("L")).astype(float)
+    M = np.asarray(Image.open(W + "work/car/views/%02d_%s_mask.png" % (pan["index"], view))) > 127
+    fr = json.load(open(W + "work/car/frame/frame.json")); v = [x for x in fr["views"] if x["name"] == view][0]; return I, M, v, fr
+
+
+def to_metric(v, fr):
+    """Pixel (col, row) of the view -> (abscissa, ordinate) in metres along the view axes rx and uy (frame.json, M20 matrix)."""
+    lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); rx, uy = np.array(v["rx"]), np.array(v["uy"]); b = v["bbox"]; ppm = v["px_per_m"]
+    amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+    return lambda c, r: np.stack([amin + (np.asarray(c) - b[0]) / ppm, bmin + (b[3] - np.asarray(r)) / ppm], -1)
+
+
+def branches(skel):
+    """Split a skeleton at its junctions into ordered pixel chains ; chains that run straight through a junction are merged."""
+    K = np.ones((3, 3), int); K[1, 1] = 0; nb = ndi.convolve(skel.astype(int), K, mode="constant") * skel
+    junc = skel & (nb >= 3); jl, nj = ndi.label(junc, np.ones((3, 3)))
+    rest = skel & ~ndi.binary_dilation(junc, np.ones((3, 3))); bl, nbr = ndi.label(rest, np.ones((3, 3)))
+    chains = []
+    for i in range(1, nbr + 1):
+        pts = np.argwhere(bl == i)
+        if len(pts) < 2: continue
+        S = {tuple(p) for p in pts}; deg = {p: sum((p[0] + dy, p[1] + dx) in S for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx) for p in S}
+        start = next((p for p, d in deg.items() if d <= 1), next(iter(S))); order = [start]; seen = {start}
+        while True:
+            c = order[-1]; nx = [(c[0] + dy, c[1] + dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if (dy or dx) and (c[0] + dy, c[1] + dx) in S and (c[0] + dy, c[1] + dx) not in seen]
+            if not nx: break
+            nx.sort(key=lambda q: abs(q[0] - c[0]) + abs(q[1] - c[1])); order.append(nx[0]); seen.add(nx[0])
+        chains.append(np.array(order, float))
+    # merge two chains whose ends meet at the same junction and continue each other (angle between end tangents under merge_deg)
+    tp = PARAMS["tangent_px"]; ends = []
+    for ci, ch in enumerate(chains):
+        for side in (0, 1):
+            e = ch[0] if side == 0 else ch[-1]; f = ch[min(tp, len(ch) - 1)] if side == 0 else ch[max(-tp - 1, -len(ch))]
+            j = jl[max(0, int(e[0]) - 2):int(e[0]) + 3, max(0, int(e[1]) - 2):int(e[1]) + 3]; jj = j[j > 0]
+            if len(jj): t = (e - f) / (np.linalg.norm(e - f) + 1e-9); ends.append((int(np.bincount(jj).argmax()), ci, side, t))
+    used, links = set(), []
+    for a in range(len(ends)):
+        for b in range(a + 1, len(ends)):
+            ja, ca, sa, ta = ends[a]; jb, cb, sb, tb = ends[b]
+            if ja != jb or ca == cb or (ca, sa) in used or (cb, sb) in used: continue
+            if np.degrees(np.arccos(np.clip(-ta @ tb, -1, 1))) < PARAMS["merge_deg"]: links.append((ca, sa, cb, sb)); used |= {(ca, sa), (cb, sb)}
+    # 28 October 2026 : walk each path from a free end and orient every chain on the way (a union of chains merged in place lost the
+    # orientation after the first link, so a line crossed back on itself : the roof loop of the right view)
+    link = {}
+    for ca, sa, cb, sb in links: link[(ca, sa)] = (cb, sb); link[(cb, sb)] = (ca, sa)
+    used, merged = set(), []
+    for c0 in range(len(chains)):
+        if c0 in used: continue
+        c, s_out, seen = c0, 0, {c0}
+        while (c, s_out) in link:
+            c2, s2 = link[(c, s_out)]
+            if c2 in seen: break
+            seen.add(c2); c, s_out = c2, 1 - s2
+        path, vis, s_in = [], set(), s_out
+        while c not in vis:
+            vis.add(c); path.append(chains[c] if s_in == 0 else chains[c][::-1])
+            if (c, 1 - s_in) not in link: break
+            c, s_in = link[(c, 1 - s_in)]
+        used |= vis; merged.append(np.vstack(path))
+    chains = merged
+    return [c for c in chains if len(c) >= PARAMS["min_branch_px"]]
+
+
+def merge_fragments(chains):
+    """One design line = one curve (section 223) : two pieces whose ends are closer than gap_px, whose end tangents and the bridge between
+    them are aligned within merge_gap_deg, are joined (joint and crease pieces alike : a line may turn from a dark groove into a step)."""
+    tp = PARAMS["tangent_px"]; ch = [list(c) for c in chains]; changed = True
+    def ends(c):
+        a, b = c[1][0], c[1][-1]; ta = (a - c[1][min(tp, len(c[1]) - 1)]); tb = (b - c[1][max(-tp - 1, -len(c[1]))])
+        return [(a, ta / (np.linalg.norm(ta) + 1e-9), 0), (b, tb / (np.linalg.norm(tb) + 1e-9), 1)]
+    def ang(u, w): return np.degrees(np.arccos(np.clip(u @ w, -1, 1)))
+    while changed:
+        changed = False; best = None
+        for i in range(len(ch)):
+            for j in range(i + 1, len(ch)):
+                for (pa, ta, sa) in ends(ch[i]):
+                    for (pb, tb, sb) in ends(ch[j]):
+                        g = pb - pa; dg = np.linalg.norm(g)
+                        if dg > PARAMS["gap_px"] or dg < 1e-9: continue
+                        gu = g / dg
+                        if ang(ta, -tb) < PARAMS["merge_gap_deg"] and ang(ta, gu) < PARAMS["merge_gap_deg"] and ang(-tb, gu) < PARAMS["merge_gap_deg"] and (best is None or dg < best[0]):
+                            best = (dg, i, sa, j, sb)
+        if best:
+            _, i, sa, j, sb = best; A = ch[i][1] if sa == 1 else ch[i][1][::-1]; B = ch[j][1] if sb == 0 else ch[j][1][::-1]
+            n = max(2, int(np.linalg.norm(B[0] - A[-1]))); br = np.linspace(A[-1], B[0], n + 2)[1:-1]
+            ch[i] = [ch[i][0] if ch[i][0] == ch[j][0] else "joint", np.vstack([A, br, B])]; del ch[j]; changed = True
+    return [(k, np.asarray(c)) for k, c in ch]
+
+
+def smooth_chain(ch, met, closed=False):
+    """ONE smoothing spline through the pixels ; the smallest sigma that CurveFair accepts (checked in metres). Returns (curve, tck, sigma, verdict)."""
+    P = ch[:, ::-1].astype(float)   # (col, row)
+    keep = np.r_[True, np.linalg.norm(np.diff(P, axis=0), axis=1) > 1e-6]; P = P[keep]
+    best = None
+    for sg in PARAMS["smooth_sigmas"]:
+        try:
+            tck, _ = splprep(P.T, s=len(P) * sg * sg, k=3 if len(P) > 4 else 1, per=1 if closed else 0)
+        except Exception:
+            continue
+        u = np.linspace(0, 1, max(20, len(P) * 2)); Cv = np.stack(splev(u, tck), 1); Mm = met(Cv[:, 0], Cv[:, 1])
+        r = CF.check_polyline(np.c_[Mm, np.zeros(len(Mm))], 2, normal=np.array([0, 0, 1.0]))
+        best = (Cv, tck, sg, r)
+        if r["ok"]: break
+    return best
+
+
+def split_at_corners(ch, corner_deg=None, min_px=None):
+    """Cut a pixel chain at its true corners (turn above corner_deg over corner_win_px, after a light smoothing) : a silhouette or an outline
+    is several smooth lines meeting at corners, never one wavy loop."""
+    P = ndi.gaussian_filter1d(ch.astype(float), 1.5, axis=0, mode="nearest"); w = PARAMS["corner_win_px"]; n = len(P); cuts = [0]
+    t = np.zeros(n)
+    for i in range(w, n - w):
+        a, b = P[i] - P[i - w], P[i + w] - P[i]; t[i] = np.degrees(np.arccos(np.clip(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9), -1, 1)))
+    for i in range(w, n - w):
+        if t[i] > (corner_deg or PARAMS["corner_deg"]) and t[i] >= t[max(0, i - w):i + w + 1].max() and i - cuts[-1] > max(2 * w, min_px or 0): cuts.append(i)
+    cuts.append(n - 1); return [ch[cuts[k]:cuts[k + 1] + 1] for k in range(len(cuts) - 1) if cuts[k + 1] - cuts[k] >= (min_px or PARAMS["min_branch_px"])]
+
+
+def split_at_inflections(ch, min_run=None):
+    """A silhouette chains several design lines (a roof arc, a concave shoulder, a fender arc) : cut it where the curvature changes sign
+    with a margin on both sides, so every piece is ONE taut arc (28 October 2026, the front view silhouette had more than two inflections)."""
+    from scipy.signal import savgol_filter
+    n = len(ch); w = PARAMS["inflect_win_px"] | 1
+    if n < 3 * w: return [ch]
+    P = ch[:, ::-1].astype(float); d1 = savgol_filter(P, w, 3, deriv=1, axis=0, mode="interp"); d2 = savgol_filter(P, w, 3, deriv=2, axis=0, mode="interp")
+    k = (d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0]) / (np.linalg.norm(d1, axis=1) ** 3 + 1e-9); sg = np.sign(k) * (np.abs(k) > PARAMS["inflect_kmin_px"])
+    # runs of one curvature sign ; only runs of at least inflect_min_run_px count, so a ripple is smoothed away, never cut into arcs
+    # (28 October 2026 : cutting at every sign change hid the waves of the noisy outlines in 39 small arcs, the opposite of the rule)
+    runs, i = [], 0
+    while i < n:
+        j = i
+        while j < n and sg[j] == sg[i]: j += 1
+        if sg[i] != 0 and j - i >= (min_run or PARAMS["inflect_min_run_px"]): runs.append((i, j, sg[i]))
+        i = j
+    cuts = [0]
+    for (a0, a1, sa), (b0, b1, sb) in zip(runs[:-1], runs[1:]):
+        c = (a1 + b0) // 2
+        if sa != sb and c - cuts[-1] >= PARAMS["sil_min_px"] and n - c >= PARAMS["sil_min_px"]: cuts.append(c)
+    cuts.append(n - 1); return [ch[cuts[j]:cuts[j + 1] + 1] for j in range(len(cuts) - 1)]
+
+
+def part_labels(view, v, fr, shape):
+    """Per pixel component of the kept car (delivery v752) seen in this view : every face splatted with a z test along tz."""
+    import fnmatch
+    D = np.load(W + PARAMS["delivery"], allow_pickle=True); P = D["P"].astype(float); names = [str(x) for x in D["names"]]; Q = D["Q"]
+    comps = list(PARAMS["groups"]); gid = {}
+    for nm in set(names): gid[nm] = next((k for k, c in enumerate(comps) if any(fnmatch.fnmatch(nm.lower(), pat) for pat in PARAMS["groups"][c])), -1)
+    # toward the camera, by view : frame.json tz is rx x uy, which points AWAY from the camera for top and bottom (28 October 2026)
+    lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(PARAMS["view_dir"][view], float); b = v["bbox"]; ppm = v["px_per_m"]
+    amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+    pts, dep, lab = [], [], []
+    for q, nm in zip(Q, names):
+        q = [int(x) for x in q]; V = P[q]; size = np.ptp(V @ np.stack([rx, uy], 1), axis=0).max() * ppm; k = int(min(PARAMS["splat_max"], max(2, np.ceil(size / 0.7))))
+        u_, w_ = np.meshgrid(np.linspace(0, 1, k), np.linspace(0, 1, k)); u_, w_ = u_.ravel(), w_.ravel()
+        X = (V[0][None] * ((1 - u_) * (1 - w_))[:, None] + V[1][None] * (u_ * (1 - w_))[:, None] + V[2 % len(V)][None] * (u_ * w_)[:, None] + V[3 % len(V)][None] * ((1 - u_) * w_)[:, None])
+        pts.append(X); lab.append(np.full(len(X), gid[nm]))
+    X = np.vstack(pts); L_ = np.concatenate(lab); c = np.round(b[0] + (X @ rx - amin) * ppm).astype(int); r = np.round(b[3] - (X @ uy - bmin) * ppm).astype(int); d = X @ tz
+    ok = (c >= 0) & (c < shape[1]) & (r >= 0) & (r < shape[0]); c, r, d, L_ = c[ok], r[ok], d[ok], L_[ok]; key = r * shape[1] + c; o = np.lexsort((-d, key)); key, L_ = key[o], L_[o]
+    first = np.r_[True, key[1:] != key[:-1]]; img = np.full(shape[0] * shape[1], -1); img[key[first]] = L_[first]; return img.reshape(shape), comps
+
+
+def label_of(ch, lab, comps):
+    """The component of a line : the most frequent part label in a band around it (a joint line takes the part it borders most)."""
+    b = PARAMS["label_band_px"]; v = []
+    for r, c in ch.astype(int)[:: max(1, len(ch) // 40)]:
+        w = lab[max(0, r - b):r + b + 1, max(0, c - b):c + b + 1].ravel(); v += [x for x in w if x >= 0]
+    return comps[np.bincount(v).argmax()] if v else "body"
+
+
+def wheels(I, M, v, view):
+    if view not in PARAMS["wheel_views"]: return []
+    E = feature.canny(I / 255.0, sigma=1.5) & M; ppm = v["px_per_m"]; r0, r1 = PARAMS["wheel_radii_m"]; radii = np.arange(int(r0 * ppm), int(r1 * ppm) + 1)
+    H = transform.hough_circle(E, radii); acc, cx, cy, rr = transform.hough_circle_peaks(H, radii, total_num_peaks=40, min_xdistance=4, min_ydistance=4)
+    out = []
+    for a, x, y, r in zip(acc, cx, cy, rr):   # wheel centres : the strongest peaks far apart, then the rings around each centre
+        if all(np.hypot(x - c["cx"], y - c["cy"]) > r1 * ppm for c in out) and len(out) < PARAMS["wheel_count"]: out.append({"cx": float(x), "cy": float(y), "rings": []})
+    for c in out:   # rings : local maxima of the accumulator along the radius at the centre (one Hough peak per place hides the others)
+        x0, y0 = int(round(c["cx"])), int(round(c["cy"])); prof = np.array([H[k, max(0, y0 - 2):y0 + 3, max(0, x0 - 2):x0 + 3].max() for k in range(len(radii))])
+        pk = [k for k in range(1, len(prof) - 1) if prof[k] >= prof[k - 1] and prof[k] >= prof[k + 1] and prof[k] > 0.35 * prof.max()]
+        pk = sorted(pk, key=lambda k: -prof[k]); rs = []
+        for k in pk:
+            if all(abs(radii[k] - q) > 3 for q in rs): rs.append(int(radii[k]))
+            if len(rs) >= PARAMS["wheel_rings"]: break
+        c["rings"] = sorted(rs)
+    return out
+
+
+def bolts(I, M, view):
+    """Small round features (bolts) as exact circles : Hough at small radii (the same method as the wheels, CarPrep), 28 October 2026."""
+    if view not in PARAMS["bolt_views"]: return []
+    E = feature.canny(I / 255.0, sigma=1.0) & ndi.binary_erosion(M, iterations=4); radii = np.arange(*PARAMS["bolt_radii_px"])
+    H = transform.hough_circle(E, radii); acc, cx, cy, rr = transform.hough_circle_peaks(H, radii, total_num_peaks=PARAMS["bolt_max"], min_xdistance=8, min_ydistance=8, threshold=PARAMS["bolt_acc"])
+    return [{"cx": float(x), "cy": float(y), "r": int(r)} for x, y, r in zip(cx, cy, rr)]
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("view"); ap.add_argument("--scale", type=float, default=PARAMS["scale"]); a = ap.parse_args(); vw = a.view
+    I, M, v, fr = load_view(vw); met = to_metric(v, fr); s = a.scale
+    BH = closing(I, disk(PARAMS["blackhat_r"])) - I; Mi = ndi.binary_erosion(M, iterations=PARAMS["mask_erode_px"])
+    L = (BH > PARAMS["line_contrast"]) & Mi; L = ndi.binary_opening(L, np.ones((1, 1))); skel = skeletonize(L)
+    lab, n = ndi.label(skel, np.ones((3, 3))); sizes = ndi.sum(skel, lab, range(1, n + 1)); skel &= np.isin(lab, np.nonzero(sizes >= PARAMS["min_branch_px"])[0] + 1)
+    chains = [("joint", c) for c in branches(skel)]
+    # crease lines : brightness steps (Canny), away from the dark lines already traced (a joint gives two Canny edges, a crease one)
+    lo_, hi_ = PARAMS["canny_low_by_view"].get(vw, PARAMS["canny_low"]), PARAMS["canny_high_by_view"].get(vw, PARAMS["canny_high"])
+    E = feature.canny(I / 255.0, sigma=PARAMS["canny_sigma"], low_threshold=lo_, high_threshold=hi_) & Mi
+    if PARAMS["dark_exclude_px"] > 0: E &= ~ndi.binary_dilation(L, iterations=PARAMS["dark_exclude_px"])
+    E = skeletonize(E)
+    chains += [("crease", c) for c in branches(E)]
+    chains = merge_fragments(chains)
+    WH = wheels(I, M, v, vw); lab, comps = part_labels(vw, v, fr, I.shape)
+    BO = [b_ for b_ in bolts(I, M, vw) if 0 <= lab[int(b_["cy"]), int(b_["cx"])] < len(comps) and comps[lab[int(b_["cy"]), int(b_["cx"])]] in PARAMS["bolt_on"]]   # bolts only on the underbody plates
+    # the silhouette : contour of the mask smoothed first (its pixel edge is noisy at the tail), cut only at real corners
+    cont = max(measure.find_contours(ndi.gaussian_filter(M.astype(float), PARAMS["sil_sigma_px"]), 0.5), key=len)
+    d_ = np.r_[0, np.cumsum(np.linalg.norm(np.diff(cont, axis=0), axis=1))]; t_ = np.arange(0, d_[-1], 1.0)   # constant 1 px step : near duplicate points made curvature spikes
+    cont = np.stack([np.interp(t_, d_, cont[:, 0]), np.interp(t_, d_, cont[:, 1])], 1)
+    curves = [("silhouette", "outline", q) for c in split_at_corners(cont, PARAMS["sil_corner_deg"], PARAMS["sil_min_px"]) for q in split_at_inflections(c)]
+    for kind, ch in chains:
+        if any((np.hypot(ch[:, 1] - b_["cx"], ch[:, 0] - b_["cy"]) < b_["r"] + 4).mean() > 0.7 for b_ in BO): continue   # a bolt is drawn as its circle
+        # inside a wheel when most of its POINTS are (an arch lip arc has its mean inside the tyre circle but runs outside it)
+        inw = [w for w in WH if (np.hypot(ch[:, 1] - w["cx"], ch[:, 0] - w["cy"]) < max(w["rings"] or [0]) + PARAMS["wheel_margin_px"]).mean() > PARAMS["wheel_share"]]
+        if inw:   # inside a wheel : rings are circles, the rest is kept only as straight spokes
+            Q_ = ch[:, ::-1].astype(float); m_ = Q_.mean(0); _, sv, vt = np.linalg.svd(Q_ - m_)
+            if sv[1] / np.sqrt(len(Q_)) <= PARAMS["spoke_resid_px"] and len(Q_) >= PARAMS["min_branch_px"]:
+                t = (Q_ - m_) @ vt[0]; seg = np.array([m_ + t.min() * vt[0], m_ + t.max() * vt[0]]); curves.append(("wheel", "spoke", seg[:, ::-1]))
+            continue
+        for piece in split_at_corners(ch): curves.append((label_of(piece, lab, comps), kind, piece))
+    out, nok = [], 0
+    ci = 0
+    while ci < len(curves):
+        comp, kind, ch = curves[ci]; ci += 1
+        if kind == "spoke":
+            Cv = ch[:, ::-1].astype(float); Cv = np.linspace(Cv[0], Cv[1], 20); r = {"ok": True}; tck = None; sg = 0
+        else:
+            sm = smooth_chain(ch, met)
+            if sm is None: continue
+            Cv, tck, sg, r = sm
+            if not r["ok"] and kind in ("joint", "crease", "outline"):   # refused at every smoothing : one gull wing is several taut arcs, cut at its inflections
+                parts = split_at_inflections(ch, PARAMS["inflect_fallback_run_px"])
+                if len(parts) > 1:
+                    for q in parts: curves.append((comp, kind + "_arc", q))
+                    continue
+        nok += r["ok"]; ctrl = np.stack(tck[1], 1) if tck is not None else Cv[[0, -1]]
+        out.append({"component": comp, "kind": kind, "ok": bool(r["ok"]), "sigma_px": sg, "pixels": len(ch), "curve_px": np.round(Cv, 2).tolist(),
+                    "curve_m": np.round(met(Cv[:, 0], Cv[:, 1]), 4).tolist(), "control_m": np.round(met(ctrl[:, 0], ctrl[:, 1]), 4).tolist(),
+                    "verdict": {k: r[k] for k in ("lobes_max", "flips_max", "stair_steps", "z_segments") if k in r}})
+    # 28 October 2026 : a thin dark line gives its skeleton plus two Canny edges, a composite edge (faint groove + step) gives pieces of
+    # both : keep both detectors, then drop every smooth line that runs along a longer one (dup_share of its points within dup_px)
+    from scipy.spatial import cKDTree
+    keep = [True] * len(out); order = sorted(range(len(out)), key=lambda i: -len(out[i]["curve_px"]))
+    for a_ in range(len(order)):
+        i = order[a_]
+        if not keep[i] or out[i].get("kind") in ("outline", "ring", "spoke"): continue
+        Ti = cKDTree(np.array(out[i]["curve_px"]))
+        for j in order[a_ + 1:]:
+            if not keep[j] or out[j].get("kind") in ("outline", "ring", "spoke"): continue
+            Cj = np.array(out[j]["curve_px"]); d_, k_ = Ti.query(Cj); near = d_ <= PARAMS["dup_px"]
+            if near.mean() < PARAMS["dup_share"]: continue
+            # the two edges of one groove have dark between them ; two design lines side by side (rail and glass edge) have light
+            Ci = np.array(out[i]["curve_px"])[k_[near]]; mid = (Ci + Cj[near]) / 2
+            def at(P_): return ndi.map_coordinates(I, [P_[:, 1], P_[:, 0]], order=1, mode="nearest")
+            groove = (np.median(at(mid)) < min(np.median(at(Ci)), np.median(at(Cj[near]))) - PARAMS["groove_dark"])
+            if groove or np.median(d_[near]) <= PARAMS["same_px"]: keep[j] = False
+    out = [o for o, k in zip(out, keep) if k]; nok = sum(o["ok"] for o in out)
+    for b_ in BO:
+        t = np.linspace(0, 2 * np.pi, 40); Cv = np.stack([b_["cx"] + b_["r"] * np.cos(t), b_["cy"] + b_["r"] * np.sin(t)], 1)
+        out.append({"component": "under", "kind": "bolt", "ok": True, "sigma_px": 0, "pixels": 0, "circle_px": [b_["cx"], b_["cy"], b_["r"]], "curve_px": np.round(Cv, 2).tolist(), "curve_m": np.round(met(Cv[:, 0], Cv[:, 1]), 4).tolist()}); nok += 1
+    for c in WH:
+        for r_ in c["rings"]:
+            t = np.linspace(0, 2 * np.pi, 180); Cv = np.stack([c["cx"] + r_ * np.cos(t), c["cy"] + r_ * np.sin(t)], 1)
+            out.append({"component": "wheel", "kind": "ring", "ok": True, "sigma_px": 0, "pixels": 0, "circle_px": [c["cx"], c["cy"], r_], "curve_px": np.round(Cv, 2).tolist(), "curve_m": np.round(met(Cv[:, 0], Cv[:, 1]), 4).tolist()}); nok += 1
+    # the view alone, at scale s : faded reference, every smooth line coloured by component, refused lines in magenta
+    base = Image.fromarray(I.astype(np.uint8)).resize((int(I.shape[1] * s), int(I.shape[0] * s)), Image.LANCZOS).convert("RGB")
+    img = Image.blend(base, Image.new("RGB", base.size, (255, 255, 255)), PARAMS["fade"]); d = ImageDraw.Draw(img)
+    for o in out:
+        col = PARAMS["colours"][o["component"]] if o["ok"] else PARAMS["colours"]["refused"]; pts = [(x * s, y * s) for x, y in o["curve_px"]]
+        d.line(pts, fill=col, width={"outline": 3, "joint": 2, "crease": 2, "spoke": 2, "ring": 2, "bolt": 2}.get(o.get("kind"), 2))
+        if o.get("kind") in ("joint", "crease", "joint_arc", "crease_arc"):
+            for q in (pts[0], pts[-1]): d.ellipse([q[0] - 3, q[1] - 3, q[0] + 3, q[1] + 3], fill=col)
+    fnt = ImageFont.truetype(PARAMS["font"], 18); cnt = {k: sum(o["component"] == k for o in out) for k in PARAMS["colours"] if k != "refused" and any(o["component"] == k for o in out)}
+    lx = 12
+    for k in cnt: d.line([lx, img.size[1] - 22, lx + 30, img.size[1] - 22], fill=PARAMS["colours"][k], width=4); d.text((lx + 36, img.size[1] - 34), k, fill=(20, 20, 20), font=fnt); lx += 36 + 11 * len(k) + 40
+    d.text((12, 8), "vue %s : %d lignes lissées (%d acceptées par CurveFair) ; %s" % (PARAMS["names"][vw], len(out), nok, ", ".join("%s %d" % (k, n_) for k, n_ in cnt.items())), fill=(20, 20, 20), font=fnt)
+    os.makedirs(W + "versions/views", exist_ok=True); os.makedirs(W + "work/car/schematic", exist_ok=True)
+    png = W + "versions/views/View_%s.png" % vw; img.save(png)
+    json.dump({"_doc": "28 October 2026 : ViewTrace of the %s view : smooth lines by component, in pixels and in metres (abscissa along rx, ordinate along uy)." % vw,
+               "view": vw, "rx": v["rx"], "uy": v["uy"], "lines": out}, open(W + "work/car/schematic/view_%s.json" % vw, "w"))
+    print(json.dumps({"view": vw, "png": png, "lines": len(out), "fair": nok, "by_component": cnt, "wheels": [(round(c["cx"], 1), round(c["cy"], 1), c["rings"]) for c in WH]}))
+
+
+if __name__ == "__main__":
+    main()

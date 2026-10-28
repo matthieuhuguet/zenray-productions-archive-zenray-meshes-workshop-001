@@ -1,0 +1,40 @@
+"""28 October 2026 : ZenRay Meshes VIEW SHEET, the schematic sheet assembled ONLY from the six views traced individually (Matthieu's rule :
+« réunir la sheet uniquement une fois que tu as fait les 6 individuellement »). Every view is re-traced first with the current ViewTrace
+(so the six share the same tool), then the six View_<view>.png are tiled as left, right, top, bottom, front, back, each with its line count
+and its CurveFair verdict ; the sheet refuses to assemble if a view is missing or has a refused line.
+python ViewSheet.py [--no-retrace] [--out versions/Schematic_views.png]
+FR : la planche assemblée seulement à partir des six vues relevées une à une, chacune relancée avec l'outil courant."""
+import argparse, json, os, subprocess, sys
+from PIL import Image, ImageDraw, ImageFont
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"layout": [["left", "right"], ["top", "bottom"], ["front", "back"]], "names": {"left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous", "front": "face", "back": "arrière"},
+          "tile_w": 1240, "margin": 24, "title_h": 40, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "py": "/Users/zenray/.venvs/zenray-meshes/bin/python"}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--no-retrace", action="store_true"); ap.add_argument("--out", default=W + "versions/Schematic_views.png"); a = ap.parse_args()
+    stats = {}
+    for row in PARAMS["layout"]:
+        for v in row:
+            if not a.no_retrace:
+                r = subprocess.run([PARAMS["py"], "-I", W + "Scripts/curverig/ViewTrace.py", v], capture_output=True, text=True)
+                if r.returncode: sys.exit("ViewTrace %s failed : %s" % (v, r.stderr[-400:]))
+            d = json.load(open(W + "work/car/schematic/view_%s.json" % v)); n = len(d["lines"]); ok = sum(o["ok"] for o in d["lines"]); stats[v] = (n, ok)
+            if ok != n: sys.exit("view %s has %d refused lines : the sheet is not assembled" % (v, n - ok))
+    tiles = {v: Image.open(W + "versions/views/View_%s.png" % v) for row in PARAMS["layout"] for v in row}
+    tw = PARAMS["tile_w"]; sc = {v: tw / t.size[0] for v, t in tiles.items()}; th = [max(int(tiles[v].size[1] * sc[v]) for v in row) for row in PARAMS["layout"]]
+    m = PARAMS["margin"]; Wd = 2 * tw + 3 * m; Hd = sum(th) + len(th) * (PARAMS["title_h"] + m) + m + 50
+    sheet = Image.new("RGB", (Wd, Hd), (250, 250, 248)); dr = ImageDraw.Draw(sheet); f = ImageFont.truetype(PARAMS["font"], 22)
+    dr.text((m, 12), "ZenRay Meshes, schémas des six vues relevées une à une (28 October 2026) : %d lignes lisses, toutes acceptées par CurveFair" % sum(n for n, _ in stats.values()), fill=(20, 20, 20), font=f)
+    y = 50
+    for ri, row in enumerate(PARAMS["layout"]):
+        x = m
+        for v in row:
+            t = tiles[v].resize((tw, int(tiles[v].size[1] * sc[v])), Image.LANCZOS); dr.text((x, y + 8), "%s : %d lignes" % (PARAMS["names"][v], stats[v][0]), fill=(20, 20, 20), font=f)
+            sheet.paste(t, (x, y + PARAMS["title_h"])); x += tw + m
+        y += th[ri] + PARAMS["title_h"] + m
+    sheet.save(a.out); print(json.dumps({"sheet": a.out, "views": stats, "size": sheet.size}))
+
+
+if __name__ == "__main__":
+    main()
