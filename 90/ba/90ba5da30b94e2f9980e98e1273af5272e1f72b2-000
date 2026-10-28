@@ -1,0 +1,68 @@
+"""28 October 2026, 01:20 : ZenRay Meshes finishing, EDGE TO EDGE, close a seam by pulling the edge of a moving part onto the straight edge of a
+fixed part (here : the fender inner edge onto the hood side edge read on the reference top view). For each slice along --axis, the moving part vertex
+nearest to the fixed edge is its edge point ; the gap vector of that slice moves every vertex of the slice, faded to 0 at --falloff-m from the edge
+point, so the edge lands at 0 mm and the panel bends smoothly behind it. The left side is computed, the right side is its mirror.
+python EdgeToEdge.py <in.npz> <out.npz> --fixed CAR_body_hood_C --moving CAR_body_fender_front_L,CAR_body_fender_front_R [--range 1.57,2.18] [--falloff-m 0.08]
+FR : soude le bord d'une pièce mobile sur le bord droit d'une pièce fixe, glissement lissé derrière le bord, symétrique.
+"""
+import argparse
+import json
+
+import numpy as np
+
+
+def verts(d, names, part):
+    return np.array(sorted({v for q, m in zip(d["Q"], names) if m == part for v in q}))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--fixed", default="CAR_body_hood_C")
+    ap.add_argument("--moving", default="CAR_body_fender_front_L,CAR_body_fender_front_R")
+    ap.add_argument("--axis", type=int, default=2)
+    ap.add_argument("--range", default="1.57,2.18")
+    ap.add_argument("--slice-m", type=float, default=0.01)
+    ap.add_argument("--falloff-m", type=float, default=0.08)
+    ap.add_argument("--max-gap-m", type=float, default=0.15)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    lo, hi = (float(v) for v in a.range.split(","))
+    F = P[verts(d, names, a.fixed)]
+    rep = {}
+    for mv in a.moving.split(","):
+        side = 1.0 if mv.endswith("_L") else -1.0
+        Fs = F[F[:, 0] * side > 0]
+        # fixed edge : the outermost fixed vertex of the upper skin per slice
+        cuts = np.arange(lo, hi + a.slice_m, a.slice_m); E = []
+        for c in cuts:
+            S = Fs[np.abs(Fs[:, a.axis] - c) < a.slice_m / 2]
+            if len(S):
+                S = S[S[:, 1] > S[:, 1].max() - 0.02]
+                E.append(S[np.argmax(S[:, 0] * side)])
+        E = np.array(E)
+        V = verts(d, names, mv); X = P[V]
+        before, after = [], []
+        disp = np.zeros_like(X)
+        for e in E:
+            sl = np.abs(X[:, a.axis] - e[a.axis]) < a.slice_m / 2
+            if not sl.any():
+                continue
+            dist = np.linalg.norm(X[sl] - e, axis=1); k = np.argmin(dist)
+            if dist[k] > a.max_gap_m:
+                continue
+            g = e - X[sl][k]; g[a.axis] = 0.0   # slide in the slice plane only
+            r = np.linalg.norm(X[sl] - X[sl][k], axis=1)
+            w = np.clip(1 - r / a.falloff_m, 0, 1); w = w * w * (3 - 2 * w)
+            idx = np.nonzero(sl)[0]
+            disp[idx] = np.where((w[:, None] * np.abs(g)).sum(1, keepdims=True) > np.abs(disp[idx]).sum(1, keepdims=True), w[:, None] * g, disp[idx])
+            before.append(dist[k] * 1000); after.append(np.linalg.norm(X[sl][k] + g - e) * 1000)
+        P[V] = X + disp
+        rep[mv] = {"slices": len(before), "gap_mm_before_p50_max": [round(float(np.median(before)), 1), round(float(max(before)), 1)] if before else None,
+                   "gap_mm_after_max": round(float(max(after)), 3) if after else None, "move_mm_max": round(float(np.abs(disp).max() * 1000), 1)}
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+    print(json.dumps(rep))
+
+
+if __name__ == "__main__":
+    main()

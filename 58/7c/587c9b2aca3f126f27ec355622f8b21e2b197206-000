@@ -1,0 +1,111 @@
+"""28 October 2026, 23:50 : ZenRay Meshes finishing, HOOD LOFT, the front hood rebuilt as one ruled quad surface, read on the reference top and side views :
+a trapezoid with straight edges (top view), one smooth line from the windshield hinge down to the nose (side view), a straight front edge (front view).
+The rear row keeps EXACTLY the vertices the hood already shares with the cowl curve (hinge stays 0 mm) ; the front row is a straight line ; every column
+uses the same Hermite profile (start slope at the hinge, end slope at the nose), so the surface is flat across x and has no step, no W.
+python HoodLoft.py <delivery.npz> <out.npz> [--front-z 2.245] [--front-y 0.535] [--front-half-w 0.713] [--s0 -0.31] [--s1 -0.59] [--rows 34] [--thick 0.012]
+FR : capot refait en surface réglée, charnière gardée, bord avant droit, un seul profil lisse.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+NAME = "CAR_body_hood_C"
+SEAM = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/finish/cowl_curve.npy"
+
+
+def shell(S, thick, support, up=1):
+    # outer skin S (rows x cols x 3), inner skin offset, walls with support loops ; winding as DeckLoft (outward, checked 28 October 2026)
+    du = np.gradient(S, axis=1); dv = np.gradient(S, axis=0); N = np.cross(du, dv)
+    N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+    N *= np.sign(N[..., up:up + 1].mean() + 1e-12)
+    B = S - thick * N
+    nb, na = S.shape[:2]; off = nb * na
+    pts = list(S.reshape(-1, 3)) + list(B.reshape(-1, 3)); faces = []; skin = []
+    gid = lambda j, i: j * na + i
+    for j in range(nb - 1):
+        for i in range(na - 1):
+            q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]
+            faces.append(q); skin.append(True); faces.append([off + x for x in q[::-1]]); skin.append(False)
+    ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + \
+           [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+    layers = [ring]
+    for s in range(support):
+        t = (s + 1) / (support + 1); base = len(pts)
+        for v in ring:
+            pts.append(S.reshape(-1, 3)[v] * (1 - t) + B.reshape(-1, 3)[v] * t)
+        layers.append(list(range(base, base + len(ring))))
+    layers.append([off + v for v in ring])
+    for l0, l1 in zip(layers[:-1], layers[1:]):
+        m = len(l0)
+        for k in range(m):
+            faces.append([l0[k], l1[k], l1[(k + 1) % m], l0[(k + 1) % m]]); skin.append(False)
+    return pts, faces, skin
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out")
+    ap.add_argument("--front-z", type=float, default=2.245)
+    ap.add_argument("--front-y", type=float, default=0.535)
+    ap.add_argument("--front-half-w", type=float, default=0.713)
+    ap.add_argument("--s0", type=float, default=-0.31, help="dy/dz at the hinge, measured on the current hood centre line")
+    ap.add_argument("--s1", type=float, default=-0.59, help="dy/dz at the nose")
+    ap.add_argument("--rows", type=int, default=34)
+    ap.add_argument("--thick", type=float, default=0.012)
+    ap.add_argument("--support", type=int, default=1)
+    ap.add_argument("--pin-mm", type=float, default=6.0, help="hinge row = the hood vertices within this distance of the cowl curve, one per x (65 on v654)")
+    ap.add_argument("--front-curve", default="/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/finish/front_curve.npy",
+                    help="the SAME edge as the band below (Matthieu, 28 October 2026) ; empty = straight line front-z, front-y")
+    ap.add_argument("--side-curve", default="", help="left side edge (x, y, z) to follow, mirrored on the right : the smoothed fender inner edge (28 October 2026)")
+    ap.add_argument("--side-blend", type=float, default=0.15, help="share of the length over which the side follow fades in from the hinge")
+    ap.add_argument("--side-power", type=float, default=4.0, help="how the side height correction spreads inward, (|x| / x_edge) ** power")
+    a = ap.parse_args()
+    P, _ = part(a.npz, NAME)
+    seam = np.load(SEAM)
+    d = cKDTree(seam).query(P)[0] * 1000
+    o = np.argsort(d); o = o[d[o] < a.pin_mm]
+    R = []
+    for i in o:   # nearest first, one vertex per x : the outer skin row, never the support loop behind it
+        if all(abs(P[i, 0] - r[0]) > 0.004 for r in R):
+            R.append(P[i])
+    R = np.array(sorted(R, key=lambda r: r[0]))
+    hw0 = np.abs(R[:, 0]).max()
+    if a.front_curve:
+        C = np.load(a.front_curve); C = C[np.argsort(C[:, 0])]
+        fx = R[:, 0] * np.abs(C[:, 0]).max() / hw0
+        F = np.stack([fx, np.interp(fx, C[:, 0], C[:, 1]), np.interp(fx, C[:, 0], C[:, 2])], 1)
+    else:
+        F = np.stack([R[:, 0] * a.front_half_w / hw0, np.full(len(R), a.front_y), np.full(len(R), a.front_z)], 1)
+    u = np.linspace(0, 1, a.rows + 1)
+    h00 = 2 * u ** 3 - 3 * u ** 2 + 1; h10 = u ** 3 - 2 * u ** 2 + u; h01 = -2 * u ** 3 + 3 * u ** 2; h11 = u ** 3 - u ** 2
+    S = np.zeros((a.rows + 1, len(R), 3))
+    for i in range(len(R)):
+        L = F[i, 2] - R[i, 2]
+        S[:, i, 0] = R[i, 0] + (F[i, 0] - R[i, 0]) * u                    # straight side edges (trapezoid in top view)
+        S[:, i, 2] = R[i, 2] + L * u
+        S[:, i, 1] = h00 * R[i, 1] + h10 * a.s0 * L + h01 * F[i, 1] + h11 * a.s1 * L
+    S[0] = R
+    if a.side_curve:
+        Cs = np.load(a.side_curve); Cs = Cs[np.argsort(Cs[:, 2])]
+        for j in range(1, a.rows + 1):
+            b = np.clip(u[j] / a.side_blend, 0, 1); b = b * b * (3 - 2 * b)
+            ze = S[j, -1, 2]; xe = np.interp(ze, Cs[:, 2], Cs[:, 0]); ye = np.interp(ze, Cs[:, 2], Cs[:, 1])
+            xl = np.abs(S[j, :, 0]).max()
+            S[j, :, 0] *= 1 + b * (xe / xl - 1)
+            S[j, :, 1] += b * (ye - S[j, -1, 1]) * (np.abs(S[j, :, 0]) / xe) ** a.side_power
+    pts, faces, skin = shell(S[::-1], a.thick, a.support)   # rows run toward -z like DeckLoft, so the winding is outward (28 October 2026)
+    np.savez(a.out, P=np.array(pts, np.float32), Q=np.array(faces, dtype=object), names=np.array([NAME] * len(faces)), skin=np.array(skin))
+    dy = np.diff(S[:, len(R) // 2, 1]) / np.diff(S[:, len(R) // 2, 2])
+    print(json.dumps({"grid": [a.rows, len(R) - 1], "faces": len(faces), "hinge_pts": len(R), "rear_half_w": round(float(hw0), 3),
+                      "centre_slope_first_last": [round(float(dy[0]), 3), round(float(dy[-1]), 3)], "slope_monotone": bool(np.all(np.diff(dy) <= 1e-9))}))
+
+
+if __name__ == "__main__":
+    main()

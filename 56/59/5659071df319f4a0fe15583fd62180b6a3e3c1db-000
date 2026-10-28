@@ -1,0 +1,63 @@
+"""28 October 2026, 00:40 : ZenRay Meshes finishing, MOUTH EDGE, the one shared edge between the hood and the band under it (the top of the mouth).
+The edge E(x) is drawn from the reference top view : straight in the middle, rounded at the corners, z = z0 - drop * (|x| / half_w) ** power, y constant.
+The band (and optionally its neighbours) is shifted column by column so its top edge lands exactly on E ; the edge is saved as a curve file that
+HoodLoft.py uses for the hood front row. FR : une seule arête commune capot et bande, lisse, droite au centre, arrondie aux coins.
+python MouthEdge.py <delivery.npz> <out.npz> <edge.npy> [--z0 2.25] [--y 0.525] [--half-w 0.69] [--drop 0.08] [--power 6] [--parts CAR_fascia_front_band_C]
+"""
+import argparse
+import json
+
+import numpy as np
+
+
+def edge(xs, a):
+    return np.stack([xs, np.full(len(xs), a.y), a.z0 - a.drop * (np.abs(xs) / a.half_w) ** a.power], 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("edge")
+    ap.add_argument("--z0", type=float, default=2.25)
+    ap.add_argument("--y", type=float, default=0.525)
+    ap.add_argument("--half-w", type=float, default=0.69)
+    ap.add_argument("--drop", type=float, default=0.08)
+    ap.add_argument("--power", type=float, default=6.0)
+    ap.add_argument("--parts", default="CAR_fascia_front_band_C")
+    ap.add_argument("--bin-m", type=float, default=0.006)
+    ap.add_argument("--follow", default="CAR_body_fascia_panel_C,CAR_fascia_side_L,CAR_fascia_side_R,CAR_grille_frame_C",
+                    help="parts that take the same z shift as the first part, per x (they hang under the band, 28 October 2026)")
+    a = ap.parse_args()
+    d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    xs = np.linspace(-a.half_w, a.half_w, 401); E = edge(xs, a); np.save(a.edge, E)
+    rep = {}
+    for part in a.parts.split(","):
+        V = np.array(sorted({v for q, m in zip(d["Q"], names) if m == part for v in q}))
+        X = P[V]
+        # top edge of the part per x bin : the highest vertex, then its z ; bins without vertex are interpolated
+        bx = np.arange(X[:, 0].min(), X[:, 0].max() + a.bin_m, a.bin_m); tz = np.full(len(bx), np.nan); ty = np.full(len(bx), np.nan)
+        for k, x0 in enumerate(bx):
+            S = X[np.abs(X[:, 0] - x0) < a.bin_m]
+            if len(S):
+                s = S[S[:, 1].argmax()]; tz[k], ty[k] = s[2], s[1]
+        ok = ~np.isnan(tz); tz = np.interp(bx, bx[ok], tz[ok]); ty = np.interp(bx, bx[ok], ty[ok])
+        cx = np.clip(X[:, 0], -a.half_w, a.half_w)
+        ez = a.z0 - a.drop * (np.abs(cx) / a.half_w) ** a.power
+        dz = ez - np.interp(X[:, 0], bx, tz); dy = a.y - np.interp(X[:, 0], bx, ty)
+        P[V, 2] += dz; P[V, 1] += dy
+        if part == a.parts.split(",")[0]:
+            fx, fz = X[:, 0], dz; o = np.argsort(fx); fx, fz = fx[o], fz[o]
+        rep[part] = {"dz_mm_max": round(float(np.abs(dz).max() * 1000), 1), "dy_mm_max": round(float(np.abs(dy).max() * 1000), 1)}
+    for part in [p for p in a.follow.split(",") if p]:
+        V = np.array(sorted({v for q, m in zip(d["Q"], names) if m == part for v in q}))
+        if not len(V):
+            continue
+        # per x bin mean of the band shift, so a column moves as one block
+        bx = np.arange(fx.min(), fx.max() + a.bin_m, a.bin_m); mz = np.array([fz[np.abs(fx - x0) < a.bin_m].mean() if np.any(np.abs(fx - x0) < a.bin_m) else np.nan for x0 in bx])
+        ok = ~np.isnan(mz); dzf = np.interp(P[V, 0], bx[ok], mz[ok])
+        P[V, 2] += dzf; rep[part] = {"dz_mm_max": round(float(np.abs(dzf).max() * 1000), 1)}
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+    print(json.dumps(rep))
+
+
+if __name__ == "__main__":
+    main()

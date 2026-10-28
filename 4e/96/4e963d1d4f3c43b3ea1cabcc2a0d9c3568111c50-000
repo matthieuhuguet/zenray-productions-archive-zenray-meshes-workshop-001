@@ -1,0 +1,57 @@
+"""28 October 2026, 02:10 : ZenRay Meshes finishing, SNAP SIDE, close the last millimetres of a seam by moving the CLEAN part, never the old one :
+every vertex of the clean part whose nearest point on the neighbour surface is closer than --max-mm is moved by that gap, and its neighbours inside
+--falloff-m follow with a smoothstep weight, so the edge lands at 0 mm and no tooth appears. Mirrored by construction (both sides are snapped).
+python SnapSide.py <in.npz> <out.npz> --part CAR_body_hood_C --onto CAR_body_fender_front_L,CAR_body_fender_front_R [--max-mm 25] [--falloff-m 0.06] [--z-range 1.58,2.10]
+FR : ferme les derniers millimètres d'une jonction en déplaçant la pièce propre, lissage autour, jamais de dent.
+"""
+import argparse
+import json
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--part", default="CAR_body_hood_C")
+    ap.add_argument("--onto", default="CAR_body_fender_front_L,CAR_body_fender_front_R")
+    ap.add_argument("--max-mm", type=float, default=25.0)
+    ap.add_argument("--edge-band-m", type=float, default=0.012, help="only the vertices this close to the part's lateral extreme are seam vertices")
+    ap.add_argument("--falloff-m", type=float, default=0.06)
+    ap.add_argument("--z-range", default="1.58,2.10")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q in d["Q"]]
+    V = np.array(sorted({v for q, m in zip(Q, names) if m == a.part for v in q})); X = P[V]
+    z0, z1 = (float(v) for v in a.z_range.split(","))
+    disp = np.zeros_like(X); rep = {}
+    for onto in a.onto.split(","):
+        F = [q for q, m in zip(Q, names) if m == onto]
+        T = np.array([[q[0], q[k], q[k + 1]] for q in F for k in range(1, len(q) - 1)])
+        tm = trimesh.Trimesh(P, T, process=False)
+        side = 1.0 if onto.endswith("_L") else -1.0
+        # seam vertices : per z slice, the hood vertices at the lateral extreme of that side
+        seam = []
+        for zc in np.arange(z0, z1, 0.004):
+            sl = np.nonzero((np.abs(X[:, 2] - zc) < 0.002) & (X[:, 0] * side > 0))[0]
+            if len(sl):
+                ex = (X[sl, 0] * side).max(); seam.extend(sl[(X[sl, 0] * side) > ex - a.edge_band_m])
+        seam = np.unique(seam)
+        cp, dist, _ = trimesh.proximity.closest_point(tm, X[seam])
+        ok = dist * 1000 < a.max_mm; seam, cp, dist = seam[ok], cp[ok], dist[ok]
+        g = cp - X[seam]
+        # spread : every hood vertex takes the gap of its nearest seam vertex, faded by distance to it
+        tr = cKDTree(X[seam]); r, k = tr.query(X)
+        w = np.clip(1 - r / a.falloff_m, 0, 1); w = w * w * (3 - 2 * w)
+        msk = X[:, 0] * side > 0
+        disp[msk] = (w[:, None] * g[k])[msk]
+        rep[onto] = {"seam_verts": int(len(seam)), "gap_mm_p50_max": [round(float(np.median(dist) * 1000), 1), round(float(dist.max() * 1000), 1)]}
+    P[V] = X + disp
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+    print(json.dumps(rep))
+
+
+if __name__ == "__main__":
+    main()

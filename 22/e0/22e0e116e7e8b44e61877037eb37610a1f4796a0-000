@@ -1,0 +1,50 @@
+"""28 October 2026, 03:00 : ZenRay Meshes finishing, HINGE CURVE, the one smooth side line of the greenhouse (windshield, roof, rear glass) on the left.
+Per z slice, the outer top vertex of the three parts ; a least squares cubic B-spline with --knots interior knots, outliers removed in --iters passes.
+Saves the curve (x, y, z) and a board : top x(z) and side y(z), current edge red, rejected blue, curve green. FR : une seule ligne lisse le long du vitrage.
+python HingeCurve.py <delivery.npz> <curve.npy> <board.png> [--knots 5] [--parts ...]
+"""
+import argparse
+import json
+
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy.interpolate import LSQUnivariateSpline
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("board")
+    ap.add_argument("--parts", default="CAR_body_glass_windshield_C,CAR_body_roof_C,CAR_body_glass_rear_C")
+    ap.add_argument("--knots", type=int, default=5)
+    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--slice-m", type=float, default=0.01)
+    a = ap.parse_args()
+    d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); parts = set(a.parts.split(","))
+    V = np.array(sorted({v for q, m in zip(d["Q"], n) if m in parts for v in q})); X = P[V]; X = X[X[:, 0] > 0.3]
+    E = []
+    for z in np.arange(X[:, 2].min() + a.slice_m, X[:, 2].max(), a.slice_m):
+        S = X[np.abs(X[:, 2] - z) < a.slice_m / 2]
+        if len(S):
+            S = S[S[:, 0] > S[:, 0].max() - 0.03]; E.append(S[S[:, 1].argmax()])
+    E = np.array(E); z = E[:, 2]; k = np.ones(len(E), bool)
+    for _ in range(a.iters):
+        t = np.linspace(z[k].min(), z[k].max(), a.knots + 2)[1:-1]
+        sx = LSQUnivariateSpline(z[k], E[k, 0], t); sy = LSQUnivariateSpline(z[k], E[k, 1], t)
+        r = np.hypot(sx(z) - E[:, 0], sy(z) - E[:, 1]); k = r < max(0.006, np.percentile(r, 90))
+    zz = np.linspace(z.min(), z.max(), 400); C = np.stack([sx(zz), sy(zz), zz], 1); np.save(a.out, C)
+    d2 = np.gradient(np.gradient(C[:, 0], zz), zz)
+    W, H = 1400, 450; im = Image.new("RGB", (W, H * 2), (60, 60, 60)); dr = ImageDraw.Draw(im)
+    def tp(zv, v, lo, hi, off):
+        return ((zv - z.min()) / (z.max() - z.min()) * (W - 40) + 20, off + H - 20 - (v - lo) / (hi - lo) * (H - 40))
+    for (ax, lo, hi, off) in ((0, 0.40, 0.70, 0), (1, 0.95, 1.35, H)):
+        for e, kk in zip(E, k):
+            x0, y0 = tp(e[2], e[ax], lo, hi, off); dr.ellipse([x0 - 3, y0 - 3, x0 + 3, y0 + 3], fill=(240, 50, 50) if kk else (120, 120, 240))
+        dr.line([tp(c[2], c[ax], lo, hi, off) for c in C], fill=(80, 230, 80), width=3)
+    dr.text((10, 10), "top x(z) : red = current outer edge, blue = rejected, green = hinge curve (rear glass left, windshield right)", fill=(255, 255, 0))
+    dr.text((10, H + 10), "side y(z)", fill=(255, 255, 0)); im.save(a.board)
+    print(json.dumps({"pts": len(E), "kept": int(k.sum()), "resid_mm_p50_p95": [round(float(np.median(r) * 1000), 1), round(float(np.percentile(r, 95) * 1000), 1)],
+                      "x_inflections": int((np.diff(np.sign(d2)) != 0).sum())}))
+
+
+if __name__ == "__main__":
+    main()
