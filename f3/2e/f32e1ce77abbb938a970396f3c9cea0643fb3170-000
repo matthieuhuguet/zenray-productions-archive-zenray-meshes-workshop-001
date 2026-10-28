@@ -1,0 +1,64 @@
+"""28 October 2026, 14:45 : ZenRay Meshes, HEIGHT FAIR, refit the skin of a mostly horizontal panel (hood, roof, decklid) as one smooth surface y(x, z).
+The upward facing vertices of the part are fitted by a symmetric polynomial in (x^2, z) of total degree --deg (least squares), each vertex moves by
+--blend of the gap ; the other vertices of the shell (underside, walls) move by the same dy as their nearest upper vertex, so the thickness is kept.
+Border vertices of the part (open edges = welds) keep their position when --keep-border is 1.
+python HeightFair.py <in.npz> <out.npz> --part CAR_body_hood_C [--deg 6] [--blend 1.0] [--keep-border 1] [--fade-m 0.03]
+FR : réajuste la peau d'un panneau presque horizontal en une seule surface lisse y(x, z), symétrique, épaisseur gardée.
+"""
+import argparse
+from collections import defaultdict
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--part", required=True)
+    ap.add_argument("--deg", type=int, default=6)
+    ap.add_argument("--blend", type=float, default=1.0)
+    ap.add_argument("--keep-border", type=int, default=1)
+    ap.add_argument("--fade-m", type=float, default=0.03, help="dy fades to 0 within this distance of a fixed border vertex")
+    ap.add_argument("--x-max", type=float, default=0.0, help="vertices with |x| above this keep their height (fade over --fade-m), for closed shells (28 October 2026)")
+    ap.add_argument("--up", type=float, default=0.5)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], names) if m == a.part]
+    vn = defaultdict(lambda: np.zeros(3)); cnt = defaultdict(int)
+    for q in Q:
+        v = P[q]; n = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); n /= np.linalg.norm(n) + 1e-12
+        for x in q:
+            vn[x] = vn[x] + n
+        for k in range(len(q)):
+            e = (min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)])); cnt[e] += 1
+    V = np.array(sorted(vn)); N = np.array([vn[v] / (np.linalg.norm(vn[v]) + 1e-12) for v in V])
+    top = V[N[:, 1] > a.up]
+    border = {v for e, c in cnt.items() if c == 1 for v in e}
+    x2, z = P[top, 0] ** 2, P[top, 2]
+    zc = z.mean(); zs = z.std() + 1e-9; xs = x2.std() + 1e-9
+    terms = [(i, j) for i in range(a.deg + 1) for j in range(a.deg + 1) if i + j <= a.deg and i <= a.deg // 2]
+    A = np.stack([(x2 / xs) ** i * ((z - zc) / zs) ** j for i, j in terms], 1)
+    coef, *_ = np.linalg.lstsq(A, P[top, 1], rcond=None)
+    dy_top = a.blend * (A @ coef - P[top, 1])
+    if a.keep_border:
+        fb = np.array([v for v in top if v in border])
+        if len(fb):
+            dist = cKDTree(P[fb]).query(P[top])[0]
+            dy_top *= np.clip(dist / max(a.fade_m, 1e-6), 0, 1)
+    if a.x_max > 0:
+        dy_top *= np.clip((a.x_max - np.abs(P[top, 0])) / max(a.fade_m, 1e-6), 0, 1)
+    tree = cKDTree(P[top][:, [0, 2]])
+    _, nn = tree.query(P[V][:, [0, 2]])
+    dy = dy_top[nn]
+    if a.keep_border:
+        dy[np.isin(V, list(border))] = 0.0
+    P[V, 1] += dy
+    P[top, 1] = P[top, 1]  # already moved through V
+    print({"top": len(top), "terms": len(terms), "dy_max_mm": round(float(np.abs(dy).max() * 1000), 2), "dy_p50_mm": round(float(np.median(np.abs(dy)) * 1000), 2)})
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+
+
+if __name__ == "__main__":
+    main()
