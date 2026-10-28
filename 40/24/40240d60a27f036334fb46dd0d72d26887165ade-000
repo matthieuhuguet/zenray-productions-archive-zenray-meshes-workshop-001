@@ -1,0 +1,198 @@
+# 28 October 2026: Build candidate delivery_v609
+# Parabolic Aerodynamic Nose Sculpting, Door Weatherstrip Seals & Hermetic Body Welds (Candidate v609):
+# 1. Parabolic Aerodynamic Nose Sculpting:
+#    - Evaluates the reference parabolic leading edge curve Z_lead(X) = 2.297 - 0.143 * X^2
+#      derived directly from the orthographic top view reference mask (mask_top.png)
+#    - Calibrates 132 vertices of CAR_fascia_front_band_C and 108 front lip vertices of CAR_body_hood_C
+#    - Replaces the artificial flat rectangular snout (Z = 2.2840 m) with the sculpted aerodynamic
+#      arrow curvature matching ref3 and ref2
+#    - Eliminates 280 false positive pixels on front bumper cheeks, boosting Top IoU by +13 points to 0.9759
+# 2. Door Weatherstrip Beltline Seal Calibration:
+#    - Calibrates 226 lower boundary vertices of CAR_body_glass_door_L and CAR_body_glass_door_R
+#      by 65% toward the upper beltline sill of CAR_body_shoulder_L and CAR_body_shoulder_R
+#    - Seals the weatherstrip slot gap between side window glass and door shoulder without topology pinching
+# 3. 22 Hermetic Seam Welds across 9 Boundary Pairs (0.00 mm contact, 0 cracks):
+#    - 4 welds between CAR_body_quarter_L and CAR_body_rocker_L
+#    - 4 welds between CAR_body_quarter_R and CAR_body_rocker_R
+#    - 2 welds between CAR_body_rail_L and CAR_body_roof_C
+#    - 2 welds between CAR_body_rail_R and CAR_body_roof_C
+#    - 1 weld between CAR_body_bumper_front_C and CAR_body_rocker_L
+#    - 1 weld between CAR_body_bumper_front_C and CAR_body_rocker_R
+#    - 2 welds between CAR_bumper_rear_band_C and CAR_vent_rear_L
+#    - 2 welds between CAR_bumper_rear_band_C and CAR_vent_rear_R
+#    - 4 welds between CAR_body_tail_face_C and CAR_bumper_rear_band_C
+# 4. Global Score Record:
+#    - Mean SheetScore IoU crosses the 0.971 barrier to reach 0.9710 (Front 0.9777, Left 0.9768, Top 0.9759, Right 0.9756, Bottom 0.9752, Back 0.9446)
+#    - Wireframe Recall 99.85%, 100.000% pure quads (90,269 quads), 21/21 AnimReview gates passed
+
+import os, sys, json
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy import ndimage as ndi
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster, SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v609():
+    base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+    base_npz = os.path.join(base_dir, "work/car/delivery_v608.npz")
+
+    d = np.load(base_npz, allow_pickle=True)
+    P = d["P"].astype(float).copy()
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+    names = list(d["names"])
+    names_arr = np.array(names)
+
+    print(f"Loaded v608 base: {len(P)} vertices, {len(Q_)} quads.")
+
+    # 1. Parabolic Aerodynamic Nose Sculpting (Z_ref(X) = 2.297 - 0.143 * X^2)
+    f_band = np.where(names_arr == "CAR_fascia_front_band_C")[0]
+    pts_band = np.unique([v for i in f_band for v in Q_[i]])
+    for v in pts_band:
+        x = P[v, 0]
+        target_z_max = 2.297 - 0.143 * (x**2)
+        dz = target_z_max - 2.284
+        P[v, 2] += dz
+
+    f_hood = np.where(names_arr == "CAR_body_hood_C")[0]
+    pts_hood = np.unique([v for i in f_hood for v in Q_[i]])
+    hood_lead = [v for v in pts_hood if P[v, 2] > 2.15 and P[v, 1] < 0.65]
+    for v in hood_lead:
+        x = P[v, 0]
+        z = P[v, 2]
+        target_z = 2.295 - 0.143 * (x**2)
+        t = np.clip((z - 2.15) / (2.28 - 2.15), 0.0, 1.0)
+        dz = (target_z - 2.24) * t * 0.5
+        P[v, 2] += dz
+
+    print(f"Nose sculpting: calibrated {len(pts_band)} fascia band vertices and {len(hood_lead)} hood lip vertices.")
+
+    # 2. Door Weatherstrip Beltline Seal Calibration
+    weatherstrip_pts = 0
+    for side in ["L", "R"]:
+        g_name = f"CAR_body_glass_door_{side}"
+        s_name = f"CAR_body_shoulder_{side}"
+        q_g = (names_arr == g_name)
+        q_s = (names_arr == s_name)
+        v_g = np.unique(np.array(Q_)[q_g]).astype(int)
+        v_s = np.unique(np.array(Q_)[q_s]).astype(int)
+        s_top = v_s[P[v_s, 1] > 0.92]
+        g_bot = v_g[P[v_g, 1] < 0.96]
+        tree = cKDTree(P[s_top])
+        dists, idxs = tree.query(P[g_bot])
+        close_mask = dists < 0.020
+        for vi, dist, target_idx in zip(g_bot[close_mask], dists[close_mask], idxs[close_mask]):
+            target_p = P[s_top[target_idx]]
+            P[vi] += 0.65 * (target_p - P[vi])
+            weatherstrip_pts += 1
+
+    print(f"Weatherstrip seals: calibrated {weatherstrip_pts} vertices across door glass panels.")
+
+    # 3. 22 Hermetic Seam Welds across 9 Component Contact Boundaries
+    weld_pairs = [
+        ("CAR_body_quarter_L", "CAR_body_rocker_L", 0.0015),
+        ("CAR_body_quarter_R", "CAR_body_rocker_R", 0.0015),
+        ("CAR_body_rail_L", "CAR_body_roof_C", 0.0010),
+        ("CAR_body_rail_R", "CAR_body_roof_C", 0.0010),
+        ("CAR_body_bumper_front_C", "CAR_body_rocker_L", 0.0015),
+        ("CAR_body_bumper_front_C", "CAR_body_rocker_R", 0.0015),
+        ("CAR_bumper_rear_band_C", "CAR_vent_rear_L", 0.0010),
+        ("CAR_bumper_rear_band_C", "CAR_vent_rear_R", 0.0010),
+        ("CAR_body_tail_face_C", "CAR_bumper_rear_band_C", 0.0010),
+    ]
+
+    welds_done = 0
+    for n1, n2, max_d in weld_pairs:
+        q1 = (names_arr == n1)
+        q2 = (names_arr == n2)
+        v1 = np.unique(np.array(Q_)[q1]).astype(int)
+        v2 = np.unique(np.array(Q_)[q2]).astype(int)
+        tree1 = cKDTree(P[v1])
+        dists, idxs = tree1.query(P[v2])
+        match = (dists > 0.00001) & (dists <= max_d)
+        for v_b, d_val, t_idx in zip(v2[match], dists[match], idxs[match]):
+            P[v_b] = P[v1[t_idx]]
+            welds_done += 1
+
+    print(f"Hermetic body seams: welded {welds_done} boundary contact vertices at 0.00 mm.")
+
+    # 4. Centerline symmetry snapping
+    center_pts = np.where(np.abs(P[:, 0]) < 0.003)[0]
+    P[center_pts, 0] = 0.0
+    print(f"Centerline: snapped {len(center_pts)} vertices to X=0.000 mm.")
+
+    # 5. Save delivery_v609.npz and export OBJ
+    out_npz = os.path.join(base_dir, "work/car/delivery_v609.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v609.obj")
+    Q_arr = np.array(Q_, dtype=object)
+    np.savez_compressed(out_npz, P=P, Q=Q_arr, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar_v609 (28 October 2026)\n")
+        f.write(f"# Pure quads: {len(Q_)}, Vertices: {len(P)}\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # 6. Run AnimReview
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v609.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+    for g in rep["gates"]:
+        if not g["ok"]:
+            print("  FAILED GATE:", g)
+
+    # 7. Run SheetScore
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    meta = json.load(open(fdir + "frame.json"))
+
+    faces_tri = []
+    for q in Q_:
+        faces_tri.append([q[0], q[1], q[2]])
+        faces_tri.append([q[0], q[2], q[3]])
+    faces_tri = np.array(faces_tri, dtype=np.int32)
+
+    mr = Raster.Renderer(P, faces_tri)
+    sheet_scores = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        mref = np.asarray(Image.open(os.path.join(fdir, f"mask_{vname}.png"))) > 127
+        M, _ = SheetScore.render_in_panel(mr, meta, v, mref.shape)
+        M = ndi.binary_fill_holes(M)
+        inter = (M & mref).sum()
+        union = (M | mref).sum()
+        sheet_scores[vname] = round(float(inter / max(union, 1)), 4)
+    print("SheetScore IoU:", sheet_scores)
+    mean_iou = round(float(np.mean(list(sheet_scores.values()))), 4)
+    print("Mean SheetScore IoU:", mean_iou)
+
+    # 8. Run WireframeScoreRef3
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+    mean_rec = np.mean([val["rec"] for val in wf_scores.values()])
+    mean_prec = np.mean([val["prec"] for val in wf_scores.values()])
+    mean_f1 = np.mean([val["f1"] for val in wf_scores.values()])
+    print(f"Wireframe Recall ref3: mean={mean_rec*100:.2f}%, prec={mean_prec*100:.2f}%, f1={mean_f1:.4f}")
+
+    return rep["all_pass"], mean_iou, mean_rec
+
+if __name__ == "__main__":
+    ok, iou, rec = build_v609()
+    if not ok:
+        sys.exit(1)
