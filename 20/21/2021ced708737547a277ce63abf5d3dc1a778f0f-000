@@ -1,0 +1,43 @@
+"""28 October 2026 : ZenRay Meshes SCHEMATIC LINES, the schematic read at the SOURCE (task KS2b-2). A network builder calls snap_polyline on a
+line it is about to use (the fender shoulder crease, a belt, a lip) : the polyline is projected into the traced view where its surface faces,
+paired with the ONE ref line that covers it (cover >= min_cover within search_px, mean offset <= max_mean_px), and moved onto it by one smooth
+displacement (polynomial of degree deg along the line, capped at cap_m, tapered to zero over taper of the length at both ends so the nodes it
+shares with other curves stay), depth kept. Every node computed later from the line (an intersection like XA or XC) then follows by itself :
+correcting a line after the network is built folded the ring at XC (KS2b-1b). Returns the line and a report.
+FR : le schéma lu à la source : une ligne est recalée sur la ref avant que le réseau ne calcule ses intersections."""
+import json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+from Schematic import view_mapper
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"search_px": 15.0, "min_cover": 0.6, "max_mean_px": 8.0, "deg": 3, "cap_m": 0.04, "taper": 0.15, "skip_kinds": ("ring", "spoke", "bolt")}
+_CACHE = {}
+
+
+def _view(vn):
+    if vn not in _CACHE:
+        fr = json.load(open(W + "work/car/frame/frame.json")); lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); v = [x for x in fr["views"] if x["name"] == vn][0]
+        L = [np.array(o["curve_px"]) for o in json.load(open(W + "work/car/schematic/view_%s.json" % vn))["lines"] if o.get("kind") not in PARAMS["skip_kinds"]]
+        _CACHE[vn] = (v, lo, hi, L, [cKDTree(x) for x in L])
+    return _CACHE[vn]
+
+
+def snap_polyline(P, vn, **kw):
+    """P (n, 3) world polyline -> (P moved onto its ref line in view vn, report dict). P is returned unchanged when no single line covers it."""
+    p = dict(PARAMS, **kw); P = np.asarray(P, float); v, lo, hi, L, T = _view(vn); m = view_mapper(v, lo, hi, 1.0); uv = m(P)
+    best = None
+    for li, t in enumerate(T):
+        dd = t.query(uv)[0]; cov = float((dd <= p["search_px"]).mean())
+        if best is None or cov > best[1] or (cov == best[1] and dd.mean() < best[2]): best = (li, cov, float(dd.mean()))
+    if best is None or best[1] < p["min_cover"]: return P, {"snapped": False, "why": "no ref line covers it", "cover": round(best[1] if best else 0, 2)}
+    d_, k_ = T[best[0]].query(uv); ok = d_ <= p["search_px"]; mpx = float(d_[ok].mean())
+    if mpx > p["max_mean_px"]: return P, {"snapped": False, "why": "mean offset %.1f px : maybe another feature" % mpx}
+    rx, uy = np.array(v["rx"], float), np.array(v["uy"], float); ppm = v["px_per_m"]
+    du = (L[best[0]][k_] - uv) / ppm; D = np.outer(du[:, 0], rx) - np.outer(du[:, 1], uy)   # image v grows down, uy grows up
+    s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; t = s / max(s[-1], 1e-12); w = ok.astype(float) + 1e-3
+    Ds = np.stack([np.polyval(np.polyfit(t, D[:, j], p["deg"], w=w), t) for j in range(3)], 1)
+    nrm = np.linalg.norm(Ds, axis=1); Ds *= np.minimum(1.0, p["cap_m"] / (nrm + 1e-12))[:, None]
+    tp = p["taper"]; ramp = np.clip(np.minimum(t, 1 - t) / max(tp, 1e-6), 0, 1); ramp = ramp * ramp * (3 - 2 * ramp)   # smoothstep to zero at both ends
+    Q = P + Ds * ramp[:, None]
+    return Q, {"snapped": True, "view": vn, "cover": round(best[1], 2), "mean_px": round(mpx, 2), "max_move_mm": round(float((np.linalg.norm(Ds, axis=1) * ramp).max() * 1000), 1)}

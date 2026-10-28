@@ -1,0 +1,103 @@
+"""28 October 2026 : ZenRay Meshes SNAP TO SCHEMATIC (task KS2b, the schematic is the source). Every design curve of the rig whose surface faces
+one of the given views is moved onto the ref line that covers it in that view : each sample goes to the nearest point of that ONE line, the
+depth comes back by a ray on the skin along the view (horizontal ray for a side view, vertical ray for the top view), the shared nodes take
+the mean move of their curves, and every curve is refit with its own control point count, its ends on its nodes (RigLib.fit_robust). A curve
+is snapped only if one ref line covers min_cover of it within search_px ; construction curves only follow their nodes.
+python SnapToSchematic.py <rig.json> <out.json> [--views left,top] [--search-px 15]
+FR : chaque courbe de design recalée sur sa ligne de la ref, dans la vue où sa surface fait face ; profondeur reprise sur la peau."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+from Schematic import view_mapper
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"search_px": 15.0, "min_cover": 0.6, "max_mean_px": 8.0, "move_deg": 3, "max_move_m": 0.04, "field_sigma_m": 0.08, "field_w0": 0.2, "field_on": "nodes", "facing_min": 0.5, "dir": {"left": (1, 0, 0), "top": (0, 1, 0)}, "samples": 120,
+          "construction_prefixes": ("sp", "up_", "ring_front_end", "ring_rear_end", "shelf_cut", "rad", "rear_q"), "cage": W + "work/car/curverig/cage_side.npz"}
+
+
+def inverse_mapper(v, lo, hi):
+    """Pixel (u, v) of a calibrated view + depth along tz -> world point (inverse of Schematic.view_mapper at scale 1)."""
+    rx, uy = np.array(v["rx"], float), np.array(v["uy"], float); b = v["bbox"]; ppm = v["px_per_m"]
+    amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+    def inv(uv, P_old):   # keeps the component of P_old outside the view plane
+        a = amin + (uv[:, 0] - b[0]) / ppm; bb = bmin + (b[3] - uv[:, 1]) / ppm
+        return P_old - np.outer(P_old @ rx, rx) - np.outer(P_old @ uy, uy) + np.outer(a, rx) + np.outer(bb, uy)
+    return inv
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("rig"); ap.add_argument("out"); ap.add_argument("--views", default="left"); ap.add_argument("--search-px", type=float, default=PARAMS["search_px"])
+    a = ap.parse_args(); views_req = a.views.split(",")
+    import CarNet as CN
+    top_y = CN.make_top_y(); wall_x = CN.make_wall_x()
+    def ray(P, vn):   # depth back on the skin, along the facing direction
+        if vn == "left": return np.stack([wall_x(P[:, 1], P[:, 2], np.full(len(P), 9.0)), P[:, 1], P[:, 2]], 1)
+        if vn == "top": return np.stack([P[:, 0], top_y(P[:, 0], P[:, 2]), P[:, 2]], 1)
+        return P
+    fr = json.load(open(W + "work/car/frame/frame.json")); lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); views = {v["name"]: v for v in fr["views"]}
+    rig = json.load(open(a.rig)); C = np.array(rig["controls"], float)
+    cg = np.load(PARAMS["cage"]); VP, VQ = cg["P"].astype(float), np.asarray(cg["Q"]); VN = np.zeros_like(VP)
+    for q in VQ: VN[q] += np.cross(VP[q[1]] - VP[q[0]], VP[q[2]] - VP[q[0]])
+    VN /= np.linalg.norm(VN, axis=1)[:, None] + 1e-15; kdV = cKDTree(VP)
+    lines = {vn: [np.array(o["curve_px"]) for o in json.load(open(W + "work/car/schematic/view_%s.json" % vn))["lines"] if o.get("kind") not in ("ring", "spoke", "bolt")] for vn in views_req}
+    trees = {vn: [cKDTree(L) for L in lines[vn]] for vn in views_req}
+    node_of = {}; [node_of.__setitem__(i, n) for n, i in rig["nodes"].items()]
+    moves, report = {}, {}
+    for name, c in rig["curves"].items():
+        if name.startswith(PARAMS["construction_prefixes"]) or not (c.get("sharp") or c.get("fixed")): continue
+        E = RL.evaluate(C[c["cvs"]], PARAMS["samples"]); n = VN[kdV.query(E)[1]].mean(0); n /= np.linalg.norm(n) + 1e-15
+        vn = max(views_req, key=lambda v: abs(n @ np.array(PARAMS["dir"][v])))
+        if abs(n @ np.array(PARAMS["dir"][vn])) < PARAMS["facing_min"]: report[name] = "not facing"; continue
+        m = view_mapper(views[vn], lo, hi, 1.0); uv = m(E); best = None
+        for li, T in enumerate(trees[vn]):
+            dd = T.query(uv)[0]; cov = (dd <= a.search_px).mean()
+            if best is None or cov > best[1] or (cov == best[1] and dd.mean() < best[2]): best = (li, cov, dd.mean())
+        if best is None or best[1] < PARAMS["min_cover"]: report[name] = "no ref line (%s, cover %.2f)" % (vn, best[1] if best else 0); continue
+        L = lines[vn][best[0]]; d_, k_ = trees[vn][best[0]].query(uv); tgt = L[k_]
+        ok = d_ <= a.search_px; tgt[~ok] = uv[~ok]   # samples beyond the line ends keep their place
+        mpx = float(d_[ok].mean()) if ok.any() else 0.0
+        if mpx > PARAMS["max_mean_px"]: report[name] = "too far to snap blind (%s, mean %.1f px) : the line may be another feature" % (vn, mpx); continue
+        # the depth of the old curve is kept : a small move on a surface that faces the view barely changes it, and a new ray could jump
+        # to another surface near an arch or a corner (first run : a node moved 355 mm)
+        # one smooth move of the whole curve (28 October 2026) : each sample sent alone to its nearest line point, the samples past the line
+        # end left in place, made a target with a jump, and the fit overshot (a control point moved 15 cm, a fold of 81 deg in the cage)
+        D = inverse_mapper(views[vn], lo, hi)(tgt, E) - E; t = np.linspace(0, 1, len(E)); w = ok.astype(float) + 1e-3
+        Ds = np.stack([np.polyval(np.polyfit(t, D[:, j], PARAMS["move_deg"], w=w), t) for j in range(3)], 1)
+        nrm = np.linalg.norm(Ds, axis=1); Ds *= np.minimum(1.0, PARAMS["max_move_m"] / (nrm + 1e-12))[:, None]
+        moves[name] = (E + Ds, vn); report[name] = "snapped %s, mean %.1f px, cover %.2f, max move %.0f mm" % (vn, mpx, best[1], float(np.linalg.norm(Ds, axis=1).max() * 1000))
+    # 28 October 2026 : ONE smooth displacement field for the whole network (a soft brush, not a line alone). The snapped curves are the
+    # anchors ; every node and control point moves by the Gaussian weighted mean of the anchor moves around it (sigma field_sigma_m), with a
+    # zero move weight field_w0 so that a point far from any snap stays. Moving one curve while its neighbours were only carried by their
+    # nodes folded the cage at the junctions (21.5 deg at K and XA).
+    AP = np.vstack([E_ + 0 * X_ for (X_, _), E_ in [(moves[n_], RL.evaluate(C[rig["curves"][n_]["cvs"]], PARAMS["samples"])) for n_ in moves]]) if moves else np.zeros((0, 3))
+    AD = np.vstack([X_ - RL.evaluate(C[rig["curves"][n_]["cvs"]], PARAMS["samples"]) for n_, (X_, _) in moves.items()]) if moves else np.zeros((0, 3))
+    kdA = cKDTree(AP) if len(AP) else None; sg2 = 2 * PARAMS["field_sigma_m"] ** 2
+    def field(P):
+        if kdA is None: return np.zeros_like(P)
+        out = np.zeros_like(P)
+        for i, p in enumerate(P):
+            idx = kdA.query_ball_point(p, 3 * PARAMS["field_sigma_m"])
+            if not idx: continue
+            w = np.exp(-((AP[idx] - p) ** 2).sum(1) / sg2); out[i] = (w[:, None] * AD[idx]).sum(0) / (w.sum() + PARAMS["field_w0"])
+        return out
+    if PARAMS["field_on"] == "all":
+        C2 = C + field(C)
+    else:   # nodes only : the other curves follow their two ends in a straight blend, so a spoke stays taut (no wave)
+        C2 = C.copy(); nid = np.array(sorted(rig["nodes"].values())); C2[nid] = C[nid] + field(C[nid])
+        for name, c in rig["curves"].items():
+            if name in moves: continue
+            cv = c["cvs"]; k = len(cv); t = np.linspace(0, 1, k)[:, None]; dA, dB = C2[cv[0]] - C[cv[0]], C2[cv[-1]] - C[cv[-1]]
+            for j in range(1, k - 1): C2[cv[j]] = C[cv[j]] + (1 - t[j]) * dA + t[j] * dB
+    dn = {i: 1 for i in rig["nodes"].values() if np.linalg.norm(C2[i] - C[i]) > 1e-6}
+    for name in moves:   # a snapped curve lies on its line : its interior is refit on its own target, its ends on the moved nodes
+        cv = rig["curves"][name]["cvs"]; k = len(cv); X = moves[name][0].copy(); X[0], X[-1] = C2[cv[0]], C2[cv[-1]]; CV = RL.fit_robust(X, k)
+        for j in range(1, k - 1): C2[cv[j]] = CV[j]
+    rig2 = dict(rig); rig2["controls"] = C2.tolist(); rig2["_doc"] = rig.get("_doc", "") + " Snapped to the schematic lines (%s), SnapToSchematic.py, 28 October 2026." % a.views
+    json.dump(rig2, open(a.out, "w"), indent=1)
+    sn = sum(1 for r in report.values() if r.startswith("snapped")); print(json.dumps({"snapped": sn, "skipped": len(report) - sn, "nodes_moved": len(dn), "max_node_move_mm": round(float(max((np.linalg.norm(C2[i] - C[i]) for i in dn), default=0) * 1000), 1)}))
+    json.dump(report, open(a.out.replace(".json", "_report.json"), "w"), indent=1)
+
+
+if __name__ == "__main__":
+    main()
