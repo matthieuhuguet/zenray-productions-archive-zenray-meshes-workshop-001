@@ -1,0 +1,40 @@
+"""28 October 2026, 14:55 : ZenRay Meshes finishing, the hood front edge curve shared with the fascia band below (no W wave).
+Points : top edge of CAR_fascia_front_band_C (highest point per x station) and front edge of the hood skin ; y = even polynomial deg 2,
+z = even polynomial deg --deg in x (a clean arc in plan, as the reference top view), MAD rejection ; sampled on --n points over [-x_end, x_end].
+Also writes the band moved onto it (every band vertex shifted by the y, z delta of its x station) : --band-out <npz> from --delivery.
+python FrontCurve.py <delivery.npz> <curve.npy> [--deg 4] [--x-end 0.69] [--band-out delivery_band.npz]
+FR : courbe du bord avant du capot, partagée avec le bandeau, arc propre sans vague ; le bandeau est redressé dessus."""
+import argparse, json, sys, os
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import FinishCheck as F
+ap = argparse.ArgumentParser(); ap.add_argument("delivery"); ap.add_argument("out")
+ap.add_argument("--deg", type=int, default=4); ap.add_argument("--x-end", type=float, default=0.69); ap.add_argument("--n", type=int, default=201)
+ap.add_argument("--band-out", default=""); ap.add_argument("--with-hood", type=int, default=0); ap.add_argument("--target", default="/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/target_v644.npz"); ap.add_argument("--hood-front-rows", type=int, default=1)
+a = ap.parse_args()
+P, Q = F.part(a.delivery, "CAR_fascia_front_band_C"); xs = np.round(P[:, 0], 3)
+top = np.array([P[xs == x][np.argmax(P[xs == x][:, 1])] for x in np.unique(xs)])
+top = top[np.abs(top[:, 0]) <= a.x_end + 1e-6]   # only the width of the hood (the band ends turn back, 28 October 2026)
+import ParamGrid as G
+Ph, Qh = F.part(a.target, "CAR_body_hood_C"); Sh = G.skin(Ph, Qh, 35, 1); Lh = Ph[G.boundary_loop(Ph, Sh)]
+hf = Lh[(Lh[:, 2] > Lh[:, 2].max() - 0.06) & (Lh[:, 1] < 0.6)]
+top = np.vstack([top, hf]) if a.with_hood else top   # Matthieu : the hood takes the edge of the part below (band only by default)
+X, Y, Z = top[:, 0], top[:, 1], top[:, 2]
+def even(x, deg): return np.stack([x ** (2 * k) for k in range(deg // 2 + 1)], 1)
+keep = np.ones(len(X), bool)
+for _ in range(4):
+    cz = np.linalg.lstsq(even(X[keep], a.deg), Z[keep], rcond=None)[0]; r = Z - even(X, a.deg) @ cz
+    mad = np.median(np.abs(r[keep] - np.median(r[keep]))) * 1.4826 + 1e-4; keep = np.abs(r - np.median(r[keep])) < 2.5 * mad
+cy = np.linalg.lstsq(even(X[keep], 2), Y[keep], rcond=None)[0]
+x = np.linspace(-a.x_end, a.x_end, a.n); C = np.stack([x, even(x, 2) @ cy, even(x, a.deg) @ cz], 1); np.save(a.out, C)
+print(json.dumps({"kept": int(keep.sum()), "of": int(len(X)), "z_centre": round(float(C[a.n // 2, 2]), 4), "z_end": round(float(C[0, 2]), 4), "y": round(float(C[a.n // 2, 1]), 4),
+                  "band_rms_mm": round(float(np.sqrt(np.mean((even(X, a.deg) @ cz - Z) ** 2)) * 1000), 2)}))
+if a.band_out:
+    d = np.load(a.delivery, allow_pickle=True); PP = d["P"].astype(float); n = np.array([str(v) for v in d["names"]])
+    bv = np.unique([v for q, m in zip(d["Q"], n) if m == "CAR_fascia_front_band_C" for v in q])
+    bx = np.round(PP[bv, 0], 3); tops = {xx: PP[bv][bx == xx][:, 1].argmax() for xx in np.unique(bx)}
+    for xx in np.unique(bx):
+        sel = bv[bx == xx]; t = PP[sel][tops[xx]]
+        dy = np.interp(t[0], C[:, 0], C[:, 1]) - t[1]; dz = np.interp(t[0], C[:, 0], C[:, 2]) - t[2]
+        PP[sel, 1] += dy; PP[sel, 2] += dz
+    np.savez(a.band_out, P=PP.astype(np.float32), Q=d["Q"], names=d["names"])

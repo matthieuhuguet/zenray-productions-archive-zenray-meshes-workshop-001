@@ -1,0 +1,66 @@
+"""28 October 2026, 23:05 : ZenRay Meshes finishing, REGION VIEW, shaded close-up of a delivery around a point, with the visible edges of chosen parts drawn on top
+(red, depth tested), several view directions side by side. FR : gros plan ombré d'une zone, arêtes visibles des pièces choisies en rouge.
+python RegionView.py <delivery.npz> <out.png> --center x,y,z --size-m 1.6 [--parts CAR_body_decklid_C,...] [--views rear34,top,back,side] [--res 700]
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import Raster
+
+VIEWS = {"rear34": ((-0.70, 0, 0.71), (0.25, 0.94, 0.25)), "front34": ((0.70, 0, -0.71), (-0.25, 0.94, -0.25)),
+         "back": ((-1, 0, 0), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0)), "top": ((1, 0, 0), (0, 0, -1)),
+         "side": ((0, 0, -1), (0, 1, 0)), "rearhigh": ((-1, 0, 0), (0, 0.6, 0.8))}
+KEY = np.array([-0.45, 0.6, 0.65])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out")
+    ap.add_argument("--center", required=True); ap.add_argument("--size-m", type=float, default=1.6)
+    ap.add_argument("--parts", default=""); ap.add_argument("--views", default="rear34,rearhigh,back,side")
+    ap.add_argument("--res", type=int, default=700)
+    a = ap.parse_args()
+    d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q in d["Q"]]
+    T = np.array([[q[0], q[k], q[k + 1]] for q in Q for k in range(1, len(q) - 1)])
+    c = np.array([float(x) for x in a.center.split(",")]); ppm = a.res / a.size_m
+    want = set(a.parts.split(",")) if a.parts else set()
+    E = set()
+    for q, n in zip(Q, names):
+        if n in want:
+            for k in range(len(q)):
+                x, y = q[k], q[(k + 1) % len(q)]; E.add((min(x, y), max(x, y)))
+    E = np.array(sorted(E)) if E else np.zeros((0, 2), int)
+    r = Raster.Renderer(P, T); tiles = []
+    for v in a.views.split(","):
+        rx, uy = (np.array(t, float) for t in VIEWS[v]); rx /= np.linalg.norm(rx); uy -= rx * (uy @ rx); uy /= np.linalg.norm(uy); tz = np.cross(rx, uy)
+        M, D, N, _ = r.render(c, ppm, (rx.tolist(), uy.tolist(), tz.tolist()), a.res)
+        k = KEY / np.linalg.norm(KEY); s = np.clip(0.28 + 0.72 * np.abs((N * k).sum(-1)), 0, 1)
+        img = np.where(M[..., None], (s[..., None] * np.array([225, 225, 220])), 70).astype(np.uint8)
+        im = Image.fromarray(img); dr = ImageDraw.Draw(im)
+        if len(E):
+            def proj(X):
+                rel = X - c
+                return a.res / 2 + (rel @ rx) * ppm, a.res / 2 - (rel @ uy) * ppm, rel @ tz
+            u0, v0, z0 = proj(P[E[:, 0]]); u1, v1, z1 = proj(P[E[:, 1]])
+            um, vm, zm = (u0 + u1) / 2, (v0 + v1) / 2, (z0 + z1) / 2
+            ii = np.clip(vm.astype(int), 0, a.res - 1); jj = np.clip(um.astype(int), 0, a.res - 1)
+            dz = D[ii, jj]
+            ok = (um >= 0) & (um < a.res) & (vm >= 0) & (vm < a.res)
+            # depth convention of Raster : compare with a tolerance both ways and keep the nearer surface only
+            vis = ok & (~np.isfinite(dz) | (np.abs(dz - zm) < 0.01) | (np.abs(dz + zm) < 0.01))
+            for i in np.nonzero(vis)[0]:
+                dr.line([(u0[i], v0[i]), (u1[i], v1[i])], fill=(230, 40, 40), width=1)
+        dr.text((8, 8), v, fill=(255, 255, 0))
+        tiles.append(np.asarray(im))
+    r.release()
+    Image.fromarray(np.concatenate(tiles, 1)).save(a.out); print(a.out)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,121 @@
+"""28 October 2026, 23:20 : ZenRay Meshes finishing, DECK LOFT, the decklid (coffre) rebuilt as ONE continuous quad surface between two shared edges :
+the lower edge of the rear glass (start) and the top front edge of the tail face (end). Each column is a cubic Hermite curve that leaves the glass on its
+slope and rolls over onto the tail face (end tangent pointing down), so the lid reads as merged into the body, never cut. Inner skin offset, walls with
+support loops. Start and end rows sit exactly on the neighbour vertices (0 mm). FR : coffre refait d'un seul tenant, collé à la vitre et à la face arrière.
+python DeckLoft.py <delivery.npz> <out.npz> [--half-w 0.58] [--edge-m 0.02] [--rows 8] [--t0 0.6] [--t1 0.5] [--thick 0.012] [--support 1]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+NAME = "CAR_body_decklid_C"
+
+
+def edge_curve(P, xs, pick, bin_m):
+    out = []
+    for x in xs:
+        S = P[np.abs(P[:, 0] - x) < bin_m]
+        out.append(pick(S) if len(S) else np.full(3, np.nan))
+    out = np.array(out)
+    for k in range(3):   # fill bins without a vertex by interpolation along x
+        bad = np.isnan(out[:, k])
+        if bad.any() and (~bad).sum() >= 2:
+            out[bad, k] = np.interp(xs[bad], xs[~bad], out[~bad, k])
+    return out
+
+
+def smooth_sym(C, xs, deg):
+    # symmetric polynomial fit of y(x) and z(x) : even powers, so the edge has no wave (28 October 2026)
+    A = np.stack([xs ** (2 * k) for k in range(deg // 2 + 1)], 1)
+    for k in (1, 2):
+        C[:, k] = A @ np.linalg.lstsq(A, C[:, k], rcond=None)[0]
+    return C
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out")
+    ap.add_argument("--half-w", type=float, default=0.58)
+    ap.add_argument("--edge-m", type=float, default=0.02)
+    ap.add_argument("--rows", type=int, default=8)
+    ap.add_argument("--t0", type=float, default=0.6, help="start tangent length / chord (glass slope)")
+    ap.add_argument("--t1", type=float, default=0.5, help="end tangent length / chord (rolls down onto the tail face)")
+    ap.add_argument("--thick", type=float, default=0.012)
+    ap.add_argument("--support", type=int, default=1)
+    ap.add_argument("--deg", type=int, default=6)
+    ap.add_argument("--glass-edge", default="1.034,-1.988", help="y,z of the straight glass lower edge (measured on |x| < 0.45, 28 October 2026) ; empty = picked per column")
+    ap.add_argument("--tail-edge", default="0.99,-2.10", help="y,z of the straight top front edge of the tail face (measured at x = 0 and 0.58) ; empty = picked per column")
+    ap.add_argument("--snap-mm", type=float, default=6.0, help="edge points within this distance land exactly on the neighbour vertex")
+    a = ap.parse_args()
+    Pg, _ = part(a.npz, "CAR_body_glass_rear_C"); Pt, _ = part(a.npz, "CAR_body_tail_face_C")
+    nx = max(2, int(round(2 * a.half_w / a.edge_m / 2)) * 2)
+    xs = np.linspace(-a.half_w, a.half_w, nx + 1)
+    # glass lower edge : the rearmost glass points that are still low (the side corners rise, they are not the edge)
+    def gpick(S):
+        S = S[S[:, 1] < S[:, 1].min() + 0.02]
+        return S[S[:, 2].argmin()] if len(S) else np.full(3, np.nan)
+    def tpick(S):
+        S = S[S[:, 1] > S[:, 1].max() - 0.008]
+        return S[S[:, 2].argmax()]
+    G = smooth_sym(edge_curve(Pg, xs, gpick, a.edge_m / 2), xs, a.deg); G[:, 0] = xs
+    T = smooth_sym(edge_curve(Pt, xs, tpick, a.edge_m / 2), xs, a.deg); T[:, 0] = xs
+    for C, e in ((G, a.glass_edge), (T, a.tail_edge)):
+        if e:
+            y, z = (float(v) for v in e.split(",")); C[:, 1], C[:, 2] = y, z
+    # snap to the neighbour vertices so the joint is 0 mm where a vertex exists
+    for C, Pn in ((G, Pg), (T, Pt)):
+        d, i = cKDTree(Pn).query(C)
+        m = d * 1000 < a.snap_mm; C[m] = Pn[i[m]]
+    # glass slope direction at its lower rows : the start tangent
+    low = Pg[(Pg[:, 2] < -1.9) & (np.abs(Pg[:, 0]) < 0.4)]
+    sl = np.polyfit(low[:, 2], low[:, 1], 1)[0]
+    t0 = np.array([0, -sl, -1.0]); t0 /= np.linalg.norm(t0)
+    t1 = np.array([0, -1.0, -0.35]); t1 /= np.linalg.norm(t1)
+    nr = a.rows; u = np.linspace(0, 1, nr + 1)
+    h00 = 2 * u ** 3 - 3 * u ** 2 + 1; h10 = u ** 3 - 2 * u ** 2 + u; h01 = -2 * u ** 3 + 3 * u ** 2; h11 = u ** 3 - u ** 2
+    S = np.zeros((nr + 1, nx + 1, 3))
+    for j in range(nx + 1):
+        ch = np.linalg.norm(T[j] - G[j])
+        S[:, j] = (h00[:, None] * G[j] + h10[:, None] * a.t0 * ch * t0 + h01[:, None] * T[j] + h11[:, None] * a.t1 * ch * t1)
+    S[0], S[-1] = G, T
+    du = np.gradient(S, axis=1); dv = np.gradient(S, axis=0); N = np.cross(du, dv)
+    N /= np.linalg.norm(N, axis=-1, keepdims=True) + 1e-12
+    N *= np.sign(N[..., 1:2].mean() + 1e-12)
+    B = S - a.thick * N
+    nb, na = S.shape[:2]; off = nb * na
+    pts = list(S.reshape(-1, 3)) + list(B.reshape(-1, 3)); faces = []; skin = []
+    gid = lambda j, i: j * na + i
+    for j in range(nb - 1):
+        for i in range(na - 1):
+            q = [gid(j, i), gid(j, i + 1), gid(j + 1, i + 1), gid(j + 1, i)]   # outward winding, measured 28 October 2026
+            faces.append(q); skin.append(True); faces.append([off + x for x in q[::-1]]); skin.append(False)
+    ring = [gid(0, i) for i in range(na)] + [gid(j, na - 1) for j in range(1, nb)] + \
+           [gid(nb - 1, i) for i in range(na - 2, -1, -1)] + [gid(j, 0) for j in range(nb - 2, 0, -1)]
+    layers = [ring]
+    for s in range(a.support):
+        t = (s + 1) / (a.support + 1); base = len(pts)
+        for v in ring:
+            pts.append(S.reshape(-1, 3)[v] * (1 - t) + B.reshape(-1, 3)[v] * t)
+        layers.append(list(range(base, base + len(ring))))
+    layers.append([off + v for v in ring])
+    for l0, l1 in zip(layers[:-1], layers[1:]):
+        m = len(l0)
+        for k in range(m):
+            faces.append([l0[k], l1[k], l1[(k + 1) % m], l0[(k + 1) % m]]); skin.append(False)
+    np.savez(a.out, P=np.array(pts, np.float32), Q=np.array(faces, dtype=object), names=np.array([NAME] * len(faces)), skin=np.array(skin))
+    gd = cKDTree(Pg).query(G)[0] * 1000; td = cKDTree(Pt).query(T)[0] * 1000
+    print(json.dumps({"grid": [nr, nx], "faces": len(faces), "glass_slope": round(float(sl), 3),
+                      "joint_glass_mm_p50_max": [round(float(np.median(gd)), 1), round(float(gd.max()), 1)],
+                      "joint_tail_mm_p50_max": [round(float(np.median(td)), 1), round(float(td.max()), 1)],
+                      "z_glass": [round(float(G[:, 2].min()), 3), round(float(G[:, 2].max()), 3)], "z_tail": [round(float(T[:, 2].min()), 3), round(float(T[:, 2].max()), 3)]}))
+
+
+if __name__ == "__main__":
+    main()

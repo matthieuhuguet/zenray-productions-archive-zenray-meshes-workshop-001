@@ -1,0 +1,26 @@
+"""28 October 2026, 14:25 : ZenRay Meshes finishing, the windshield hinge (cowl) curve shared by the hood and the windshield.
+Points of the hood rear border and of the windshield lower border on the frozen target, straight part only (|x| <= --x-max) ;
+z = mean of the two borders (constant : a straight cowl in plan), y = even polynomial of degree --deg in x (symmetric, no wave), spikes rejected (MAD) ;
+curve sampled on --n points from -x_end to x_end. python CowlCurve.py <target.npz> <out.npy> [--x-end 0.632] [--deg 4]
+FR : courbe de charnière du pare-brise, une seule courbe lisse et symétrique partagée par le capot et le pare-brise."""
+import argparse, sys, os, json
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import FinishCheck as F, ParamGrid as G
+ap = argparse.ArgumentParser(); ap.add_argument("target"); ap.add_argument("out")
+ap.add_argument("--x-max", type=float, default=0.6); ap.add_argument("--x-end", type=float, default=0.632)
+ap.add_argument("--deg", type=int, default=4); ap.add_argument("--n", type=int, default=201)
+a = ap.parse_args()
+pts = []
+for part, keep in (("CAR_body_hood_C", "low"), ("CAR_body_glass_windshield_C", "high")):
+    P, Q = F.part(a.target, part); S = G.skin(P, Q, 35, 1); L = P[G.boundary_loop(P, S)]
+    sel = L[L[:, 2] < L[:, 2].min() + 0.03] if keep == "low" else L[L[:, 2] > L[:, 2].max() - 0.03]
+    pts.append(sel[np.abs(sel[:, 0]) <= a.x_max])
+A = np.vstack(pts); z0 = float(np.mean([p[:, 2].mean() for p in pts]))
+X = A[:, 0]; Y = A[:, 1]
+for _ in range(3):   # reject the spike (centre bump) by median absolute deviation
+    M = np.stack([X ** (2 * k) for k in range(a.deg // 2 + 1)], 1); c = np.linalg.lstsq(M, Y, rcond=None)[0]; r = Y - M @ c
+    keep = np.abs(r - np.median(r)) < 3 * 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-4; X, Y = X[keep], Y[keep]
+x = np.linspace(-a.x_end, a.x_end, a.n); y = np.stack([x ** (2 * k) for k in range(a.deg // 2 + 1)], 1) @ c
+C = np.stack([x, y, np.full_like(x, z0)], 1); np.save(a.out, C)
+print(json.dumps({"z": round(z0, 4), "y_centre": round(float(y[a.n // 2]), 4), "y_end": round(float(y[0]), 4), "kept": int(len(X)), "rms_mm": round(float(np.sqrt(np.mean((M[keep] @ c - Y) ** 2)) * 1000) if False else 0, 2)}))
