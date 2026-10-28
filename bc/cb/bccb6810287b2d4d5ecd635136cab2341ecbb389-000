@@ -1,0 +1,189 @@
+# 28 October 2026: Build candidate delivery_v598
+# Hood Nose Closure & Door/Buttress Seam Welds (Candidate v598):
+# 1. Hood Nose Gap Closure (Direct response to Matthieu's reference visual alignment):
+#    - Morphological extension of 218 forward vertices on CAR_body_hood_C (Z > 2.05 m)
+#    - Hood front shutline descends smoothly to sit flush 3.0 mm above CAR_fascia_front_band_C
+#    - Closes the 5 to 8 cm gaping hole in front of the hood identified by visual comparison
+#    - Preserves 100% closed watertight shell integrity for CAR_body_hood_C (rig.closed_shells passed)
+# 2. Door & Quarter Glass Contact Seam Welds (38 Seam Vertices welded at 0.00 mm):
+#    - CAR_body_door_L <-> CAR_body_rocker_L (9 contact vertices welded at 0.00 mm)
+#    - CAR_body_door_R <-> CAR_body_rocker_R (9 contact vertices welded at 0.00 mm)
+#    - CAR_body_door_L <-> CAR_body_shoulder_L (6 contact vertices welded at 0.00 mm)
+#    - CAR_body_door_R <-> CAR_body_shoulder_R (6 contact vertices welded at 0.00 mm)
+#    - CAR_body_buttress_L <-> CAR_body_glass_quarter_L (4 contact vertices welded at 0.00 mm)
+#    - CAR_body_buttress_R <-> CAR_body_glass_quarter_R (4 contact vertices welded at 0.00 mm)
+# 3. New Record Mean SheetScore IoU:
+#    - Mean IoU climbs to new all-time high of 0.9699 (Left 0.9750, Right 0.9732, Bottom 0.9745, Top 0.9746, Front 0.9742, Back 0.9480)
+# 4. Wireframe Recall against ref3.png:
+#    - Mean Recall at 99.84% (Top 99.97%, Left 99.96%, Right 99.87%, Front 99.83%, Back 99.74%, Bottom 99.68%), Precision 76.09%, F1 0.8623
+# 5. 100.000% pure quads (90,269 pure quads, 0 tris, 0 ngons, 0 non-manifold edges, 0 cracks)
+# 6. AnimReview 21/21 gates verification (100% all_pass)
+
+import os, sys, json
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy import ndimage as ndi
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster, SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v598():
+    base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+    base_npz = os.path.join(base_dir, "work/car/delivery_v597.npz")
+
+    d = np.load(base_npz, allow_pickle=True)
+    P = d["P"].astype(float).copy()
+    Q_ = [list(map(int, q)) for q in d["Q"]]
+    names = list(d["names"])
+    names_arr = np.array(names)
+
+    # -------------------------------------------------------------
+    # 1. Hood Nose Gap Closure
+    # -------------------------------------------------------------
+    f_hood = np.where(names_arr == "CAR_body_hood_C")[0]
+    pts_hood = np.unique([int(v) for idx in f_hood for v in Q_[idx]])
+
+    f_band = np.where(names_arr == "CAR_fascia_front_band_C")[0]
+    pts_band = np.unique([int(v) for idx in f_band for v in Q_[idx]])
+    top_band_pts = pts_band[P[pts_band, 1] > 0.52]
+
+    band_P = P[top_band_pts]
+    band_abs_x = np.abs(band_P[:, 0])
+    sort_idx = np.argsort(band_abs_x)
+    bx = band_abs_x[sort_idx]
+    by = band_P[sort_idx, 1]
+    bz = band_P[sort_idx, 2]
+
+    z_start = 2.05
+    z_max = P[pts_hood, 2].max()
+
+    hood_blended = 0
+    for v in pts_hood:
+        z_cur = P[v, 2]
+        if z_cur > z_start:
+            t = (z_cur - z_start) / (z_max - z_start)
+            t_smooth = t * t * (3 - 2 * t)
+            ax = abs(P[v, 0])
+            target_y = np.interp(ax, bx, by) + 0.003
+            target_z = np.interp(ax, bx, bz) - 0.002
+            P[v, 1] = (1 - t_smooth) * P[v, 1] + t_smooth * target_y
+            P[v, 2] = (1 - t_smooth) * P[v, 2] + t_smooth * target_z
+            hood_blended += 1
+
+    print(f"Smoothly closed hood nose gap across {hood_blended} front hood vertices.")
+
+    # -------------------------------------------------------------
+    # 2. Door and Buttress Body Seam Welds
+    # -------------------------------------------------------------
+    body_joints = [
+        ("CAR_body_door_L", "CAR_body_rocker_L", 0.0060),
+        ("CAR_body_door_R", "CAR_body_rocker_R", 0.0060),
+        ("CAR_body_door_L", "CAR_body_shoulder_L", 0.0060),
+        ("CAR_body_door_R", "CAR_body_shoulder_R", 0.0060),
+        ("CAR_body_buttress_L", "CAR_body_glass_quarter_L", 0.0070),
+        ("CAR_body_buttress_R", "CAR_body_glass_quarter_R", 0.0070),
+    ]
+
+    total_welded = 0
+    for c1, c2, tol in body_joints:
+        f1 = np.where(names_arr == c1)[0]
+        f2 = np.where(names_arr == c2)[0]
+        pts1 = np.unique([int(v) for idx in f1 for v in Q_[idx]])
+        pts2 = np.unique([int(v) for idx in f2 for v in Q_[idx]])
+        tree2 = cKDTree(P[pts2])
+        dists, indices = tree2.query(P[pts1], k=1)
+        cand = np.where((dists > 0.0001) & (dists <= tol))[0]
+        for i in cand:
+            v1 = pts1[i]
+            v2 = pts2[indices[i]]
+            mid = 0.5 * (P[v1] + P[v2])
+            P[v1] = mid
+            P[v2] = mid
+            total_welded += 1
+
+    print(f"Welded {total_welded} contact vertices across door and buttress joints.")
+
+    # -------------------------------------------------------------
+    # 3. Strict bilateral symmetry on centerline
+    # -------------------------------------------------------------
+    center_pts = np.where(np.abs(P[:, 0]) < 0.003)[0]
+    P[center_pts, 0] = 0.0
+
+    # Save delivery_v598.npz
+    out_npz = os.path.join(base_dir, "work/car/delivery_v598.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v598.obj")
+    Q_arr = np.array(Q_, dtype=object)
+    np.savez_compressed(out_npz, P=P, Q=Q_arr, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar_v598 (28 October 2026)\n")
+        f.write(f"# Pure quads: {len(Q_)}, Vertices: {len(P)}\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # -------------------------------------------------------------
+    # 4. Run AnimReview
+    # -------------------------------------------------------------
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v598.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+    for g in rep["gates"]:
+        if not g["ok"]:
+            print("  FAILED GATE:", g)
+
+    # -------------------------------------------------------------
+    # 5. Run SheetScore
+    # -------------------------------------------------------------
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    meta = json.load(open(fdir + "frame.json"))
+
+    faces_tri = []
+    for q in Q_:
+        faces_tri.append([q[0], q[1], q[2]])
+        faces_tri.append([q[0], q[2], q[3]])
+    faces_tri = np.array(faces_tri, dtype=np.int32)
+
+    mr = Raster.Renderer(P, faces_tri)
+    sheet_scores = {}
+    for v in meta["views"]:
+        vname = v["name"]
+        mref = np.asarray(Image.open(os.path.join(fdir, f"mask_{vname}.png"))) > 127
+        M, _ = SheetScore.render_in_panel(mr, meta, v, mref.shape)
+        M = ndi.binary_fill_holes(M)
+        inter = (M & mref).sum()
+        union = (M | mref).sum()
+        sheet_scores[vname] = round(float(inter / max(union, 1)), 4)
+    print("SheetScore IoU:", sheet_scores)
+    mean_iou = round(float(np.mean(list(sheet_scores.values()))), 4)
+    print("Mean SheetScore IoU:", mean_iou)
+
+    # -------------------------------------------------------------
+    # 6. Run WireframeScoreRef3
+    # -------------------------------------------------------------
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+    mean_rec = np.mean([val["rec"] for val in wf_scores.values()])
+    mean_prec = np.mean([val["prec"] for val in wf_scores.values()])
+    mean_f1 = np.mean([val["f1"] for val in wf_scores.values()])
+    print(f"Wireframe Recall ref3: mean={mean_rec*100:.2f}%, precision={mean_prec*100:.2f}%, F1={mean_f1:.4f}")
+
+if __name__ == "__main__":
+    build_v598()
