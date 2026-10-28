@@ -1,0 +1,2515 @@
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/AssemblyCheck.py
+"""28 October 2026 : ZenRay Meshes ASSEMBLY CHECK (task KA, Procedura, SKILL section 230). Reads the assembly graph (named parts, typed
+mates with tolerances) and checks it on a delivery : every part closed (no open edge) ; concentric (wheel centre on the arch centre in the
+side view, tyre to arch clearance in range) ; contact (share of the part touching its housing within tol) ; gap (panel gap in range along
+the shared band) ; hinge (axis defined ; the opening test comes with K3). A part is ADMITTED only if it is closed and all its mates pass.
+Writes a JSON report ; exit 0 only when every part is admitted.
+python AssemblyCheck.py <delivery.npz> [--graph templates/car/assembly.json] [--out report.json] [--selftest]
+FR : le vérificateur du graphe d'assemblage : pièces fermées, liaisons typées mesurées, pièce admise seulement si tout passe."""
+import argparse, fnmatch, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+GRAPH = "/Users/zenray/.claude/skills/zenray-meshes/templates/car/assembly.json"
+
+
+def load(npz):
+    d = np.load(npz, allow_pickle=True); return d["P"].astype(float), [list(map(int, q)) for q in d["Q"]], np.arr
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/BranchComponents.py
+# 26 October 2026 : ZenRay Meshes, ORGANIC COMPONENT TABLE judged by the soft ridge bench (BranchLab), replacing the binary colour class cover for the wood components.
+# EN: the trunk, roots and foliage keep their region agreement (ComponentScore) ; main limbs and branches are judged by the ridge bench (precision x recall of the drawn centreline on the
+# soft limb ridges of every view) because a binary colour mask loses the relief (Matthieu, 26 October 2026) ; twigs are hidden by the leaves in the reference, so they are reported as not measurable.
+# FR : tableau des composants de l'arbre, bois jugé par le banc de crêtes douces. Usage: python BranchComponents.py <tag> [obj=tree]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import BranchLab as B
+W = B.W
+
+
+def main(tag, obj="tree"):
+    cj = json.load(open(W + "versions/Components_%s_%s.json" % (obj, tag))); comp = {k: dict(v) for k, v in cj["components"].items()}
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, 1); sk = json.load(open(W + "work/%s/tree_%s_skeleton.json" % (obj, tag))); N = np.array(sk["nodes"]); par = np.array(sk["parent"]); rad = np.array(sk["rad
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/BranchLab.py
+# 26 October 2026 : ZenRay Meshes, BRANCH LAB, the fast common bench of the branch tournament (shared by every organic object).
+# EN: no render, no Houdini. A branch set is a list of 3D polylines with radii ; the bench projects it into the calibrated sheet views and judges it against SOFT ridge maps
+# of the reference photograph (multi scale ridge filter, no binary mask, relief kept), so a tournament of methods costs seconds. Car lesson (skill section 42) : few control points,
+# smooth by construction, measured on the sheet, one clean component first.
+# FR : banc commun du tournoi des méthodes de branches : courbes 3D projetées dans les vues calibrées, jugées contre des cartes de crêtes douces de la référence.
+# Usage : python BranchLab.py ridge <obj=tree>          -> writes work/<obj>/ridge_<view>.npy and versions/Ridge_<obj>.png (a look at the soft maps)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+SIDE = ("front", "back", "right", "left")
+
+
+class Views:
+    def __init__(self, obj="tree"):
+        self.obj = obj; prm = json.load(open(W + "work/
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/BranchMethods.py
+# 26 October 2026 : ZenRay Meshes, the METHODS of the branch tournament (shared by every organic object). Each method returns a tree graph (nodes, parent), the bench
+# (BranchLab) gives radii by the pipe model and the score. No Houdini, no render. FR : les méthodes du tournoi des branches, un graphe d'arbre chacune.
+# Usage : python BranchMethods.py <method id> [k=v ...] [obj=tree]   e.g.  python BranchMethods.py m10 tau=0.4
+import sys, os, json, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import BranchLab as B
+W = B.W
+
+
+def truth_curves(obj, nodes, parent, tol=0.3, ymin=7.8):
+    # 3D truth on a synthetic instance : precision = share of the curve samples lying on the truth wood surface, recall = share of the truth wood samples within tol of the curve. FR : vérité 3D des courbes.
+    from scipy.spatial import cKDTree
+    import TruthScore as T
+    tw = T.sample(W + "work/%s/topo_w_truth.npz" % obj, "branches", n=60000, ymin=ymin); cp = B.densify(nodes, parent, 0.1); cp = cp[cp[:, 1] > ymin]
+    dc = cKDTree(tw).query(cp)[0]; dt = cKDTree(cp).query(tw)[0]; return {"truth_precision": round(float((dc < tol).mean()), 3), "truth_recall": rou
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CaptureCar.py
+# 27 October 2026 13:13 Paris: capture the live car review viewport with a temporary camera, restoring the view afterwards.
+import hou
+output = globals()['OUTPUT']
+subject = hou.node(globals().get('SUBJECT', '/obj/ZRM_CarReview'))
+viewer = next(p for p in hou.ui.paneTabs() if p.type() == hou.paneTabType.SceneViewer)
+viewport = viewer.curViewport()
+old_camera = viewport.camera()
+old_view = viewport.defaultCamera().stash()
+camera = hou.node('/obj').createNode('cam', 'zrm_capture_camera')
+flags = [(n, n.isDisplayFlagSet()) for n in hou.node('/obj').children() if n.type().name() == 'geo']
+try:
+    for node, flag in flags: node.setDisplayFlag(node == subject)
+    camera.parmTuple('t').set(globals().get('POSITION', (5.5, 3.2, 6.5)))
+    camera.parmTuple('r').set(hou.hmath.buildRotateLookAt(hou.Vector3(camera.parmTuple('t').eval()), hou.Vector3(globals().get('TARGET', (0, 0.6, 0))), hou.Vector3(0, 1, 0)).extractRotates())
+    camera.parm('focal').set(45)
+    viewport.setCamera(camera)
+    settings = viewer.flipbookSettings().stash()
+    settings.output(output); settings.outputToMPlay(False)
+    settings.useResolution(True); settings.resolution((1200, 900))
+    settings.frameRange((hou.fra
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CarTry.sh
+#!/bin/zsh
+# 26 October 2026 : ZenRay Meshes, one car experiment with the gate rule : build, six view audit, topology audit, then the four numbers that decide (faults, review gates, silhouette, lines).
+# Usage: CarTry.sh <tag>      FR : un essai de voiture, les chiffres qui tranchent.
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; cd $W; TAG=$1
+zsh Scripts/BuildCar.sh $TAG > /tmp/claude-501/build_$TAG.log 2>&1 && zsh Scripts/Audit.sh $TAG > /tmp/claude-501/audit_$TAG.log 2>&1 && zsh Scripts/TopoAudit.sh $TAG --no-board > /tmp/claude-501/topo_$TAG.log 2>&1
+/Users/zenray/.venvs/zenray-uv/bin/python -I - <<PYEOF
+import json, re
+t = json.load(open("versions/Topo_$TAG.json")); r = json.load(open("versions/Review_$TAG.json")); a = open("versions/Audit_$TAG.md").read()
+print("$TAG faults", t["error_faces"], "faces", t["faces"], "gates", r["passed"], "/", r["total"], [g["gate"] for g in r["gates"] if not g["ok"]])
+for g in r["gates"]:
+    if g["gate"] in ("topology.fault_pct_visible", "arch.ring_fault_pct"): print("  ", g["gate"], g["measured"])
+print("  ", [l for l in a.splitlines() if l.startswith("| mean")][0])
+PYEOF
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CarTurnover.py
+#!/usr/bin/env python3
+# 26 October 2026 18:35: turnover of the ZenRay Meshes car, one full orbit of 24 frames, one MP4 per duration.
+# Every visual value lives in DEFAULTS or MATERIAL_COLOURS below, or behind a flag: one edit changes every frame and every video.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/CarTurnover.py
+"""Orbit the ZenRay Meshes car once around its vertical axis and encode the frames as turnover MP4 files.
+
+The camera turns counter-clockwise seen from above, at a constant height and a constant distance.
+It frames the bounding sphere of the car once, so the car keeps the same apparent size on every frame.
+Frame k (1 based) is taken at start_azimuth + 360 * (k - 1) / frames degrees: frame 1 is the three quarter
+front view, and the last frame lies one step (15 degrees for 24 frames) before it, so the loop has no seam.
+Every MP4 is encoded from the same frames; only the frame rate changes.
+The source file is only read. Only the numbered PNG frames of the output folder are replaced.
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from fractions import Fraction
+
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CarTurnoverWire.py
+#!/usr/bin/env python3
+# 26 October 2026 19:02: wireframe turnover of the ZenRay Meshes car, the same orbit as CarTurnover.py.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/CarTurnoverWire.py --help
+# Camera, framing, background and mesh loading are imported from CarTurnover.py, which is read and never edited here.
+"""Orbit the ZenRay Meshes car once in wireframe: the real polygon edges drawn over the shaded surface.
+
+The edges are the consecutive corners of each polygon of the export, so a quad shows its four sides and never
+the diagonal of the fan triangulation that the surface uses.
+Hidden edges are removed with the test of TopoCheck.board: a sample of an edge is visible when its depth is not
+behind the depth buffer of the surface by more than edge_eps (4 mm). The test runs on samples spaced along every
+edge, not on its midpoint only, so a long edge that is half behind the car shows only its front half.
+Frames are rendered at size * supersample and reduced with a Lanczos filter, so the thin lines stay sharp.
+Frame k (1 based) is taken at start_azimuth + 360 * (k - 1) / frames degrees, exactly as in CarTurnover.py.
+"""
+
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CleanChain.sh
+#!/bin/zsh
+# 27 October 2026 : ZenRay Meshes, the CLEANUP CHAIN of the car delivery (v479 on), on the delivery file after the floor remesh : work/car/delivery_<tag>_floor.npz is the anchor and the input,
+# work/car/delivery_<tag>.npz the output (and the OBJ). Flatten the twisted quads, slide the free points, twice, regularise the worst corners, flatten ; each step keeps the guard (no face may become faulty)
+# and the move cap is measured from the anchor. It runs without Houdini, so a variant is tested in a minute : zsh Scripts/CleanChain.sh <tag> then TopoCheck.
+# 27 October 2026 (v481) : the chain ends with a random hill climb on the judge (HillClimb.py).
+# FR : chaîne de nettoyage de la livraison, sans Houdini ; l'ancre est le fichier après le plancher.
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1
+cd $W
+# the parameters of the chain (HDA) : RELAX_MM the cap of every relax step, TOURS the number of flatten + slide tours, REG_DEV the corner deviation above which the regularise step acts (degrees), REG_MM its cap
+RELAX_MM=${RELAX_MM:-8}; TOURS=${TOURS:-2}; REG_DEV=${REG_DEV:-25}; REG_MM=${REG_MM:-8}
+# the hill climb at 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CleanView.py
+# 25 October 2026 : ZenRay Meshes, CLEAN VIEW of ONE asset only (never the scene) : smooth shaded (vertex normals, cusp
+# angle), four views (three quarter front, three quarter rear, side, front), optional part filter, one board. This is the
+# judge of "is the surface clean" ; the orthographic sheet boards judge "is it the right shape".
+# FR : rendu lissé de l'asset seul, quatre vues, pour juger la propreté de la surface.
+# Usage: python CleanView.py <car.npz> <out.png> [exclude=sub1,sub2] [cusp_deg=30] [res=900]
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import Raster
+
+VIEWS = {"three_quarter_front": ((0.70, 0, -0.71), (-0.25, 0.94, -0.25)), "three_quarter_rear": ((-0.70, 0, 0.71), (0.25, 0.94, 0.25)),
+         "side": ((0, 0, -1), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0)),
+         # 26 October 2026: extra views for close ups (CV_VIEWS picks four, CV_FOCUS "z0,z1" frames a part of the length)
+         "back": ((-1, 0, 0), (0, 1, 0)), "top": ((0, 0, -1), (-1, 0, 0)), "low_rear": ((-0.75, 0, 0.66), (0.08, 0.99, 0.09)),
+         "low_front": ((0.75, 0, -0.66), (-0.08, 0.99, -0.09)), "bottom": ((0, 0, 1),
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ComponentExport.py
+"""27 October 2026 : ZenRay Meshes, COMPONENT EXPORT and ASSEMBLY TEST (Transformers rule, skill section 125).
+Every named component of the delivery file becomes its own OBJ in local coordinates (origin = its pivot) plus one line in assembly.json : name, pivot (bbox centre, or the axle for a wheel part), faces, open edges, bbox, file.
+The assembly test rebuilds the whole car from these files by translating each by its pivot and compares the points with the delivery : the largest error must be under 0.01 mm ; removing one component leaves the others unchanged by construction.
+FR : chaque component dans son propre fichier à son pivot, la voiture se reconstruit par translations exactes.
+Usage: python ComponentExport.py <delivery.npz> <out_dir> [--wheels wheel_params.json]
+"""
+import argparse, json, os, collections
+import numpy as np
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--wheels", default="")
+a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); Q = [list(map(int, q)) for q in d["Q"]]; names = np.array([str(x) for x in d["names"]])
+axle = {}
+if a.wheels:
+    f
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ComponentScore.py
+# 26 October 2026 : ZenRay Meshes, COMPONENT COMPLETION of the car being iterated, measured against the reference component
+# sheet (numbered markers of work/car/components/markers_v1.json, 43 components of ZenRayMeshes1.md section 10).
+# EN: the model is rendered in the six sheet panel cameras with face ids, each face is mapped to a reference component by the
+# part name patterns of work/car/component_params.json, then per component : BUILT (a part exists), PLACEMENT (the reference
+# marker lands on that component in the model render), LINES (F1 of the reference edges against the model edges inside the
+# component's own region), TOPOLOGY (share of faces without a TopoCheck fault). Completion = weighted sum, ranked, with the tool
+# that makes the component. Reuses SheetScore.render_in_panel, LineScore edges, RegionCensus face ids and TopoCheck flags.
+# FR : complétion par composant de la voiture en cours, face à la planche des composants de la référence.
+# Usage: python ComponentScore.py <tag> [--no-board]   -> versions/Components_<tag>.json, .md, _board.png
+import sys, os, json, re, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+f
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/CurveStats.py
+# 26 October 2026 : ZenRay Meshes, CURVE STATS : the measured guides of a tree (the car's ShapeCheck for limbs). A limb file (nodes, parent, radius) is cut into chains (root, fork or tip to the next fork or tip) ; per chain and per class
+# (limb r >= 0.12 m, branch 0.04 to 0.12 m, twig below) : length, straightness, mean radius, taper, turning rate, kinks (turn above 25 degrees between two steps), fork angle, radius ratio ; per fork : the pipe exponent e that
+# solves sum(r_child^e) = r_parent^e (Leonardo da Vinci : e = 2) and the child/parent radius ratio ; plus the Strahler order. FR : mesures des guides 3D de l'arbre, propreté des courbes.
+# Usage: python CurveStats.py <limbs.npz> [label] [--json out.json]
+import sys, os, json
+import numpy as np
+from scipy.optimize import brentq
+
+
+def chains_of(N, par):
+    kids = [[] for _ in N]
+    for i, p in enumerate(par):
+        if p >= 0: kids[p].append(i)
+    key = {i for i in range(len(N)) if par[i] < 0 or len(kids[i]) != 1}; out = []
+    for k in key:
+        for c in kids[k]:
+            ch = [k, c]
+            while c not in key: c = kids[c][0]; ch.append(c)
+            out.append(ch)
+    return out, kids
+
+
+def strahler(kids, root=
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/EvolutionVideo.py
+#!/usr/bin/env python3
+# 26 October 2026 18:15: evolution video of ZenRay Meshes, one square frame per version.
+# Every visual value lives in DEFAULTS or OBJECTS below, or behind a flag: one edit changes every frame.
+# Usage: python3 EvolutionVideo.py --obj car  |  python3 EvolutionVideo.py --obj tree --size 2048
+"""Build a square evolution MP4 of the ZenRay Meshes car or tree.
+
+Each source version becomes one square PNG frame, then the frames are encoded
+with libx264 at --fps (default 4, so one version lasts 0.25 second). The source
+files are only read: they are never modified, moved or deleted.
+"""
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+from PIL import Image, ImageDraw, ImageFont
+
+PROJECT_DIR = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+VERSIONS_DIR = os.path.join(PROJECT_DIR, "versions")
+EVOLUTION_DIR = os.path.join(PROJECT_DIR, "Evolution")
+DATE_TAG = "26-October-2026"
+RESAMPLE = getattr(Image, "Resampling", Image).LANCZOS
+
+FONT_CANDIDATES = [
+    "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf",  # GT Ultra Regular, first choice
+    "/System/Library/Fonts/Helvetica.ttc",  
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ExportGuidePanels.py
+# 27 October 2026 13:44 Paris: export the edited native guide panels and their exact mirror instances for the assembly.
+import hou,json,numpy as np
+config=json.load(open(globals()['CONFIG']));points=[];faces=[];names=[]
+for panel in config['panels']:
+    node=hou.node(panel['sop'])
+    if node is None:raise ValueError('Missing guide panel: '+panel['sop'])
+    node.cook(force=True);geo=node.geometry()
+    if node.errors():raise ValueError(str(node.errors()))
+    p=np.array(geo.pointFloatAttribValues('P')).reshape(-1,3)
+    q=[[v.point().number() for v in f.vertices()] for f in geo.prims() if f.type()==hou.primType.Polygon]
+    if not q:raise ValueError('Empty guide panel: '+panel['sop'])
+    for part,mirror in [(panel['part'],False)]+([(panel['mirror_part'],True)] if panel.get('mirror_part') else []):
+        offset=sum(len(x) for x in points);current=p.copy()
+        if mirror:current[:,0]*=-1
+        points.append(current);faces.extend([[i+offset for i in (f[::-1] if mirror else f)] for f in q]);names.extend([part]*len(q))
+np.savez(globals()['OUT'],P=np.vstack(points),Q=np.array(faces,np.int32),names=np.array(names))
+result={'parts':sorted(set(names)),'faces':len(faces)}
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/FairPart.py
+"""28 October 2026, 13:55 : ZenRay Meshes, FAIR PART, undo crumpling of a part : Laplacian relaxation of its interior vertices,
+border vertices (the welded joints) fixed, until the p90 dihedral angle between neighbour faces reaches the target (default : the same part in --ref).
+Vertices on an edge sharper than --keep-deg in the reference part are fixed too (design creases), when the topology matches the reference.
+python FairPart.py <in.npz> <out.npz> --parts A,B [--ref delivery_v577.npz] [--step 0.5] [--max-iters 400] [--keep-deg 25]
+FR : défroisse une pièce par relaxation de l'intérieur, bords soudés fixes, jusqu'à la rugosité de la version de référence.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+
+
+def faces_of(d, part):
+    n = np.array([str(x) for x in d["names"]])
+    return [list(map(int, q)) for q, m in zip(d["Q"], n) if m == part]
+
+
+def rough(P, Q):
+    N, E = [], defaultdict(list)
+    for i, q in enumerate(Q):
+        v = P[q]; nn = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); N.append(nn / (np.linalg.norm(nn) + 1e-12))
+        for k in range(len(q)):
+            a, b = q[k], q[(k + 1) % len(q)]; E[(min(a, b), max(a, b))
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/FloorRemesh.py
+"""26 October 2026 : ZenRay Meshes, FLOOR REMESH, the retopology of the hidden underbody on the delivery file.
+The lofted underbody (CAR_body_under_floor_C) is a thin slab made of 229 rows of two huge columns and flat fans : 35 percent of its faces are faulty (aspect, density, poles).
+It is rebuilt as ONE clean sheet of quads, the lower surface of the slab : rows across the car, columns that follow the real outline row by row (xl(z) to xr(z)),
+heights read from the old surface (lowest hit above each plan point), rows added where the surface bends (adaptive, tolerance `tol_mm`). Nothing else of the car is touched.
+Every value is a parameter (HDA) : python FloorRemesh.py <delivery_in.npz> <delivery_out.npz> [--part NAME] [--cell 0.1] [--tol-mm 4] [--min-div 3] [--obj out.obj]
+FR : retopologie du plancher caché : une seule nappe de quads propres, colonnes qui suivent le contour, rangées ajoutées là où la surface plie.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class Surface:
+    """The old floor as triangles seen in plan (x, z) : the lowest and the highest y above any plan point."""
+
+ 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/FoliageDiag.py
+# 26 October 2026 : ZenRay Meshes, FOLIAGE DIAGNOSTIC : in each height band and each view, the leaves only of the built tree against the reference foliage mask : how many pixels are missing, how many are in excess.
+# FR : feuillage seul du modèle contre le masque de feuillage de la référence, par bande et par vue (excès ou manque). Usage: python FoliageDiag.py <tag> [obj=tree]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image
+import BranchLab as B, ComponentScore as C, Raster, SheetScore
+tag = sys.argv[1]; obj = sys.argv[2] if len(sys.argv) > 2 else "tree"
+V, R, A = B._views_with_arg(obj); dl = np.load(B.W + "work/%s/topo_%s.npz" % (obj, tag), allow_pickle=True); P, F, T, N = C.tri_render(dl); lid = [i for i, n in enumerate(N) if str(n) == "leaves"]; r = Raster.Renderer(P, F[np.isin(T, lid)])
+top = float(P[:, 1].max()); cb = V.crown_base; bands = {"low": (cb, cb + (top - cb) / 3), "mid": (cb + (top - cb) / 3, cb + 2 * (top - cb) / 3), "high": (cb + 2 * (top - cb) / 3, top)}
+out = {}
+for band, (ya, yb) in bands.items():
+    for vn in ("front", "back", "right", "left"):
+        v = [x for x in V.meta["view
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GateCandidate.py
+"""27 October 2026 : ZenRay Meshes, GATE of one loop candidate against the last kept version.
+Keeps the candidate only when every measured number holds or improves : absolute faults DOWN, quads kept at 100 %,
+six-view silhouette and line scores not lower, review gates not fewer, arch ring fault rate not worse.
+FR : porte de décision d'une candidate, comparée à la dernière version gardée."""
+import json, os, sys
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+N, C = sys.argv[1], sys.argv[2]
+ver = lambda t: f"{W}/versions/{t}"
+
+def topo(t):
+    d = json.load(open(ver(f"Topo_{t}.json"))); return {"error_faces": d["error_faces"], "quad_pct": d["quad_pct"], "tris": d["tris"]}
+
+def review(t):
+    d = json.load(open(ver(f"Review_{t}.json")))
+    ring = [g["measured"] for g in d["gates"] if g["gate"] == "arch.ring_fault_pct"][0]
+    vis = [g["measured"] for g in d["gates"] if g["gate"] == "topology.fault_pct_visible"][0]
+    return {"passed": d["passed"], "total": d["total"], "ring_pct": ring, "visible_pct": vis}
+
+def six(t):
+    s = json.load(open(f"{ver(f'Audit_{t}')}/silhouette.json")); l = json.load(open(f"{ver(f'Audit_{t}')}/lines.json"))
+    return {"silhouette": s["mean_kept
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GridM20.py
+# 26 October 2026 : grid of m20 settings scored on one object, truth metrics included. FR : balayage de réglages de m20 sur un objet.
+# Usage : python GridM20.py obj=tree_syn out=/path/grid_tree_syn.jsonl   (English identifiers)
+import sys, json, itertools, time, numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts")
+import BranchLab as B, BranchMethods as M
+obj, out = "tree_syn", "/tmp/grid.jsonl"
+for a in sys.argv[1:]:
+    k, v = a.split("=")
+    if k == "obj": obj = v
+    if k == "out": out = v
+GRID = {"tau2": (0.15, 0.2, 0.3), "avg2": (0.2, 0.25, 0.35), "sub2": (3.0, 4.5, 6.0)}   # the grid is the interface : change it here only
+V, RL, E, geo, root, r_root = M.setup(obj)
+f = open(out, "a")
+for tau2, avg2, sub2 in itertools.product(GRID["tau2"], GRID["avg2"], GRID["sub2"]):
+    t0 = time.time(); N, par = M.m20_staged(V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, tau2=tau2, sub2=sub2, avg2=avg2, tol=0.08)
+    rad = np.sqrt(B.radius_from_ridge(V, RL, N, par, r_root) * B.pipe_radius(par, r_root * 0.8, tip_r=0.02, expo=1.6)); rad[par < 0] = r_root
+    s = B.score(V, RL, N, par, rad); r = {"obj": obj, "tau2": tau2, "avg2": avg2, "sub2": sub2, "G": s["
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GuideOverlay.py
+# 27 October 2026 13:23 Paris: project independent panel guides into the reference cameras for inspection.
+import argparse,json,os,sys
+import numpy as np
+from PIL import Image,ImageDraw
+from scipy.interpolate import BSpline
+from scipy.ndimage import distance_transform_edt
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from RowOverlay import project
+from LineScore import ref_edges
+
+
+def curves(data,count):
+    c=np.asarray(data['controls']);t=np.linspace(0,1,count)
+    u=BSpline.design_matrix(t,data['knots_u'],3).toarray()
+    v=BSpline.design_matrix(t,data['knots_v'],3).toarray()
+    return [np.einsum('ui,j,ijc->uc',u,v[k],c) for k in (0,count-1)] + [np.einsum('i,vj,ijc->vc',u[k],v,c) for k in (0,count-1)]
+
+
+def main(args):
+    data=json.load(open(args.guides));meta=json.load(open(os.path.join(args.frame,'frame.json')))
+    sheet=json.load(open(os.path.join(args.views,'sheet.json')));lines=curves(data,args.samples)
+    os.makedirs(args.out,exist_ok=True);report={}
+    for view in meta['views']:
+        panel=next(p for p in sheet['panels'] if p['name']==view['name'])
+        path=os.path.join(args.views,'%02d_%s_rgb.png'%(panel['index'],view['name']))
+        origina
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GuidePanel.py
+# 27 October 2026 13:18 Paris: fit an editable cubic guide surface to one measured panel, without touching its assembly neighbours.
+import argparse, json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np
+from scipy.interpolate import BSpline, LinearNDInterpolator, NearestNDInterpolator
+from scipy.spatial import cKDTree
+from ReplaceComponents import read_mesh
+from TopoFix import save, orient
+from collections import Counter, defaultdict
+
+
+def knots(count):
+    return np.r_[np.zeros(4), np.linspace(0, 1, count - 2)[1:-1], np.ones(4)]
+
+
+def build(config):
+    p, q, names = read_mesh(config['source'])
+    side = float(config['side'])
+    faces = [f for f, name in zip(q, names) if name == config['part']]
+    selected = []
+    for f in faces:
+        v = p[f]; normal = np.cross(v[1]-v[0], v[2]-v[0])
+        if side * normal[0] > config['normal_min'] * np.linalg.norm(normal): selected.append(f)
+    edges = Counter(tuple(sorted((a,b))) for f in selected for a,b in zip(f,f[1:]+f[:1]))
+    adjacency = defaultdict(list)
+    for (a,b), count in edges.items():
+        if count == 1: adjacency[a].append(b); adjacency[b].append(a)
+    assert 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GuidePanelCurves.py
+# 27 October 2026 13:49 Paris: exact editable-surface isocurves, displayed as native cubic NURBS rather than sampled polylines.
+import hou,json,numpy as np
+node=hou.pwd();geo=node.geometry();source=node.inputs()[0].geometry().prims()[0];geo.clear()
+d=json.load(open(node.parent().node('CTRL_guides').evalParm('guide_file')))
+control=np.array([[source.vertex(i,j).point().position() for j in range(source.numRows())] for i in range(source.numCols())])
+def basis(value,knots,degree):
+    if value==1:value=np.nextafter(1.,0.)
+    knots=np.asarray(knots);weights=((knots[:-1]<=value)&(value<knots[1:])).astype(float)
+    for order in range(1,degree+1):
+        out=np.zeros(len(weights)-1)
+        for i in range(len(out)):
+            left=knots[i+order]-knots[i];right=knots[i+order+1]-knots[i+1]
+            if left>0:out[i]+=(value-knots[i])/left*weights[i]
+            if right>0:out[i]+=(knots[i+order+1]-value)/right*weights[i+1]
+        weights=out
+    return weights
+name=geo.addAttrib(hou.attribType.Prim,'name','')
+for axis,knots in [('u',d['knots_u']),('v',d['knots_v'])]:
+    for value in d['config'].get('guide_iso_values',[0,.25,.5,.75,1]):
+        weights=basis(value,knots,3)
+        po
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GuidePanelHou.py
+# 27 October 2026 13:24 Paris: a native editable NURBS surface, editable CV stage, quad conversion and closed thickness in the live scene.
+import hou
+import json
+from pathlib import Path
+config_path=globals()['GUIDES']
+data=json.loads(Path(config_path).read_text())
+root=hou.node('/obj');object_name=globals().get('OBJECT_NAME','ZRM_DoorGuides');obj=root.node(object_name) or root.createNode('geo',object_name)
+ctrl=obj.node('CTRL_guides') or obj.createNode('null','CTRL_guides')
+if not ctrl.parm('guide_file'):
+    group=ctrl.parmTemplateGroup()
+    group.append(hou.StringParmTemplate('guide_file','Guide control net',1,default_value=(config_path,),string_type=hou.stringParmType.FileReference))
+    group.append(hou.FloatParmTemplate('thickness_m','Thickness (m)',1,default_value=(data['config']['thickness_m'],),min=0.001,max=0.03))
+    ctrl.setParmTemplateGroup(group)
+ctrl.parm('guide_file').set(config_path)
+surface=obj.node('guide_surface') or obj.createNode('python','guide_surface')
+surface.parm('python').set('''# 27 October 2026 13:24 Paris: control points remain editable in the next Edit SOP.
+import hou,json
+node=hou.pwd();geo=node.geometry();d=json.load(open(node.parent().node('CTRL_
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/GuidePanelSample.py
+# 27 October 2026 13:32 Paris: quad isocurves sampled from the edited native NURBS, with a real seam support band and a closed shell.
+import hou,numpy as np
+node=hou.pwd();geo=node.geometry();surface=node.inputs()[0].geometry().prims()[0];ctrl=node.parent().node('CTRL_guides')
+geo.clear()
+nu,nv=ctrl.evalParm('segments_u'),ctrl.evalParm('segments_v')
+span_u=np.linalg.norm(np.array(surface.positionAt(0,.5))-np.array(surface.positionAt(1,.5)))
+span_v=np.linalg.norm(np.array(surface.positionAt(.5,0))-np.array(surface.positionAt(.5,1)))
+width=ctrl.evalParm('seam_width_m')
+def axis(count,length):
+    near=min(width/max(length,1e-8),.2)
+    return np.unique(np.r_[0,near,np.linspace(near,1-near,count-1),1-near,1])
+u,v=axis(nu,span_u),axis(nv,span_v)
+# 27 October 2026 14:14 Paris: leave the measured adjustable clearance at each pair of panel boundaries.
+gaps=ctrl.parmTuple('interface_gap_m').eval()
+for coords,length,gap in [(u,span_u,gaps[0]),(v,span_v,gaps[1])]:
+    fraction=min(float(gap)/max(length,1e-8),.2)
+    coords[:]=fraction+coords*(1-2*fraction)
+p=np.array([[surface.positionAt(float(a),float(b)) for b in v] for a in u]);a,b=p.shape[:2]
+n=np.cross(np.gradient(p,axis=0),np.gradient(
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/HeightFair.py
+"""28 October 2026, 14:45 : ZenRay Meshes, HEIGHT FAIR, refit the skin of a mostly horizontal panel (hood, roof, decklid) as one smooth surface y(x, z).
+The upward facing vertices of the part are fitted by a symmetric polynomial in (x^2, z) of total degree --deg (least squares), each vertex moves by
+--blend of the gap ; the other vertices of the shell (underside, walls) move by the same dy as their nearest upper vertex, so the thickness is kept.
+Border vertices of the part (open edges = welds) keep their position when --keep-border is 1.
+python HeightFair.py <in.npz> <out.npz> --part CAR_body_hood_C [--deg 6] [--blend 1.0] [--keep-border 1] [--fade-m 0.03]
+FR : réajuste la peau d'un panneau presque horizontal en une seule surface lisse y(x, z), symétrique, épaisseur gardée.
+"""
+import argparse
+from collections import defaultdict
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--part", required=True)
+    ap.add_argument("--deg", type=int, default=6)
+    ap.add_argument("--blend", type=float, default=1.0)
+    ap.add_argument("--keep-border", type=int, def
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/HillClimb.py
+"""27 October 2026 : ZenRay Meshes, HILL CLIMB, a random search of small point moves with the judge as the only criterion.
+Each pass, every free point that touches a faulty face gets a random move of `sigma` mm along the surface (along its curve for a point on a crease, nothing for a corner or an open border) ;
+TopoCheck judges the whole file once ; a point keeps its move only if the faces around it have fewer faults than before, the others go back, and the guard of PlanarizeQuads then sends back every face
+that would be newly faulty. The faulty set can only shrink, the moves stay within `--max-mm` of the anchor. Same faces, same names, same point count.
+python HillClimb.py <delivery_in.npz> <delivery_out.npz> --guard topo_params.json [--anchor a.npz] [--passes 60] [--sigma-mm 3] [--max-mm 8] [--seed 1] [--obj out.obj]
+FR : recherche aléatoire de petits déplacements, le juge est le seul critère, un point garde son déplacement si les faces autour de lui ont moins de fautes.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import TopoCheck as TC  # noqa: E402
+from RelaxQuads import
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/HoleCloser.py
+"""28 October 2026, 13:35 : ZenRay Meshes, HOLE CLOSER, closing plates for see-through gaps of a side view.
+Each hole region of the left view (pixels inside the filled silhouette that the model does not cover) larger than --min-px gets a flat grid of quads,
+in the plane x = median x of the body vertices that border it (seen through the gap), cells of --cell px, trimmed to the dilated region ;
+the plate is mirrored on the right (x -> -x) and named CAR_closer_NN_L / _R. Same rule as a sheet-metal closing panel behind a joint.
+python HoleCloser.py <in.npz> <out.npz> [--min-px 30] [--cell 2] [--dilate 2] [--skip-parts CAR_liner_cabin_C] [--view left]
+FR : plaques de fermeture des trous traversants vus de côté, miroitées, en quads propres.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster  # noqa: E402
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+
+
+def cam(meta, vn, shape):
+    v = [x for x in meta["views"] if x["name"] == vn][0]
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy, t
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/HoleMap.py
+"""28 October 2026, 13:10 : see-through holes of a delivery in one sheet view, drawn red on the reference, saved as png.
+python HoleMap.py <obj> <view> <out.png>   FR : trous traversants d'une vue, en rouge sur la référence."""
+import sys, os, json
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster
+from SheetScore import render_in_panel
+obj, view, out = sys.argv[1:4]
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+meta = json.load(open(W + "frame/frame.json")); sheet = json.load(open(W + "views/sheet.json"))
+mesh = trimesh.load(obj, force="mesh", process=False); mr = Raster.Renderer(mesh.vertices, mesh.faces)
+v = [v for v in meta["views"] if v["name"] == view][0]; pan = [p for p in sheet["panels"] if p["name"] == view][0]
+ref = np.asarray(Image.open(W + "views/%02d_%s_rgb.png" % (pan["index"], view)).convert("RGB")).copy()
+mref = np.asarray(Image.open(W + "frame/mask_%s.png" % view)) > 127
+M, img = render_in_panel(mr, meta, v, mref.shape)
+H = ndi.binary_fill_holes(M) & ~M
+ref[H] = [255, 0, 0]
+Image.fromarray(ref).resize((ref.shape[1] * 3, ref.shape[0] * 3), Ima
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/InterfaceCollision.py
+# 27 October 2026 13:33 Paris: detect crossing surface edges in either direction between named assembly components.
+import argparse,json,os,sys
+import numpy as np,trimesh
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+
+
+def mesh_for(points,polys,names,part):
+    faces=[f for f,n in zip(polys,names) if n==part]
+    if not faces:raise ValueError('Missing component: '+part)
+    faces=[(f[0],f[k],f[k+1]) for f in faces for k in range(1,len(f)-1)]
+    return trimesh.Trimesh(vertices=points,faces=faces,process=False)
+
+
+def crossing(a,b,eps):
+    edges=a.edges_unique;starts=a.vertices[edges[:,0]];vectors=a.vertices[edges[:,1]]-starts
+    lengths=np.linalg.norm(vectors,axis=1);valid=lengths>2*eps
+    starts=starts[valid];vectors=vectors[valid];lengths=lengths[valid]
+    normals=vectors/lengths[:,None]
+    locations,ray,tri=b.ray.intersects_location(starts,normals,multiple_hits=True)
+    if len(ray)==0:return 0
+    distance=np.linalg.norm(locations-starts[ray],axis=1)
+    return int(np.sum((distance>eps)&(distance<lengths[ray]-eps)))
+
+
+def main(args):
+    p,q,n=read_mesh(args.assembly);subject=mesh_for(p,q,n,args.part);result={}
+    for
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/JointWeld.py
+"""28 October 2026, 13:00 : ZenRay Meshes, JOINT WELD, generic contact weld between components (Lego rule : 0 mm between parts).
+Every border vertex (open edge) of a component is moved onto the nearest point of ANOTHER component's vertex set when closer than --tol-mm.
+Pairs are symmetric : a weld on the left side is mirrored on the right (mirror map from PlanarizeQuads). Same faces, same names, same point count.
+Report : gaps before and after (count, p50, p95, max) per component pair.
+python JointWeld.py <in.npz> <out.npz> [--tol-mm 8] [--min-mm 0.01] [--skip name,name] [--report out.json] [--dry]
+FR : soudure générique des bords ouverts d'un composant sur le composant voisin le plus proche, 0 mm, symétrique.
+"""
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from PlanarizeQuads import mirror_map  # noqa: E402
+
+
+def border_vertices(Q, names):
+    """Vertices on an edge used once inside its own component."""
+    cnt = defaultdict(int)
+    for q, n in zip(Q, names):
+        k = len(q)
+        for i in range(k):
+            a, b
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/JudgeDelivery.sh
+#!/bin/zsh
+# 28 October 2026 : judge one delivery npz (topology, review, six-view silhouette and lines, holes) and print one line. Usage: JudgeDelivery.sh vNNN
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; C=$1; cd $W; mkdir -p versions/Audit_$C
+$PY -I Scripts/TopoCheck.py work/car/delivery_$C.npz work/car/topo_params.json versions/Topo_$C --no-board > /dev/null
+$PY -I Scripts/AnimReview.py work/car/delivery_$C.npz work/car/topo_params.json work/car/wheel_params.json versions/Review_$C > /dev/null 2>&1
+$PY -I -c "
+import sys;sys.path.insert(0,'Scripts');import numpy as np,TopoFix
+d=np.load('work/car/delivery_$C.npz',allow_pickle=True);TopoFix.write_obj('versions/ZenRayCar_$C.obj',d['P'],[list(map(int,q)) for q in d['Q']],[str(x) for x in d['names']])"
+$PY -I Scripts/SheetScore.py work/car/frame work/car/views versions/ZenRayCar_$C.obj versions/Audit_$C/vs.png > versions/Audit_$C/silhouette.json
+$PY -I Scripts/LineScore.py work/car/frame work/car/views versions/ZenRayCar_$C.obj versions/Audit_$C/lines.png > versions/Audit_$C/lines.json
+$PY -I - $C <<'PYE'
+import json,sys;t=sys.argv[1]
+T=json.load(open(f'versions/Topo_{t}.json'));R=json.
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/LinerRecess.py
+# 27 October 2026 14:00 Paris: move existing support behind independent panels, preserving its connectivity and both sides.
+import argparse,json,os,sys
+import numpy as np
+from scipy.interpolate import LinearNDInterpolator,NearestNDInterpolator
+from scipy.spatial import ConvexHull
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+from ReplaceComponents import read_mesh
+from TopoFix import save
+
+
+def main(args):
+    if args.settings:
+        settings=json.load(open(args.settings)).get('liner',{})
+        for key,value in settings.items():
+            if hasattr(args,key):setattr(args,key,value)
+    p,q,n=read_mesh(args.assembly);source,_,_=read_mesh(args.panel);nu,nv=args.grid
+    inner=source[nu*nv:nu*nv*2];yz=inner[:,[2,1]];x=np.abs(inner[:,0]);hull=ConvexHull(yz)
+    linear=LinearNDInterpolator(yz,x);near=NearestNDInterpolator(yz,x)
+    ids=sorted({v for face,name in zip(q,n) if name==args.support for v in face})
+    if not ids:raise ValueError('Missing support '+args.support)
+    used_elsewhere={v for face,name in zip(q,n) if name!=args.support for v in face}
+    if used_elsewhere.intersection(ids):raise ValueError('Support shares points with other components')
+    be
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/LoopStep.sh
+#!/bin/zsh
+# 27 October 2026 : ZenRay Meshes, ONE LOOP STEP on the delivery file of the last kept version.
+# Usage: LoopStep.sh <base_tag> <candidate_tag> <seed>
+# 1 hill climb on the delivery (judge = TopoCheck, guard per face, mirror pairs, fold cap, cap 10 mm from the base)
+# 2 topology judge and senior review on the candidate ; 3 six-view silhouette and lines of the candidate OBJ ; 4 gate against the base.
+# FR : une itération de boucle sur la livraison ; porte finale = GateCandidate.py.
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; B=$1; C=$2; SEED=${3:-1}
+cd $W; mkdir -p versions/Audit_$C
+$PY -I Scripts/HillClimb.py work/car/delivery_$B.npz work/car/delivery_$C.npz --guard work/car/topo_params.json --anchor work/car/delivery_$B.npz --passes ${PASSES:-300} --sigma-mm ${SIGMA:-12} --max-mm 10 --fold-cap-deg 5.5 --fold-grow-deg 0.3 --seed $SEED --obj versions/ZenRayCar_$C.obj | tail -1
+$PY -I Scripts/TopoCheck.py work/car/delivery_$C.npz work/car/topo_params.json versions/Topo_$C --no-board > /dev/null
+$PY -I Scripts/AnimReview.py work/car/delivery_$C.npz work/car/topo_params.json work/car/wheel_params.json versions/Review_$
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/PartView.py
+# 26 October 2026 : ZenRay Meshes, PART VIEW : the delivery polygons of the parts whose name contains a word, seen along an axis (back, front, side, top), faulty faces coloured by category, painter order (nearest last),
+# framed on the part. FR : gros plan filaire d'une pièce, fautes en couleur. Usage: python PartView.py <tag> <word> <back|front|side|top> <out.png> [px_per_m=1500] [pad_m=0.05]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from PIL import Image, ImageDraw
+import TopoCheck as TC
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+tag, word, view, out = sys.argv[1:5]; ppm = float(sys.argv[5]) if len(sys.argv) > 5 else 1500.0; pad = float(sys.argv[6]) if len(sys.argv) > 6 else 0.05
+d = np.load(W + "work/car/delivery_%s.npz" % tag, allow_pickle=True); tp = TC.load_params(W + "work/car/topo_params.json"); Q_ = [list(map(int, q)) for q in d["Q"]]; N, T = np.unique(d["names"], return_inverse=True)
+P = d["P"].astype(float); C = np.array([len(q) for q in Q_], np.int32); I = np.array([v for q in Q_ for v in q], np.int32); res, flags, err = TC.analyse(P, C, I, T, N, tp)
+st = np.concatenate([[0], np.cumsum(C.astype(np.int
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/PlanarizeQuads.py
+"""27 October 2026 : ZenRay Meshes, PLANARIZE QUADS, the cleanup of twisted quads on the delivery file.
+TopoCheck flags a quad as a FOLD when both of its triangulations bend by more than `fold_max_deg` (a twisted quad). The loft builds such quads where two rows or two seams shear against each other.
+Every flagged quad is pulled toward the best fit plane of its four corners, a little per pass, each vertex moving at most `--max-mm` from where it started ; quads that stay flat are not touched.
+Nothing else changes : same faces, same names, same vertex count. Every value is a parameter (HDA) : python PlanarizeQuads.py <delivery_in.npz> <delivery_out.npz> [--max-mm 5] [--target-deg 17] [--iters 80] [--step 0.3] [--guard topo_params.json] [--obj out.obj]
+FR : les quads vrillés (pli en diagonale) sont rapprochés de leur plan moyen, chaque sommet bougeant d'au plus quelques millimètres.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def quad_fold(V):
+    """V is (n, 4, 3). Returns the fold angle of TopoCheck (the smaller bend of the two triangulations, degrees) for every quad."""
+    def tn(a, b,
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/RadiusCalib.py
+# 26 October 2026 : ZenRay Meshes, RADIUS CALIBRATION on a synthetic tree whose true radii are known : at the nodes of the TRUTH skeleton (no reconstruction error), two photo estimators of the radius are compared with the true value
+# per radius bin : (1) the half prominence width of the grey profile (RadiusProbe), (2) the sato scale of the strongest ridge (BranchLab). The result is a correction curve to apply to the real tree. FR : calibration des estimateurs de rayon sur la vérité.
+# Usage: python RadiusCalib.py [obj=tree_syn]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+import BranchLab as B, RadiusProbe as RP
+
+
+def main(obj="tree_syn"):
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, 0); d = json.load(open(B.W + "work/%s/tree_w_truth_skeleton.json" % obj)); N = np.array(d["nodes"]); par = np.array(d["parent"]); r = np.array(d["radius"])
+    np.savez("/tmp/claude-501/truth_nodes.npz", nodes=N, parent=par, radius=r); pr = {i: m for i, m, _ in RP.probe("/tmp/claude-501/truth_nodes.npz", obj, ret_nodes=True, min_y=V.crown_base)}
+    est_s = {}
+    for i in range(1, len(N)):
+        if N[i][1] < V.crown_base: co
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/RadiusProbe.py
+# 26 October 2026 : ZenRay Meshes, RADIUS PROBE : the width of every strong limb measured DIRECTLY on the reference photograph, independent of the ridge scale and of the pipe model. For each node of a limb file seen
+# in a side view with a strong ridge, the grey profile is sampled across the limb (normal to its projected tangent), the width is the full width at half prominence of the bright peak, radius = width / 2 / px per metre.
+# The report is the ratio measured / model radius per class and the median radius per class. FR : sonde de rayon, largeur mesurée sur la photo contre le rayon du modèle. Usage: python RadiusProbe.py <limbs.npz> [obj=tree]
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from scipy.ndimage import map_coordinates, gaussian_filter
+import BranchLab as B
+
+
+def probe(path, obj="tree", radius=None, ret_nodes=False, min_y=None):
+    V, R, A = B._views_with_arg(obj); RL = B.limb_map(R, A, 1); d = np.load(path); N = d["nodes"]; par = d["parent"]; r = d["radius"] if radius is None else radius; out = []
+    G = {vn: gaussian_filter(V.gray[vn], 1.0) for vn in ("front", "back", "right", "left")}
+    for i in range
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/RadiusTruthTest.py
+# 26 October 2026 : radius error of the branch curves against the 3D truth skeleton of a synthetic tree. FR : erreur de rayon contre la vérité.
+# Usage : python RadiusTruthTest.py obj=tree_syn   (English identifiers, comments English first)
+import sys, json, numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts")
+import BranchLab as B, BranchMethods as M
+from scipy.spatial import cKDTree
+obj = "tree_syn"
+for a in sys.argv[1:]:
+    k, v = a.split("=")
+    if k == "obj": obj = v
+V, RL, E, geo, root, r_root = M.setup(obj)
+N, par = M.m20_staged(V, RL, E, geo, root, r_root, tau1=0.3, sub1=4, tau2=0.2, sub2=4.5, avg2=0.25, tol=0.08)
+T = json.load(open("/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/%s/tree_w_truth_skeleton.json" % obj))
+tn = np.array(T["nodes"]); tr = np.array(T["radius"]); tt = cKDTree(tn)
+d, j = tt.query(N); rt = tr[j]
+ok = (d < 0.25) & (par >= 0)
+rr = B.radius_from_ridge(V, RL, N, par, r_root)
+print("n curve nodes", len(N), "matched", int(ok.sum()), "root r", round(r_root, 3), "truth root r", round(float(tr[0]), 3))
+bins = [(0.0, 0.05), (0.05, 0.1), (0.1, 0.2), (0.2, 0.4), (0.4, 2.0)]
+def rep(name, r):
+    out = []
+    for lo, hi in b
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/RelaxQuads.py
+"""27 October 2026 : ZenRay Meshes, RELAX QUADS, tangential smoothing of the delivery file with the face by face guard of PlanarizeQuads.
+Every free point (not on a crease, not on an open border) moves toward the average of its neighbours, but only along the surface (the normal part of the move is removed), a little per pass, at most `--max-mm` from where it started.
+It evens out the trapezoids and the thin strips that TopoCheck flags as angle, aspect or density faults ; the guard (same as PlanarizeQuads) sends back every face that would become faulty.
+Same faces, same names, same point count. python RelaxQuads.py <delivery_in.npz> <delivery_out.npz> --guard topo_params.json [--max-mm 8] [--iters 20] [--step 0.4] [--crease-deg 25] [--obj out.obj]
+FR : lissage tangent des points libres, chaque point à quelques millimètres au plus de sa place, la garde annule toute face qui deviendrait fautive.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from PlanarizeQuads import guard, mirror_map  # noqa: E402
+
+
+def topology(P, Q, crease_deg):
+    """Neighbour lists as flat arrays and the mask of points t
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ReplaceComponents.py
+# 27 October 2026 13:10 Paris: replace named assembly components without changing any other component.
+import argparse
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import numpy as np
+from TopoFix import save
+
+
+def read_mesh(path):
+    data = np.load(path, allow_pickle=True)
+    if 'Q' in data:
+        return data['P'], [list(map(int, q)) for q in data['Q']], list(map(str, data['names']))
+    starts = np.r_[0, np.cumsum(data['C'])]
+    return data['P'], [data['I'][a:b].tolist() for a, b in zip(starts[:-1], starts[1:])], [str(data['names'][t]) for t in data['T']]
+
+
+def replace(source, replacement, output, patterns):
+    points, faces, names = read_mesh(source)
+    new_points, new_faces, new_names = read_mesh(replacement)
+    selected = lambda name: any(pattern in name for pattern in patterns)
+    incoming = {name for name in new_names if selected(name)}
+    existing = set(names)
+    assert incoming and incoming <= existing, 'Replacement must match existing named components'
+    keep = [i for i, name in enumerate(names) if name not in incoming]
+    add = [i for i, name in enumerate(new_names) if name in incoming]
+    offset = len(points)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/RunTree.sh
+#!/bin/zsh
+# 25 October 2026 : ZenRay Meshes tree loop step : grow the skeleton (TreeGrow, k=v rules), rebuild /obj/ZRM_Tree in
+# the live Houdini, export, score against the sheet and the hull. Usage: RunTree.sh <tag> [k=v ...]
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1; shift; OBJ=${OBJ:-tree}   # 26 October 2026: the object directory (work/$OBJ) is a parameter, tree by default
+cd $W
+$PY -I Scripts/archetypes/TreeGrow.py work/$OBJ/hull_B.npz work/$OBJ/tree_v1_measure.json work/$OBJ/tree_${TAG}_skeleton.json obj=$OBJ shell_clumps=3100 shell_depth_m=0.6 influence_m=2.6 root_flare=1.0 "$@" | tail -1
+rm -f work/$OBJ/tree_${TAG}.obj   # 26 October 2026: a stale OBJ of the same tag must not pass for the new one
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "import hou, re
+geo=hou.node('/obj/ZRM_Tree'); sk=geo.node('skeleton_chains'); code=sk.parm('python').eval()
+code=re.sub(r\"json.load\(open\('[^']*'\)\)\", \"json.load(open('$W/work/$OBJ/tree_${TAG}_skeleton.json'))\", code); sk.parm('python').set(code)
+ex=geo.node('EXPORT_obj'); ex.parm('sopoutput').set('$W/work/$OBJ/tree_${TAG}.obj'); ex.parm('execu
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/StripFair.py
+"""28 October 2026, 14:20 : ZenRay Meshes, STRIP FAIR, smooth a part made of rows along one axis (bands, bars, panels extruded in x).
+Rows are the chains of edges running mostly along --axis ; each row gets y(x) and z(x) refitted by a polynomial of degree --deg on its current points
+(symmetric : even powers only when the row spans both sides), the row ends keep their position (welds) with --keep-ends. Same faces, same names.
+python StripFair.py <in.npz> <out.npz> --parts A,B [--deg 6] [--keep-ends 1] [--blend 1.0]
+FR : lisse une bande rangée par rangée, courbe polynomiale par rangée, extrémités soudées gardées.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+
+
+def rows_of(P, Q, axis):
+    nb = defaultdict(set)
+    for q in Q:
+        for k in range(len(q)):
+            a, b = q[k], q[(k + 1) % len(q)]
+            d = P[b] - P[a]
+            if abs(d[axis]) > 0.7 * np.linalg.norm(d):
+                nb[a].add(b); nb[b].add(a)
+    seen, rows = set(), []
+    for v in nb:
+        if v in seen:
+            continue
+        comp, st = [], [v]
+        while st:
+            x = st.pop()
+            if x in seen:
+                continue
+      
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TailFace.py
+# 25 October 2026 : ZenRay Meshes car, TAIL FACE by the depth rule applied to a whole surface. The body is clipped at cut_z
+# (behind the rear arch, CarTail.py) ; the cap behind it is a quad grid over the body section at the cut : column x from
+# the section outline, height y between the section bottom and top at that x, and depth z = the most rearward position
+# both views allow : the top view (z where the plan half width still reaches |x|) and the side view (z_back(y)), never
+# behind the tail tip nor in front of the cut. Named CAR_body_tail_face_C ; output npz (P, Q, names) + _cut.json for CarTail.
+# FR : face arrière où chaque point recule jusqu'à la profondeur que permettent la vue de dessus et la vue de côté.
+# Usage: python TailFace.py <tail_face_params.json> <body_panels.npz> <out.npz>
+import sys, os, json
+import numpy as np
+
+
+def main(params, body, out):
+    W = os.path.dirname(os.path.abspath(params)); C = json.load(open(params)); zc = C["cut_z"]
+    m = json.load(open(os.path.join(W, "arch_v1_measure.json"))); pr = m["profiles"]; ztip = m["keys"]["tail"]
+    zs, hw = np.array(pr["z"]), np.array(pr["hw"]); ey = np.array(pr["ext_y"]); eb = np.array(pr["z_back"], float
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TopoAudit.sh
+#!/bin/zsh
+# 26 October 2026 : ZenRay Meshes, TOPOLOGY AUDIT of the built car : export the real polygons of OUT_car (ExportTopo.py,
+# Houdini live) then the senior review (TopoCheck.py) : versions/Topo_<tag>.md, .json and _wire.png.
+# FR : audit de topologie de la voiture construite, export Houdini puis juge.
+# Usage: TopoAudit.sh <tag> [--no-board]
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1
+cd $W
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "g={'SOP':'/obj/ZRM_Car/OUT_car','OUT':'$W/work/car/topo_$TAG.npz'}; exec(open('$W/Scripts/ExportTopo.py').read(), g); result=g['result']" live > /dev/null
+# 26 October 2026: the DELIVERY file (what a buyer gets) : the polygons of OUT_car, the hood and decklid closed by a ladder of quads
+# (cap_ladder) and a grouped polygon OBJ ; the judge and the senior review run on it. FR : fichier de livraison.
+$PY -I Scripts/TopoFix.py work/car/topo_$TAG.npz work/car/delivery_$TAG.npz --nofix --split5 --cap=CAR_body_hood_C,CAR_body_decklid_C --obj=versions/ZenRayCar_$TAG.obj > /dev/null
+# 27 October 2026: the hidden underbody is rebuilt as one clean sheet of quads (FloorR
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TopoCheck.py
+# 26 October 2026 : ZenRay Meshes, TOPOCHECK, the senior review of a model's topology, MEASURED and never estimated :
+# what an animator or a senior tech artist checks in wireframe before a model is sold (Matthieu, 26 October 2026 : « une
+# topologie parfaite, comme si un 3D animator ou un 3D tech artist senior avait vérifié le modèle, en wireframe »).
+# Rules from ZenRayMeshes1.md section 6 (quad dominant, edge flow, poles off creases, density transitions, n-gons, panel
+# shells). Input : the real polygons exported by ExportTopo.py (P, C vertex counts, I indices, T part id, names).
+# Output : <out>.json (every measure), <out>.md (the review), <out>_wire.png (six views, wireframe on shaded surface,
+# faces with an error in red, triangles in yellow). Exit code 0 when the review runs ; the score is in the json.
+# FR : le juge de topologie, la relecture d'un senior mesurée : quads, pôles, plis, densité, symétrie, fil de fer.
+# Usage: python TopoCheck.py <topo.npz> <topo_params.json> <out_prefix> [--no-board]
+#        python TopoCheck.py --selftest      (green on a clean quad torus, red on each injected defect)
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.ab
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TopoFix.py
+# 26 October 2026 : ZenRay Meshes, TOPOFIX, the repair half of the retopology step (TopoCheck is the judge) : on a
+# component npz (P, Q polygons, names per polygon), per part : WELD points at the same place (unwelded seams are cracks),
+# drop polygons that collapse, ORIENT every connected piece consistently (breadth first over shared edges, the majority
+# winding of the piece is kept), and a closed piece outward (positive signed volume). Parts stay separate shells.
+# FR : réparation de topologie par pièce : soudure, faces effondrées, orientation cohérente (vers l'extérieur si fermé).
+# Usage: python TopoFix.py <in.npz> <out.npz> [weld_tol_m=1e-7] [--across] [--nofix] [--cap=part1,part2] [--split5] [--twist=20] [--obj=<out.obj>]
+#        --nofix keeps the polygons as they are (a topology export), --cap closes clipped thick panels (cap_ladder), --obj writes a grouped polygon OBJ
+#        python TopoFix.py --selftest
+import sys, json
+from collections import defaultdict, deque
+import numpy as np
+
+
+def weld(P, Q, N, tol=1e-7, across=False):
+    """across : weld coincident points whatever their part (26 October 2026, a component made of one grid whose parts share
+    points, the t
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TopoToRender.py
+# 26 October 2026 : ZenRay Meshes, a topology npz (P, C, I, T, names) as a render npz (P, F triangles, T, names) for CleanView.py, any object. FR : topologie vers triangles.
+# Usage: python TopoToRender.py <topo.npz> <out.npz>
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, ComponentScore as C
+# 27 October 2026 13:14 Paris: accept both polygon encodings used by the delivery chain.
+d = np.load(sys.argv[1], allow_pickle=True)
+if 'Q' in d:
+    names, part_ids = np.unique(d['names'], return_inverse=True)
+    counts = np.array([len(q) for q in d['Q']], dtype=np.int32)
+    d = {'P': d['P'], 'C': counts, 'I': np.concatenate(d['Q']).astype(np.int32), 'T': part_ids, 'names': names}
+P, F, T, N = C.tri_render(d)
+np.savez(sys.argv[2], P=P, F=F, T=T, names=N)
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TreeFromSheet.sh
+#!/bin/zsh
+# 26 October 2026 : ZenRay Meshes, ONE COMMAND from a calibrated sheet to an organic asset (tree like objects) : soft ridge maps, measured limbs and branches (m20), twigs, leaf cards, build in Houdini,
+# scores, components table and a smooth hero. Every number lives in the block below (HDA style : change it here, nowhere else). FR : une commande, de la planche à l'arbre.
+# Usage: OBJ=tree zsh TreeFromSheet.sh <tag>        (OBJ = work/<obj>, tree by default)
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1; OBJ=${OBJ:-tree}; cd $W
+# ---- parameters (the winning recipe of the 26 October 2026 tournament, skill sections 101 to 103) ----
+M20="tau1=0.3 sub1=4 tau2=0.2 sub2=4.5 avg2=0.25 tol=0.08"     # limbs : thick ridges first, then medium branches hung on them ; tol = the smoothing of every whole branch curve in metres (0.08 : limbs 98 percent clean of kinks)
+BUILD="prune_out=0 max_seg_m=3.0 carve_wood=1 carve_k=1 carve_dilate_px=3 carve_mask=ridgewood file_twigs=1 shell_clumps=2400 root_flare=1.25 trunk_clear_k=1.0 trunk_clear_m=0.1"   # no old pruning, leaves carved off visible wood, twigs toward the foliage, a sl
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TreeIter.sh
+#!/bin/zsh
+# 26 October 2026 : ZenRay Meshes, FAST tree modelling step : TreeGrow + Houdini rebuild + topology export + X-ray limb score of one wood class, nothing else (no board, no hero).
+# Usage: TreeIter.sh <tag> <class thick|med|thin> [k=v ...]   rules default to work/$OBJ/tree_rules.txt and tree_ctrl.txt, arguments override.  FR : un pas court, un score.
+set -e
+W=/Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-uv/bin/python; TAG=$1; CLS=$2; OBJ=${OBJ:-tree}; cd $W
+RULES=$(cat work/$OBJ/tree_rules.txt); CTRL=$(cat work/$OBJ/tree_ctrl.txt)
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "c=hou.node('/obj/ZRM_Tree/CTRL_zrm'); [c.parm(kv.split('=')[0]).set(float(kv.split('=')[1])) for kv in '$CTRL'.split(',')]; result=1" live > /dev/null
+rm -f work/$OBJ/topo_$TAG.npz
+OBJ=$OBJ zsh Scripts/RunTree.sh $TAG ${=RULES} "${@:3}" > /tmp/claude-501/tree_$TAG.log 2>&1 || true
+python3 /Users/zenray/.claude/Memory1/Houdini/MCP/zrhoudini.py hom "g={'SOP':'/obj/ZRM_Tree/OUT_tree','OUT':'$W/work/$OBJ/topo_$TAG.npz'}; exec(open('$W/Scripts/ExportTopo.py').read(), g); result=g['result']" live > /dev/null || true   # 26 October 2026: a timeout of the 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TreeWoodCheck.py
+# 26 October 2026, 19:45 : ZenRay Meshes, independent check of the eucalyptus evolution video (object "tree", no leaves).
+# It reads the MP4 back with ffprobe and compares its size, codec, pixel format, rate, frame count and duration with what
+# was asked. For each pair of consecutive versions it compares the geometry fingerprint of the kept triangles with the
+# pixels of the PNG frames, outside the label corner. Two versions with the same geometry may differ on a few silhouette
+# pixels only, because the renderer is not bit-exact across vertex orders (measured at 1024 px: up to 7 pixels). Two
+# versions with different geometry must change many more pixels, otherwise they look alike and a warning is raised.
+# The first, middle and last frames of the video are decoded and compared with their PNG source, and a contact sheet of
+# the version frames is drawn. Exit code 0 when no error is raised, 1 otherwise ; warnings do not change the exit code.
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I -B /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/TreeWoodCheck.py
+import argparse
+import json
+import os
+import re
+import subprocess
+
+import numpy as np
+from PIL import Image, ImageDra
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TreeWoodEvolution.py
+# 26 October 2026, 19:30 : ZenRay Meshes, evolution video of the eucalyptus object "tree" WITHOUT its leaves.
+# One square image per version, drawn with the smooth renderer of Raster.py (the one CleanView.py uses), with the same
+# view, light and greys as CleanView.py. One camera for every version: the centre is the centre of the last version and
+# the scale is the largest diagonal of all versions, so the tree keeps the same size from one frame to the next. The scale
+# grows again only if some version would still leave the frame. Every frame is also checked for clipping at its border.
+# The version label sits at the bottom left. H.264 comes from ffmpeg, then ffprobe must read back the video that was asked.
+# A version with no render file is reported as absent, never invented. A JSON summary with the same stem as the video
+# records the versions, the camera, the fit ratios and one geometry fingerprint per version (checked by TreeWoodCheck.py).
+# Usage: /Users/zenray/.venvs/zenray-uv/bin/python -I -B /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/TreeWoodEvolution.py
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+import
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/TrimHidden.py
+"""28 October 2026, 13:20 : ZenRay Meshes, TRIM HIDDEN, keep of one part only the faces seen from outside (sheet views and an orbit), plus a few rings.
+Used on the cabin liner : what shows through the panel joints is kept (the jamb), the rest of the old inner copy is removed.
+python TrimHidden.py <in.npz> <out.npz> --part CAR_liner_cabin_C [--rename CAR_body_jamb_C] [--rings 2] [--orbit 16] [--res 1400]
+FR : garde d'une pièce les seules faces visibles de l'extérieur (vues de la planche et orbite), plus quelques anneaux.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--part", required=True)
+    ap.add_argument("--rename", default="")
+    ap.add_argument("--rings", type=int, default=2)
+    ap.add_argument("--orbit", type=int, default=16)
+    ap.add_argument("--elev", default="-20,0,15,35")
+    ap.add_argument("--res", type=int, default=1400)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ViewDiff.py
+"""28 October 2026, 15:10 : one view of a delivery against the reference mask : missing (red) and extra (blue) pixels on the reference image, x3, plus counts by row band.
+python ViewDiff.py <obj> <view> <out.png>   FR : écart d'une vue, manque en rouge, surplus en bleu."""
+import sys, os, json
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster
+from SheetScore import render_in_panel
+obj, view, out = sys.argv[1:4]
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+meta = json.load(open(W + "frame/frame.json")); sheet = json.load(open(W + "views/sheet.json"))
+mesh = trimesh.load(obj, force="mesh", process=False); mr = Raster.Renderer(mesh.vertices, mesh.faces)
+v = [v for v in meta["views"] if v["name"] == view][0]; pan = [p for p in sheet["panels"] if p["name"] == view][0]
+ref = np.asarray(Image.open(W + "views/%02d_%s_rgb.png" % (pan["index"], view)).convert("RGB")).copy()
+mref = np.asarray(Image.open(W + "frame/mask_%s.png" % view)) > 127
+M, _ = render_in_panel(mr, meta, v, mref.shape); M = ndi.binary_fill_holes(M)
+miss = mref & ~M; extra = M & ~mref
+ref[miss] = [25
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/WheelBuild.py
+# 25 October 2026 : ZenRay Meshes, WHEEL component (clean quads) : tyre = revolved section (sidewall bulge, shoulder,
+# tread, grooves), rim = lip ring + barrel + spokes as thick quad ribbons (straight or split pairs, concave toward the
+# hub) + hub cap ; four instances placed at the measured axles. Parameters in work/car/wheel_params.json (HDA interface).
+# Output npz (points, quads, name per quad) read by a Python SOP in Houdini.
+# FR : roue en quads propres, pneu en révolution, jante à branches en rubans épais, quatre instances.
+# Usage: python WheelBuild.py <wheel_params.json> <out.npz>
+import sys, json, math
+import numpy as np
+
+
+class Mesh:
+    def __init__(self): self.P, self.Q, self.N, self.PN = [], [], [], []
+    def grid(self, G, name, close_u=False, flip=False, close_v=False):
+        """G: (nu, nv, 3) point grid -> quads; close_u wraps the first axis, close_v the second (26 October 2026)."""
+        b = len(self.P); nu, nv = G.shape[:2]; self.P.extend(G.reshape(-1, 3).tolist()); self.PN.extend([name] * (nu * nv))
+        for i in range(nu if close_u else nu - 1):
+            for j in range(nv if close_v else nv - 1):
+                a, c = i * nv + j, ((i + 1) % nu) *
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/ZenRayMeshesCar.py
+"""28 October 2026 : ZenRay Meshes CAR, the algorithm in one command (task K0, SKILL section 229). The stages live in a JSON
+(work/car/pipeline.json, the interface) ; each stage is a script with its parameters, run in order, timed, stopped at the first failure.
+The car being built is work/car/delivery_pipe.npz. Stage 'checkpoint' starts from the kept car for every component no stage rebuilds yet ;
+each validated component stage (K1 body cage, K2 panels, ...) is appended and replaces its parts, until the checkpoint is no longer needed
+and the whole car comes from the reference sheet. The agent builds and improves stages ; it never models the car by hand.
+python ZenRayMeshesCar.py run [--from NAME] [--to NAME]     python ZenRayMeshesCar.py list
+FR : l'algorithme en une commande : des étages scriptés et paramétrés, enchaînés, mesurés."""
+import json, os, shutil, subprocess, sys, time
+A = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"; PIPE = A + "work/car/pipeline.json"
+SUBST = {"{A}": A, "{PY}": "/Users/zenray/.venvs/zenray-meshes/bin/python"}
+
+
+def sub(x):
+    for k, v in SUBST.items(): x = x.replace(k, v)
+    return x
+
+
+def run(frm=None, to=None):
+    cfg = json.load(open(PI
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/archetypes/TreeBuild.py
+# 25 October 2026 : ZenRay Meshes tree archetype, Houdini build : trunk + limb chains swept as clean quad tubes,
+# leaf clumps of quad cards at the tips. Native SOPs (Python SOP only reads the skeleton JSON into curves).
+# EN: chains: from the root, every node continues with its thickest child, the other children start new chains at
+# the parent position (one tube per branch, like a modeller or SpeedTree); pscale = radius; Sweep 2.0 with a circle of
+# `sides` sides; leaf clump = `cards` crossed quad cards copied to every tip with random orientation and size.
+# FR : chaque branche est un tube propre balayé le long de sa chaîne, des touffes de cartes de feuilles aux extrémités.
+# Run in Houdini: g = {'SKEL': ..., 'OUT': ...}; exec(open(this).read(), g)
+# 26 October 2026 : TOPOLOGY OF THE WOOD (TopoCheck is the judge) : tube ends are closed by `quad_caps` (a Coons patch of (n/4) x (n/4) quads built on the open ring, then raised into a dome of `cap_dome` ring radii for rings under
+# `cap_dome_max_r` metres, flat above : the trunk base) instead of Sweep's concentric grid cap (valence 16 pole and degenerate quads). Leaves keep a width floor `leaf_tip_w` at both ends (a pointed 7 x 2 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/archetypes/TreeGrow.py
+# 25 October 2026 : ZenRay Meshes tree archetype, LIMBS by space colonization (Runions et al. 2007), no AI.
+# EN: attraction points are sampled in the crown volume measured on the sheet (visual hull above the crown base);
+# branches grow from the trunk top toward them (influence radius, kill radius, step), radii follow the pipe model
+# (r_parent^2 = sum r_child^2), the trunk is the measured sweep. Output JSON skeleton (nodes, parents, radii, tips)
+# read by a Python SOP in Houdini that builds curves for Sweep (clean quad rings) and leaf cards (quads) at the tips.
+# FR : les branches poussent vers des points tirés dans le volume mesuré de la couronne ; rayons par le modèle des tuyaux.
+# Usage: python TreeGrow.py <hull.npz> <measure.json> <out.json> [k=v]
+import sys, os, json
+import numpy as np
+from scipy.spatial import cKDTree
+
+# learned defaults 25 October 2026 (TreeFit + sweeps v4 to v13, best v12: sheet 0.849, hull 0.874)
+P = {"ridge": 0, "base_cap": 1.15, "trunk_smooth": 1.5, "leaf_inset_m": 0.15, "crown_rule": 1, "crown_min_frac": 0.22, "trunk_clear_k": 1.6, "trunk_clear_m": 0.35, "max_seg_m": 1.0, "shell_clumps": 14000, "shell_depth_m": 0.6, "prune_out": 1, "root_flare": 1.
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/CageFit.py
+"""28 October 2026 : ZenRay Meshes CAGE FIT (task K1a, the Maya way) : the body as ONE subdivision cage whose edge loops follow the
+curves. The rig curves (clean NURBS) are re-sampled at the cage spacing (cage_m, about 8 cm, opposite sides matched again), the Coons and
+crown positions are the targets, design curves are creased (sharp), and the cage is moved until its subdivision limit passes through the
+targets (inverse subdivision : cage += target - limit, iters times, three Catmull Clark levels as the limit). Patch borders are now inner
+loops of one mesh, so the surface stays smooth across them (a Coons loft only matches positions there, hence the pinches).
+python CageFit.py <rig.json> <out.npz> [--cage-m 0.08] [--iters 12] [--levels 3]
+FR : la caisse en une cage de subdivision dont les boucles suivent les courbes, ajustée pour passer par elles."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+import RetopoMethods as M
+from PatchNet import Net
+
+
+def coarse_counts(rig, cage_m):
+  
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/CarNet.py
+"""28 October 2026 : ZenRay Meshes CAR NET, the curve network of the whole body, section by section, all in ONE PatchNet so that every
+curve between two panels exists once (welded by construction). Section 1 is the front fender (FenderNet.add_fender). Section 2 (task C2a)
+is the door section : DOOR (rocker crease to shoulder crease), DOOR_SB (shoulder crease to belt), ROCKER_D (sill bottom to rocker crease,
+under the door), ROCKER_F (under the fender, up to the front arch) and RING_LOW (the arch ring from the fender down to the sill bottom).
+Lines come from DesignLines.json (one arc each, measured on the reference side view), the rear door cut from the reference (a slanted
+line, measured on the left view), x from the sculpt skin. FR : le réseau de courbes de la caisse, section par section, un seul réseau."""
+import json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import Common as C
+import FenderNet as F
+
+PARAMS = {   # 28 October 2026 : the interface of the door section (side view z, y in metres)
+    "rear_cut_bottom": (-0.498, 0.318), "rear_cut_top": (-0
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/CombBoard.py
+"""28 October 2026 : ZenRay Meshes CURVATURE COMB board : sections of a mesh with their curvature comb (the designer's fairness tool) ; a
+fair section has a comb that grows and shrinks smoothly and changes side only at a real inflection. Red ticks mark the curvature flips that
+CurveFair counts. python CombBoard.py <mesh.npz> <out.png> --at -0.5,-0.95 [--axis z] [--scale 0.004]
+FR : coupes avec leur peigne de courbure, l'outil des designers pour juger qu'une courbe est lisse."""
+import argparse, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy.signal import savgol_filter
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import CurveFair as CF
+PARAMS = {"panel_px": 520, "cols": 3, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "comb_every": 4}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("out"); ap.add_argument("--at", required=True); ap.add_argument("--axis", default="z")
+    ap.add_argument("--scale", type=float, default=0.004); ap.add_argument("--keep-x", type=float, default=0.3); ap.add_argument("--box", default="")   # u0,u1,v0,v1 zoom
+    a = ap.pa
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/CurveFair.py
+"""28 October 2026 : ZenRay Meshes CURVE FAIRNESS, Matthieu's rule made a verifier : no zigzag, no staircase edge, no Z segment ; every
+curve is smoothed for a motion pleasant to the eye ; only a truly straight line (glass, table) stays straight, and then perfectly straight.
+A polyline is resampled by arc length, split at true corners (turn above corner_deg concentrated within corner_win_m), and each piece is
+compared with its local cubic fit (Savitzky Golay over window_m, which keeps arcs and S curves exact) :
+  lobes    = sign changes of the distance to that fit where it exceeds lobe_tol_mm (a zigzag or a staircase alternates at every step ; a tight
+             but taut fillet only leaves one or two lobes, so it is NOT refused : correction of 28 October 2026, the first version refused fillets) ;
+  flips    = sign changes of the curvature of the fit, counted only where |curvature| > kappa_min (a wave longer than the window shows here) ;
+  waviness = largest distance to the fit, reported only.
+A piece passes when lobes <= lobes_max and flips <= allowed (1 for a rig curve : an arc or one S ; 2 for a mesh section, which may cross a
+soft concave valley between two convex areas). Two 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/FoldLocate.py
+"""28 October 2026 : ZenRay Meshes FOLD LOCATOR : on a subdivided mesh (npz P, Q) and its rig (sharp curves exempt), the non design
+folds (dihedral between neighbour faces, edges farther than 12 mm from a sharp curve) : p50, p99, max, and the worst ones clustered with
+their nearest rig nodes. It says WHERE a pinch is, so the curve network is fixed there instead of guessed.
+python FoldLocate.py <mesh.npz> <rig.json> [--k 4] [--top 60]   FR : localise les plis hors arêtes de design et les nœuds voisins."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import RigLib as RL
+ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("rig"); ap.add_argument("--k", type=int, default=4); ap.add_argument("--top", type=int, default=60); a = ap.parse_args()
+d = np.load(a.mesh); P = d["P"]; Q = d["Q"]; rig = json.load(open(a.rig)); C = np.array(rig["controls"])
+kds = cKDTree(np.vstack([RL.evaluate(C[c["cvs"]], 300) for c in rig["curves"].values() if c.get("sharp")]))
+fn = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]); fn /= np.lina
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/HouRigBuild.py
+# 28 October 2026 : ZenRay Meshes CURVE RIG, Houdini builder. Run inside Houdini (MCP or Python shell) :
+#   exec(open('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/curverig/HouRigBuild.py').read()); build('/obj/ZRM_CurveRig', RIG_JSON, LIB_DIR)
+# Network : CTRL (rig file, density, subdivision, one crown per patch, mirror) -> CONTROLS (the controllers, points) -> EDIT (move them with
+# the handles, like a Maya rig) -> CURVES (the NURBS, coloured : sharp red, fixed white, free blue) and LOFT (Coons patches of the curves,
+# crowns, 'sharp' edge group) -> CREASE -> MIRROR -> SUBDIVIDE (creases kept) ; CTRL_SPHERES shows the controllers ; DISPLAY merges all.
+# FR : le montage du rig de courbes dans Houdini : contrôleurs, nœud Edit, courbes NURBS, loft, symétrie, subdivision.
+import hou, json
+
+PY_HEAD = ("import sys, json, importlib\n"
+           "ctrl = hou.node('../CTRL'); lib = ctrl.parm('lib_dir').eval()\n"
+           "if lib not in sys.path: sys.path.insert(0, lib)\n"
+           "import RigLib; importlib.reload(RigLib)\n"
+           "import numpy as np\n"
+           "rig = RigLib.load(ctrl.parm('rig_json').eval())\n"
+           "node = hou.pwd(); geo = node.geometry()\n")
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/MakeRigCar.py
+"""28 October 2026 : ZenRay Meshes CURVE RIG of the body (generalizes MakeRigFender). The CarNet network (fender, door section, ...) is
+solved, built and fitted once (R07 : the curves that are not design lines relax with the surface), then every curve becomes a clamped
+cubic B-spline fitted to its FITTED vertex chain (adaptive, fewest control points under fit_tol_mm), every node one shared control, and
+every patch crown fitted to the fitted surface : the rig reproduces the fit, then the designer edits the controls. Writes the rig JSON and
+the loft, and measures it. python MakeRigCar.py [--sections fender,door] [--out work/car/curverig/RIG_car.json]
+FR : le rig de courbes de la caisse : réseau ajusté une fois, courbes NURBS prises sur la surface ajustée, bombés ajustés."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+import Common as C
+import CarNet as CN
+
+PARAMS = {"mode": "hard", "hard_cv_line": 4, "hard_cv_arc": 6, "hard_arcs": ["lip", "lip_r", "lip_t", "lip_f", "lip_low", "ou
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/MakeRigFender.py
+"""28 October 2026 : ZenRay Meshes CURVE RIG, first instance : the front fender. Takes the FenderNet curve network (shared nodes, patches,
+solved counts), turns every curve into a clamped cubic B-spline with few control points (cv_per_m, between cv_min and cv_max : few points,
+so the curve cannot wave), makes every network node ONE shared control, fits each patch crown to the sculpt (least squares along the patch
+normal), writes the rig JSON, then lofts it with RigLib and measures it like the tournament (sculpt deviation, fold, shading noise against
+the reference, crease on an edge loop, weld ready). python MakeRigFender.py [--out work/car/curverig/RIG_fender.json]
+FR : le rig de courbes de l'aile : courbes NURBS à peu de points, nœuds partagés, bombé par patch, loft mesuré."""
+import argparse, io, contextlib, json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+import Common as C
+import FenderNet as F
+from PatchNet import Net
+
+PARAMS = {"cv_min": 4, "cv_max": 12, "fit_tol_mm": 4.0}   # 28 October 2026 : few control points per curve, th
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/RenderRig.py
+"""28 October 2026 : ZenRay Meshes CURVE RIG preview : loft of a rig JSON, two Catmull Clark levels (design edges sharp), smooth shaded
+render (three quarter front and side) and a ZEBRA render (reflection stripes : a wrinkle bends the stripes, a clean class A surface keeps
+them smooth), one board. python RenderRig.py <rig.json> <out.png> [title]   FR : aperçu du rig, rendu lissé et rayures zébrées."""
+import os, subprocess, sys, json
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo")); sys.path.insert(0, os.path.dirname(HERE))
+import RigLib as RL, Common as C, RetopoMethods as M, Raster
+from PIL import Image, ImageDraw
+rig_path, out = sys.argv[1], sys.argv[2]; title = sys.argv[3] if len(sys.argv) > 3 else os.path.basename(rig_path)
+if rig_path.endswith(".npz"):   # 28 October 2026 : an already subdivided mesh (CageFit output : P, Q)
+    d = np.load(rig_path); P = d["P"]; Q = d["Q"].tolist()
+else:
+    rig = json.load(open(rig_path)); P, Q, sharp, lines, grids = RL.loft(rig); sh = set(map(tuple, sharp))
+    P, Q, sh = M._cc(P, Q, sh); P, Q, _ = M._cc(P, Q, sh)
+T = C.tris(
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/RigLib.py
+"""28 October 2026 : ZenRay Meshes CURVE RIG LIBRARY (pure numpy : the same code runs in Houdini's Python SOPs and in the bench).
+A rig is a JSON : controls (the controllers, 3D points ; a node shared by several curves is ONE control), curves (B-spline of degree 3
+through clamped knots, its control indices, flags fixed and sharp, optional locked sample fractions), patches (four sides, each a chain of
+curves ; '-' reverses), counts (intervals per curve, opposite sides equal) and crowns (one bulge per patch, metres). The surface is a
+loft of the curves only : every patch is a Coons patch of its four sampled sides plus its crown along the patch normal ; curves shared by
+two patches are sampled once, so the panels are welded by construction. Moving a control moves its curves, which moves the loft.
+FR : la bibliothèque du rig de courbes : contrôleurs, courbes NURBS, loft de Coons avec bombé, soudé par construction."""
+import json
+import numpy as np
+
+
+# ---------- B-spline ----------
+def knots(k, p):
+    """Clamped uniform knot vector for k control points of degree p."""
+    inner = np.linspace(0, 1, k - p + 1)[1:-1]
+    return np.r_[np.zeros(p + 1), inner, np.ones(p + 1)]
+
+
+def basi
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/RockerCorner.py
+"""28 October 2026 : ZenRay Meshes ROCKER CORNER (task KF2b-1). The lower corner of the body side, where the side wall stops and the body turns
+under the car (or meets the skirt blade). Its HEIGHT is the reference's own line : the left view traces it as a horizontal crease (ViewTrace,
+component rocker) and the right view confirms it within 2 mm ; the sculpt v752 puts its wall bottom about 8 mm higher, so the sculpt is only a
+diagnostic for the height. Its DEPTH x(z) is measured on the sculpt, section by section : at every z the outer skin profile x(y) is read
+(largest x within probe_m of (y, z)), the wall is the straight line fitted to it between wall_y0 and wall_y1 (it leans), and x is that line
+at the reference height. x(z) is smoothed (smoothing spline, the smallest smoothing for which every panel segment, cut at the door range
+read from the delivery, passes CurveFair) into ONE design line from arch to arch.
+Writes work/car/curverig/rocker_corner.json (the line, the reference height, the panel cuts, the raw readings) and versions/RockerCorner.png
+(profiles at six z with the wall line and the corner read on the sculpt ; the height along the car ; the depth along the car).
+python 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/Schematic.py
+"""28 October 2026 : ZenRay Meshes SCHEMATIC, the blueprint sheet that makes the truth (Matthieu's rule : the schematics are checked first,
+the 3D follows ; a schematic is faster to correct than a component). One sheet with the six reference views (left, right, top, bottom,
+front, back), each at its calibrated scale (work/car/frame/frame.json), and on every view : every NURBS curve of the rig, coloured by the
+component it belongs to (left side as built, right side mirrored), thick when it is a sharp crease, medium for a design or border line,
+thin for a spoke ; the nodes (named on the left and top views) ; the measured points (pixel readings, crosses) and the ONE smooth curve
+fitted through them (purple), so each reading and its smoothing are checked side by side. Also writes points.json : every node with its
+world matrix (tangent, binormal, normal, position, like a Maya controller), and every measured line with its points, its smooth fit and
+the residual of each point to the fit.
+python Schematic.py [--rig work/car/curverig/RIG_car_hard.json] [--cage work/car/curverig/cage_side.npz] [--out versions/Schematic_car.png]
+FR : la planche des schémas, les six vues de la ref et toutes l
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/SchematicComponents.py
+"""28 October 2026 : ZenRay Meshes SCHEMATIC COMPONENTS (task KS3 ; not Scripts/finish/ComponentSheet.py, the 3D sheet of the delivery). The six traced views (ViewTrace) regrouped by component : one board per
+component, one cell per view where it has lines, each cell cropped around that component's lines so that its curves read at a glance (its
+lines thick in its colour with their control points, the other lines of the view thin grey for context, the clay view faded behind).
+A component with no traced line in any view gets an empty board that says so : that is the list of curves still to draw (KS3).
+Writes versions/schematic_components/Comp_<component>.png, the assembled versions/Schematic_components.png, and work/car/schematic/components.json,
+the index mapping component -> (view, line index, kind, control point count) that a network builder reads.
+python SchematicComponents.py [--components hood,roof,...]
+FR : la planche par composant : chaque composant dessiné seul dans chaque vue où il a des traits, pour une validation un par un."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+HERE = os.path.dirname(os.path.abspath(__file__)); 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/SchematicLines.py
+"""28 October 2026 : ZenRay Meshes SCHEMATIC LINES, the schematic read at the SOURCE (task KS2b-2). A network builder calls snap_polyline on a
+line it is about to use (the fender shoulder crease, a belt, a lip) : the polyline is projected into the traced view where its surface faces,
+paired with the ONE ref line that covers it (cover >= min_cover within search_px, mean offset <= max_mean_px), and moved onto it by one smooth
+displacement (polynomial of degree deg along the line, capped at cap_m, tapered to zero over taper of the length at both ends so the nodes it
+shares with other curves stay), depth kept. Every node computed later from the line (an intersection like XA or XC) then follows by itself :
+correcting a line after the network is built folded the ring at XC (KS2b-1b). Returns the line and a report.
+FR : le schéma lu à la source : une ligne est recalée sur la ref avant que le réseau ne calcule ses intersections."""
+import json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+from Schematic import view_mapper
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"search_px": 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/SchematicMatch.py
+"""28 October 2026 : ZenRay Meshes SCHEMATIC MATCH (task KS2, the schematic as the source). Every curve of the curve rig is projected into the six
+traced views (ViewTrace) and paired with the schematic line that covers it best ; the result says, curve by curve, which ref line carries it
+and how far it sits from it, in pixels and in millimetres. A design curve that no ref line covers, or that sits more than far_px away, is
+badly placed (the red fender of the first sheet) ; spokes are construction lines and only reported. Writes work/car/schematic/rig_match.json
+and versions/views/Match_<view>.png : schematic lines grey, rig curves green (near), orange (off), red (far or not on any ref line).
+python SchematicMatch.py [--rig work/car/curverig/RIG_car_hard.json]
+FR : chaque courbe du réseau 3D appariée à la ligne de la ref qui la porte, avec son écart en millimètres."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+from Schematic import vie
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/SectionBoard.py
+"""28 October 2026 : ZenRay Meshes SECTION BOARD. Cross sections z = const of the sculpt (outer skin, grey), of chosen delivery parts
+(colours) and of a rig or cage (red), with the rig nodes near each plane, so a curve network is laid on the real shape and not guessed
+from one view (lesson of the quarter band : a line seen in the side view lands 30 cm inboard on a nearly flat haunch top).
+python SectionBoard.py <out.png> --z -0.77,-0.95,-1.13 [--box 0.5,1.15,0.75,1.3] [--delivery npz] [--parts CAR_body_belt_L,...] [--cage npz] [--rig json]
+FR : coupes transversales de la sculpture, des pièces livrées et du rig, pour poser les lignes sur la vraie forme."""
+import argparse, json, os, sys, fnmatch
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"panel_px": 420, "cols": 3, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "node_tol_m": 0.03,
+          "palette": [(46, 134, 222), (230, 126, 34), (39, 174, 96), (142, 68, 173), (241, 196, 15), (26, 188, 156), (211, 84, 0), (127, 140, 141)]}
+
+
+def section(P, F, z):
+    """Segments of the quad or triangle mesh (P, F) cut by the plane z (ret
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/SnapToSchematic.py
+"""28 October 2026 : ZenRay Meshes SNAP TO SCHEMATIC (task KS2b, the schematic is the source). Every design curve of the rig whose surface faces
+one of the given views is moved onto the ref line that covers it in that view : each sample goes to the nearest point of that ONE line, the
+depth comes back by a ray on the skin along the view (horizontal ray for a side view, vertical ray for the top view), the shared nodes take
+the mean move of their curves, and every curve is refit with its own control point count, its ends on its nodes (RigLib.fit_robust). A curve
+is snapped only if one ref line covers min_cover of it within search_px ; construction curves only follow their nodes.
+python SnapToSchematic.py <rig.json> <out.json> [--views left,top] [--search-px 15]
+FR : chaque courbe de design recalée sur sa ligne de la ref, dans la vue où sa surface fait face ; profondeur reprise sur la peau."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import RigLib as RL
+from Schematic import view_mapper
+W = "/Users/ze
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/TwoViewValidate.py
+"""28 October 2026 : ZenRay Meshes TWO VIEW VALIDATE (task KS2c). A design curve may only be snapped on a schematic line whose identity is
+validated : the nearest traced line can be another feature (the fender crease went onto the arch lip, KS2b-2). For a curve that runs along
+the car, every candidate line of the left view (its height y(z)) and of the top view (its width x(z)) that covers it within search_px is paired ;
+each pair rebuilds a 3D line (x(z), y(z), z) over the z range they share, and its distance to the sculpt is measured. The right pair lies on the
+skin (median under skin_ok_mm), a wrong pair floats. The report says, curve by curve : the skin distance of the current curve, of the pair
+made of the nearest lines, and of the best pair, and whether proximity alone would have chosen wrong.
+python TwoViewValidate.py [--rig work/car/curverig/RIG_car_hard.json] [--out work/car/schematic/two_view.json]
+FR : un appariement courbe et ligne n'est validé que si les lignes des deux vues reconstruisent une courbe posée sur la peau."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.inse
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/ViewSheet.py
+"""28 October 2026 : ZenRay Meshes VIEW SHEET, the schematic sheet assembled ONLY from the six views traced individually (Matthieu's rule :
+« réunir la sheet uniquement une fois que tu as fait les 6 individuellement »). Every view is re-traced first with the current ViewTrace
+(so the six share the same tool), then the six View_<view>.png are tiled as left, right, top, bottom, front, back, each with its line count
+and its CurveFair verdict ; the sheet refuses to assemble if a view is missing or has a refused line.
+python ViewSheet.py [--no-retrace] [--out versions/Schematic_views.png]
+FR : la planche assemblée seulement à partir des six vues relevées une à une, chacune relancée avec l'outil courant."""
+import argparse, json, os, subprocess, sys
+from PIL import Image, ImageDraw, ImageFont
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {"layout": [["left", "right"], ["top", "bottom"], ["front", "back"]], "names": {"left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous", "front": "face", "back": "arrière"},
+          "tile_w": 1240, "margin": 24, "title_h": 40, "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "py": "/User
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/curverig/ViewTrace.py
+"""28 October 2026 : ZenRay Meshes VIEW TRACE, the schematic of ONE reference view, done individually (Matthieu's rule : each of the six views
+is traced on its own, every visible line of every component, each line smoothed ; the sheet is assembled only after the six). It assembles
+the priority methods already proven in this workshop, nothing new :
+  silhouette   : the contour of the calibrated mask (frame masks) ;
+  design lines : thin dark lines of the clay reference (black hat), thinned to a skeleton and split at its junctions (the graph of
+                 WireframeExtractor, M19), branches that go straight through a junction merged back into one line ;
+  wheels       : Hough circles on the edges (CarPrep), kept as exact circles, the lines inside a wheel belong to the wheel ;
+  glass        : the dark regions inside the silhouette (side and top views), their border lines belong to the glass ;
+  smoothing    : every line becomes ONE smoothing spline through its pixels (sections 60 and 223 of the skill) and must pass CurveFair
+                 (no zigzag, stair, Z or wave) ; a refused line is smoothed more, up to smooth_sigmas, and stays flagged if it still fails.
+Writes versions/
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/BeltBand.py
+"""28 October 2026, 15:20 : ZenRay Meshes finishing, BELT BAND, the light band under the side windows, between the belt line (top) and the shoulder
+crease (bottom) of DesignLines.json, each ONE arc in y(z) (reference side view) ; x of each edge read on the old shoulder at that height and fitted
+as one arc too ; ruled quad band (--cols), proud of the old surface by --proud-m, 12 mm shell, mirrored. FR : la bande de ceinture tendue entre deux arcs.
+python BeltBand.py <delivery.npz> <out.npz> [--lines DesignLines.json] [--cols 4] [--proud-m 0.002] [--edge-m 0.02]"""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--lines", default=W + "work/car/finish/DesignLines.json")
+ap.add_argument("--cols", type=int, default=4); ap.add_argument("--proud-m", type=float, default=0.002); ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--thick", type=float, default=0.012)
+a = ap.parse_args(); L = json.load(open(a.lines)); S, _ = part(a.npz
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/BoardRow.py
+"""28 October 2026 : one row of the sheet board (reference view next to the model in the same camera) for a delivery npz, cropped and enlarged.
+python BoardRow.py <delivery.npz> <view: front|back|left|right|top|bottom> <out.png>  FR : une ligne de la planche, référence à côté du modèle."""
+import os, subprocess, sys
+import numpy as np
+from PIL import Image
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"; d = np.load(sys.argv[1], allow_pickle=True); view, out = sys.argv[2], sys.argv[3]
+Q = [list(map(int, q)) for q in d["Q"]]; n = [str(x) for x in d["names"]]; N = sorted(set(n)); ix = {m: i for i, m in enumerate(N)}; F = []; T = []
+for q, m in zip(Q, n):
+    for k in range(1, len(q) - 1):
+        F.append([q[0], q[k], q[k + 1]]); T.append(ix[m])
+tmp = W + "work/car/_board_tmp.npz"; np.savez(tmp, P=d["P"], F=np.array(F), T=np.array(T), names=np.array(N))
+subprocess.run([sys.executable, "-I", W + "Scripts/SheetBoard.py", W + "work/car/frame", W + "work/car/views", tmp, W + "work/car/_board_tmp.png", "10"], check=True, capture_output=True)
+im = Image.open(W + "work/car/_board_tmp.png"); h = im.height / 6; k = ["front", "back", "left", "right", "top", "bottom"].index(view)
+r = i
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/BoltRebuild.py
+"""28 October 2026, 20:00 : ZenRay Meshes finishing, BOLT REBUILD, each connected component of the bolt part is rebuilt as a clean all quad bolt head :
+an octagonal prism (centre, radius and height from the old component, axis = the component's thinnest direction), side quads, caps as 4 quad fans,
+closed and outward. FR : chaque boulon refait en prisme octogonal tout en quads, fermé.
+python BoltRebuild.py <in.npz> <out.npz> [--part CAR_under_bolt_C] [--sides 8]"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", default="CAR_under_bolt_C"); ap.add_argument("--sides", type=int, default=8); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = list(d["P"].astype(float)); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+idx = [i for i, m in enumerate(n) if m == a.part]; V = sorted({v for i in idx for v in Q[i]}); par = {v: v for v in V}
+def f(x):
+    while par[x] != x: par[x] = par[par[x]]; x = par[x]
+    return x
+for i in idx:
+    for v in Q[i][1:]: par[f(v)] = f(Q[i][0])
+comps = defaultdict(list)
+for v in V: comps[f(
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/ComponentSheet.py
+"""28 October 2026 : ZenRay Meshes COMPONENT SHEET, the car as a game car is judged (Forza, GTA) : component by component. Groups the parts
+of a delivery into real car components (PARAMS["components"]), audits each one by script (closed shells, non manifold edges, quads, folded
+quads, openable without its inner panel, pivot), lists the components a game car has and this one lacks, renders every component alone
+(three quarter front, auto framed) on one sheet with its status line, and writes the table. Nothing is judged by eye here.
+python ComponentSheet.py <delivery.npz> <out.png>   FR : la planche des composants de la voiture, chacun isolé, avec son état mesuré."""
+import json, os, re, sys
+from collections import defaultdict
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import Raster
+
+PARAMS = {   # 28 October 2026 : one place for the component map ; a part goes to the first component whose pattern matches its name
+    "components": [
+        ("Capot", r"CAR_body_hood"), ("Toit et rails", r"CAR_body_(roof|rail)"), ("Coffre", r"CAR_body_decklid"), ("Face arrière", r"CAR_body_rear_C")
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/CowlCurve.py
+"""28 October 2026, 14:25 : ZenRay Meshes finishing, the windshield hinge (cowl) curve shared by the hood and the windshield.
+Points of the hood rear border and of the windshield lower border on the frozen target, straight part only (|x| <= --x-max) ;
+z = mean of the two borders (constant : a straight cowl in plan), y = even polynomial of degree --deg in x (symmetric, no wave), spikes rejected (MAD) ;
+curve sampled on --n points from -x_end to x_end. python CowlCurve.py <target.npz> <out.npy> [--x-end 0.632] [--deg 4]
+FR : courbe de charnière du pare-brise, une seule courbe lisse et symétrique partagée par le capot et le pare-brise."""
+import argparse, sys, os, json
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import FinishCheck as F, ParamGrid as G
+ap = argparse.ArgumentParser(); ap.add_argument("target"); ap.add_argument("out")
+ap.add_argument("--x-max", type=float, default=0.6); ap.add_argument("--x-end", type=float, default=0.632)
+ap.add_argument("--deg", type=int, default=4); ap.add_argument("--n", type=int, default=201)
+a = ap.parse_args()
+pts = []
+for part, keep in (("CAR_body_hood_C", "low"), ("CAR_body_glass_windshield_C", "high")):
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/CurveSnap.py
+"""28 October 2026, 03:20 : ZenRay Meshes finishing, CURVE SNAP, pin the lateral edge of several parts on ONE smooth curve (x(z), y(z)) and its mirror.
+Per part and per side, the seam vertices are the vertices within --edge-band-m of the part's lateral extreme in each z slice ; each moves in x and y
+onto the curve at its own z, and every other vertex of the part takes the move of its nearest seam vertex, faded to 0 at --falloff-m (smoothstep),
+as SnapSide.py does, so no tooth appears. FR : épingle le bord latéral de plusieurs pièces sur une seule courbe lisse, symétrique.
+python CurveSnap.py <in.npz> <out.npz> <curve_L.npy> --parts A,B,C [--z-range lo,hi] [--falloff-m 0.06] [--edge-band-m 0.012] [--max-mm 60]
+"""
+import argparse
+import json
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("curve")
+    ap.add_argument("--parts", default="CAR_body_glass_windshield_C,CAR_body_roof_C,CAR_body_glass_rear_C")
+    ap.add_argument("--z-range", default="")
+    ap.add_argument("--falloff-m", type=float, default=0.06)
+    ap.add_argument("--edge-band-m", type=float, de
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/DeckLoft.py
+"""28 October 2026, 23:20 : ZenRay Meshes finishing, DECK LOFT, the decklid (coffre) rebuilt as ONE continuous quad surface between two shared edges :
+the lower edge of the rear glass (start) and the top front edge of the tail face (end). Each column is a cubic Hermite curve that leaves the glass on its
+slope and rolls over onto the tail face (end tangent pointing down), so the lid reads as merged into the body, never cut. Inner skin offset, walls with
+support loops. Start and end rows sit exactly on the neighbour vertices (0 mm). FR : coffre refait d'un seul tenant, collé à la vitre et à la face arrière.
+python DeckLoft.py <delivery.npz> <out.npz> [--half-w 0.58] [--edge-m 0.02] [--rows 8] [--t0 0.6] [--t1 0.5] [--thick 0.012] [--support 1]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+NAME = "CAR_body_decklid_C"
+
+
+def edge_curve(P, xs, pick, bin_m):
+    out = []
+    for x in xs:
+        S = P[np.abs(P[:, 0] - x) < bin_m]
+        out.append(pick(S) if len(S) else np.full(3, np.nan))
+    out = np.array(out)
+    for k in range
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/DloFromSheet.py
+"""28 October 2026, 13:20 : ZenRay Meshes finishing, DLO FROM SHEET, read the side window opening (daylight opening) of the reference side view :
+per column, below the roof edge, the dark line under the rail (window top) and the start of the light belt band (window bottom) ; y in metres per z,
+then compared with the model side glasses (top and bottom per z). Saves dlo_top_L.npy, dlo_bot_L.npy (x taken from the model glass edges).
+python DloFromSheet.py <delivery.npz> [--z-range -1.3,1.0]   FR : relève l'ouverture des vitres sur la vue de côté de la ref."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--z-range", default="-1.25,0.95"); a = ap.parse_args()
+fr = json.load(open(W + "work/car/frame/frame.json")); v = [x for x in fr["views"] if x["name"] == "left"][0]; ppm = v["px_per_m"]; b = v["bbox"]
+im = np.array(Image.open(W + "work/car/views/02_left_rgb.png").convert("L")).astype(int); m = np.array(Image.open(W + "work/car/frame/mask_left.p
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/DropNonManifold.py
+"""28 October 2026, 16:40 : ZenRay Meshes finishing, DROP NON MANIFOLD, where an edge is used by 3 or more faces of one part (a wall built on a hole
+edge that a bevel ring also uses), remove the faces that are perpendicular to the part's main skin (walls) on those edges, until each edge has 2.
+python DropNonManifold.py <in.npz> <out.npz> --parts A,B   FR : supprime les murs en trop sur les arêtes partagées par 3 faces."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", required=True); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+drop = set(); rep = {}
+for p in a.parts.split(","):
+    idx = [i for i, m in enumerate(n) if m == p]; E = defaultdict(list); N = {}
+    for i in idx:
+        q = Q[i]; v = P[q]; nn = np.cross(v[2] - v[0], v[-1] - v[1]); N[i] = nn / (np.linalg.norm(nn) + 1e-12)
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+    main = np.array([N[i] for i 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/EdgeToEdge.py
+"""28 October 2026, 01:20 : ZenRay Meshes finishing, EDGE TO EDGE, close a seam by pulling the edge of a moving part onto the straight edge of a
+fixed part (here : the fender inner edge onto the hood side edge read on the reference top view). For each slice along --axis, the moving part vertex
+nearest to the fixed edge is its edge point ; the gap vector of that slice moves every vertex of the slice, faded to 0 at --falloff-m from the edge
+point, so the edge lands at 0 mm and the panel bends smoothly behind it. The left side is computed, the right side is its mirror.
+python EdgeToEdge.py <in.npz> <out.npz> --fixed CAR_body_hood_C --moving CAR_body_fender_front_L,CAR_body_fender_front_R [--range 1.57,2.18] [--falloff-m 0.08]
+FR : soude le bord d'une pièce mobile sur le bord droit d'une pièce fixe, glissement lissé derrière le bord, symétrique.
+"""
+import argparse
+import json
+
+import numpy as np
+
+
+def verts(d, names, part):
+    return np.array(sorted({v for q, m in zip(d["Q"], names) if m == part for v in q}))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--fixed", default="CAR_body_hood_C")
+    ap.add_arg
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/EdgeToLine.py
+"""28 October 2026, 14:00 : ZenRay Meshes finishing, EDGE TO LINE, move the top (or bottom) edge of parts in y onto a reference line y(z) (read on the
+side view), the vertices below following with a smoothstep falloff over --falloff-m, only inside --z-range ; applied the same to the L and R parts,
+so the symmetry is kept. FR : amène le bord haut d'une pièce sur une ligne de la vue de côté, fondu vers le bas.
+python EdgeToLine.py <in.npz> <out.npz> <line.npy (x, y, z)> --parts A_L,A_R [--end max] [--z-range 0.0,0.9] [--falloff-m 0.08] [--max-mm 50]"""
+import argparse, json
+import numpy as np
+from scipy.interpolate import UnivariateSpline
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("line")
+ap.add_argument("--parts", required=True); ap.add_argument("--end", default="max"); ap.add_argument("--z-range", default="0.0,0.9")
+ap.add_argument("--falloff-m", type=float, default=0.08); ap.add_argument("--max-mm", type=float, default=50.0); ap.add_argument("--fade-m", type=float, default=0.10)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+L = np.load(a.line);
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FacetFair.py
+"""28 October 2026, 16:50 : ZenRay Meshes finishing, FACET FAIR, a faceted panel (front fender) made taut facet by facet : the faces are grouped in
+facets bounded by creases sharper than --crease-deg (region growing on face normals), each facet with enough faces is refitted along its own mean
+normal as one degree 2 surface (local frame), the move fades to 0 within --fade-m of the facet outline, so creases and welds stay ; L and R.
+python FacetFair.py <in.npz> <out.npz> --part CAR_body_fender_front_L [--crease-deg 20] [--min-faces 40] [--fade-m 0.03]
+FR : tend un panneau à facettes facette par facette, arêtes gardées."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", required=True)
+ap.add_argument("--crease-deg", type=float, default=20.0); ap.add_argument("--min-faces", type=int, default=40); ap.add_argument("--fade-m", type=float, default=0.03)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+
+
+def run(part):
+    Q = [list(map(int, q)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FacingEdge.py
+"""28 October 2026, 06:00 : ZenRay Meshes finishing, FACING EDGE, the edge of a frame part that faces an edge of a panel, as one smooth curve :
+per z slice, the panel edge point (max or min along --axis) and the frame vertex nearest to it ; outliers out, LSQ cubic spline with --knots knots
+on x(z) and y(z). Saves the curve and its x mirror (_R). FR : le bord d'un cadre qui fait face au bord d'une pièce, lissé en une courbe.
+python FacingEdge.py <delivery.npz> <panel> <frame> <out_L.npy> --axis 1 --end max [--z-range lo,hi] [--knots 4]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.interpolate import LSQUnivariateSpline
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("panel"); ap.add_argument("frame"); ap.add_argument("out")
+ap.add_argument("--axis", type=int, default=1); ap.add_argument("--end", default="max"); ap.add_argument("--z-range", default=""); ap.add_argument("--knots", type=int, default=4)
+a = ap.parse_args()
+G, _ = part(a.npz, a.panel); Fr, _ = part(a.npz, a.frame); sg = 1 if a.end == "max" else -1
+lo, hi = (float(v)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FenderGrid.py
+"""28 October 2026, 21:10 : ZenRay Meshes finishing, FENDER GRID, the front fender rebuilt as one adaptive quad grid (finish checklist) :
+columns in z (door cut to nose), each column runs from its bottom (the sill line, or the arch circle when the column is over the wheel) to its top
+(the top edge : hood side curve where it exists, the frozen target fender top behind it, one arc each), so the arch edge follows the circle exactly
+and no cell is cut ; x of every vertex = ray (+x to -x) hit on the frozen target fender, then smoothed (Gaussian over --smooth cells) ; closed 12 mm
+shell, outward by signed volume, mirrored. FR : l'aile refaite en une grille adaptée, arche suivant le cercle, profondeur lue sur la forme gelée.
+python FenderGrid.py <delivery.npz> <out.npz> [--target work/car/target_v644.npz] [--rows 22] [--smooth 1.5]"""
+import argparse, json, os, sys
+import numpy as np, trimesh
+from scipy.ndimage import gaussian_filter
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part, tri
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--t
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FenderPatch.py
+"""28 October 2026, 22:40 : ZenRay Meshes finishing, FENDER PATCH, the front fender as patches between design curves (section 225 : patch layout first,
+four sided sections from the arch to the upper surface), nothing projected on the crumpled frozen shape :
+three boundary curves per column z (one arc each) : BOTTOM (the arch circle over the wheel, the sill line elsewhere), CREASE (the shoulder crease of the
+reference side view, lifted over the arch so it never crosses it), TOP (the hood side edge, the old fender top behind the cowl) ; x of each curve is one
+arc fitted on the frozen fender at that height ; the lower facet is ruled bottom to crease, the upper facet ruled crease to top with a light crown ;
+the crease row is shared (a crisp edge with one support row each side) ; closed 12 mm shell, mirrored. FR : l'aile en patchs tendus entre courbes de design.
+python FenderPatch.py <delivery.npz> <out.npz> [--crease z0,y0,z1,y1,sag] [--rows-low 8] [--rows-up 10] [--crown-m 0.01]"""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+ap =
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FenderPatch3.py
+"""28 October 2026, 23:00 : ZenRay Meshes finishing, FENDER PATCH 3, the front fender as THREE four sided patches (section 225, GrabCAD : supporting
+curves from the arch to the upper surface) split by two vertical curves at the arch ends z = cz -+ R : REAR (door cut to arch), OVER THE ARCH,
+FRONT (arch to nose). Every column of every patch has the same R rows from the arch level yk up to the top (lower facet, support, crease, support,
+upper facet) ; the side patches have --rows-sill extra rows from the sill up to yk, ending on the vertical arch flank. Shared columns are computed with
+the same formula, welded, and the single sheet is solidified (Solidify logic). Curves : arch circle (fitted on the arch part), sill y, crease (reference
+side view, one arc, lifted over the arch), top (hood side edge, old top behind the cowl) ; x of each curve one arc on the frozen fender.
+python FenderPatch3.py <delivery.npz> <out.npz>   FR : l'aile en trois patchs à quatre côtés, soudés par construction."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from Finis
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FenderRebuild.py
+"""28 October 2026, 17:30 : ZenRay Meshes finishing, FENDER REBUILD, the front fender rebuilt from its design lines (rule 223, every line ONE arc) :
+a quad grid in the side view plane (z, y) between the door cut (z_rear) and the nose (z_front), from the bottom line up to the hood side edge
+(the hood weld, read on the hood and fitted as one arc) ; the wheel arch is a circle fitted on the old arch ring (its cells removed) ; x(z, y) is
+made of two facets split at the crease arc (reference side view) : the upper facet leans from the hood edge out to the crease, the lower facet
+falls from the crease to the bottom line, each edge x an arc fitted on the old fender. 12 mm shell, mirrored to the right.
+python FenderRebuild.py <delivery.npz> <out.npz> [--crease z0,y0,z1,y1,sag]   FR : l'aile avant refaite depuis ses lignes."""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+from RearBlueprint import shell_holed
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--z-rear", type=float, default=0.70); ap.add_argument("--z-front", type=float, default=2.06)
+a
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FillHoles.py
+"""28 October 2026, 18:50 : ZenRay Meshes finishing, FILL HOLES, every closed boundary loop (open edges) of a part with an EVEN number of vertices
+(up to --max-n) is capped by quads around a new centre vertex (centroid, pushed along the loop normal by --dome of the loop radius), winding taken
+from the neighbour faces so the cap is consistent ; odd loops and loops that do not close are reported. FR : bouche les trous par des quads en éventail.
+python FillHoles.py <in.npz> <out.npz> [--max-n 400] [--dome 0.0]"""
+import argparse, json
+from collections import defaultdict, Counter
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--max-n", type=int, default=400); ap.add_argument("--dome", type=float, default=0.0); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]; P = list(d["P"].astype(float))
+filled = Counter(); skipped = Counter(); NQ, NN = [], []
+for part in sorted(set(n)):   # per part : a border vertex shared with another part must not branch the walk (28 October 2026)
+    E = defaultdict(list); D = set()
+    for i, q in enumerate(Q)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FinishAudit.py
+"""28 October 2026, 16:00 : ZenRay Meshes, FINISH AUDIT, is the car finished and ready for texturing ? The production checklist (Blender Studio
+modeling guide, Autodesk Maya Mesh Cleanup, GeoInspector) measured on the whole delivery and per part :
+  open edges (holes), non manifold edges, n-gons, triangles, degenerate faces, flipped faces (normal pointing into the car), lamina faces
+  (two faces on the same vertices), stacked layers (a visible part lying within 4 mm of another visible part over more than 20 % of its area :
+  a band laid over an old panel), unwelded seams (open border vertices of a part within 0.5..15 mm of another part : a crack that should be a weld),
+  tiny fragments (parts under 40 faces), hidden faces (never seen from 26 outside directions).
+Exit 0 only when every count is 0. --json writes the per part table. FR : le modèle est-il fini et prêt pour le texturing ? Liste de contrôle mesurée.
+python FinishAudit.py <delivery.npz> [--json out.json] [--top 30]"""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FinishCheck.py
+"""28 October 2026, 15:40 : ZenRay Meshes, FINISH CHECK, the verifier of the finishing stage for one component (section 215 of the skill).
+Compares a candidate part with the same part of the frozen target (v644) : surface deviation both ways (mm), edge length ratio p95/p50 and p95/p5,
+quad share, cracks (coincident unwelded points), open edges, fold inside a quad (worst diagonal), valence of interior vertices.
+python FinishCheck.py <candidate.npz> <part_name> [--target work/car/target_v644.npz] [--json out.json]
+Exit code 0 when every limit of FINISH passes. FR : vérificateur de finition d'une pièce contre la cible gelée.
+"""
+import argparse
+import json
+import sys
+from collections import defaultdict
+
+import numpy as np
+import trimesh
+
+FINISH = {"dev_p95_mm": 1.0, "dev_max_mm": 3.0, "cover_max_mm": 3.0, "edge_p95_p50": 1.6, "quad_pct": 100.0,
+          "fold_max_deg": 10.0, "cracks": 0, "open_edges": 0}
+TARGET = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/target_v644.npz"
+
+
+def part(npz, name):
+    d = np.load(npz, allow_pickle=True)
+    n = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == name]
+    V = sorted({v for q
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FixDegenerate.py
+"""28 October 2026, 19:30 : ZenRay Meshes finishing, FIX DEGENERATE, faces of zero area (or a repeated vertex) are removed by collapsing their
+shortest edge (both ends to the midpoint, within the part), repeated until none is left ; faces that lose a vertex become triangles only if a quad
+cannot be kept, and are then reported. FR : supprime les faces d'aire nulle en écrasant leur plus courte arête.
+python FixDegenerate.py <in.npz> <out.npz> [--min-area 1e-8]"""
+import argparse, json
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--min-area", type=float, default=1e-8); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+area = lambda q: np.linalg.norm(np.cross(P[q[2]] - P[q[0]], P[q[-1]] - P[q[1]])) / 2
+remap = list(range(len(P))); root = lambda v: v if remap[v] == v else root(remap[v]); fixed = 0
+for it in range(20):
+    bad = [i for i, q in enumerate(Q) if len(set(q)) < len(q) or area(q) < a.min_area]
+    if not bad: break
+    for i in bad:
+        q = [root(v) for v in Q[i]]
+        if len(set(q)) < 2: co
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/FrontCurve.py
+"""28 October 2026, 14:55 : ZenRay Meshes finishing, the hood front edge curve shared with the fascia band below (no W wave).
+Points : top edge of CAR_fascia_front_band_C (highest point per x station) and front edge of the hood skin ; y = even polynomial deg 2,
+z = even polynomial deg --deg in x (a clean arc in plan, as the reference top view), MAD rejection ; sampled on --n points over [-x_end, x_end].
+Also writes the band moved onto it (every band vertex shifted by the y, z delta of its x station) : --band-out <npz> from --delivery.
+python FrontCurve.py <delivery.npz> <curve.npy> [--deg 4] [--x-end 0.69] [--band-out delivery_band.npz]
+FR : courbe du bord avant du capot, partagée avec le bandeau, arc propre sans vague ; le bandeau est redressé dessus."""
+import argparse, json, sys, os
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import FinishCheck as F
+ap = argparse.ArgumentParser(); ap.add_argument("delivery"); ap.add_argument("out")
+ap.add_argument("--deg", type=int, default=4); ap.add_argument("--x-end", type=float, default=0.69); ap.add_argument("--n", type=int, default=201)
+ap.add_argument("--band-out", default=""); ap.add_argument("--wi
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/GlassRuled.py
+"""28 October 2026, 20:30 : ZenRay Meshes finishing, GLASS RULED, a side window rebuilt as a taut ruled surface (finish checklist + rule 223) :
+top edge = the rail outer edge curve (rail_out2_L.npy), bottom edge = the belt line arc of DesignLines.json (y) with x one arc fitted on the old glass
+bottom ; per z column a straight segment from bottom to top, columns from the old glass z range (cut where the edges meet, a pointed tip), sides
+mirrored ; closed 6 mm shell (outward by signed volume). FR : vitre latérale refaite en surface réglée tendue entre la ceinture et le rail.
+python GlassRuled.py <delivery.npz> <out.npz> --part CAR_body_glass_door_L [--inset-m 0.004] [--rows 10]"""
+import argparse, json, os, sys
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/finish/"
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--part", required=True)
+ap.add_argument("--inset-m", type=float, default=0.004); ap.add_argument("--rows", type=int, default=10); ap.add_argument("--edge-m", type=float, default=0.02)
+ap.add_argument("--
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/HingeCurve.py
+"""28 October 2026, 03:00 : ZenRay Meshes finishing, HINGE CURVE, the one smooth side line of the greenhouse (windshield, roof, rear glass) on the left.
+Per z slice, the outer top vertex of the three parts ; a least squares cubic B-spline with --knots interior knots, outliers removed in --iters passes.
+Saves the curve (x, y, z) and a board : top x(z) and side y(z), current edge red, rejected blue, curve green. FR : une seule ligne lisse le long du vitrage.
+python HingeCurve.py <delivery.npz> <curve.npy> <board.png> [--knots 5] [--parts ...]
+"""
+import argparse
+import json
+
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy.interpolate import LSQUnivariateSpline
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("board")
+    ap.add_argument("--parts", default="CAR_body_glass_windshield_C,CAR_body_roof_C,CAR_body_glass_rear_C")
+    ap.add_argument("--knots", type=int, default=5)
+    ap.add_argument("--iters", type=int, default=5)
+    ap.add_argument("--slice-m", type=float, default=0.01)
+    a = ap.parse_args()
+    d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x i
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/HoodLoft.py
+"""28 October 2026, 23:50 : ZenRay Meshes finishing, HOOD LOFT, the front hood rebuilt as one ruled quad surface, read on the reference top and side views :
+a trapezoid with straight edges (top view), one smooth line from the windshield hinge down to the nose (side view), a straight front edge (front view).
+The rear row keeps EXACTLY the vertices the hood already shares with the cowl curve (hinge stays 0 mm) ; the front row is a straight line ; every column
+uses the same Hermite profile (start slope at the hinge, end slope at the nose), so the surface is flat across x and has no step, no W.
+python HoodLoft.py <delivery.npz> <out.npz> [--front-z 2.245] [--front-y 0.535] [--front-half-w 0.713] [--s0 -0.31] [--s1 -0.59] [--rows 34] [--thick 0.012]
+FR : capot refait en surface réglée, charnière gardée, bord avant droit, un seul profil lisse.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+NAME = "CAR_body_hood_C"
+SEAM = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/finish/cowl_curve.npy"
+
+
+def shell(S, thick, support, up=1)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/HouFinishPreview.py
+# 28 October 2026 : finishing preview in the live Houdini scene : /obj/ZRM_Finish shows the candidate part (left) and the target part shifted (right), wireframe on shaded.
+import hou
+cand, targ, shift = globals()['CAND'], globals()['TARG'], float(globals().get('SHIFT', 1.7))
+g = hou.node('/obj/ZRM_Finish') or hou.node('/obj').createNode('geo', 'ZRM_Finish')
+for c in g.children(): c.destroy()
+a = g.createNode('file', 'candidate'); a.parm('file').set(cand)
+b = g.createNode('file', 'target'); b.parm('file').set(targ)
+t = g.createNode('xform', 'shift_target'); t.setInput(0, b); t.parm('tx').set(shift)
+m = g.createNode('merge', 'both'); m.setInput(0, a); m.setInput(1, t)
+m.setDisplayFlag(True); m.setRenderFlag(True); g.layoutChildren()
+result = [a.geometry().intrinsicValue('primitivecount'), b.geometry().intrinsicValue('primitivecount')]
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/LineAudit.py
+"""28 October 2026, 14:40 : ZenRay Meshes finishing, LINE AUDIT, the rule of Matthieu : a body line is ONE segment, a straight line or an arc whose
+curvature keeps its sign, never a wave. For every long body part, its edge lines per 2 cm slice along z (top edge in the side view : y max ; bottom
+edge : y min ; outer edge in the top view : |x| max), each line is checked : inflections (sign changes of the second difference after a 3 point
+smoothing, ignoring changes below --tol-mm) and wave amplitude (max deviation from the best degree 2 arc, mm). Sorted worst first, --json out.
+python LineAudit.py <delivery.npz> [--min-len 0.6] [--tol-mm 1.0] [--json out.json]   FR : compte les vagues de chaque ligne de la carrosserie."""
+import argparse, json
+import numpy as np
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("--min-len", type=float, default=0.6); ap.add_argument("--tol-mm", type=float, default=1.0)
+ap.add_argument("--json", default=""); ap.add_argument("--top", type=int, default=25)
+a = ap.parse_args()
+d = np.load(a.npz, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]])
+SKIP = ("wheel", "tire", "rim", "liner", "closer",
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/MergeCoincident.py
+"""28 October 2026, 16:20 : ZenRay Meshes finishing, MERGE COINCIDENT, inside each part, vertices closer than --tol-mm become one (faces re indexed),
+degenerate faces (a vertex repeated, or area 0) are removed. Nothing moves more than tol. Same names. FR : soude les sommets confondus dans chaque pièce.
+python MergeCoincident.py <in.npz> <out.npz> [--tol-mm 0.1]"""
+import argparse, json
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--tol-mm", type=float, default=0.1); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+remap = np.arange(len(P)); merged = 0
+for p in sorted(set(n)):
+    V = np.array(sorted({x for q, m in zip(Q, n) if m == p for x in q})); t = cKDTree(P[V])
+    for i, j in sorted(t.query_pairs(a.tol_mm / 1000)):
+        ri, rj = remap[V[i]], remap[V[j]]
+        while remap[ri] != ri: ri = remap[ri]
+        while remap[rj] != rj: rj = remap[rj]
+        if ri != rj: remap[max(ri, rj)] = min(ri, rj); merged += 1
+for k in range(len(remap)):
+    r = remap[
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/MirrorMove.py
+"""28 October 2026, 03:50 : ZenRay Meshes finishing, MIRROR MOVE, make a part's move symmetric : the right half takes the mirrored displacement of the
+left half (inverse distance of the 4 nearest left vertices, measured on the BEFORE positions), so a non mirrored grid still moves symmetrically.
+python MirrorMove.py <before.npz> <after.npz> <out.npz> --parts A,B   FR : rend un déplacement symétrique, même sur une grille non miroir.
+"""
+import argparse
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+ap = argparse.ArgumentParser(); ap.add_argument("before"); ap.add_argument("after"); ap.add_argument("out"); ap.add_argument("--parts", required=True)
+a = ap.parse_args()
+o = np.load(a.before, allow_pickle=True); d = np.load(a.after, allow_pickle=True)
+P0 = o["P"].astype(float); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); S = np.array([-1, 1, 1])
+for part in a.parts.split(","):
+    V = np.array(sorted({v for q, m in zip(d["Q"], n) if m == part for v in q})); X0 = P0[V]
+    L = V[X0[:, 0] > 0]; R = V[X0[:, 0] <= 0]
+    dist, idx = cKDTree(P0[L]).query(P0[R] * S, k=4)
+    w = 1 / (dist + 1e-6); w /= w.sum(1, keepdims=True)
+    P[R] = P0[R] + ((P[L] - P0[L
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/MirrorPart.py
+"""28 October 2026 : mirror a rebuilt left part to the right (x -> -x, faces reversed), renamed. python MirrorPart.py <in.npz> <name_L> <name_R> <out.npz>"""
+import sys
+import numpy as np
+i, nl, nr, o = sys.argv[1:5]
+d = np.load(i, allow_pickle=True); P = d["P"].copy(); P[:, 0] *= -1
+Q = np.array([list(q)[::-1] for q in d["Q"]], dtype=object)
+n = np.array([nr if str(x) == nl else str(x) for x in d["names"]])
+np.savez(o, P=P, Q=Q, names=n, **({"skin": d["skin"]} if "skin" in d.files else {}))
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/MouthEdge.py
+"""28 October 2026, 00:40 : ZenRay Meshes finishing, MOUTH EDGE, the one shared edge between the hood and the band under it (the top of the mouth).
+The edge E(x) is drawn from the reference top view : straight in the middle, rounded at the corners, z = z0 - drop * (|x| / half_w) ** power, y constant.
+The band (and optionally its neighbours) is shifted column by column so its top edge lands exactly on E ; the edge is saved as a curve file that
+HoodLoft.py uses for the hood front row. FR : une seule arête commune capot et bande, lisse, droite au centre, arrondie aux coins.
+python MouthEdge.py <delivery.npz> <out.npz> <edge.npy> [--z0 2.25] [--y 0.525] [--half-w 0.69] [--drop 0.08] [--power 6] [--parts CAR_fascia_front_band_C]
+"""
+import argparse
+import json
+
+import numpy as np
+
+
+def edge(xs, a):
+    return np.stack([xs, np.full(len(xs), a.y), a.z0 - a.drop * (np.abs(xs) / a.half_w) ** a.power], 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("edge")
+    ap.add_argument("--z0", type=float, default=2.25)
+    ap.add_argument("--y", type=float, default=0.525)
+    ap.add_argument("--half-w", type=float, default=0.69)
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/OrientParts.py
+"""28 October 2026, 18:20 : ZenRay Meshes finishing, ORIENT PARTS, consistent winding inside each connected component of the listed parts (BFS over
+manifold edges : a neighbour sharing an edge in the SAME direction is flipped), then each closed component oriented outward by signed volume.
+python OrientParts.py <in.npz> <out.npz> --parts A,B   FR : orientation cohérente des faces de chaque morceau, puis vers l'extérieur."""
+import argparse, json
+from collections import defaultdict, deque
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", required=True); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = [list(map(int, q)) for q in d["Q"]]
+rep = {}
+for p in a.parts.split(","):
+    idx = [i for i, m in enumerate(n) if m == p]; E = defaultdict(list)
+    for i in idx:
+        q = Q[i]
+        for k in range(len(q)): E[(min(q[k], q[(k + 1) % len(q)]), max(q[k], q[(k + 1) % len(q)]))].append(i)
+    def dirs(i, e):
+        q = Q[i]
+        for k in range(len(q)):
+            if (q[k], q[(k + 1) % len(q)]) == e: return 1
+        retur
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/PairOddLoops.py
+"""28 October 2026, 22:00 : ZenRay Meshes finishing, PAIR ODD LOOPS, an odd boundary loop cannot be capped with quads only. From an edge of an odd loop,
+walk the quad strip across the part (enter the face by that edge, leave by the opposite edge) until the strip reaches another open edge ; every crossed
+quad is split in two by the midpoints of its entry and exit edges (an edge loop insertion), so both end loops gain one vertex : two odd loops of the
+same part become even. Tries every edge of the loop and keeps the shortest strip that ends on another ODD loop. Then run FillHoles.py.
+python PairOddLoops.py <in.npz> <out.npz>   FR : rend paires deux boucles impaires d'une pièce en insérant une boucle d'arêtes entre elles."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--max-strip", type=int, default=400); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = list(d["P"].astype(float)); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+key = lambda u, w: (min(u, w), max(u, w)); pairs = 0; rep = defaultdict(int)
+
+
+def build
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/PanelCoons.py
+"""28 October 2026, 15:55 : ZenRay Meshes finishing, method A : PANEL COONS, a new clean quad shell for a mostly horizontal panel (hood, roof, decklid),
+rebuilt ON TOP of the frozen target shape (section 215).
+1 outline of the upward skin of the target part (open edges of its up facing faces), smoothed and cut in four sides at its four plan corners ;
+2 Coons grid in plan (x, z), segment counts = side length / --edge-m, the same on opposite sides (even), uniform arc length sampling ;
+3 heights by vertical ray onto the target top skin ; 4 lower skin offset by --thick along the normal ; 5 walls with --support loops.
+python PanelCoons.py <target.npz> <part> <out.npz> [--edge-m 0.02] [--thick 0.012] [--support 1] [--smooth 0.0]
+FR : nouvelle coque propre d'un panneau presque horizontal, grille de Coons en plan, projetée sur la forme gelée.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+import trimesh
+
+
+def part(npz, name):
+    d = np.load(npz, allow_pickle=True); n = np.array([str(x) for x in d["names"]])
+    Q = [list(map(int, q)) for q, m in zip(d["Q"], n) if m == name]
+    return d["P"].astype(float), Q
+
+
+def resample(poly, n):
+    seg = np.
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/ParamGrid.py
+"""28 October 2026, 16:15 : ZenRay Meshes finishing, method A2 : PARAM GRID, a new clean quad shell for one panel, rebuilt on top of the frozen target.
+1 outer skin of the target part = the largest face region bounded by sharp edges (> --sharp-deg) whose mean normal points up (or --skin-axis) ;
+2 Tutte embedding of that skin on the unit square (boundary arc length on the 4 sides, 4 corners at the sharpest turns of the outline) ;
+3 regular grid in (u, v) with counts = mean side length / --edge-m (even), mapped back to 3D by barycentric lookup ;
+4 fairing : least squares tensor B-spline (cubic, --ctrl-u x --ctrl-v control points) of the mapped grid, border rows kept ;
+5 inner skin offset by --thick along the normal, walls with --support loops. Same part name, closed shell, quads only.
+python ParamGrid.py <target.npz> <part> <out.npz> [--edge-m 0.02] [--thick 0.012] [--ctrl-u 14] [--ctrl-v 8]
+FR : grille paramétrique (Tutte) projetée sur la forme gelée, lissée par B-spline, coque fermée en quads.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spl
+from scipy.spatial import cKDTree
+
+
+de
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/PillarBar.py
+"""28 October 2026, 06:40 : ZenRay Meshes finishing, PILLAR BAR, the B pillar (window support between the door glass and the quarter glass)
+rebuilt as a closed quad bar : at each row of the old strip, the section spans from the door glass rear edge to the quarter glass front edge, its
+outer face --proud-m outside the glass, its inner face --depth-m inside, along the local glass normal ; rows resampled to --rows, ends capped.
+Built on the left, mirrored to the right. FR : montant B refait en barre fermée qui remplit le jour entre les deux vitres.
+python PillarBar.py <delivery.npz> <out_part.npz> [--rows 12] [--proud-m 0.003] [--depth-m 0.015]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--rows", type=int, default=12); ap.add_argument("--proud-m", type=float, default=0.003); ap.add_argument("--depth-m", type=float, default=0.015)
+a = ap.parse_args()
+S, _ = part(a.npz, "CAR_pillar_b_L"); Gd, _ = part(a.npz, "CAR_body_glass_door_L"); Gq, _ = part(a.npz, "CAR_body_glass_q
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/ProfileFit.py
+"""28 October 2026, 12:40 : ZenRay Meshes finishing, PROFILE FIT, bring the centre line of the greenhouse onto the top silhouette of the reference side
+view : per z, the gap between the reference top (mask_left, frame.json) and the model top near x = 0, smoothed (LSQ spline), applied in y to the chosen
+parts with a weight that is 1 at the centre and fades to 0 at --x-edge (cos^2), and fades to 0 outside --z-range, so the side welds (rail) and the
+hinge do not move. FR : ramène la ligne centrale du vitrage sur la silhouette haute de la vue de côté de la référence, sans toucher aux soudures.
+python ProfileFit.py <in.npz> <out.npz> [--parts roof,windshield] [--z-range -0.4,1.35] [--x-edge 0.55] [--knots 6]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy.interpolate import LSQUnivariateSpline
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out")
+ap.add_argument("--parts", default="CAR_body_roof_C,CAR_body_glass_windshield_C"); ap.add_argument("--z-range", default="-0.4,1.35")
+ap.add_argument("--x-edge", type=float, default=0.55); ap.add_argument("-
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RailLoft.py
+"""28 October 2026, 12:00 : ZenRay Meshes finishing, RAIL LOFT, the roof rail (side hinge of the greenhouse, from the rear deck over the roof
+edge and down the windshield pillar) rebuilt as one smooth quad band : per z slice of the old rail, its inner top edge (side of roof and glass) and
+its outer edge (side of the side windows), each smoothed by a least squares cubic spline in z ; a ruled band between them with --cols columns
+and a crown of --crown-m outward at mid width ; 12 mm shell. Mirrored to the right. FR : le rail du pavillon refait en une bande lisse.
+python RailLoft.py <delivery.npz> <out.npz> [--knots 8] [--cols 4] [--crown-m 0.006] [--edge-m 0.02]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from scipy.interpolate import LSQUnivariateSpline
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--knots", type=int, default=8); ap.add_argument("--cols", type=int, default=4); ap.add_argument("--crown-m", type=float, default=0.006)
+ap.add_argument("--edge-m", type=float, default=0.02); ap.add_argument("--outer-cu
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RearBlueprint.py
+"""28 October 2026, 08:00 : ZenRay Meshes finishing, REAR BLUEPRINT, the rear (coffre) rebuilt from the lines of the reference back view.
+The tail face is a smooth symmetric surface z(x, y) fitted on the old tail face (polynomial in x^2 and y, robust), so the waves go ; on it, a quad frame
+with the recess hole of the reference (x +-hole_x, y hole_y0..hole_y1) ; the top rows roll over onto the decklid edge ; inside the hole, the recess
+panel and the light bar strip as clean grids set back by --recess-m. Every value is a parameter (JSON --params overrides), measured on the
+reference back view (frame.json : 172.44 px per m, axis u 312.5, ground v 323). FR : l'arrière refait d'après les lignes de la vue arrière.
+python RearBlueprint.py <delivery.npz> <out.npz> [--params file.json]
+"""
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+import ParamGrid as PG
+
+PAR = {   # 28 October 2026, read on refs back view x3 crop (native px / 172.44)
+    "frame_x": 0.975, "frame_y0": 0.49, "frame_y1": 0.95, "deck_y": 0.99, "deck_z": -2.10, "roll_rows"
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RearCorner.py
+"""28 October 2026, 10:30 : ZenRay Meshes finishing, REAR CORNER, the cut corner facets of the reference back view : on each side, a ruled quad
+facet from the outer edge of the rebuilt rear (tail frame and lower panel, its outermost vertex per height) to the body side line at z = --side-z
+(outermost x of the quarter, shoulder and rocker at that depth, smoothed). Mirrored to the right. FR : facettes d'angle arrière, du bord de l'arrière au flanc.
+python RearCorner.py <delivery.npz> <out.npz> [--side-z -1.85] [--cols 4] [--y0 0.17] [--y1 0.95]
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from FinishCheck import part
+from RearBlueprint import shell_holed
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out")
+ap.add_argument("--side-z", type=float, default=-1.85); ap.add_argument("--cols", type=int, default=4)
+ap.add_argument("--y0", type=float, default=0.17); ap.add_argument("--y1", type=float, default=0.95); ap.add_argument("--edge-m", type=float, default=0.02)
+ap.add_argument("--thick", type=float, default=0.012)
+a = ap.parse_args()
+R = np.vstack([part(a.npz, n)[0] 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RearLower.py
+"""28 October 2026, 09:30 : ZenRay Meshes finishing, REAR LOWER, the lower rear (under the ledge) rebuilt from the reference back view lines :
+a lower panel on the same designed surface as RearBlueprint.py (it meets the frame bottom at frame_y0 exactly), with two trapezoid cutouts (vents)
+and the central plate (diffuser) recessed behind 18 mm bevel rings. The grid columns follow the slanted cutout edges (guide lines x_k(y)), so every
+hole is a block of whole cells with straight edges, never a staircase. Values in LOW (JSON --params overrides), measured on the reference back view.
+python RearLower.py <delivery.npz> <out.npz> [--params file.json]   FR : le bas de l'arrière, découpes et plaque, d'après la vue arrière.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from RearBlueprint import PAR, shell_holed
+
+LOW = {   # 28 October 2026, reference back view x3 crop / 3 / 172.44 ; x = -(u - 312.5) / ppm, y = (323 - v) / ppm
+    "low_y0": 0.162, "plate_y1": 0.375, "cut_y0": 0.327, "cut_y1": 0.433,
+    "plate_x": 0.465, "cut_in_top": 0.449, "cut_in_bot": 0.594, "cut_out_top": 0.913, "cut_out_bot":
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RearShell.py
+"""28 October 2026, 17:00 : ZenRay Meshes finishing, REAR SHELL, the whole rear as ONE closed, welded, all quad shell (finish checklist, section 224).
+One structured skin grid from the ground lip (low_y0) to the deck edge : columns follow the lower cutout guides below frame_y0 and stay vertical
+above, rows break on every design height ; every recess (upper panel, light bar, two vents, diffuser plate) is a DEPTH given to the vertices by an
+inside distance ramp over --bevel-m, so chamfers are grid cells and nothing is laid over anything ; then the sheet is solidified (inner skin offset
+along vertex normals, walls on the outer border only). Values in PAR (RearBlueprint) and LOW (RearLower), JSON --params overrides.
+python RearShell.py <delivery.npz> <out.npz> [--thick 0.015]   FR : tout l'arrière en une seule coque fermée et soudée."""
+import argparse, json, os, sys
+from collections import defaultdict
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from RearBlueprint import PAR
+from RearLower import LOW
+
+ap = argparse.ArgumentParser(); ap.add_argument("npz"); ap.add_argument("out"); ap.add_argument("--params", default="")
+ap.add_argument("--thick",
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RegionView.py
+"""28 October 2026, 23:05 : ZenRay Meshes finishing, REGION VIEW, shaded close-up of a delivery around a point, with the visible edges of chosen parts drawn on top
+(red, depth tested), several view directions side by side. FR : gros plan ombré d'une zone, arêtes visibles des pièces choisies en rouge.
+python RegionView.py <delivery.npz> <out.png> --center x,y,z --size-m 1.6 [--parts CAR_body_decklid_C,...] [--views rear34,top,back,side] [--res 700]
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import Raster
+
+VIEWS = {"rear34": ((-0.70, 0, 0.71), (0.25, 0.94, 0.25)), "front34": ((0.70, 0, -0.71), (-0.25, 0.94, -0.25)),
+         "back": ((-1, 0, 0), (0, 1, 0)), "front": ((1, 0, 0), (0, 1, 0)), "top": ((1, 0, 0), (0, 0, -1)),
+         "side": ((0, 0, -1), (0, 1, 0)), "rearhigh": ((-1, 0, 0), (0, 0.6, 0.8))}
+KEY = np.array([-0.45, 0.6, 0.65])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("npz"); ap.add_argument("out")
+    ap.add_argument("--center", required=True); ap.add_argument("--size-m", type=float, default=1.6)
+    ap.add_arg
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/RenderVersion.sh
+#!/bin/zsh
+# 28 October 2026 : one kept version as a three view clean render (three quarter front, side, three quarter rear). FR : rendu propre d'une version.
+# Usage: zsh RenderVersion.sh vNNN
+cd /Users/zenray/.claude/tmp/tmp-zenray-meshes; PY=/Users/zenray/.venvs/zenray-meshes/bin/python; mkdir -p work/car/regress
+$PY -I Scripts/TopoToRender.py work/car/delivery_$1.npz work/car/regress/r_$1.npz >/dev/null && CV_VIEWS=three_quarter_front,side,three_quarter_rear $PY -I Scripts/CleanView.py work/car/regress/r_$1.npz work/car/regress/cv_$1.png '' 30 520 >/dev/null
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/ReplaceParts.py
+"""28 October 2026 : replace a set of parts of a delivery by all the parts of a candidate npz. python ReplaceParts.py <delivery> <cand> <out> --remove A,B,C
+FR : remplace un groupe de pièces par les pièces d'un candidat."""
+import argparse, numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("dl"); ap.add_argument("cand"); ap.add_argument("out"); ap.add_argument("--remove", required=True); a = ap.parse_args()
+d = np.load(a.dl, allow_pickle=True); s = np.load(a.cand, allow_pickle=True); old = set(a.remove.split(","))
+n = np.array([str(x) for x in d["names"]]); keep = [i for i, m in enumerate(n) if m not in old]
+P = np.vstack([d["P"], s["P"]]); base = len(d["P"])
+DQ = d["Q"]; SQ = s["Q"]
+Q = [list(map(int, DQ[i])) for i in keep] + [[base + int(v) for v in q] for q in SQ]; N = list(n[keep]) + [str(x) for x in s["names"]]
+np.savez(a.out, P=P.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(N)); print(len(Q), "faces,", len(set(n[keep])), "kept parts")
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/SideFair.py
+"""28 October 2026, 16:10 : ZenRay Meshes finishing, SIDE FAIR, a side panel as ONE taut surface (rule 223 : no wave) : the outward facing vertices
+(normal x > --out) of the part are refitted by x = f(y, z), a polynomial of total degree --deg (2 = one bend each way, no inflection), each moved in x
+by --blend of the gap ; the rest of the shell follows its nearest outer vertex (thickness kept) ; the move fades to 0 within --fade-m of the part's
+open border (welds) and of its outline in (y, z). Applied to the L part and mirrored onto the R part when the topology matches, else computed on R too.
+python SideFair.py <in.npz> <out.npz> --part CAR_body_quarter_L [--deg 2] [--blend 1.0] [--fade-m 0.05] [--out 0.5]"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--part", required=True)
+ap.add_argument("--deg", type=int, default=2); ap.add_argument("--blend", type=float, default=1.0); ap.add_argument("--fade-m", type=float, default=0.05); ap.add_argument("--out-n", type=float, default=0.5)
+a = ap.parse_args()
+d = np.load(a.inp, all
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/SnapEnd.py
+"""28 October 2026, 05:00 : ZenRay Meshes finishing, SNAP END, like SnapSide.py but for the end of a part along z (the top edge of the windshield
+against the roof) : per x slice, the vertices within --edge-band-m of the part's z extreme (--end min or max) move onto the nearest point of the
+neighbour surface, the rest follows with a smoothstep falloff. FR : soude l'extrémité en z d'une pièce propre sur sa voisine, lissage autour.
+python SnapEnd.py <in.npz> <out.npz> --part CAR_body_glass_windshield_C --onto CAR_body_roof_C --end min [--max-mm 20] [--falloff-m 0.06]
+"""
+import argparse
+import json
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out")
+ap.add_argument("--part", required=True); ap.add_argument("--onto", required=True); ap.add_argument("--end", default="min")
+ap.add_argument("--max-mm", type=float, default=20.0); ap.add_argument("--edge-band-m", type=float, default=0.012); ap.add_argument("--falloff-m", type=float, default=0.06)
+ap.add_argument("--axis", type=int, default=2, help="axis of the end (2 = z ; 1 = y for the top or bottom edge of a side window, 28 October 2026)")
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/SnapSide.py
+"""28 October 2026, 02:10 : ZenRay Meshes finishing, SNAP SIDE, close the last millimetres of a seam by moving the CLEAN part, never the old one :
+every vertex of the clean part whose nearest point on the neighbour surface is closer than --max-mm is moved by that gap, and its neighbours inside
+--falloff-m follow with a smoothstep weight, so the edge lands at 0 mm and no tooth appears. Mirrored by construction (both sides are snapped).
+python SnapSide.py <in.npz> <out.npz> --part CAR_body_hood_C --onto CAR_body_fender_front_L,CAR_body_fender_front_R [--max-mm 25] [--falloff-m 0.06] [--z-range 1.58,2.10]
+FR : ferme les derniers millimètres d'une jonction en déplaçant la pièce propre, lissage autour, jamais de dent.
+"""
+import argparse
+import json
+
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--part", default="CAR_body_hood_C")
+    ap.add_argument("--onto", default="CAR_body_fender_front_L,CAR_body_fender_front_R")
+    ap.add_argument("--max-mm", type=float, default=25.0)
+    ap.add_argument("--edge-band-m", type=float, default=0.012, help
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/Solidify.py
+"""28 October 2026, 17:40 : ZenRay Meshes finishing, SOLIDIFY, every single sided part (open edges over --ratio of its faces, or listed) becomes a
+closed shell : coincident vertices merged inside the part, inner copy offset by --thick along the vertex normals (away from the visible side), faces
+reversed, one quad wall per open edge ; closed shell oriented by signed volume. Parts that already are closed are left untouched.
+python Solidify.py <in.npz> <out.npz> [--parts A,B | --auto 1 --ratio 0.25] [--thick 0.005] [--skip liner]   FR : épaissit les pièces simple face en coques fermées."""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", default=""); ap.add_argument("--auto", type=int, default=1)
+ap.add_argument("--ratio", type=float, default=0.25); ap.add_argument("--thick", type=float, default=0.005); ap.add_argument("--skip", default="liner,wheel,tire,rim"); ap.add_argument("--merge-mm", type=float, default=0.1)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/SwapPart.py
+"""28 October 2026 : replace one named part of a delivery by the same part from a candidate npz (finishing stage). python SwapPart.py <delivery.npz> <cand.npz> <part> <out.npz>"""
+import sys
+import numpy as np
+dl, cd, name, out = sys.argv[1:5]
+d = np.load(dl, allow_pickle=True); c = np.load(cd, allow_pickle=True)
+n = np.array([str(x) for x in d["names"]]); keep = n != name
+Q = [list(map(int, q)) for q in d["Q"][keep]]; N = list(n[keep])
+used = sorted({v for q in Q for v in q}); r = {v: i for i, v in enumerate(used)}
+P = list(d["P"][used]); Q = [[r[v] for v in q] for q in Q]
+cn = np.array([str(x) for x in c["names"]]); base = len(P); P += list(c["P"])
+for q, m in zip(c["Q"], cn):
+    if m == name:
+        Q.append([base + int(v) for v in q]); N.append(name)
+np.savez(out, P=np.array(P, np.float32), Q=np.array(Q, dtype=object), names=np.array(N))
+print(len(Q))
+
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/SymFix.py
+"""28 October 2026 : ZenRay Meshes finishing, SYM FIX, every vertex of the listed R parts whose mirror has no L point within --tol-mm is moved onto the
+mirror of its nearest L point (and the same the other way). python SymFix.py <in> <out> --pairs CAR_body_shoulder [--tol-mm 3]
+FR : recale sur le miroir les sommets d'une paire L/R qui n'ont pas de jumeau."""
+import argparse, json
+import numpy as np
+from scipy.spatial import cKDTree
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--pairs", required=True); ap.add_argument("--tol-mm", type=float, default=3.0); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); rep = {}; S = np.array([-1.0, 1, 1])
+for b in a.pairs.split(","):
+    VL = np.array(sorted({int(v) for q, m in zip(d["Q"], n) if m == b + "_L" for v in q})); VR = np.array(sorted({int(v) for q, m in zip(d["Q"], n) if m == b + "_R" for v in q}))
+    for A, B in ((VR, VL), (VL, VR)):
+        dd, k = cKDTree(P[B]).query(P[A] * S); bad = dd * 1000 > a.tol_mm
+        P[A[bad]] = P[B[k[bad]]] * S; rep[b] = rep.get(b, 0) + int(bad.sum())
+np.savez(a.out, P=P.ast
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/TrimBehind.py
+"""28 October 2026, 11:00 : ZenRay Meshes finishing, TRIM BEHIND, delete the faces of old parts that lie outward of a new facet (in the x, z plane of
+each height : outward of the line from the facet inner edge to its outer edge) and behind --z-max, so the facet shows. Mirrored by |x|.
+python TrimBehind.py <in.npz> <facet.npz> <facet_part_L> <out.npz> --parts A_L,B_L,... [--z-max -1.85] [--margin-m 0.003]
+FR : supprime les faces des vieilles pièces qui passent devant une nouvelle facette, pour qu'elle se voie."""
+import argparse, json
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("facet"); ap.add_argument("fname"); ap.add_argument("out")
+ap.add_argument("--parts", required=True); ap.add_argument("--z-max", type=float, default=-1.85); ap.add_argument("--margin-m", type=float, default=0.003)
+a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = list(d["Q"])
+f = np.load(a.facet, allow_pickle=True); FP = f["P"].astype(float); fn = np.array([str(x) for x in f["names"]])
+V = np.array(sorted({v for q, m in zip(f["Q"], fn) if m == a.fname for v in q})); X = FP[V]
+ys =
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/TrimUnder.py
+"""28 October 2026 : ZenRay Meshes finishing, TRIM UNDER, delete the faces of an old part that lie UNDER a new panel : centroid within --dist-m of the
+panel, inside the panel z span, and below the panel top edge (max y of the panel in that z slice minus --below-m) ; both sides (x > 0 with the _L panel,
+mirrored on _R). Then run FinishAudit ; open edges on the cut are closed by FillHoles or welded to the panel.
+python TrimUnder.py <in.npz> <out.npz> --old CAR_body_shoulder --panel CAR_body_fender_front [--dist-m 0.05] [--below-m 0.005]
+FR : rogne les faces d'une vieille pièce cachées sous un panneau neuf."""
+import argparse, json
+import numpy as np, trimesh
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--old", required=True); ap.add_argument("--panel", required=True)
+ap.add_argument("--dist-m", type=float, default=0.05); ap.add_argument("--below-m", type=float, default=0.005); ap.add_argument("--sym", type=int, default=1); ap.add_argument("--keep-circle", default=""); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = np.array([str(x) for x in d["names"]]); Q = list(d["Q"]); drop = set(); rep 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/finish/TrisToQuads.py
+"""28 October 2026, 19:45 : ZenRay Meshes finishing, TRIS TO QUADS, pairs of triangles of the same part sharing an edge become one quad (the pair with
+the flattest dihedral first) ; a triangle left alone is split in 3 quads by its centre and its edge midpoints, the 3 neighbours that share those edges
+getting the midpoint inserted (they become 5 sided and are then split in a quad plus ... ) : only done when the neighbour is itself a triangle of the
+pool, otherwise the lone triangle is reported. FR : apparie les triangles en quads.
+python TrisToQuads.py <in.npz> <out.npz>"""
+import argparse, json
+from collections import defaultdict
+import numpy as np
+ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); a = ap.parse_args()
+d = np.load(a.inp, allow_pickle=True); P = d["P"].astype(float); n = [str(x) for x in d["names"]]; Q = [list(map(int, q)) for q in d["Q"]]
+T = [i for i, q in enumerate(Q) if len(q) == 3]; E = defaultdict(list)
+for i in T:
+    q = Q[i]
+    for k in range(3): E[(min(q[k], q[(k + 1) % 3]), max(q[k], q[(k + 1) % 3]))].append(i)
+nrm = lambda q: (lambda v: v / (np.linalg.norm(v) + 1e-12))(np.cross(P[q[1]] - P[q[0]], P[q[2]] - P[q[0]]))
+cand = []
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/Bench.py
+"""28 October 2026 : ZenRay Meshes RETOPO BENCH, shared measures of a retopology candidate (any mesh file or npz with P and Q/F) :
+silhouette masks against the reference sheet (IoU per view, the reference is the threshold), shading noise (high frequency energy of a
+smooth shaded render inside a window, against the same energy of the reference grey image), deviation to the sculpt (mm), topology
+(quads, irregular interior vertices, min angle), boundary distance to the contour curves. FR : les mesures communes du tournoi de retopologie.
+python Bench.py sil <mesh> [views]          IoU of the silhouettes, per view
+python Bench.py selftest                    the reference against itself is green, its inverse is red"""
+import json, os, sys
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE))
+import Raster
+from SheetScore import render_in_panel
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+META = json.load(open(W + "frame/frame.json"))
+
+
+def load(path):
+    """Mesh file (obj, ply) or npz (P, Q or F) to (P float array, list of polygons)."""
+    if path.endswith(".n
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/Common.py
+"""28 October 2026 : ZenRay Meshes RETOPO COMMON, the shared pieces of the retopology tournament : the sculpt (frozen target, projection by
+nearest vertex then tangent plane), the contours (the coarse FenderPatch3 sheet projected on the sculpt : its boundary loop is the shared
+sampling with the neighbours, its crease row is the shoulder crease), the three common phases (P2 boundary on the contours, P3 fairing with
+a fit weight to the sculpt, P4 finish : 2.5 mm shell and audit), the measures against the reference sheet, the board, and the bridge to the
+open Houdini (port 18812, the same as the MCP server). Every value lives in PARAMS. FR : les pièces communes du tournoi de retopologie."""
+import json, os, socket, subprocess, sys, time
+from collections import defaultdict
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE))
+A = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"; W = A + "work/car/"; RT = W + "retopo/"
+PY = "/Users/zenray/.venvs/zenray-meshes/bin/python"
+PARAMS = {   # 28 October 2026 : the 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/FenderNet.py
+"""28 October 2026 : ZenRay Meshes FENDER NET, the front fender as a PatchNet instance (task T4 : a ring of quads that follows the arch).
+Curves : door cut, sill, hood seam (top), front edge and front bottom edge, taken from the coarse FenderPatch3 sheet and laid on the sculpt
+(normal offset smoothed along the curve) ; the shoulder crease (sharp) ; the arch lip (sharp, x of the arch part) ; a ring of ring_w
+around the lip with its support row at support_m ; two vertical spokes from the ring to the crease at spoke_deg. Five four sided
+patches : RING, A (rear), B (over the arch), C (front), D (above the crease). Then R07 (PatchNet.fit), the 2.5 mm shell, the mirror.
+python FenderNet.py [--out work/car/retopo/fender/fendernet.npz]   FR : l'aile en réseau de patchs, anneau autour de l'arche."""
+import argparse, json, os, sys
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+import RetopoMethods as M
+from PatchNet import Net
+
+PARAMS = {   # 28 October 2026 : the interface of the fender net
+    "spacing_m": 0.025, "ring_w": 0.05, "support_m": 0.01
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/PatchNet.py
+"""28 October 2026 : ZenRay Meshes PATCHNET, the generic retopology builder of the winning method (R07, SKILL section 227).
+A curve network : nodes (3D points), edges (3D polylines between two nodes, flags fixed and sharp, optional locked samples), and four
+sided patches whose sides are chains of edges (S0 bottom left to right, S1 right bottom to top, S2 top left to right, S3 left bottom to
+top ; a leading '-' reverses an edge). solve_counts() gives every edge its number of intervals so that opposite sides match (only the
+smaller side grows), build() samples every edge once (neighbours share the samples : welded by construction) and fills each patch with a
+Coons grid (arc length parameters), fit() is R07 : global fit to the sculpt with a bending energy, fixed edges held, then the support
+rows next to every sharp side pinned at support_m. An instance script (FenderNet.py, then the whole body) only draws the curves.
+FR : le constructeur générique de la retopologie : réseau de courbes, patchs à quatre côtés, Coons soudés, ajustement R07."""
+import numpy as np
+from scipy.sparse import identity, diags
+from scipy.sparse.linalg import spsolve
+import Common as C
+
+
+def resample(poly,
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/RetopoMethods.py
+"""28 October 2026 : ZenRay Meshes RETOPO METHODS, phase 1 (raw topology) of the sixteen tournament methods, each a distinct principle.
+Every method returns (P, Q) for the test component (front fender L) ; phases 2 to 4 are in Common.py unless a method overrides them.
+Inputs : the coarse sheet (contours, shared sampling, 2 cm), the fine sheet projected on the sculpt (REG, the sculpt region, 1 cm).
+FR : la phase 1 des seize méthodes du tournoi, un principe distinct chacune."""
+import json, os, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+FD = C.RT + "fender/"; HOU_DIR = FD + "hou/"; os.makedirs(HOU_DIR, exist_ok=True)
+
+
+def grids(path):
+    """Per patch, the 2D array [column, row] of unique vertex indices, its crease row, and the unique P (not projected)."""
+    d = np.load(path); P = d["P"]; F = d["F"]; GI = d["GI"]; rm = d["rm"]
+    used, inv = np.unique(F.ravel(), return_inverse=True); m = -np.ones(len(P), np.int64); m[used] = np.arange(len(used))
+    out = []
+    for pk in sorted(set(GI[:, 0])):
+        sel = np.nonzero(GI[:, 0] == pk)[0]; ni = GI[sel, 1].max() + 1; 
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/SculptOuter.py
+"""28 October 2026 : ZenRay Meshes RETOPO, SCULPT OUTER SKIN. The body parts of a delivery, inflated by c through an unsigned distance field
+(Houdini /obj/ZRM_Retopo, INFLATE then KEEP_OUTER), are one surface that still joins the outer and the inner skin through the panel gaps.
+Keep only the faces SEEN FROM OUTSIDE (GPU face id renders from --dirs directions on a sphere), keep the largest seen piece, then move every
+vertex back along its normal by c (a morphological closing : gaps narrower than 2c stay bridged, convex creases stay sharp), then Taubin
+smoothing (--smooth iterations, no shrink). The result is the sculpt, the frozen target of the retopology ; it is never edited afterwards.
+python SculptOuter.py <inflate.npz> <out sculpt.npz> [--dirs 162] [--res 2048] [--smooth 4]
+FR : la peau extérieure du sculpt, faces vues de l'extérieur seulement, dégonflée de c, lissée sans rétrécir."""
+import argparse, json, os, sys, time
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import Raster
+ap = argparse.ArgumentParser(); ap.add_argument("inp
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/Tournament.py
+"""28 October 2026 : ZenRay Meshes RETOPO TOURNAMENT, runs the four phases of each method on the test component and writes the measures
+(results/<id>.json) and one board per phase (boards/<id>_P<k>.png). P1 raw topology (Methods.py), P2 boundary on the shared contours,
+P3 fairing with the fit weight, P4 closed 2.5 mm shell (audit of the solid). Then `sheet` builds the contact sheet and the table.
+python Tournament.py run R06 R07 ...        python Tournament.py sheet
+FR : le lanceur du tournoi, quatre phases par méthode, mesures et planches."""
+import json, os, sys, time, traceback
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+import RetopoMethods as M
+OUT = C.RT + "fender/"; os.makedirs(OUT + "results", exist_ok=True); os.makedirs(OUT + "boards", exist_ok=True); os.makedirs(OUT + "meshes", exist_ok=True)
+
+
+def run(mid):
+    res = {"id": mid, "doc": (M.METHODS[mid].__doc__ or "").strip(), "phases": {}}
+    try:
+        t0 = time.time(); P, Q = M.METHODS[mid](); P = np.asarray(P, float); Q = [list(map(int, q)) for q in Q]; P, Q = C.compact(P, Q)
+        res["p1_sec"] = round(time.time() - t0, 1)
+        stages = [("
+=== /Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/Tune07.py
+"""28 October 2026 : ZenRay Meshes RETOPO, tuning of the winner R07 : contour fairing sigma (samples) and bending stiffness lambda.
+python Tune07.py   FR : réglage du vainqueur, lissage des contours et raideur de flexion."""
+import json, sys, os, itertools
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import Common as C
+import RetopoMethods as M
+rows = []
+for sg, lam in itertools.product((0, 3, 6), (2, 4, 8, 16)):
+    C.PARAMS["contour_sigma"] = sg; C.PARAMS["r07_lambda"] = lam; C._CT = None
+    P, Q = M.R07(); P, Q = C.compact(np.asarray(P, float), [list(map(int, q)) for q in Q]); m = C.measure(P, Q)
+    rows.append({"sigma": sg, "lambda": lam, **{k: m[k] for k in ("dev_p95_mm", "fair_p95_deg", "shading_ratio", "outline_top_mm", "crease_on_edges", "weld_ready")}})
+    C.save_cand(C.RT + "fender/meshes/R07_s%d_l%d.npz" % (sg, lam), P, Q); print(json.dumps(rows[-1]), flush=True)
+json.dump(rows, open(C.RT + "fender/Tune07.json", "w"), indent=1)
+
