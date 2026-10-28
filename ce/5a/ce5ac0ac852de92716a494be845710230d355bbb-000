@@ -1,0 +1,68 @@
+"""28 October 2026, 13:20 : ZenRay Meshes, TRIM HIDDEN, keep of one part only the faces seen from outside (sheet views and an orbit), plus a few rings.
+Used on the cabin liner : what shows through the panel joints is kept (the jamb), the rest of the old inner copy is removed.
+python TrimHidden.py <in.npz> <out.npz> --part CAR_liner_cabin_C [--rename CAR_body_jamb_C] [--rings 2] [--orbit 16] [--res 1400]
+FR : garde d'une pièce les seules faces visibles de l'extérieur (vues de la planche et orbite), plus quelques anneaux.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--part", required=True)
+    ap.add_argument("--rename", default="")
+    ap.add_argument("--rings", type=int, default=2)
+    ap.add_argument("--orbit", type=int, default=16)
+    ap.add_argument("--elev", default="-20,0,15,35")
+    ap.add_argument("--res", type=int, default=1400)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = np.array([str(x) for x in d["names"]])
+    tris, owner = [], []
+    for i, q in enumerate(Q):
+        for k in range(1, len(q) - 1):
+            tris.append([q[0], q[k], q[k + 1]]); owner.append(i)
+    owner = np.array(owner)
+    r = Raster.Renderer(P, np.array(tris))
+    c = 0.5 * (P.min(0) + P.max(0)); ext = float(np.linalg.norm(P.max(0) - P.min(0)))
+    seen = np.zeros(len(Q), bool)
+    dirs = [np.array(v, float) for v in ([1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1])]
+    for el in [float(e) for e in a.elev.split(",")]:
+        for k in range(a.orbit):
+            az = 2 * np.pi * k / a.orbit
+            dirs.append(np.array([np.cos(np.radians(el)) * np.sin(az), np.sin(np.radians(el)), np.cos(np.radians(el)) * np.cos(az)]))
+    for t in dirs:
+        t = t / np.linalg.norm(t)
+        up = np.array([0, 1.0, 0]) if abs(t[1]) < 0.9 else np.array([1.0, 0, 0])
+        rx = np.cross(up, t); rx /= np.linalg.norm(rx); uy = np.cross(t, rx)
+        M, D, N, F = r.render(c, a.res / ext, (rx.tolist(), uy.tolist(), (-t).tolist()), a.res)
+        f = F[M]; f = f[(f >= 0) & (f < len(owner))]
+        seen[owner[f]] = True
+    part = names == a.part
+    keep = seen & part
+    vset = set()
+    for _ in range(a.rings):
+        vset = {v for i in np.flatnonzero(keep) for v in Q[i]}
+        keep = keep | (part & np.array([any(v in vset for v in q) for q in Q]))
+    drop = part & ~keep
+    print(json.dumps({"part_faces": int(part.sum()), "seen": int((seen & part).sum()), "kept": int(keep.sum()), "removed": int(drop.sum())}))
+    Qk = [q for q, dd in zip(Q, drop) if not dd]; nk = names[~drop]
+    if a.rename:
+        nk = np.where(nk == a.part, a.rename, nk)
+    used = sorted({v for q in Qk for v in q}); remap = {v: i for i, v in enumerate(used)}
+    np.savez(a.out, P=P[used].astype(np.float32), Q=np.array([[remap[v] for v in q] for q in Qk], dtype=object), names=nk)
+
+
+if __name__ == "__main__":
+    main()

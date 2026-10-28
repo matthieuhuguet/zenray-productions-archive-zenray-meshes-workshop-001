@@ -1,0 +1,75 @@
+"""28 October 2026, 14:20 : ZenRay Meshes, STRIP FAIR, smooth a part made of rows along one axis (bands, bars, panels extruded in x).
+Rows are the chains of edges running mostly along --axis ; each row gets y(x) and z(x) refitted by a polynomial of degree --deg on its current points
+(symmetric : even powers only when the row spans both sides), the row ends keep their position (welds) with --keep-ends. Same faces, same names.
+python StripFair.py <in.npz> <out.npz> --parts A,B [--deg 6] [--keep-ends 1] [--blend 1.0]
+FR : lisse une bande rangée par rangée, courbe polynomiale par rangée, extrémités soudées gardées.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+
+
+def rows_of(P, Q, axis):
+    nb = defaultdict(set)
+    for q in Q:
+        for k in range(len(q)):
+            a, b = q[k], q[(k + 1) % len(q)]
+            d = P[b] - P[a]
+            if abs(d[axis]) > 0.7 * np.linalg.norm(d):
+                nb[a].add(b); nb[b].add(a)
+    seen, rows = set(), []
+    for v in nb:
+        if v in seen:
+            continue
+        comp, st = [], [v]
+        while st:
+            x = st.pop()
+            if x in seen:
+                continue
+            seen.add(x); comp.append(x); st.extend(nb[x] - seen)
+        if len(comp) >= 5:
+            rows.append(sorted(comp, key=lambda i: P[i, axis]))
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--parts", required=True)
+    ap.add_argument("--axis", type=int, default=0)
+    ap.add_argument("--deg", type=int, default=6)
+    ap.add_argument("--keep-ends", type=int, default=1)
+    ap.add_argument("--blend", type=float, default=1.0)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float); names = np.array([str(x) for x in d["names"]])
+    rep = {}
+    for part in a.parts.split(","):
+        Q = [list(map(int, q)) for q, m in zip(d["Q"], names) if m == part]
+        rows = rows_of(P, Q, a.axis)
+        moved = 0
+        for r in rows:
+            x = P[r, a.axis]
+            sym = x.min() < -0.05 and x.max() > 0.05
+            for c in [i for i in range(3) if i != a.axis]:
+                y = P[r, c]
+                if sym:
+                    A = np.stack([x ** (2 * k) for k in range(a.deg // 2 + 1)], 1)
+                else:
+                    A = np.stack([x ** k for k in range(a.deg + 1)], 1)
+                coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+                fit = A @ coef
+                new = y + a.blend * (fit - y)
+                if a.keep_ends:
+                    new[0], new[-1] = y[0], y[-1]
+                P[r, c] = new
+            moved += len(r)
+        rep[part] = {"rows": len(rows), "vertices": moved}
+        print(part, rep[part])
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+
+
+if __name__ == "__main__":
+    main()

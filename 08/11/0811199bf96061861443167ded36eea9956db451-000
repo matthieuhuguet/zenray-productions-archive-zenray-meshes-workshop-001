@@ -1,0 +1,100 @@
+"""28 October 2026, 13:55 : ZenRay Meshes, FAIR PART, undo crumpling of a part : Laplacian relaxation of its interior vertices,
+border vertices (the welded joints) fixed, until the p90 dihedral angle between neighbour faces reaches the target (default : the same part in --ref).
+Vertices on an edge sharper than --keep-deg in the reference part are fixed too (design creases), when the topology matches the reference.
+python FairPart.py <in.npz> <out.npz> --parts A,B [--ref delivery_v577.npz] [--step 0.5] [--max-iters 400] [--keep-deg 25]
+FR : défroisse une pièce par relaxation de l'intérieur, bords soudés fixes, jusqu'à la rugosité de la version de référence.
+"""
+import argparse
+import json
+from collections import defaultdict
+
+import numpy as np
+
+
+def faces_of(d, part):
+    n = np.array([str(x) for x in d["names"]])
+    return [list(map(int, q)) for q, m in zip(d["Q"], n) if m == part]
+
+
+def rough(P, Q):
+    N, E = [], defaultdict(list)
+    for i, q in enumerate(Q):
+        v = P[q]; nn = np.cross(v[2] - v[0], v[3 % len(q)] - v[1]); N.append(nn / (np.linalg.norm(nn) + 1e-12))
+        for k in range(len(q)):
+            a, b = q[k], q[(k + 1) % len(q)]; E[(min(a, b), max(a, b))].append(i)
+    N = np.array(N)
+    ang = np.array([np.degrees(np.arccos(np.clip(N[f[0]] @ N[f[1]], -1, 1))) for f in E.values() if len(f) == 2])
+    ang = ang[ang < 60]
+    return float(np.percentile(ang, 90)) if len(ang) else 0.0, E, N
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--parts", required=True)
+    ap.add_argument("--ref", default="/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/delivery_v577.npz")
+    ap.add_argument("--step", type=float, default=0.5)
+    ap.add_argument("--max-iters", type=int, default=400)
+    ap.add_argument("--keep-deg", type=float, default=25.0)
+    ap.add_argument("--hold", type=float, default=0.0, help="pull back to the start position per step")
+    ap.add_argument("--wheels", default="/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/wheel_params.json")
+    ap.add_argument("--free-borders", type=int, default=0)
+    ap.add_argument("--taubin", type=int, default=1)
+    ap.add_argument("--slack", type=float, default=1.15, help="stop when p90 <= target x slack")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True); r = np.load(a.ref, allow_pickle=True)
+    P = d["P"].astype(float); Pr = r["P"].astype(float)
+    rep = {}
+    for part in a.parts.split(","):
+        Q = faces_of(d, part); Qr = faces_of(r, part)
+        if not Q:
+            continue
+        target = rough(Pr, Qr)[0] if Qr else 1.5
+        p0, E, _ = rough(P, Q)
+        cnt = defaultdict(int); nb = defaultdict(set)
+        for q in Q:
+            for k in range(len(q)):
+                x, y = q[k], q[(k + 1) % len(q)]
+                cnt[(min(x, y), max(x, y))] += 1; nb[x].add(y); nb[y].add(x)
+        fixed = set() if a.free_borders else {v for e, c in cnt.items() if c == 1 for v in e}   # strips made only of borders (28 October 2026)
+        if Qr and len(Qr) == len(Q) and all(len(x) == len(y) for x, y in zip(Q, Qr)):
+            # same topology : keep the reference's design creases (index map by face order)
+            m = {}
+            for q, qr in zip(Q, Qr):
+                for v, vr in zip(q, qr):
+                    m[v] = vr
+            _, Er, Nr = rough(Pr, Qr)
+            inv = {}
+            for q, qr in zip(Q, Qr):
+                for v, vr in zip(q, qr):
+                    inv[vr] = v
+            for (x, y), fs in Er.items():
+                if len(fs) == 2 and np.degrees(np.arccos(np.clip(Nr[fs[0]] @ Nr[fs[1]], -1, 1))) > a.keep_deg:
+                    fixed.add(inv.get(x, -1)); fixed.add(inv.get(y, -1))
+        if a.wheels:   # the arch ring stays as it is (its gate sits at the limit) (28 October 2026)
+            wj = json.load(open(a.wheels)); Rc = wj["tyre_r"] * 1.14
+            for v in list(nb):
+                for ins in wj["instances"]:
+                    rr = np.hypot(P[v, 1] - ins["y"], P[v, 2] - ins["z"])
+                    if Rc - 0.06 < rr < Rc + 0.16:
+                        fixed.add(v); break
+        free = np.array(sorted(set(nb) - fixed), dtype=int)
+        if not len(free):
+            print(part, 'no free vertex (all on borders or creases)'); continue
+        it = 0; p = p0; P0 = P.copy()
+        while p > target * a.slack and it < a.max_iters:
+            for lam in ((a.step, -a.step * 1.06) if a.taubin else (a.step,)):   # Taubin lambda / mu : no shrinkage (28 October 2026)
+                avg = np.array([P[list(nb[v])].mean(0) for v in free])
+                P[free] += lam * (avg - P[free]) + a.hold * (P0[free] - P[free])   # data term : keep the low frequency shape (28 October 2026)
+            it += 1
+            if it % 10 == 0:
+                p = rough(P, Q)[0]
+        p = rough(P, Q)[0]
+        rep[part] = {"before": round(p0, 2), "after": round(p, 2), "target": round(target, 2), "iters": it, "free": len(free)}
+        print(part, rep[part])
+    np.savez(a.out, P=P.astype(np.float32), Q=d["Q"], names=d["names"])
+    json.dump(rep, open(a.out.replace(".npz", "_fair.json"), "w"), indent=1)
+
+
+if __name__ == "__main__":
+    main()

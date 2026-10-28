@@ -1,0 +1,106 @@
+"""28 October 2026, 13:35 : ZenRay Meshes, HOLE CLOSER, closing plates for see-through gaps of a side view.
+Each hole region of the left view (pixels inside the filled silhouette that the model does not cover) larger than --min-px gets a flat grid of quads,
+in the plane x = median x of the body vertices that border it (seen through the gap), cells of --cell px, trimmed to the dilated region ;
+the plate is mirrored on the right (x -> -x) and named CAR_closer_NN_L / _R. Same rule as a sheet-metal closing panel behind a joint.
+python HoleCloser.py <in.npz> <out.npz> [--min-px 30] [--cell 2] [--dilate 2] [--skip-parts CAR_liner_cabin_C] [--view left]
+FR : plaques de fermeture des trous traversants vus de côté, miroitées, en quads propres.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import Raster  # noqa: E402
+
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/"
+
+
+def cam(meta, vn, shape):
+    v = [x for x in meta["views"] if x["name"] == vn][0]
+    lo = np.array(meta["lo"]); D = np.array(meta["dims_m"]); hi = lo + D
+    rx, uy, tz = np.array(v["rx"], float), np.array(v["uy"], float), np.array(v["tz"], float)
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy)))
+    umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"]; bb = v["bbox"]; R = int(max(shape)); xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2; cu = ucen + (R / 2 - xc) / s; cv = vcen + (yc - R / 2) / s
+    c = cu * rx + cv * uy
+    def pix2world(i, j):   # row i, column j -> point on the plane through c
+        return c + ((j + 0.5) - R / 2) / s * rx[None] * 1 + ((R / 2) - (i + 0.5)) / s * uy[None] if np.ndim(i) == 0 else \
+            c[None] + (((j + 0.5) - R / 2) / s)[:, None] * rx[None] + (((R / 2) - (i + 0.5)) / s)[:, None] * uy[None]
+    return c, s, rx, uy, tz, R, pix2world
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp"); ap.add_argument("out")
+    ap.add_argument("--view", default="left")
+    ap.add_argument("--min-px", type=int, default=30)
+    ap.add_argument("--cell", type=int, default=2)
+    ap.add_argument("--dilate", type=int, default=2)
+    ap.add_argument("--skip-parts", default="CAR_liner_cabin_C")
+    ap.add_argument("--start", type=int, default=1)
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float); Q = [list(map(int, q)) for q in d["Q"]]; names = [str(x) for x in d["names"]]
+    nm = np.array(names); skip = set(a.skip_parts.split(","))
+    tris, own = [], []
+    for i, q in enumerate(Q):
+        for k in range(1, len(q) - 1):
+            tris.append([q[0], q[k], q[k + 1]]); own.append(i)
+    own = np.array(own); r = Raster.Renderer(P, np.array(tris))
+    meta = json.load(open(W + "frame/frame.json"))
+    shape = np.asarray(Image.open(W + "frame/mask_%s.png" % a.view)).shape
+    c, s, rx, uy, tz, R, p2w = cam(meta, a.view, shape)
+    M, Dp, N, F = r.render(c, s, (rx.tolist(), uy.tolist(), tz.tolist()), R)
+    M = M[: shape[0], : shape[1]]; F = F[: shape[0], : shape[1]]
+    H = ndi.binary_fill_holes(M) & ~M
+    lab, nl = ndi.label(H)
+    newP, newQ, newN = [list(p) for p in P], list(Q), list(names)
+    axis = int(np.argmax(np.abs(tz)))   # depth axis of the view (x for a side view)
+    k_out = a.start; rep = []
+    for k in range(1, nl + 1):
+        reg = lab == k
+        if reg.sum() < a.min_px:
+            continue
+        ring = ndi.binary_dilation(reg, iterations=3) & M
+        f = F[ring]; f = f[(f >= 0) & (f < len(own))]
+        faces = [own[x] for x in f if nm[own[x]] not in skip]
+        if not faces:
+            continue
+        vv = np.unique([v for fi in faces for v in Q[fi]])
+        depth = float(np.median(P[vv, axis]))
+        area = ndi.binary_dilation(reg, iterations=a.dilate)
+        ii, jj = np.nonzero(area)
+        i0, i1, j0, j1 = ii.min(), ii.max() + 1, jj.min(), jj.max() + 1
+        ci = np.arange(i0, i1 + a.cell, a.cell); cj = np.arange(j0, j1 + a.cell, a.cell)
+        gi, gj = np.meshgrid(ci, cj, indexing="ij")
+        pts = p2w(gi.ravel().astype(float) - 0.5, gj.ravel().astype(float) - 0.5)
+        pts[:, axis] = depth
+        for side, sx in (("L", 1.0), ("R", -1.0)):
+            base = len(newP); idx = -np.ones(gi.shape, int); used = 0
+            cells = []
+            for u in range(len(ci) - 1):
+                for w in range(len(cj) - 1):
+                    if area[ci[u]: ci[u + 1], cj[w]: cj[w + 1]].any():
+                        cells.append((u, w))
+            need = sorted({(u + du, w + dw) for u, w in cells for du in (0, 1) for dw in (0, 1)})
+            for (u, w) in need:
+                p = pts[u * len(cj) + w].copy(); p[0] *= sx
+                idx[u, w] = len(newP); newP.append(list(p))
+            for (u, w) in cells:
+                q = [idx[u, w], idx[u, w + 1], idx[u + 1, w + 1], idx[u + 1, w]]
+                newQ.append(q if sx > 0 else q[::-1]); newN.append("CAR_closer_%02d_%s" % (k_out, side))
+        rep.append({"closer": k_out, "px": int(reg.sum()), "depth_m": round(depth, 4), "cells": len(cells),
+                    "parts": sorted(set(nm[faces]))[:5]})
+        k_out += 1
+    print(json.dumps(rep, indent=0))
+    np.savez(a.out, P=np.array(newP, np.float32), Q=np.array(newQ, dtype=object), names=np.array(newN))
+
+
+if __name__ == "__main__":
+    main()

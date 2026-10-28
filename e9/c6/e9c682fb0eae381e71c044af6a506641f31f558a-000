@@ -1,0 +1,112 @@
+"""28 October 2026, 13:00 : ZenRay Meshes, JOINT WELD, generic contact weld between components (Lego rule : 0 mm between parts).
+Every border vertex (open edge) of a component is moved onto the nearest point of ANOTHER component's vertex set when closer than --tol-mm.
+Pairs are symmetric : a weld on the left side is mirrored on the right (mirror map from PlanarizeQuads). Same faces, same names, same point count.
+Report : gaps before and after (count, p50, p95, max) per component pair.
+python JointWeld.py <in.npz> <out.npz> [--tol-mm 8] [--min-mm 0.01] [--skip name,name] [--report out.json] [--dry]
+FR : soudure générique des bords ouverts d'un composant sur le composant voisin le plus proche, 0 mm, symétrique.
+"""
+import argparse
+import json
+import os
+import sys
+from collections import defaultdict
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from PlanarizeQuads import mirror_map  # noqa: E402
+
+
+def border_vertices(Q, names):
+    """Vertices on an edge used once inside its own component."""
+    cnt = defaultdict(int)
+    for q, n in zip(Q, names):
+        k = len(q)
+        for i in range(k):
+            a, b = int(q[i]), int(q[(i + 1) % k])
+            cnt[(n, min(a, b), max(a, b))] += 1
+    bv = defaultdict(set)
+    for (n, a, b), c in cnt.items():
+        if c == 1:
+            bv[n].add(a)
+            bv[n].add(b)
+    return bv
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inp")
+    ap.add_argument("out")
+    ap.add_argument("--tol-mm", type=float, default=8.0)
+    ap.add_argument("--min-mm", type=float, default=0.01)
+    ap.add_argument("--skip", default="")
+    ap.add_argument("--report", default="")
+    ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--all", action="store_true", help="every vertex, not only open borders (closed shells such as doors)")
+    a = ap.parse_args()
+    d = np.load(a.inp, allow_pickle=True)
+    P = d["P"].astype(float)
+    Q = [list(map(int, q)) for q in d["Q"]]
+    names = [str(x) for x in d["names"]]
+    skip = set(s for s in a.skip.split(",") if s)
+    owner = {}
+    for q, n in zip(Q, names):
+        for v in q:
+            owner.setdefault(v, n)
+    bv = border_vertices(Q, names)
+    comps = sorted(set(names))
+    vert_of = defaultdict(set)
+    for q, n in zip(Q, names):
+        vert_of[n].update(q)
+    tol = a.tol_mm / 1000.0
+    # one tree over all vertices, owner name per vertex
+    allv = np.array(sorted(owner))
+    own = np.array([owner[v] for v in allv])
+    tree = cKDTree(P[allv])
+    moves = {}
+    claimed = {}
+    pairs = defaultdict(list)
+    for n in comps:
+        if n in skip:
+            continue
+        cand = vert_of[n] if a.all else bv.get(n, ())
+        for v in cand:
+            ds, ii = tree.query(P[v], k=24, distance_upper_bound=tol)
+            best = None
+            for dd, i in zip(np.atleast_1d(ds), np.atleast_1d(ii)):
+                if not np.isfinite(dd) or i >= len(allv):
+                    break
+                if own[i] == n or own[i] in skip:
+                    continue
+                best = (dd, allv[i])
+                break
+            if best and best[0] > a.min_mm / 1000.0:
+                if best[1] in claimed.get(n, {}):
+                    continue   # two vertices of one piece onto one point = a crack (28 October 2026)
+                claimed.setdefault(n, {})[best[1]] = v
+                moves[v] = best[1]
+                pairs[(n, owner[best[1]])].append(best[0] * 1000)
+    # target = midpoint for border-border, else onto the other vertex
+    mir = mirror_map(P)
+    Pn = P.copy()
+    for v, t in moves.items():
+        Pn[v] = 0.5 * (P[v] + P[t]) if t in moves and moves.get(t) == v else P[t]
+    # symmetry : copy the canonical side's result onto the mirror
+    for v in moves:
+        m = mir[v]
+        if m >= 0 and m != v and m not in moves:
+            Pn[m] = Pn[v] * np.array([-1.0, 1.0, 1.0])
+    rep = {f"{k[0]}|{k[1]}": {"n": len(g), "p50": round(float(np.median(g)), 2), "max": round(float(max(g)), 2)} for k, g in sorted(pairs.items(), key=lambda kv: -len(kv[1]))}
+    out = {"welded_vertices": len(moves), "pairs": len(pairs), "max_move_mm": round(float(np.linalg.norm(Pn - P, axis=1).max() * 1000), 2), "detail": rep}
+    print(json.dumps({k: v for k, v in out.items() if k != "detail"}))
+    for k, v in list(rep.items())[:25]:
+        print(k, v)
+    if a.report:
+        json.dump(out, open(a.report, "w"), indent=1)
+    if not a.dry:
+        np.savez(a.out, P=Pn.astype(np.float32), Q=np.array(Q, dtype=object), names=np.array(names))
+
+
+if __name__ == "__main__":
+    main()
