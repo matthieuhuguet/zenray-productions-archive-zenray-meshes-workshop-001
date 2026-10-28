@@ -31,11 +31,15 @@ PARAMS = {   # 28 October 2026 : the interface of the view trace
     "splat_max": 12, "view_dir": {"front": (0, 0, 1), "back": (0, 0, -1), "left": (1, 0, 0), "right": (-1, 0, 0), "top": (0, 1, 0), "bottom": (0, -1, 0)}, "label_band_px": 2, "delivery": "work/car/delivery_v752.npz",
     "groups": {   # delivery part name pattern -> schematic component (first match wins)
         "glass": ["*glass*"], "wheel": ["*wheel*", "*tyre*"], "light": ["*light*"], "roof": ["*roof*", "*rail*"], "pillar": ["*pillar*", "*buttress*"],
-        "hood": ["*hood*"], "trunk": ["*decklid*"], "door": ["*door*"], "fender": ["*fender*", "*vent*", "*arch_front*"], "quarter": ["*quarter*", "*shoulder*", "*arch_rear*", "*belt*"],
+        "hood": ["*hood*"], "trunk": ["*decklid*"], "door": ["*door*"], "fender": ["*fender*", "*vent*", "*arch_front*"], "quarter": ["*quarter*", "*shoulder_rear*", "*arch_rear*"], "flank": ["*shoulder*", "*belt*"],
         "bumper": ["*bumper*", "*fascia*", "*grille*", "*splitter*", "*rear_C*"], "rocker": ["*rocker*", "*sill*"], "under": ["*under*", "*susp*", "*wheelwell*"]},
     "colours": {"silhouette": (30, 30, 30), "glass": (31, 119, 180), "wheel": (44, 160, 44), "light": (255, 187, 0), "roof": (148, 103, 189), "pillar": (140, 86, 75),
                 "hood": (227, 119, 194), "trunk": (188, 189, 34), "door": (23, 190, 207), "fender": (214, 39, 40), "quarter": (255, 127, 14), "bumper": (127, 127, 127),
                 "rocker": (0, 100, 0), "under": (90, 90, 160), "body": (60, 60, 60), "refused": (255, 0, 255)},
+    # 28 October 2026, KS3a : the shoulder and belt parts of v752 run along several panels (shoulder z -0.68 to 2.08 : door top and front fender),
+    # so a line on them takes its panel from where it sits along the car : in front of the door fender, over the door door, behind it quarter ;
+    # the door range is read from the door parts of the delivery, never written here
+    "flank_split": {"door_parts": ["*body_door_*"], "front": "fender", "middle": "door", "rear": "quarter"},
     "names": {"front": "face", "back": "arrière", "left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous"},
     # 28 October 2026, KS2d : the topology sheet ref2 draws the soft creases as dark strokes ; its views sit on the clay views within a pixel
     # (phase correlation, shift (row, col) added to ref2 pixels) ; a high contrast keeps the design strokes and drops the light topology grid
@@ -205,15 +209,26 @@ def part_labels(view, v, fr, shape):
         pts.append(X); lab.append(np.full(len(X), gid[nm]))
     X = np.vstack(pts); L_ = np.concatenate(lab); c = np.round(b[0] + (X @ rx - amin) * ppm).astype(int); r = np.round(b[3] - (X @ uy - bmin) * ppm).astype(int); d = X @ tz
     ok = (c >= 0) & (c < shape[1]) & (r >= 0) & (r < shape[0]); c, r, d, L_ = c[ok], r[ok], d[ok], L_[ok]; key = r * shape[1] + c; o = np.lexsort((-d, key)); key, L_ = key[o], L_[o]
-    first = np.r_[True, key[1:] != key[:-1]]; img = np.full(shape[0] * shape[1], -1); img[key[first]] = L_[first]; return img.reshape(shape), comps
+    first = np.r_[True, key[1:] != key[:-1]]; img = np.full(shape[0] * shape[1], -1); img[key[first]] = L_[first]
+    zw = (X[:, 2])[ok][o]; zimg = np.full(shape[0] * shape[1], np.nan); zimg[key[first]] = zw[first]   # world z of the visible face, for the flank split
+    dz = [P[[int(i) for i in q]][:, 2] for q, nm in zip(Q, names) if any(fnmatch.fnmatch(nm.lower(), pat) for pat in PARAMS["flank_split"]["door_parts"])]
+    dzz = np.concatenate(dz) if dz else np.array([0.0])
+    return img.reshape(shape), comps, zimg.reshape(shape), (float(dzz.min()), float(dzz.max()))
 
 
-def label_of(ch, lab, comps):
-    """The component of a line : the most frequent part label in a band around it (a joint line takes the part it borders most)."""
-    b = PARAMS["label_band_px"]; v = []
+def label_of(ch, lab, comps, zimg=None, door=None):
+    """The component of a line : the most frequent part label in a band around it (a joint line takes the part it borders most) ; a line on a
+    flank part (shoulder, belt) takes its panel from the median world z of its pixels against the door range (KS3a, 28 October 2026)."""
+    b = PARAMS["label_band_px"]; v, zs = [], []
     for r, c in ch.astype(int)[:: max(1, len(ch) // 40)]:
         w = lab[max(0, r - b):r + b + 1, max(0, c - b):c + b + 1].ravel(); v += [x for x in w if x >= 0]
-    return comps[np.bincount(v).argmax()] if v else "body"
+        if zimg is not None: zs += list(zimg[max(0, r - b):r + b + 1, max(0, c - b):c + b + 1].ravel()[w >= 0])
+    if not v: return "body"
+    k = np.bincount(v).argmax(); comp = comps[k]
+    if comp == "flank" and zimg is not None and door is not None:
+        zz = np.array(zs, float)[np.array(v) == k]; zz = zz[np.isfinite(zz)]; zm = float(np.median(zz)) if len(zz) else 0.0; fs = PARAMS["flank_split"]
+        comp = fs["front"] if zm > door[1] else (fs["rear"] if zm < door[0] else fs["middle"])
+    return comp
 
 
 def wheels(I, M, v, view):
@@ -259,7 +274,7 @@ def main():
     chains = merge_fragments(chains)
     sh_ = src["shift"].get(vw)
     if sh_: chains = [(k_, c_ + np.array(sh_)) for k_, c_ in chains]   # onto the clay frame
-    WH = wheels(I, M, v, vw) if src["wheels"] else []; lab, comps = part_labels(vw, v, fr, I.shape)
+    WH = wheels(I, M, v, vw) if src["wheels"] else []; lab, comps, zimg, door = part_labels(vw, v, fr, I.shape)
     BO = [] if not src["wheels"] else [b_ for b_ in bolts(I, M, vw) if 0 <= lab[int(b_["cy"]), int(b_["cx"])] < len(comps) and comps[lab[int(b_["cy"]), int(b_["cx"])]] in PARAMS["bolt_on"]]   # bolts only on the underbody plates
     # the silhouette : contour of the mask smoothed first (its pixel edge is noisy at the tail), cut only at real corners
     cont = max(measure.find_contours(ndi.gaussian_filter(M.astype(float), PARAMS["sil_sigma_px"]), 0.5), key=len)
@@ -275,7 +290,7 @@ def main():
             if sv[1] / np.sqrt(len(Q_)) <= PARAMS["spoke_resid_px"] and len(Q_) >= PARAMS["min_branch_px"]:
                 t = (Q_ - m_) @ vt[0]; seg = np.array([m_ + t.min() * vt[0], m_ + t.max() * vt[0]]); curves.append(("wheel", "spoke", seg[:, ::-1]))
             continue
-        for piece in split_at_corners(ch): curves.append((label_of(piece, lab, comps), kind, piece))
+        for piece in split_at_corners(ch): curves.append((label_of(piece, lab, comps, zimg, door), kind, piece))
     out, nok = [], 0
     ci = 0
     while ci < len(curves):
