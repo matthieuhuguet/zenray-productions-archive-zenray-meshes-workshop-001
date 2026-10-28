@@ -1,0 +1,121 @@
+"""28 October 2026 : ZenRay Meshes ROCKER CORNER (task KF2b-1). The lower corner of the body side, where the side wall stops and the body turns
+under the car (or meets the skirt blade). Its HEIGHT is the reference's own line : the left view traces it as a horizontal crease (ViewTrace,
+component rocker) and the right view confirms it within 2 mm ; the sculpt v752 puts its wall bottom about 8 mm higher, so the sculpt is only a
+diagnostic for the height. Its DEPTH x(z) is measured on the sculpt, section by section : at every z the outer skin profile x(y) is read
+(largest x within probe_m of (y, z)), the wall is the straight line fitted to it between wall_y0 and wall_y1 (it leans), and x is that line
+at the reference height. x(z) is smoothed (smoothing spline, the smallest smoothing for which every panel segment, cut at the door range
+read from the delivery, passes CurveFair) into ONE design line from arch to arch.
+Writes work/car/curverig/rocker_corner.json (the line, the reference height, the panel cuts, the raw readings) and versions/RockerCorner.png
+(profiles at six z with the wall line and the corner read on the sculpt ; the height along the car ; the depth along the car).
+python RockerCorner.py [--z0 -1.3 --z1 0.95]
+FR : le coin bas de la caisse : hauteur prise sur la ligne de la ref, profondeur sur la paroi de la sculpture, lissé en une seule ligne."""
+import argparse, fnmatch, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.interpolate import UnivariateSpline
+from PIL import Image, ImageDraw, ImageFont
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(os.path.dirname(HERE), "retopo"))
+import Common as C
+import CurveFair as CF
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {   # 28 October 2026 : the interface of the corner measure
+    "z0": -1.30, "z1": 0.95, "dz": 0.02,               # sculpt readings along the car, rear arch lower end to front arch lower end
+    "y_lo": 0.11, "y_hi": 0.30, "dy": 0.002,            # profile heights read at each z
+    "probe_m": 0.006,                                   # sculpt points within this distance of (y, z) give the skin x (largest x)
+    "wall_y0": 0.20, "wall_y1": 0.26,                   # the wall line is fitted here (above the turn, below the rocker crease)
+    "tol_m": 0.004,                                     # the sculpt profile still belongs to the wall within this distance of the line
+    "smooth_s": [1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4],   # smoothing factors tried, smallest first, until every panel segment passes CurveFair
+    "ref_line": {"view": "left", "component": "rocker", "max_y_m": 0.25, "min_span_m": 1.0},   # the traced reference line that gives the height
+    "door_parts": ["*body_door_*"], "delivery": "work/car/delivery_v752.npz",                 # the panel cuts of the line (door range)
+    "board_z": [0.88, 0.62, 0.20, -0.40, -0.90, -1.20], "board_px": 340,
+    "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf",
+}
+
+
+def profile(kd, P, z, ys, r):
+    xs = []
+    for y in ys:
+        k = kd.query_ball_point([y, z], r); xs.append(P[k, 0].max() if k else np.nan)
+    return np.array(xs)
+
+
+def corner_at(kd, P, z, p):
+    """The sculpt profile at z, its leaning wall line x = a y + b, and the lowest height still on that line (the corner read on the sculpt)."""
+    ys = np.arange(p["y_lo"], p["y_hi"] + 1e-9, p["dy"]); xs = profile(kd, P, z, ys, p["probe_m"]); ok = ~np.isnan(xs)
+    wm = ok & (ys >= p["wall_y0"]) & (ys <= p["wall_y1"])
+    if wm.sum() < 5: return None
+    a, b = np.polyfit(ys[wm], xs[wm], 1)
+    yc = None
+    for i in np.nonzero(ys <= p["wall_y0"])[0][::-1]:   # coming down from wall_y0
+        if not ok[i] or abs(xs[i] - (a * ys[i] + b)) > p["tol_m"]: break
+        yc = ys[i]
+    if yc is None: return None
+    return {"z": round(float(z), 4), "y": round(float(yc), 4), "x": round(float(a * yc + b), 4), "wall": [round(float(a), 4), round(float(b), 4)], "ys": ys, "xs": xs}
+
+
+def ref_height(p):
+    """The height of the reference's traced corner line and its z extent (left view : abscissa along rx = -z)."""
+    rl = p["ref_line"]; lines = json.load(open(W + "work/car/schematic/view_%s.json" % rl["view"]))["lines"]
+    cand = [np.array(o["curve_m"]) for o in lines if o["component"] == rl["component"]]
+    cand = [M for M in cand if M[:, 1].max() < rl["max_y_m"] and np.ptp(M[:, 0]) >= rl["min_span_m"]]
+    if not cand: raise SystemExit("RockerCorner : no traced %s line in the %s view" % (rl["component"], rl["view"]))
+    M = max(cand, key=lambda M_: np.ptp(M_[:, 0])); zr = np.sort(-M[:, 0])
+    return float(np.median(M[:, 1])), float(zr[0]), float(zr[-1])
+
+
+def door_range(p):
+    D = np.load(W + p["delivery"], allow_pickle=True); P = D["P"]; names = [str(x) for x in D["names"]]
+    z = [P[[int(i) for i in q]][:, 2] for q, nm in zip(D["Q"], names) if any(fnmatch.fnmatch(nm.lower(), pt) for pt in p["door_parts"])]
+    z = np.concatenate(z); return float(z.min()), float(z.max())
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--z0", type=float, default=PARAMS["z0"]); ap.add_argument("--z1", type=float, default=PARAMS["z1"]); a = ap.parse_args(); p = PARAMS
+    S = C.sculpt(); P = S.P[S.P[:, 0] > 0.3]; kd = cKDTree(P[:, 1:3])
+    zs = np.arange(a.z0, a.z1 + 1e-9, p["dz"]); reads = [r for r in (corner_at(kd, P, z, p) for z in zs) if r is not None]
+    Z = np.array([r["z"] for r in reads]); Y = np.array([r["y"] for r in reads])
+    y_ref, ze0, ze1 = ref_height(p); d0, d1 = door_range(p); cuts = [ze0, d0, d1, ze1]
+    keep = (Z >= ze0 - 1e-9) & (Z <= ze1 + 1e-9); Zk = Z[keep]; Xw = np.array([r["wall"][0] * y_ref + r["wall"][1] for r, k in zip(reads, keep) if k])
+    used, segs = None, []
+    for s in p["smooth_s"]:   # the smallest smoothing for which every panel segment passes CurveFair
+        sx = UnivariateSpline(Zk, Xw, s=s * len(Zk)); segs = []
+        for za, zb in zip(cuts[:-1], cuts[1:]):
+            zz = np.linspace(za, zb, 200); L = np.stack([sx(zz), np.full_like(zz, y_ref), zz], 1); segs.append(bool(CF.check_polyline(L, CF.PARAMS["allowed_flips_rig"])["ok"]))
+        if all(segs): used = s; break
+    sx = UnivariateSpline(Zk, Xw, s=(used or p["smooth_s"][-1]) * len(Zk)); zz = np.linspace(ze0, ze1, 400); line = np.stack([sx(zz), np.full_like(zz, y_ref), zz], 1)
+    dev = float(np.abs(sx(Zk) - Xw).max() * 1000); dy_sculpt = float(np.median(Y[keep]) - y_ref) * 1000
+    out = {"_doc": "28 October 2026 : RockerCorner, the lower corner of the body side : height from the reference's traced line, depth from the sculpt wall at that height, one smoothed design line (KF2b-1).",
+           "params": {k: v for k, v in p.items() if k != "font"}, "y_ref": round(y_ref, 4), "z_range": [round(ze0, 3), round(ze1, 3)], "cuts_z": [round(c, 3) for c in cuts],
+           "smooth_s": used, "segments_ok": segs, "curvefair_ok": used is not None, "x_fit_max_dev_mm": round(dev, 1), "sculpt_corner_minus_ref_mm": round(dy_sculpt, 1),
+           "line": np.round(line, 4).tolist(), "readings": [{k: r[k] for k in ("z", "y", "x", "wall")} for r in reads]}
+    json.dump(out, open(W + "work/car/curverig/rocker_corner.json", "w"), indent=1)
+    # board : six sculpt profiles (wall line, corner read on the sculpt, reference height), then the height and the depth along the car
+    n = len(p["board_z"]); cp = p["board_px"]; fnt = ImageFont.truetype(p["font"], 16); B = Image.new("RGB", (n * cp, cp + 300), (252, 252, 250)); d = ImageDraw.Draw(B)
+    for i, z in enumerate(p["board_z"]):
+        r = corner_at(kd, P, z, p); ox = i * cp
+        d.rectangle((ox + 4, 4, ox + cp - 4, cp - 4), outline=(200, 200, 200)); d.text((ox + 10, 8), "z = %.2f" % z, fill=(20, 20, 20), font=fnt)
+        if r is None: continue
+        xm, ym = 0.86, p["y_lo"]; sc = (cp - 40) / 0.22
+        T = lambda x, y, ox=ox: (ox + 20 + (x - xm) * sc, cp - 20 - (y - ym) * sc)
+        d.line([T(x, y) for x, y in zip(r["xs"], r["ys"]) if x == x], fill=(90, 90, 90), width=2)
+        aa, bb = r["wall"]; d.line([T(aa * yy + bb, yy) for yy in (p["y_lo"], p["y_hi"])], fill=(31, 119, 180), width=1)
+        cx, cy_ = T(r["x"], r["y"]); d.ellipse((cx - 5, cy_ - 5, cx + 5, cy_ + 5), outline=(120, 120, 120), width=2)
+        rx_, ry_ = T(aa * y_ref + bb, y_ref); d.ellipse((rx_ - 5, ry_ - 5, rx_ + 5, ry_ + 5), fill=(214, 39, 40))
+        d.text((ox + 10, 28), "sculpture %.3f, ref %.3f m" % (r["y"], y_ref), fill=(214, 39, 40), font=fnt)
+    oy = cp + 20; zl, zh = a.z0 - 0.05, a.z1 + 0.05; sx_ = (n * cp - 40) / (zh - zl); sy_ = 1200.0
+    TZ = lambda z, y: (20 + (zh - z) * sx_, oy + 110 - (y - 0.12) * sy_)
+    d.text((10, oy - 16), "hauteur (vue de côté, avant à gauche) : coin lu sur la sculpture en gris, ligne de la ref en rouge, y = %.3f m (la sculpture est %+.1f mm plus haut)" % (y_ref, dy_sculpt), fill=(20, 20, 20), font=fnt)
+    for z_, y_ in zip(Z, Y): x0, y0 = TZ(z_, y_); d.ellipse((x0 - 2, y0 - 2, x0 + 2, y0 + 2), fill=(120, 120, 120))
+    d.line([TZ(ze0, y_ref), TZ(ze1, y_ref)], fill=(214, 39, 40), width=2)
+    oy2 = oy + 130; TX = lambda z, x: (20 + (zh - z) * sx_, oy2 + 110 - (x - 0.94) * 600.0)
+    d.text((10, oy2 - 10), "profondeur x(z) à cette hauteur (vue de dessus) : paroi mesurée en gris, ligne lissée en rouge, coupes de panneau en bleu ; CurveFair par panneau : %s" % ", ".join("oui" if s_ else "non" for s_ in segs), fill=(20, 20, 20), font=fnt)
+    for z_, x_ in zip(Zk, Xw): x0, y0 = TX(z_, x_); d.ellipse((x0 - 2, y0 - 2, x0 + 2, y0 + 2), fill=(120, 120, 120))
+    d.line([TX(q[2], q[0]) for q in line], fill=(214, 39, 40), width=2)
+    for c in cuts: d.line([TX(c, 0.94), TX(c, 1.12)], fill=(31, 119, 180), width=1)
+    B.save(W + "versions/RockerCorner.png")
+    print(json.dumps({"readings": len(reads), "of": len(zs), "y_ref": round(y_ref, 4), "z_range": [round(ze0, 3), round(ze1, 3)], "cuts_z": [round(c, 3) for c in cuts],
+                      "smooth_s": used, "segments_ok": segs, "x_fit_max_dev_mm": round(dev, 1), "sculpt_corner_minus_ref_mm": round(dy_sculpt, 1)}))
+
+
+if __name__ == "__main__":
+    main()
