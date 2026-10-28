@@ -1,0 +1,119 @@
+"""28 October 2026 : ZenRay Meshes SCHEMATIC COMPONENTS (task KS3 ; not Scripts/finish/ComponentSheet.py, the 3D sheet of the delivery). The six traced views (ViewTrace) regrouped by component : one board per
+component, one cell per view where it has lines, each cell cropped around that component's lines so that its curves read at a glance (its
+lines thick in its colour with their control points, the other lines of the view thin grey for context, the clay view faded behind).
+A component with no traced line in any view gets an empty board that says so : that is the list of curves still to draw (KS3).
+Writes versions/schematic_components/Comp_<component>.png, the assembled versions/Schematic_components.png, and work/car/schematic/components.json,
+the index mapping component -> (view, line index, kind, control point count) that a network builder reads.
+python SchematicComponents.py [--components hood,roof,...]
+FR : la planche par composant : chaque composant dessiné seul dans chaque vue où il a des traits, pour une validation un par un."""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+W = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+PARAMS = {   # 28 October 2026 : the interface of the component sheet
+    "components": ["hood", "roof", "trunk", "glass", "pillar", "door", "fender", "quarter", "bumper", "rocker", "light", "wheel", "under", "silhouette"],
+    "names": {"hood": "capot", "roof": "toit", "trunk": "coffre", "glass": "vitres", "pillar": "montants", "door": "porte", "fender": "aile avant",
+              "quarter": "custode et arrière", "bumper": "boucliers et calandre", "rocker": "bas de caisse", "light": "phares et feux", "wheel": "roues",
+              "under": "soubassement", "silhouette": "silhouette", "mirror": "rétroviseurs"},
+    "views": ["left", "top", "front", "back", "right", "bottom"],
+    "view_names": {"front": "face", "back": "arrière", "left": "gauche", "right": "droite", "top": "dessus", "bottom": "dessous"},
+    "images": {"front": "00_front", "back": "01_back", "left": "02_left", "right": "03_right", "top": "04_top", "bottom": "05_bottom"},
+    "skip_kinds": ["spoke"],   # wheel spokes are construction of the rim, drawn on the wheel board only when asked
+    "cell_px": 420, "pad_px": 24, "min_box_px": 60, "title_px": 44, "label_px": 26, "gap_px": 10, "fade": 0.55,
+    # 28 October 2026 : bumper maroon, not grey (the grey bumper vanished among the grey context lines) ; context lines light and thin
+    "line_w": 3, "border_w": 2, "ctx_w": 1, "ctx_colour": (185, 185, 185), "ctrl_r": 3, "sheet_width_px": 2600,
+    # a component is drawn with the lines it owns AND the lines that border it (a joint between the hood and the windshield belongs to both
+    # boards) : each line is sampled side_off_px on both sides along its normal in the v752 part label image (ViewTrace.part_labels)
+    "side_off_px": 6, "side_min_share": 0.15,   # 0.15 (28 October 2026) : a windshield loop borders the hood on its base only, a fifth of its length
+    "colours": {"silhouette": (30, 30, 30), "glass": (31, 119, 180), "wheel": (44, 160, 44), "light": (255, 187, 0), "roof": (148, 103, 189), "pillar": (140, 86, 75),
+                "hood": (227, 119, 194), "trunk": (188, 189, 34), "door": (23, 190, 207), "fender": (214, 39, 40), "quarter": (255, 127, 14), "bumper": (128, 0, 64),
+                "rocker": (0, 100, 0), "under": (90, 90, 160), "body": (60, 60, 60)},
+    "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "font_num": "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf",
+}
+
+
+def px_of_metric(v, fr):
+    """(abscissa, ordinate) in metres along rx and uy -> pixel (col, row) of the view : the inverse of ViewTrace.to_metric."""
+    lo = np.array(fr["lo"], float); hi = lo + np.array(fr["dims_m"], float); rx, uy = np.array(v["rx"]), np.array(v["uy"]); b = v["bbox"]; ppm = v["px_per_m"]
+    amin = sum(min(rx[k] * lo[k], rx[k] * hi[k]) for k in range(3)); bmin = sum(min(uy[k] * lo[k], uy[k] * hi[k]) for k in range(3))
+    return lambda M: np.stack([b[0] + (np.asarray(M)[:, 0] - amin) * ppm, b[3] - (np.asarray(M)[:, 1] - bmin) * ppm], 1)
+
+
+def line_sides(o, lab, comps, zimg, door):
+    """The components on each side of a traced line : majority label at side_off_px along both normals ('outside' off the car)."""
+    import ViewTrace as VT
+    p = PARAMS; C = np.array(o["curve_px"], float)
+    if len(C) < 2: return []
+    T = np.gradient(C, axis=0); T /= np.linalg.norm(T, axis=1)[:, None] + 1e-12; N = np.stack([-T[:, 1], T[:, 0]], 1); out = []
+    fs = VT.PARAMS["flank_split"]; fid = comps.index("flank") if "flank" in comps else -2
+    for sg in (1, -1):
+        Q = np.round(C + sg * p["side_off_px"] * N).astype(int); ok = (Q[:, 0] >= 0) & (Q[:, 0] < lab.shape[1]) & (Q[:, 1] >= 0) & (Q[:, 1] < lab.shape[0])
+        names = []
+        for (cx, cy), k in zip(Q, ok):
+            if not k: names.append("outside"); continue
+            l = lab[cy, cx]
+            if l < 0: names.append("outside"); continue
+            if l == fid:
+                z = zimg[cy, cx]; names.append(fs["front"] if z > door[1] else (fs["rear"] if z < door[0] else fs["middle"]))
+            else: names.append(comps[l])
+        u, c = np.unique(names, return_counts=True); best = u[c.argmax()]
+        if c.max() >= p["side_min_share"] * len(names): out.append(str(best))
+    return out
+
+
+def cell(vn, lines, mine, base, inv, fnt, comp=None):
+    """One view cropped around the component's lines, at cell_px."""
+    p = PARAMS; P = np.vstack([np.array(lines[i]["curve_px"]) for i in mine]); x0, y0 = P.min(0) - p["pad_px"]; x1, y1 = P.max(0) + p["pad_px"]
+    if x1 - x0 < p["min_box_px"]: cx = (x0 + x1) / 2; x0, x1 = cx - p["min_box_px"] / 2, cx + p["min_box_px"] / 2
+    if y1 - y0 < p["min_box_px"]: cy = (y0 + y1) / 2; y0, y1 = cy - p["min_box_px"] / 2, cy + p["min_box_px"] / 2
+    x0, y0 = max(0, x0), max(0, y0); x1, y1 = min(base.size[0], x1), min(base.size[1], y1)
+    s = p["cell_px"] / max(x1 - x0, y1 - y0); w, h = int((x1 - x0) * s), int((y1 - y0) * s)
+    img = base.crop((int(x0), int(y0), int(x1), int(y1))).resize((max(1, w), max(1, h)), Image.LANCZOS); dr = ImageDraw.Draw(img)
+    T = lambda Q: [((x - x0) * s, (y - y0) * s) for x, y in Q]
+    for i, o in enumerate(lines):
+        if i not in mine and o.get("kind") not in p["skip_kinds"]: dr.line(T(o["curve_px"]), fill=p["ctx_colour"], width=p["ctx_w"])
+    for i in mine:   # owned lines thick, bordering lines (owned by a neighbour) thinner, both in the board's colour
+        o = lines[i]; own = comp is None or o["component"] == comp; col = p["colours"].get(comp or o["component"], (60, 60, 60))
+        dr.line(T(o["curve_px"]), fill=col, width=p["line_w"] if own else p["border_w"])
+        if o.get("control_m"):
+            for x, y in T(inv(np.array(o["control_m"]))):
+                r = p["ctrl_r"]; dr.ellipse((x - r, y - r, x + r, y + r), outline=col, width=1)
+    out = Image.new("RGB", (p["cell_px"], p["cell_px"] + p["label_px"]), (250, 250, 250)); out.paste(img, ((p["cell_px"] - w) // 2, p["label_px"] + (p["cell_px"] - h) // 2))
+    ImageDraw.Draw(out).text((6, 3), "%s : %d" % (p["view_names"][vn], len(mine)), fill=(20, 20, 20), font=fnt); return out
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--components", default=",".join(PARAMS["components"])); a = ap.parse_args(); p = PARAMS
+    fr = json.load(open(W + "work/car/frame/frame.json")); V = {v["name"]: v for v in fr["views"]}; fnt = ImageFont.truetype(p["font"], 18); fnt_t = ImageFont.truetype(p["font"], 24)
+    import ViewTrace as VT
+    data, bases, invs = {}, {}, {}
+    for vn in p["views"]:
+        data[vn] = json.load(open(W + "work/car/schematic/view_%s.json" % vn))["lines"]; invs[vn] = px_of_metric(V[vn], fr)
+        I_, M_, v_, fr_ = VT.load_view(vn); lab, comps, zimg, door = VT.part_labels(vn, v_, fr_, I_.shape)
+        for o in data[vn]: o["sides"] = line_sides(o, lab, comps, zimg, door) if o.get("kind") not in ("spoke", "bolt", "ring") else []
+        I = Image.open(W + "work/car/views/%s_rgb.png" % p["images"][vn]).convert("RGB"); bases[vn] = Image.blend(I, Image.new("RGB", I.size, (255, 255, 255)), p["fade"])
+    os.makedirs(W + "versions/schematic_components", exist_ok=True); index, boards = {}, []
+    for comp in a.components.split(","):
+        per = {vn: [i for i, o in enumerate(data[vn]) if (o["component"] == comp or comp in o.get("sides", [])) and o.get("kind") not in p["skip_kinds"]] for vn in p["views"]}
+        index[comp] = {vn: [{"line": i, "kind": data[vn][i]["kind"], "ok": data[vn][i]["ok"], "owned": data[vn][i]["component"] == comp, "sides": data[vn][i].get("sides", []),
+                             "controls": len(data[vn][i].get("control_m") or [])} for i in per[vn]] for vn in p["views"] if per[vn]}
+        cells = [cell(vn, data[vn], per[vn], bases[vn], invs[vn], fnt, comp) for vn in p["views"] if per[vn]]
+        n = sum(len(x) for x in per.values()); no = sum(1 for vn in per for i in per[vn] if data[vn][i]["component"] == comp)
+        title = "%s : %d lignes (%d à lui, %d en bordure)" % (p["names"].get(comp, comp), n, no, n - no) + ("" if n else ", aucune ligne relevée dans les six vues : à dessiner")
+        bw = max(p["cell_px"], len(cells) * (p["cell_px"] + p["gap_px"]), int(fnt_t.getlength(title)) + 40); bh = p["title_px"] + (p["cell_px"] + p["label_px"] if cells else 40)
+        B = Image.new("RGB", (bw, bh), (255, 255, 255)); dB = ImageDraw.Draw(B); dB.rectangle((0, 0, 14, p["title_px"] - 10), fill=p["colours"].get(comp, (60, 60, 60)))
+        dB.text((22, 6), title, fill=(15, 15, 15), font=fnt_t)
+        for k, c in enumerate(cells): B.paste(c, (k * (p["cell_px"] + p["gap_px"]), p["title_px"]))
+        B.save(W + "versions/schematic_components/Comp_%s.png" % comp); boards.append(B)
+    sw = p["sheet_width_px"]; sc = [min(1.0, sw / b.size[0]) for b in boards]; hs = [int(b.size[1] * k) for b, k in zip(boards, sc)]
+    S = Image.new("RGB", (sw, sum(hs) + p["gap_px"] * len(boards)), (235, 235, 235)); y = 0
+    for b, k, h in zip(boards, sc, hs): S.paste(b.resize((int(b.size[0] * k), h), Image.LANCZOS), (0, y)); y += h + p["gap_px"]
+    S.save(W + "versions/Schematic_components.png")
+    json.dump({"_doc": "28 October 2026 : SchematicComponents index mapping, component -> view -> traced lines (view_<view>.json line index, kind, CurveFair ok, control point count).", "components": index},
+              open(W + "work/car/schematic/components.json", "w"), indent=1)
+    print(json.dumps({"sheet": W + "versions/Schematic_components.png", "lines": {c: [sum(len(x) for x in index[c].values()), sum(1 for x in index[c].values() for e in x if e["owned"])] for c in index}, "empty": [c for c in index if not index[c]]}))
+
+
+if __name__ == "__main__":
+    main()
