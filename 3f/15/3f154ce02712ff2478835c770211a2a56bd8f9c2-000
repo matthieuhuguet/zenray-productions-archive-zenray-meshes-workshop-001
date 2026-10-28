@@ -14,7 +14,13 @@ import CarNet as CN
 
 PARAMS = {"mode": "hard", "hard_cv_line": 4, "hard_cv_arc": 6, "hard_arcs": ["lip", "lip_r", "lip_t", "lip_f", "lip_low", "out_rear", "out_front", "out_low", "crease2", "crease2a", "crease2b", "crease2c", "lipq_f", "lipq_t", "lipq_b", "lip_lowq", "outq_f", "outq_t", "outq_b", "out_lowq"], "crown_robust": True,   # 28 October 2026 : hard surface mode (default)
           "cv_min": 4, "cv_max": 12, "fit_tol_mm": 4.0, "lambda": 8.0, "iters": 5,
-          "free_edges": ["dc_lower", "dc_upper"]}   # 28 October 2026 : panel cuts inside the network relax with the surface
+          "free_edges": ["dc_lower", "dc_upper"],
+          # 28 October 2026, KF2 : the lower arch lips turn under the car then climb the arch ; six uniform controls rang around that turn
+          # (two S bends, refused by CurveFair) : their x is made concave from the bottom (RigLib.concave_profile) and they are fitted fair
+          # (RigLib.fit_fair : parameter crowded into the turn, third differences penalized) ; region checked stable for cv 10 to 12,
+          # l0 0.05 to 0.2 m per radian, lambda 0.1 to 10 (all four lips pass), the lowest lambda kept for the closest shape (3.6 mm at most)
+          "fair_fit": {"curves": ["lip_low", "out_low", "lip_lowq", "out_lowq"], "cv": 12, "l0_m": 0.1, "lambda": 0.1, "x_concave": True,
+                       "g1_max_deg": 45.0}}   # a neighbour at a node is the line's continuation when its tangent is within g1_max_deg   # 28 October 2026 : panel cuts inside the network relax with the surface
 
 
 def make(out, sections):
@@ -24,12 +30,12 @@ def make(out, sections):
     net.solve_counts(); P0, Q = net.build()
     hard = PARAMS["mode"] == "hard"
     X = P0.copy() if hard else net.fit(PARAMS["lambda"], PARAMS["iters"])   # hard : no fit of the surface to the sculpt, the curves alone
-    ctl = []; node_idx = {}; nid = {}
+    ctl = []; node_idx = {}; nid = {}; fair_g1 = {}
     for name in net.nodes:
         v = net.evid[[k for k, e in net.edges.items() if e["a"] == name or e["b"] == name][0]]
         e0 = [k for k, e in net.edges.items() if e["a"] == name or e["b"] == name][0]; vid = net.evid[e0][0] if net.edges[e0]["a"] == name else net.evid[e0][-1]
         node_idx[name] = len(ctl); ctl.append(X[vid].tolist())
-    curves = {}; fit_err = {}
+    curves = {}; fit_err = {}; fair_later = []
     for name, e in net.edges.items():
         chain = e["poly"] if (hard and not e["locked"]) else X[net.evid[name]]
         if e["locked"]:
@@ -37,12 +43,34 @@ def make(out, sections):
         dense = np.vstack([np.linspace(a, b, 6, endpoint=False) for a, b in zip(chain[:-1], chain[1:])] + [chain[-1:]])
         if hard:   # few points, robust : one clean line through the dirty source
             k = PARAMS["hard_cv_arc"] if name in PARAMS["hard_arcs"] else PARAMS["hard_cv_line"]   # by curve type, never by the noise of the source
-            CV = RL.fit_robust(dense, k); err = float(np.median(cKDTree(RL.evaluate(CV, 800)).query(chain)[0]) * 1000)
+            if name in PARAMS["fair_fit"]["curves"]: fair_later.append((name, e, chain)); continue   # fitted after their neighbours (G1 at the nodes)
+            CV = RL.fit_robust(dense, k)
+            err = float(np.median(cKDTree(RL.evaluate(CV, 800)).query(chain)[0]) * 1000)
         else:
             for k in range(PARAMS["cv_min"], PARAMS["cv_max"] + 1):
                 CV = RL.fit(dense, k); err = float(cKDTree(RL.evaluate(CV, 800)).query(chain)[0].max() * 1000)
                 if err <= PARAMS["fit_tol_mm"]: break
         fit_err[name] = round(err, 2); ids = [node_idx[e["a"]]]
+        for c in CV[1:-1]: ids.append(len(ctl)); ctl.append(c.tolist())
+        ids.append(node_idx[e["b"]]); curves[name] = {"cvs": ids, "fixed": e["fixed"], "sharp": e["sharp"]}
+    ff = PARAMS["fair_fit"]; Cn = lambda: np.array(ctl, float)
+    for name, e, chain in fair_later:   # 28 October 2026, KF2 : fair fit, tangent held to the design line it continues at each node
+        src = RL.concave_profile(chain) if ff["x_concave"] else np.asarray(chain, float); ch = np.asarray(chain, float)
+        dirs = []
+        for end, node in ((0, e["a"]), (1, e["b"])):
+            d_in = (ch[min(4, len(ch) - 1)] - ch[0]) if end == 0 else (ch[-1] - ch[-1 - min(4, len(ch) - 1)]); d_in /= np.linalg.norm(d_in) + 1e-15
+            best = None
+            for nm2, c2 in curves.items():
+                ids2 = c2["cvs"]
+                if len(ids2) < 3 or node_idx[node] not in (ids2[0], ids2[-1]): continue
+                CC = Cn()[ids2]; away = (CC[1] - CC[0]) if ids2[0] == node_idx[node] else (CC[-2] - CC[-1]); away /= np.linalg.norm(away) + 1e-15
+                want = -away if end == 0 else away   # continuing the line through the node
+                cosang = float(want @ d_in)
+                if cosang > np.cos(np.radians(ff["g1_max_deg"])) and (best is None or cosang > best[0]): best = (cosang, want, nm2)
+            dirs.append(best[1] if best else None); fair_g1[name + ("@a" if end == 0 else "@b")] = best[2] if best else None
+        dense = np.vstack([np.linspace(a_, b_, 6, endpoint=False) for a_, b_ in zip(src[:-1], src[1:])] + [src[-1:]])
+        CV = RL.fit_fair(dense, ff["cv"], ff["l0_m"], ff["lambda"], start_dir=dirs[0], end_dir=dirs[1])
+        fit_err[name] = round(float(np.median(cKDTree(RL.evaluate(CV, 800)).query(ch)[0]) * 1000), 2); ids = [node_idx[e["a"]]]
         for c in CV[1:-1]: ids.append(len(ctl)); ctl.append(c.tolist())
         ids.append(node_idx[e["b"]]); curves[name] = {"cvs": ids, "fixed": e["fixed"], "sharp": e["sharp"]}
     rig = {"_doc": "ZenRay Meshes curve rig of the body, sections %s (28 October 2026). Move the controls (Houdini EDIT), curves and loft follow." % ",".join(sections),
@@ -63,6 +91,7 @@ def make(out, sections):
         else:
             T = X[g["G"]] if g["G"].shape == G.shape else Xg; r = ((T - Xg) * Nn).sum(2)
             rig["crowns"][name] = round(float((Wb * r).sum() / max((Wb * Wb).sum(), 1e-12)), 4)
+    rig["fair_g1"] = fair_g1   # which curve each fair fitted end continues (None : a corner, no tangent held)
     json.dump(rig, open(out, "w"), indent=1)
     P, Qr, sharp, lines, grids = RL.loft(rig); C._CT = net.as_contours(); m = C.measure(P, Qr)
     dfit = cKDTree(X).query(P)[0] * 1000

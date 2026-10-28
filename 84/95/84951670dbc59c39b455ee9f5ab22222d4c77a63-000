@@ -53,6 +53,47 @@ def fit_robust(X, k, p=3, iters=4):
     return CV
 
 
+def concave_profile(X, axis=0):
+    """28 October 2026, KF2 : the coordinate axis of a chain, from its lower end (y) to its upper end, made concave (its increments never
+    grow) by pool adjacent violators, ends kept : an arch lip that turns under the car and climbs the arch keeps ONE bend in that coordinate,
+    the bumps of the sculpt that put two S bends in it are gone."""
+    X = np.array(X, float); flip = X[0, 1] > X[-1, 1]; Y = X[::-1].copy() if flip else X.copy(); out = []
+    for v in np.diff(Y[:, axis]):
+        out.append([v, 1])
+        while len(out) > 1 and out[-2][0] < out[-1][0]:
+            a, b = out.pop(), out.pop(); out.append([(a[0] * a[1] + b[0] * b[1]) / (a[1] + b[1]), a[1] + b[1]])
+    inc = np.concatenate([[v] * n for v, n in out]); Y[:, axis] = np.r_[Y[0, axis], Y[0, axis] + np.cumsum(inc)]
+    return Y[::-1] if flip else Y
+
+
+def fit_fair(X, k, l0=0.1, lam=0.1, p=3, iters=4, start_dir=None, end_dir=None):
+    """28 October 2026, KF2 : a fair fit for a curve with a tight turn (an arch lip that turns under the car). The parameter grows with the arc
+    length plus l0 metres per radian of turning, so the uniform knots crowd into the turn ; the third differences of the controls are
+    penalized (lam, scaled by points per control) so the curve cannot ring around it ; ends exact, Cauchy weights as fit_robust.
+    start_dir / end_dir (unit vectors, optional) hold the tangent at an end : the second control moves only along start_dir from the first,
+    the one before last only back along end_dir from the last, so a design line stays G1 through a node shared with the curve it continues.
+    The rig format is unchanged (uniform clamped knots), only the fit parameter differs."""
+    X = np.asarray(X, float); p = min(p, k - 1); d = np.diff(X, axis=0); ds = np.linalg.norm(d, axis=1); u = d / (ds[:, None] + 1e-15)
+    th = np.r_[0, np.arccos(np.clip((u[:-1] * u[1:]).sum(1), -1, 1))]; th = 0.5 * (th + np.r_[th[1:], 0])
+    t = np.r_[0, np.cumsum(ds + l0 * th)]; t /= t[-1]; B = basis(t, k, p); n = len(X)
+    # controls as an affine map of the unknowns z : CVflat = T z + c0 (ends fixed, held tangents as one scalar each)
+    cols, c0 = [], np.zeros(3 * k); c0[0:3] = X[0]; c0[3 * k - 3:] = X[-1]
+    def col(): v = np.zeros(3 * k); cols.append(v); return v
+    for j in range(1, k - 1):
+        if j == 1 and start_dir is not None:
+            c0[3:6] = X[0]; col()[3:6] = np.asarray(start_dir, float)
+        elif j == k - 2 and end_dir is not None:
+            c0[3 * j:3 * j + 3] = X[-1]; col()[3 * j:3 * j + 3] = -np.asarray(end_dir, float)
+        else:
+            for c in range(3): col()[3 * j + c] = 1.0
+    T = np.stack(cols, 1); Bk = np.kron(B, np.eye(3)); Dk = np.kron(np.diff(np.eye(k), 3, axis=0), np.eye(3)); sc = n / k; w = np.ones(n)
+    for _ in range(iters):
+        W = np.repeat(w, 3); A = (Bk @ T) * W[:, None]; r0 = (np.ravel(X) - Bk @ c0) * W; P_ = Dk @ T; q0 = -Dk @ c0
+        z = np.linalg.solve(A.T @ A + lam * sc * P_.T @ P_, A.T @ r0 + lam * sc * P_.T @ q0)
+        CV = (T @ z + c0).reshape(k, 3); r = np.linalg.norm(B @ CV - X, axis=1); s_ = 1.4826 * np.median(r) + 1e-4; w = np.sqrt(1.0 / (1.0 + (r / (2.5 * s_)) ** 2))
+    return CV
+
+
 def turning_deg(X):
     """Total turning of a polyline (degrees), on a light smoothing : decides how many control points an arc needs."""
     X = np.asarray(X, float); d = np.diff(X, axis=0); d = d[np.linalg.norm(d, axis=1) > 1e-9]
