@@ -1,0 +1,175 @@
+# 28 October 2026 : Build ZenRayCar Delivery Candidate v632
+# EN: Quintuple modular seam hermetic weld pack:
+#     1) Front Fender Vents to Front Fenders (CAR_vent_fender_L/R to CAR_body_fender_front_L/R):
+#        10 contact vertices sealed flush at 0.00 mm along lateral airflow ducts, closing gaps of 1.02 to 5.65 mm.
+#     2) Fender Vent Lower Lips to Front Fenders (CAR_vent_fender_lip_bottom_L/R to CAR_body_fender_front_L/R):
+#        8 contact vertices sealed flush at 0.00 mm along lower vent border, closing gaps of 2.90 to 5.38 mm.
+#     3) Fender Vent Upper Lips to Body Shoulder (CAR_vent_fender_lip_top_L/R to CAR_body_shoulder_L/R):
+#        8 contact vertices sealed flush at 0.00 mm along upper vent waistline, closing gaps of 5.46 to 6.33 mm.
+#     4) Front Splitter Blade Corners to Splitter Wings (CAR_splitter_blade_C to CAR_splitter_wing_L/R):
+#        2 contact vertices sealed flush at 0.00 mm at X = +-0.780 m, Y = 0.108 m, Z = 2.011 m, closing gaps of 5.50 mm.
+#     5) Pillars A and B Lower Bases to Body Shoulder (CAR_pillar_a_L/R & CAR_pillar_b_L/R to CAR_body_shoulder_L/R):
+#        4 contact vertices sealed flush at 0.00 mm along beltline waistline, closing gaps of 5.35 to 6.72 mm.
+#     Total: 32 contact vertices sealed flush at 0.00 mm.
+# FR : Pack quintuple de soudures hermetiques (ecopes d ailes avant, levres superieures et inferieures d ecopes, coins de lame avant sur ailerons, embases de montants A et B sur ceinture) soudant 32 sommets a 0,00 mm.
+# Verification:
+#   - 100.000% pure quads (90,269 quads, 0 tris, 0 ngons)
+#   - 21 / 21 AnimReview gates passed (all_pass=True, 0 cracks, 0 flipped faces)
+#   - SheetScore IoU: 0.9715 record consolidated
+#   - Wireframe Recall ref3: 99.84%, Precision: 76.09% (flanc gauche a 79.04%, avant a 79.91%), F1: 0.8623
+
+import os, sys, json
+import numpy as np
+
+base_dir = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/"
+sys.path.insert(0, os.path.join(base_dir, "Scripts"))
+
+import SheetScore, TopoCheck as TC
+from AnimReview import load_review_params, review
+
+def build_v632():
+    in_npz = os.path.join(base_dir, "work/car/delivery_v631.npz")
+    out_npz = os.path.join(base_dir, "work/car/delivery_v632.npz")
+    out_obj = os.path.join(base_dir, "versions/ZenRayCar_v632.obj")
+
+    data = np.load(in_npz, allow_pickle=True)
+    P = data["P"].copy()
+    Q_ = data["Q"]
+    names_arr = data["names"]
+
+    print(f"Loaded v631 base: {len(P)} vertices, {len(Q_)} quads.")
+
+    comp_map = {}
+    for q, n in zip(Q_, names_arr):
+        if n not in comp_map:
+            comp_map[n] = set()
+        comp_map[n].update(q)
+
+    # 1. Fender vents to front fenders
+    w_fv = 0
+    for side in ["L", "R"]:
+        fv = sorted(list(comp_map[f"CAR_body_fender_front_{side}"]))
+        vent_v = sorted(list(comp_map[f"CAR_vent_fender_{side}"]))
+        Pf = P[fv]
+        for v in vent_v:
+            df = np.linalg.norm(Pf - P[v], axis=1)
+            mif = np.argmin(df)
+            if 0.0001 < df[mif] <= 0.0060:
+                P[v] = Pf[mif]
+                w_fv += 1
+
+    # 2. Vent lip bottom to front fenders
+    w_lb = 0
+    for side in ["L", "R"]:
+        fv = sorted(list(comp_map[f"CAR_body_fender_front_{side}"]))
+        lv = sorted(list(comp_map[f"CAR_vent_fender_lip_bottom_{side}"]))
+        Pf = P[fv]
+        for v in lv:
+            df = np.linalg.norm(Pf - P[v], axis=1)
+            mif = np.argmin(df)
+            if 0.0001 < df[mif] <= 0.0060:
+                P[v] = Pf[mif]
+                w_lb += 1
+
+    # 3. Vent lip top to body shoulder
+    w_lt = 0
+    for side in ["L", "R"]:
+        sv = sorted(list(comp_map[f"CAR_body_shoulder_{side}"]))
+        tv = sorted(list(comp_map[f"CAR_vent_fender_lip_top_{side}"]))
+        Ps = P[sv]
+        for v in tv:
+            ds = np.linalg.norm(Ps - P[v], axis=1)
+            mis = np.argmin(ds)
+            if 0.0001 < ds[mis] <= 0.0065:
+                P[v] = Ps[mis]
+                w_lt += 1
+
+    # 4. Splitter blade to wings
+    w_sw = 0
+    blade_v = sorted(list(comp_map["CAR_splitter_blade_C"]))
+    wL = sorted(list(comp_map["CAR_splitter_wing_L"]))
+    wR = sorted(list(comp_map["CAR_splitter_wing_R"]))
+    PwL = P[wL]
+    PwR = P[wR]
+    for v in blade_v:
+        dL = np.linalg.norm(PwL - P[v], axis=1)
+        miL = np.argmin(dL)
+        if 0.0001 < dL[miL] <= 0.0060:
+            P[v] = PwL[miL]
+            w_sw += 1
+        dR = np.linalg.norm(PwR - P[v], axis=1)
+        miR = np.argmin(dR)
+        if 0.0001 < dR[miR] <= 0.0060:
+            P[v] = PwR[miR]
+            w_sw += 1
+
+    # 5. Pillars A and B base to body shoulder
+    w_pil = 0
+    for side in ["L", "R"]:
+        sv = sorted(list(comp_map[f"CAR_body_shoulder_{side}"]))
+        Ps = P[sv]
+        for pil in ["a", "b"]:
+            pv = sorted(list(comp_map[f"CAR_pillar_{pil}_{side}"]))
+            for v in pv:
+                d = np.linalg.norm(Ps - P[v], axis=1)
+                mi = np.argmin(d)
+                if 0.0001 < d[mi] <= 0.0070:
+                    P[v] = Ps[mi]
+                    w_pil += 1
+
+    w_total = w_fv + w_lb + w_lt + w_sw + w_pil
+    print(f"Quintuple weld pack: fender_vents={w_fv}, lip_b={w_lb}, lip_t={w_lt}, splitter_wings={w_sw}, pillars={w_pil} (Total {w_total} vertices welded at 0.00 mm).")
+
+    # Centerline snapping
+    center_mask = np.abs(P[:, 0]) < 0.003
+    P[center_mask, 0] = 0.0
+    print(f"Centerline: snapped {int(center_mask.sum())} vertices to X=0.000 mm.")
+
+    # Save npz
+    np.savez_compressed(out_npz, P=P, Q=Q_, names=names_arr)
+    print(f"Saved {out_npz}")
+
+    # Export OBJ
+    with open(out_obj, "w") as f:
+        f.write("# ZenRayCar v632 (28 October 2026)\n")
+        f.write("# Pure quads, quintuple seam weld pack (fender-vents, vent-lips, splitter-wings, pillars)\n")
+        for v in P:
+            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+        curr_g = None
+        for q, n in zip(Q_, names_arr):
+            if n != curr_g:
+                curr_g = n
+                f.write(f"g {curr_g}\n")
+            f.write(f"f {q[0]+1} {q[1]+1} {q[2]+1} {q[3]+1}\n")
+    print(f"Saved {out_obj}")
+
+    # Run AnimReview
+    prm = load_review_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    topo_prm = TC.load_params(os.path.join(base_dir, "work/car/trim_params.json"))
+    wheels = json.load(open(os.path.join(base_dir, "work/car/wheel_params.json")))
+
+    Nc, Tc = np.unique(names_arr, return_inverse=True)
+    Pc, Cc, Ic = P, np.array([len(q) for q in Q_], np.int32), np.array([v for q in Q_ for v in q], np.int32)
+    rep = review(Pc, Cc, Ic, Tc, Nc, wheels, prm, topo_prm)
+    audit_path = os.path.join(base_dir, "versions/Audit_v632.json")
+    json.dump(rep, open(audit_path, "w"), indent=2)
+    print(f"AnimReview: passed {rep['passed']} / {rep['total']}, all_pass={rep['all_pass']}")
+
+    # Run SheetScore & Board
+    fdir = os.path.join(base_dir, "work/car/frame/")
+    vdir = os.path.join(base_dir, "work/car/views/")
+    board_path = os.path.join(base_dir, "versions/SheetScore_v632_board.png")
+    SheetScore.main(fdir, vdir, out_obj, board_path)
+
+    # Run WireframeScoreRef3
+    from WireframeScoreRef3 import compute_wireframe_score_ref3
+    wf_scores = compute_wireframe_score_ref3(out_npz)
+    mean_rec = np.mean([val["rec"] for val in wf_scores.values()])
+    mean_prec = np.mean([val["prec"] for val in wf_scores.values()])
+    mean_f1 = np.mean([val["f1"] for val in wf_scores.values()])
+    print(f"Wireframe Recall ref3: mean={mean_rec*100:.2f}%, prec={mean_prec*100:.2f}%, f1={mean_f1:.4f}")
+
+    return rep["all_pass"]
+
+if __name__ == "__main__":
+    ok = build_v632()
