@@ -55,6 +55,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "write_obj": True,
     "face_options": {},               # {face id: {"skip": bool, "corners": [node ids], "rotate": int}} per face topology choices
     "boundary_step_m": 0.01,          # /faces : spacing of the boundary polyline returned for drawing and picking
+    "project_arcs": True,             # 29 October 2026 : nodes and arc polylines are put on the reference surface before the faces (curves drawn off the shell fold the first quad row)
     "seed_plane_tol_m": 0.5,          # component seeds : a face is a candidate when the seed projects inside its loop and lies within this of its plane
 }
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
@@ -259,6 +260,19 @@ def _doctor(doc, prm):
     return D, issues, polys
 
 
+def project_doc(doc, params=None):
+    """29 October 2026 : POST /project : every node and every control point moved to its closest point on the reference surface. The input is not
+    modified ; returns the moved document and how far points moved (the curves then follow the shell instead of floating above or below it)."""
+    prm = dict(PARAMS); prm.update(params or {}); ref = load_ref(prm["ref"]); D = copy.deepcopy(doc)
+    pts = [n["p"] for n in D["nodes"]] + [p for a in D["arcs"] for p in a["ctrl"]]
+    if not pts: return {"ok": True, "doc": D, "moved": {"points": 0}}
+    q, _, d = ref.closest(np.array(pts, float)); q = q.tolist(); k = 0
+    for n in D["nodes"]: n["p"] = q[k]; k += 1
+    for a in D["arcs"]:
+        for i in range(len(a["ctrl"])): a["ctrl"][i] = q[k]; k += 1
+    return native({"ok": True, "doc": D, "moved": {"points": len(pts), "median_m": float(np.median(d)), "p90_m": float(np.percentile(d, 90)), "max_m": float(d.max())}})
+
+
 def doctor(doc, params=None):
     prm = dict(PARAMS); prm.update(params or {})
     fixed, issues, _ = _doctor(doc, prm)
@@ -275,6 +289,14 @@ class Net:
         self.ref = load_ref(ref if ref is not None else self.prm["ref"])
         self.fixed, self.issues, polys = _doctor(doc, self.prm)
         self.nodes = {n["id"]: np.array(n["p"], float) for n in self.fixed["nodes"]}
+        if self.prm.get("project_arcs") and self.nodes:      # 29 October 2026 : one batched closest point query for every node and every polyline point
+            ids = list(self.nodes); keys = [a["id"] for a in self.fixed["arcs"]]; sizes = [len(polys[k]) for k in keys]
+            allp = np.concatenate([np.array([self.nodes[i] for i in ids])] + [polys[k] for k in keys]) if keys else np.array([self.nodes[i] for i in ids])
+            q, _, d = self.ref.closest(allp); self.projected = {"points": int(len(allp)), "median_m": float(np.median(d)), "max_m": float(d.max())}
+            for j, i in enumerate(ids): self.nodes[i] = q[j]
+            o = len(ids)
+            for k, n in zip(keys, sizes): polys[k] = q[o:o + n]; o += n
+        else: self.projected = None
         self.next_node = (max(self.nodes) + 1) if self.nodes else 0; self.real_nodes = set(self.nodes)
         self.arcs = {}; self.mirror = {}
         for a in self.fixed["arcs"]:
