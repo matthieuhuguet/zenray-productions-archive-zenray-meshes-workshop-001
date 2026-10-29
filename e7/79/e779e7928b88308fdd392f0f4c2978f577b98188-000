@@ -1,0 +1,75 @@
+# 29 October 2026 : ZenRay Lines, shared B-spline helpers (used by ZrlExport.py and by anyone reading lines.json).
+# EN: every arc of lines.json is a clamped UNIFORM cubic B-spline. Only the control points are stored, the knot vector is
+#     rebuilt from their count n : [0,0,0,0, 1, 2, ..., n-4, n-3,n-3,n-3,n-3] (n-3 spans, parameter u in [0, n-3]).
+#     The browser editor (app.js, Spline.knots) uses the very same convention, so both sides evaluate the same curve.
+# FR : chaque arc est une B-spline cubique uniforme à nœuds multiples aux extrémités ; seuls les points de contrôle sont stockés.
+import numpy as np
+from scipy.interpolate import BSpline
+
+DEGREE = 3
+
+
+def knots(n, degree=DEGREE):
+    """Uniform clamped knot vector for n control points (parameter range [0, n - degree])."""
+    if n < degree + 1:
+        raise ValueError(f"a cubic arc needs at least {degree + 1} control points, got {n}")
+    spans = n - degree
+    return np.concatenate([np.zeros(degree), np.arange(spans + 1, dtype=float), np.full(degree, float(spans))])
+
+
+def basis_matrix(u, n, degree=DEGREE):
+    """(len(u), n) matrix of the n B-spline basis functions evaluated at u."""
+    t = knots(n, degree)
+    u = np.clip(np.asarray(u, float), 0.0, float(n - degree))
+    return BSpline(t, np.eye(n), degree, extrapolate=False)(u)
+
+
+def evaluate(ctrl, u):
+    """Points of the curve at parameters u (array), ctrl (n,3)."""
+    ctrl = np.asarray(ctrl, float)
+    return basis_matrix(u, len(ctrl)) @ ctrl
+
+
+def sample(ctrl, per_span=40):
+    """Polyline of the curve, per_span samples per span plus the final point (same sampling as the editor)."""
+    n = len(ctrl)
+    spans = n - DEGREE
+    u = np.concatenate([np.arange(spans * per_span) / per_span, [float(spans)]])
+    return evaluate(ctrl, u)
+
+
+def clean_polyline(Q, eps=1e-9):
+    """Drop consecutive duplicate points (zero chord). The first and the last coordinates are always preserved."""
+    Q = np.asarray(Q, float)
+    keep = np.concatenate([[True], np.linalg.norm(np.diff(Q, axis=0), axis=1) > eps])
+    out = Q[keep]
+    return out if len(out) >= 2 else Q[[0, -1]]
+
+
+def polyline_length(Q):
+    Q = np.asarray(Q, float)
+    return float(np.linalg.norm(np.diff(Q, axis=0), axis=1).sum())
+
+
+def chord_parameters(Q, n, degree=DEGREE):
+    """Chord length parameters of the points Q, scaled to the spline parameter range [0, n - degree]."""
+    cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))])
+    if cum[-1] <= 0:
+        return np.linspace(0.0, n - degree, len(Q))
+    return cum / cum[-1] * (n - degree)
+
+
+def fit(Q, n):
+    """Least squares clamped cubic B-spline with n control points through the polyline Q.
+    The first and the last control point are the first and the last point of Q (held, not fitted)."""
+    Q = clean_polyline(Q)
+    P = np.zeros((n, 3))
+    P[0], P[-1] = Q[0], Q[-1]
+    if n == 2:
+        return P
+    u = chord_parameters(Q, n)
+    B = basis_matrix(u, n)
+    rhs = Q - np.outer(B[:, 0], P[0]) - np.outer(B[:, -1], P[-1])
+    sol = np.linalg.lstsq(B[:, 1:-1], rhs, rcond=None)[0]
+    P[1:-1] = sol
+    return P

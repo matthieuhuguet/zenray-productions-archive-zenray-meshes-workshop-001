@@ -1,0 +1,157 @@
+"""29 October 2026 : ZenRay Lines EMBED, the lines become edges of the surface.
+EN: every faired line of the network (work/retopo/network.npz) is traced on the closed shell as a shortest edge path hugging the
+line (Dijkstra on a thin tube around it, paths never cross : a vertex used by one line is closed to the others), then every path
+vertex is SNAPPED onto its line, junction vertices onto their node. The faces are flood filled across the non line edges : each
+region is one component, bounded exactly by its faired lines and sharing them with its neighbours (welded by construction). The
+wheel arches become openings. The surface is smoothed (Taubin) with the line vertices held. Output : work/lines/embed.npz
+(V, F, region per face, region names, line edges) for the constrained quad remesh in Houdini (ZrlHoudini.py).
+python ZrlEmbed.py        FR : les lignes deviennent des arêtes de la surface ; chaque région bornée par ses lignes est un component."""
+import json, os, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix, csr_matrix, diags
+from scipy.sparse.csgraph import dijkstra, connected_components
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+
+PARAMS = {   # 29 October 2026 : the interface of the embedding, one place
+    "network": f"{ROOT}/work/retopo/network.npz", "shell": f"{ROOT}/work/retopo/shell.npz", "out": f"{ROOT}/work/lines/embed.npz",
+    "island_min_m": 0.25,        # closed lines shorter than this are label noise, dropped
+    "tube_m": 0.04,              # radius of the tube searched around a line (29 October 2026 : 1.2 cm split the tube where a line floats over a crease)
+    "tube_retry_m": 0.07,        # wider tube when the first one is blocked
+    "tube_last_m": 0.30,         # last resort : a wide tube, the path walks around a slot
+    "snap_window": 5, "snap_passes": 3,   # 29 October 2026 : path vertices snap onto their own path smoothed along itself (on the surface)
+    "sigma_m": 0.003,            # how strongly the path hugs the line
+    "lay_smooth": 6,             # half window (samples of 2 mm) of the smoothing of a line laid on the surface
+    "region_min_faces": 400,     # smaller regions are merged into their longest neighbour
+    "openings": ["CAR_arch_"],   # regions removed : the wheel openings
+    "taubin_iters": 12, "taubin_lam": 0.5, "taubin_mu": -0.53,
+}
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def edges_of(F):
+    E = np.sort(np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=1)
+    fid = np.r_[np.arange(len(F)), np.arange(len(F)), np.arange(len(F))]
+    return E, fid
+
+
+def trace(V, A, tree, line, s, t, forbid, prm, radius):
+    """Shortest edge path from vertex s to t inside the tube around the polyline `line`, avoiding `forbid`."""
+    loc = set()
+    for ids in tree.query_ball_point(line[::2], radius): loc.update(ids)
+    loc.update((s, t)); loc = np.array(sorted(v for v in loc if v in (s, t) or v not in forbid))
+    d, _ = cKDTree(line).query(V[loc])
+    sub = A[loc][:, loc].tocoo(); w = sub.data * (1.0 + 0.5 * (d[sub.row] + d[sub.col]) / prm["sigma_m"])
+    G = csr_matrix((w, (sub.row, sub.col)), shape=(len(loc), len(loc)))
+    pos = {int(v): i for i, v in enumerate(loc)}; dist, pred = dijkstra(G, indices=pos[s], return_predecessors=True)
+    if not np.isfinite(dist[pos[t]]): return None
+    path = [pos[t]]
+    while path[-1] != pos[s]: path.append(pred[path[-1]])
+    return loc[np.array(path[::-1])]
+
+
+def trace_full(V, A, line, s, t, prm):
+    """29 October 2026 : last resort, Dijkstra on the whole surface : every border must close, or the components leak into one."""
+    d, _ = cKDTree(line).query(V, distance_upper_bound=1.0); d = np.minimum(d, 1.0)
+    C = A.tocoo(); w = C.data * (1.0 + 0.5 * (d[C.row] + d[C.col]) / prm["sigma_m"])
+    G = csr_matrix((w, (C.row, C.col)), shape=A.shape); dist, pred = dijkstra(G, indices=s, return_predecessors=True, limit=np.inf)
+    if not np.isfinite(dist[t]): return None
+    path = [t]
+    while path[-1] != s: path.append(pred[path[-1]])
+    return np.array(path[::-1])
+
+
+def build(prm=PARAMS):
+    S = np.load(prm["shell"], allow_pickle=True); V = S["verts"].copy(); F = S["faces"]; lab = S["lab"]; names = [str(n) for n in S["names"]]
+    N = np.load(prm["network"], allow_pickle=True); nodes = N["nodes"]; ab = N["ab"]; closed = N["closed"]; dense = N["dense"]; L = N["L"]; pair = N["pair"]
+    log("shell", len(V), "verts", len(F), "faces ; network", len(L), "lines")
+    E, _ = edges_of(F); E = np.unique(E, axis=0); le = np.linalg.norm(V[E[:, 0]] - V[E[:, 1]], axis=1)
+    A = coo_matrix((np.r_[le, le], (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(len(V), len(V))).tocsr()
+    tree = cKDTree(V); _, node_v = tree.query(nodes); node_v = node_v.astype(np.int64)
+    lab = np.where(lab < 0, 0, lab)                                   # 29 October 2026 : 42 unlabelled shell vertices
+    # 29 October 2026 : the faired lines float up to 3 cm off the shell on long curved spans ; each line is laid on the surface
+    # (nearest shell vertex) then smoothed along itself, so the tube, the path and the snap all live on the surface
+    on = {}
+    for i in range(len(L)):
+        X = V[tree.query(np.asarray(dense[i], float))[1]]; k = prm["lay_smooth"]
+        if len(X) > 2 * k + 2:
+            ker = np.ones(2 * k + 1) / (2 * k + 1); Xs = np.stack([np.convolve(np.pad(X[:, c], k, mode="edge"), ker, mode="valid") for c in range(3)], 1)
+            Xs[0], Xs[-1] = X[0], X[-1]; X = Xs
+        on[i] = X
+    keep = [i for i in range(len(L)) if not (closed[i] and L[i] < prm["island_min_m"])]
+    seen = {}                                                          # 29 October 2026 : twin lines (same pair, same ends) kept once
+    for i in sorted(keep, key=lambda i: -L[i]):
+        k = (tuple(sorted(map(str, pair[i]))), tuple(sorted(ab[i].tolist())))
+        if not closed[i] and k in seen: continue
+        seen[k] = i
+    keep = sorted(seen.values())
+    order = sorted(keep, key=lambda i: -L[i]); forbid = set(); paths = {}; failed = []
+    for i in order:
+        line = on[i]
+        if closed[i]:
+            s = int(tree.query(line[0])[1]); m = int(tree.query(line[len(line) // 2])[1]); segs = [(line[: len(line) // 2 + 1], s, m), (line[len(line) // 2:], m, s)]
+        else:
+            segs = [(line, int(node_v[ab[i, 0]]), int(node_v[ab[i, 1]]))]
+        full = []
+        for seg, a, b in segs:
+            p = trace(V, A, tree, seg, a, b, forbid, prm, prm["tube_m"])
+            if p is None: p = trace(V, A, tree, seg, a, b, forbid, prm, prm["tube_retry_m"])
+            if p is None: p = trace(V, A, tree, seg, a, b, set(), prm, prm["tube_retry_m"])
+            if p is None: p = trace(V, A, tree, seg, a, b, set(), prm, prm["tube_last_m"])   # 29 October 2026 : a line crossing a slot
+            if p is None: p = trace_full(V, A, seg, a, b, prm); log("line", i, "traced on the whole surface", None if p is None else len(p))
+            if p is None: failed.append(i); full = None; break
+            full = list(p) if not full else full + list(p[1:])
+            forbid.update(int(v) for v in p[1:-1])
+        if full is not None: paths[i] = np.array(full)
+    log("traced", len(paths), "lines ; failed", failed)
+    # snap : interior path vertices onto their line, junctions onto their node
+    for i, p in paths.items():
+        X = V[p].copy(); k = prm["snap_window"]
+        for _ in range(prm["snap_passes"]):
+            if len(X) <= 2 * k + 2: break
+            ker = np.ones(2 * k + 1) / (2 * k + 1); Xs = np.stack([np.convolve(np.pad(X[:, c], k, mode="edge"), ker, mode="valid") for c in range(3)], 1)
+            Xs[0], Xs[-1] = X[0], X[-1]; X = Xs
+        V[p[1:-1]] = X[1:-1]
+    for n, v in enumerate(node_v): V[v] = nodes[n]
+    con = set()
+    for p in paths.values():
+        for a, b in zip(p[:-1], p[1:]): con.add((min(a, b), max(a, b)))
+    con = np.array(sorted(con)); log("line edges", len(con))
+    # regions : faces connected across non line edges
+    Ef, fid = edges_of(F); key = Ef[:, 0] * len(V) + Ef[:, 1]; ck = set((con[:, 0] * len(V) + con[:, 1]).tolist())
+    o = np.argsort(key, kind="stable"); ks = key[o]; same = ks[1:] == ks[:-1]; fa = fid[o][:-1][same]; fb = fid[o][1:][same]
+    free = np.array([k not in ck for k in ks[1:][same].tolist()])
+    G = coo_matrix((np.ones(free.sum()), (fa[free], fb[free])), shape=(len(F), len(F))); nreg, reg = connected_components(G, directed=False)
+    flab = np.array([np.bincount(t).argmax() for t in lab[F]]) if False else np.where(lab[F[:, 1]] == lab[F[:, 2]], lab[F[:, 1]], lab[F[:, 0]])
+    size = np.bincount(reg, minlength=nreg)
+    # merge small regions into the neighbour sharing the longest border
+    for _ in range(3):
+        small = np.flatnonzero(size < prm["region_min_faces"])
+        if len(small) == 0: break
+        nb = np.c_[reg[fa], reg[fb]]; nb = nb[nb[:, 0] != nb[:, 1]]
+        best = {}
+        for a, b in np.r_[nb, nb[:, ::-1]].tolist():
+            if size[a] < prm["region_min_faces"] and size[b] >= size[a]: best.setdefault(a, {}).setdefault(b, 0); best[a][b] += 1
+        for a, d in best.items(): reg[reg == a] = max(d, key=d.get)
+        _, reg = np.unique(reg, return_inverse=True); size = np.bincount(reg)
+    nreg = int(reg.max()) + 1
+    rname = [names[np.bincount(flab[reg == r], minlength=len(names)).argmax()] for r in range(nreg)]
+    log("regions", nreg, {n: rname.count(n) for n in sorted(set(rname)) if rname.count(n) > 1})
+    keepf = np.array([not any(rname[r].startswith(o) for o in prm["openings"]) for r in reg])
+    # Taubin smoothing, line vertices held (uniform Laplacian)
+    hold = np.zeros(len(V), bool); hold[np.unique(con)] = True
+    Wm = (A > 0).astype(float); deg = np.asarray(Wm.sum(1)).ravel(); Lm = diags(1.0 / np.maximum(deg, 1)) @ Wm
+    for _ in range(prm["taubin_iters"]):
+        for f in (prm["taubin_lam"], prm["taubin_mu"]):
+            D = Lm @ V - V; D[hold] = 0; V = V + f * D
+    F2 = F[keepf]; reg2 = reg[keepf]; used = np.unique(F2); remap = -np.ones(len(V), np.int64); remap[used] = np.arange(len(used))
+    out = dict(V=V[used], F=remap[F2], region=reg2, region_names=np.array(rname), line_edges=remap[con[(remap[con] >= 0).all(1)]])
+    os.makedirs(os.path.dirname(prm["out"]), exist_ok=True); np.savez(prm["out"], **out)
+    log("saved", prm["out"], len(out["V"]), "verts", len(out["F"]), "faces", "openings removed", int((~keepf).sum()), "faces")
+    return out
+
+
+if __name__ == "__main__":
+    build()

@@ -1,0 +1,307 @@
+# 29 October 2026 : ZenRay Lines EXPORT, the data behind the browser editor (lines/index.html).
+# EN: reads the faired border network (work/retopo/network.npz) and the clean shell (work/retopo/shell.npz) and writes, in lines/data/ :
+#       lines.json     : nodes, arcs as clamped uniform cubic B-splines (control points only, see ZrlSpline.py), mirror arc ids, components
+#       view_<n>.png   : shaded orthographic render of the shell (grey Lambert, light pastel tint per component, white background)
+#       depth_<n>.png  : the same view as a 16 bit depth map (0 = empty, else depth = depth_offset + value / 65535 * depth_scale)
+#       views.json     : per view the camera (center, px_per_m, res, rx, uy, tz) and the depth encoding
+#       export_report.json : fit errors, mirror quality, arc ends that are off their node (read it before trusting the junctions)
+#     Pixel convention (same as Raster.py) : col = (p - center).rx * s + res/2 - 0.5 ; row = res/2 - 0.5 - (p - center).uy * s.
+#     python ZrlExport.py            everything      |   python ZrlExport.py --skip-views   only lines.json (seconds, no GPU)
+# FR : exporte le réseau de lignes en B-splines éditables, les vues orthographiques ombrées, leurs cartes de profondeur et un rapport.
+import argparse, json, os, sys, time, colorsys
+sys.dont_write_bytecode = True      # the folder is shared with other tools : leave no __pycache__ behind
+import numpy as np
+from scipy.spatial import cKDTree
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (f"{ROOT}/Scripts", f"{ROOT}/Scripts/retopo", HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import ZrlSpline as SP
+
+PARAMS = {   # 29 October 2026 : the interface of the exporter, every tunable value lives here
+    "network": f"{ROOT}/work/retopo/network.npz",
+    "shell": f"{ROOT}/work/retopo/shell.npz",
+    "out_dir": f"{ROOT}/lines/data",
+    "date": "29 October 2026",
+    # control points of an arc : one per ctrl_spacing_m of arc length (+1 for the end point), clamped to [ctrl_min, ctrl_max]
+    "ctrl_spacing_m": 0.15, "ctrl_min": 4, "ctrl_max": 16,
+    "refine_tol_m": 0.0,         # > 0 : add control points (up to ctrl_max) while the fit error is above this, 0 = off (strict spacing rule)
+    "per_span": 40,              # samples per span used to measure the fit error (the editor draws 40 per span too)
+    # mirror search (x -> -x)
+    "mirror_samples": 48, "mirror_prune_m": 0.15, "mirror_max_cost_m": 0.03, "mirror_self_bias_m": 5e-4,
+    # views
+    "res": 1600, "margin": 0.04, "smooth_deg": 45.0,
+    "light_dir": (-0.35, 0.55, 0.76),       # camera space, x right, y up, z toward the viewer
+    "ambient": 0.46, "grey": 0.90, "tint": 0.42, "tint_saturation": 0.34,
+    "outline": 0.58, "component_edge": 0.88, "depth_pad": 1e-3,
+    "decimals": 6,
+}
+VIEW_ORDER = ["left", "right", "top", "front", "back"]
+VIEW_LABEL = {"left": "Left", "right": "Right", "top": "Top", "front": "Front", "back": "Back"}
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------- network
+def load_network(path):
+    d = np.load(path, allow_pickle=True)
+    polys = [np.asarray(x, float) for x in d["dense"]]
+    return {"nodes": np.asarray(d["nodes"], float), "names": [str(n) for n in d["names"]],
+            "pair": [[str(a), str(b)] for a, b in d["pair"]], "ab": np.asarray(d["ab"], int),
+            "closed": np.asarray(d["closed"], bool), "polys": polys}
+
+
+def resample(P, m):
+    cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))])
+    if cum[-1] <= 0:
+        return np.repeat(P[:1], m, axis=0)
+    t = np.linspace(0.0, cum[-1], m)
+    return np.stack([np.interp(t, cum, P[:, c]) for c in range(3)], 1)
+
+
+def mirror_table(polys, prm):
+    """Mirror arc id of every arc : the arc whose polyline, mirrored by x -> -x, is closest (itself for a centre arc).
+    The cost of a pair is the worse of the two one-sided mean distances. Pairs are matched greedily by increasing cost, so
+    the relation is an involution (mirror[mirror[k]] == k). An arc with no counterpart under mirror_max_cost_m gets -1."""
+    M = np.array([-1.0, 1.0, 1.0])
+    n = len(polys)
+    S = [resample(P, prm["mirror_samples"]) for P in polys]
+    trees = [cKDTree(P) for P in polys]
+    lo = np.array([P.min(0) for P in polys]); hi = np.array([P.max(0) for P in polys])
+    mlo = np.stack([-hi[:, 0], lo[:, 1], lo[:, 2]], 1); mhi = np.stack([-lo[:, 0], hi[:, 1], hi[:, 2]], 1)   # bbox of the mirrored arcs
+    pad = prm["mirror_prune_m"]
+    cost = np.full((n, n), np.inf)
+    for k in range(n):
+        for j in range(k, n):
+            # arc j must overlap the mirrored bbox of arc k (padded) : a cheap prune before the two KD-tree queries
+            if np.any(hi[j] < mlo[k] - pad) or np.any(lo[j] > mhi[k] + pad):
+                continue
+            a = trees[j].query(S[k] * M)[0].mean()
+            b = trees[k].query(S[j] * M)[0].mean()
+            cost[k, j] = cost[j, k] = max(a, b)
+    bias = prm["mirror_self_bias_m"]
+    cand = sorted((cost[k, j] + (0.0 if k == j else bias), k, j) for k in range(n) for j in range(k, n)
+                  if cost[k, j] <= prm["mirror_max_cost_m"])
+    mirror = np.full(n, -1, int)
+    for c, k, j in cand:
+        if mirror[k] < 0 and mirror[j] < 0:
+            mirror[k] = j; mirror[j] = k
+    return mirror, cost
+
+
+def ctrl_count(length, prm):
+    n = int(round(length / prm["ctrl_spacing_m"])) + 1
+    return int(np.clip(n, prm["ctrl_min"], prm["ctrl_max"]))
+
+
+def fit_error(Q, ctrl, per_span):
+    """Largest distance (m) between the dense polyline Q and the sampled B-spline, measured both ways."""
+    C = SP.sample(ctrl, per_span)
+    e1 = cKDTree(C).query(Q)[0].max()
+    e2 = cKDTree(Q).query(C)[0].max()
+    return float(max(e1, e2))
+
+
+def fit_arcs(net, mirror, prm):
+    polys = [SP.clean_polyline(P) for P in net["polys"]]
+    lengths = np.array([SP.polyline_length(P) for P in polys])
+    n = np.array([ctrl_count(L, prm) for L in lengths])
+    if prm["refine_tol_m"] > 0:      # optional : grow n while the fit is worse than the tolerance
+        for k in range(len(polys)):
+            while n[k] < prm["ctrl_max"] and fit_error(polys[k], SP.fit(polys[k], n[k]), prm["per_span"]) > prm["refine_tol_m"]:
+                n[k] += 1
+    for k in range(len(polys)):      # a mirror pair shares one control point count : mirrored edits map index to index
+        if mirror[k] >= 0:
+            n[k] = n[mirror[k]] = max(n[k], n[mirror[k]])
+    ctrl = [SP.fit(polys[k], int(n[k])) for k in range(len(polys))]
+    err = np.array([fit_error(polys[k], ctrl[k], prm["per_span"]) for k in range(len(polys))])
+    return ctrl, lengths, err
+
+
+def rnd(a, d):
+    return [float(x) + 0.0 for x in np.round(np.asarray(a, float), d)]
+
+
+def build_doc(net, mirror, ctrl, prm):
+    d = prm["decimals"]
+    nodes = [{"id": i, "p": rnd(p, d)} for i, p in enumerate(net["nodes"])]
+    arcs = []
+    for k in range(len(ctrl)):
+        a, b = int(net["ab"][k][0]), int(net["ab"][k][1])
+        C = [rnd(p, d) for p in ctrl[k]]
+        arcs.append({"id": k, "a": a, "b": b, "closed": bool(net["closed"][k]), "pair": net["pair"][k], "ctrl": C, "mirror": int(mirror[k])})
+    return {"version": 1, "date": prm["date"], "units": "m",
+            "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"},
+            "nodes": nodes, "arcs": arcs, "components": net["names"]}
+
+
+def dump_doc(doc, path):
+    """lines.json layout : one line per node and per arc (readable, diff friendly). app.js writes the same layout."""
+    sep = (",", ":")
+    out = ["{", f'"version": {doc["version"]}, "date": {json.dumps(doc["date"])}, "units": {json.dumps(doc["units"])},']
+    if "spline" in doc:
+        out.append('"spline": ' + json.dumps(doc["spline"], separators=sep) + ",")
+    out.append('"nodes": [\n' + ",\n".join(json.dumps(n, separators=sep) for n in doc["nodes"]) + "\n],")
+    out.append('"arcs": [\n' + ",\n".join(json.dumps(a, separators=sep) for a in doc["arcs"]) + "\n],")
+    out.append('"components": ' + json.dumps(doc["components"], separators=sep))
+    out.append("}")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, path)
+
+
+def end_gap_report(net, ctrl):
+    gaps = []
+    for k in range(len(ctrl)):
+        for e, idx in ((0, net["ab"][k][0]), (len(ctrl[k]) - 1, net["ab"][k][1])):
+            if idx >= 0:
+                gaps.append({"arc": k, "end": "a" if e == 0 else "b", "node": int(idx),
+                             "gap_m": round(float(np.linalg.norm(ctrl[k][e] - net["nodes"][idx])), 5)})
+    return gaps
+
+
+def lines_stage(prm, net):
+    log("network : %d arcs, %d nodes, %d components" % (len(net["polys"]), len(net["nodes"]), len(net["names"])))
+    mirror, cost = mirror_table(net["polys"], prm)
+    inv = bool(all(mirror[mirror[k]] == k for k in range(len(mirror)) if mirror[k] >= 0))
+    log("mirror : %d pairs, %d centre (self), %d without counterpart, involution %s"
+        % (int(((mirror >= 0) & (mirror != np.arange(len(mirror)))).sum() // 2), int((mirror == np.arange(len(mirror))).sum()),
+           int((mirror < 0).sum()), inv))
+    ctrl, lengths, err = fit_arcs(net, mirror, prm)
+    log("fit : control points %d..%d, error mean-of-max %.2f mm, worst %.2f mm" % (min(len(c) for c in ctrl), max(len(c) for c in ctrl),
+        1000 * err.mean(), 1000 * err.max()))
+    doc = build_doc(net, mirror, ctrl, prm)
+    os.makedirs(prm["out_dir"], exist_ok=True)
+    dump_doc(doc, os.path.join(prm["out_dir"], "lines.json"))
+    gaps = end_gap_report(net, ctrl)
+    big = [g for g in gaps if g["gap_m"] > 1e-3]
+    worst = sorted(range(len(err)), key=lambda k: -err[k])[:12]
+    report = {
+        "date": prm["date"], "arcs": len(ctrl), "nodes": len(net["nodes"]), "components": len(net["names"]),
+        "ctrl_count": {"min": int(min(len(c) for c in ctrl)), "max": int(max(len(c) for c in ctrl)), "mean": round(float(np.mean([len(c) for c in ctrl])), 2)},
+        "fit_error_mm": {"mean_of_arc_max": round(float(1000 * err.mean()), 3), "median_of_arc_max": round(float(1000 * np.median(err)), 3),
+                         "p95": round(float(1000 * np.percentile(err, 95)), 3), "worst": round(float(1000 * err.max()), 3),
+                         "arcs_over_2mm": int((err > 0.002).sum()), "arcs_over_5mm": int((err > 0.005).sum()),
+                         "worst_arcs": [{"arc": int(k), "err_mm": round(float(1000 * err[k]), 3), "ctrl": int(len(ctrl[k])),
+                                         "length_m": round(float(lengths[k]), 3)} for k in worst]},
+        "mirror": {"pairs": int(((mirror >= 0) & (mirror != np.arange(len(mirror)))).sum() // 2),
+                   "self": int((mirror == np.arange(len(mirror))).sum()), "none": [int(k) for k in np.flatnonzero(mirror < 0)], "involution": inv},
+        "arc_ends_on_nodes": {"ends": len(gaps), "off_by_over_1mm": len(big), "off_by_over_1cm": sum(g["gap_m"] > 0.01 for g in gaps),
+                              "off_by_over_5cm": sum(g["gap_m"] > 0.05 for g in gaps), "worst": sorted(big, key=lambda g: -g["gap_m"])[:15]},
+        "closed_flag_but_open_polyline": [int(k) for k in range(len(ctrl)) if net["closed"][k] and np.linalg.norm(ctrl[k][0] - ctrl[k][-1]) > 1e-6],
+        "arc_length_m": {"geometric_total": round(float(lengths.sum()), 3), "note": "length of the dense polyline, NOT network.npz L (L is the raw zigzag path, longer)"},
+    }
+    with open(os.path.join(prm["out_dir"], "export_report.json"), "w") as f:
+        json.dump(report, f, indent=1)
+    log("arc ends off their node: %d of %d ends by more than 1 mm (%d by more than 1 cm)" % (len(big), len(gaps), report["arc_ends_on_nodes"]["off_by_over_1cm"]))
+    return doc, report
+
+
+# ---------------------------------------------------------------------------------------------------------------- views
+def tint_table(names, prm):
+    """Light pastel colour per component ; the L / R / C variants of a name share one colour."""
+    bases = sorted({n[:-2] if n[-2:] in ("_L", "_R", "_C") else n for n in names})
+    hue = {b: (i * 0.61803398875) % 1.0 for i, b in enumerate(bases)}
+    out = []
+    for n in names:
+        b = n[:-2] if n[-2:] in ("_L", "_R", "_C") else n
+        out.append(colorsys.hsv_to_rgb(hue[b], prm["tint_saturation"], 1.0))
+    return np.array(out)
+
+
+def shade_view(mask, N, comp, tints, prm):
+    L = np.array(prm["light_dir"], float); L /= np.linalg.norm(L)
+    diff = np.clip(N @ L, 0.0, 1.0)
+    shade = prm["ambient"] + (1.0 - prm["ambient"]) * diff
+    albedo = (1.0 - prm["tint"]) * prm["grey"] + prm["tint"] * tints[np.clip(comp, 0, len(tints) - 1)]
+    rgb = np.clip(albedo * shade[..., None], 0.0, 1.0)
+    # component borders : slightly darker pixels where the component changes
+    edge_c = np.zeros(mask.shape, bool)
+    for ax in (0, 1):
+        d = (comp != np.roll(comp, 1, axis=ax)) & mask & np.roll(mask, 1, axis=ax)
+        edge_c |= d
+    rgb[edge_c] *= prm["component_edge"]
+    # silhouette : a one pixel outline on the shape boundary
+    inner = mask.copy()
+    inner[1:] &= mask[:-1]; inner[:-1] &= mask[1:]; inner[:, 1:] &= mask[:, :-1]; inner[:, :-1] &= mask[:, 1:]
+    rgb[mask & ~inner] *= prm["outline"]
+    out = np.ones(mask.shape + (3,))
+    out[mask] = rgb[mask]
+    return (np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8)
+
+
+def views_stage(prm):
+    import Raster
+    from ZrrData import frame
+    from PIL import Image
+    S = np.load(prm["shell"], allow_pickle=True)
+    V, F, lab, names = S["verts"], S["faces"], S["lab"], [str(n) for n in S["names"]]
+    # verify the axes before building the views : *_L components on +x, the hood at the front
+    lat = 1.0 if np.mean([V[lab == i][:, 0].mean() for i, n in enumerate(names) if n.endswith("_L")]) > 0 else -1.0
+    hood = names.index("CAR_body_hood_C")
+    fwd = 1.0 if V[lab == hood][:, 2].mean() > 0 else -1.0
+    log("axes : left side at %sx, front (hood) at %sz" % ("+" if lat > 0 else "-", "+" if fwd > 0 else "-"))
+    X, Y, Z = np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])
+    spec = {"left": (lat * X, None), "right": (-lat * X, None), "top": (Y, fwd * Z), "front": (fwd * Z, None), "back": (-fwd * Z, None)}
+    lo, hi = V.min(0), V.max(0)
+    center = (lo + hi) / 2
+    res = prm["res"]
+    s = float(int(res * (1 - 2 * prm["margin"]) / float((hi - lo).max())))     # same px_per_m for every view
+    log("shell : %d verts, %d faces, bbox %s .. %s, px_per_m %g, res %d" % (len(V), len(F), np.round(lo, 3), np.round(hi, 3), s, res))
+    tints = tint_table(names, prm)
+    lf = lab[F]
+    face_comp = np.where(lf[:, 1] == lf[:, 2], lf[:, 1], lf[:, 0])
+    R = Raster.Renderer(V, F, smooth_deg=prm["smooth_deg"])
+    views = {}
+    try:
+        for name in VIEW_ORDER:
+            normal, up = spec[name]
+            rx, uy, tz = frame(normal, up) if up is not None else frame(normal)
+            t0 = time.time()
+            mask, depth, N, fid = R.render(center, s, (rx, uy, tz), res)
+            comp = np.where(fid >= 0, face_comp[np.clip(fid, 0, None)], 0)
+            Image.fromarray(shade_view(mask, N, comp, tints, prm)).save(os.path.join(prm["out_dir"], f"view_{name}.png"))
+            ok = mask & np.isfinite(depth)
+            dmin, dmax = float(depth[ok].min()), float(depth[ok].max())
+            pad = (dmax - dmin) * prm["depth_pad"] + 1e-6
+            off, scale = dmin - pad, (dmax - dmin) + 2 * pad
+            q = np.zeros(mask.shape, np.uint16)
+            q[ok] = np.clip(np.rint((depth[ok] - off) / scale * 65535.0), 1, 65535).astype(np.uint16)
+            Image.fromarray(q).save(os.path.join(prm["out_dir"], f"depth_{name}.png"))
+            views[name] = {"label": VIEW_LABEL[name], "center": rnd(center, 6), "px_per_m": s, "res": res,
+                           "rx": rnd(rx, 9), "uy": rnd(uy, 9), "tz": rnd(tz, 9),
+                           "depth_offset": off, "depth_scale": scale,
+                           "image": f"data/view_{name}.png", "depth": f"data/depth_{name}.png"}
+            log("view %-5s rx=%s uy=%s tz=%s  covered %.1f%%  depth %.3f..%.3f  (%.1fs)" % (name, np.round(rx, 2), np.round(uy, 2), np.round(tz, 2),
+                100.0 * ok.mean(), dmin, dmax, time.time() - t0))
+    finally:
+        R.release()
+    with open(os.path.join(prm["out_dir"], "views.json"), "w") as f:
+        json.dump(views, f, indent=1)
+    return views
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ZenRay Lines exporter (lines.json, views, depth maps, report)")
+    ap.add_argument("--skip-views", action="store_true", help="only write lines.json and the report (no GPU)")
+    ap.add_argument("--skip-lines", action="store_true", help="only write the views and the depth maps")
+    ap.add_argument("--out", default=PARAMS["out_dir"], help="output folder (default lines/data)")
+    ap.add_argument("--res", type=int, default=PARAMS["res"], help="view resolution in pixels (square)")
+    ap.add_argument("--refine-tol-m", type=float, default=PARAMS["refine_tol_m"], help="grow control point counts until the fit error is below this (0 = off)")
+    a = ap.parse_args()
+    prm = dict(PARAMS); prm.update({"out_dir": a.out, "res": a.res, "refine_tol_m": a.refine_tol_m})
+    os.makedirs(prm["out_dir"], exist_ok=True)
+    if not a.skip_lines:
+        lines_stage(prm, load_network(prm["network"]))
+    if not a.skip_views:
+        views_stage(prm)
+    log("done ->", prm["out_dir"])
+
+
+if __name__ == "__main__":
+    main()

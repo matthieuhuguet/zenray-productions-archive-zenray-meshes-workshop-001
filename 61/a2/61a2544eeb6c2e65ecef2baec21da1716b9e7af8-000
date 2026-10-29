@@ -1,0 +1,55 @@
+"""29 October 2026 : ZenRay Lines BOARD, the audit board of a component model : every component in its own colour, the lines
+(component borders) in dark, six views, a legend with the face count of each component ; optional wireframe for quad meshes.
+EN: works on the embedded triangle surface (work/lines/embed.npz) and on the quad car (work/lines/car_*.npz).
+python ZrlBoard.py <npz> <out.png> [title]        FR : la planche d'audit : un component par couleur, les lignes en sombre."""
+import colorsys, sys
+import numpy as np
+from PIL import Image, ImageDraw
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo")
+import ZrrData as D, ZrrColorMap as CM
+from Raster import Renderer
+
+PARAMS = {"res": 1400, "px_per_m": 260.0, "light": (0.3, 0.5, 0.81), "line_rgb": (25, 25, 25), "wire": True,   # 29 October 2026
+          "views": [("Left", (1, 0, 0)), ("Front", (0, 0, 1)), ("Back", (0, 0, -1)), ("Top", (0, 1, 0)), ("Bottom", (0, -1, 0)), ("Three quarter", (0.62, 0.45, 0.64))]}
+
+
+def region_colours(names):
+    out = []
+    for k, n in enumerate(names):
+        h = (hash(n.split("#")[0]) % 997) / 997.0; l = 0.62 + 0.1 * ((k * 7) % 3) / 2.0
+        out.append(np.array(colorsys.hls_to_rgb(h, l, 0.55)) * 255)
+    return np.array(out)
+
+
+def board(V, faces, region, names, out, title, edges=None, quads=None, prm=PARAMS):
+    tri = faces if faces.shape[1] == 3 else np.r_[faces[:, [0, 1, 2]], faces[:, [0, 2, 3]]]
+    reg_t = region if faces.shape[1] == 3 else np.r_[region, region]
+    cols = region_colours(names); R = Renderer(V, tri, smooth_deg=45.0); lo, hi = V.min(0), V.max(0); ctr = (lo + hi) / 2
+    tiles = []; s = prm["px_per_m"]; res = prm["res"]
+    seg = []
+    if edges is not None: seg.append((edges, prm["line_rgb"], 2))
+    if quads is not None and prm["wire"]:
+        Eq = np.unique(np.sort(np.r_[quads[:, [0, 1]], quads[:, [1, 2]], quads[:, [2, 3]], quads[:, [3, 0]]], axis=1), axis=0); seg.insert(0, (Eq, (70, 70, 70), 1))
+    for t, d in prm["views"]:
+        rx, uy, tz = D.frame(np.array(d, float)); mask, depth, N, fid = R.render(ctr, s, (rx, uy, tz), res); ok = fid >= 0
+        img = np.full(mask.shape + (3,), 250.0); lam = (0.55 + 0.45 * np.clip(N[ok] @ np.array(prm["light"]), 0, 1))[:, None]
+        img[ok] = cols[reg_t[fid[ok]]] * lam; im = Image.fromarray(img.astype(np.uint8)); dr = ImageDraw.Draw(im)
+        for E, col, w in seg:
+            a = V[E[:, 0]] - ctr; b = V[E[:, 1]] - ctr; m = 0.5 * (a + b)
+            xm = m @ rx * s + res / 2 - 0.5; ym = res / 2 - 0.5 - m @ uy * s; xi = np.clip(xm.astype(int), 0, res - 1); yi = np.clip(ym.astype(int), 0, res - 1)
+            vis = np.isfinite(depth[yi, xi]) & (m @ tz > depth[yi, xi] - 0.006) & (xm >= 0) & (xm < res) & (ym >= 0) & (ym < res)
+            for k in np.flatnonzero(vis):
+                dr.line([(a[k] @ rx * s + res / 2 - 0.5, res / 2 - 0.5 - a[k] @ uy * s), (b[k] @ rx * s + res / 2 - 0.5, res / 2 - 0.5 - b[k] @ uy * s)], fill=col, width=w)
+        A = np.asarray(im); ys, xs = np.nonzero(mask); tiles.append((t, Image.fromarray(A[max(ys.min() - 8, 0):ys.max() + 9, max(xs.min() - 8, 0):xs.max() + 9])))
+    R.release()
+    cnt = np.bincount(region, minlength=len(names)); order = np.argsort(-cnt)
+    legend = [(f"{names[r].replace('CAR_', '')}  {cnt[r]}", cols[r]) for r in order if cnt[r] > 0]
+    return CM.sheet(tiles, legend, out, title)
+
+
+if __name__ == "__main__":
+    d = np.load(sys.argv[1], allow_pickle=True); out = sys.argv[2]; title = sys.argv[3] if len(sys.argv) > 3 else "ZenRay Lines audit board, 29 October 2026"
+    names = [f"{n}#{k}" for k, n in enumerate(d["region_names"])]
+    if "F" in d.files: print(board(d["V"], d["F"], d["region"], names, out, title, edges=d["line_edges"]))
+    else: print(board(d["P"], d["Q"], d["region"], names, out, title, quads=d["Q"]))

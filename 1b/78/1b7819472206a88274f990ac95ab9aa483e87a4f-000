@@ -1,0 +1,93 @@
+# 29 October 2026 : ZenRay Lines HOUDINI, the constrained quad remesh of the component surface, run inside Houdini (MCP houdini_hom).
+# EN: builds /obj/ZRL_Car : load the embedded surface (work/lines/embed.npz : faces, region per face) on the left half, mirror it
+# (exact symmetry), mark the line edges (two faces of different regions) and the opening borders as constrained edges, quad remesh
+# with the lines held, transfer the region to every quad, write work/lines/car_<tag>.npz (P, Q, region, region names).
+# FR : remaillage quad contraint par les lignes dans Houdini ; chaque quad garde son component ; symétrie exacte par miroir.
+# Use : exec(open(this).read()); result = build(tag="v001", quad_m=0.025)
+import json, os, time
+import numpy as np
+import hou
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : the interface of the Houdini pass, one place
+    "embed": f"{ROOT}/work/lines/embed.npz", "half_margin_m": 0.02, "quad_m": 0.025, "net": "/obj/ZRL_Car",
+    "curvature_weight": 1.0, "adaptivity": 0.0, "decimation_level": 2,
+}
+
+LOAD_CODE = r'''
+# 29 October 2026 : load the left half of the embedded component surface (numpy -> Houdini, one call per array)
+import numpy as np
+geo = hou.pwd().geometry()
+d = np.load(hou.pwd().parm("embed_path").eval(), allow_pickle=True)
+V, F, reg = d["V"], d["F"], d["region"].astype(np.int32)
+m = hou.pwd().parm("half_margin").eval()
+keep = (V[F][:, :, 0] >= -m).all(1); F = F[keep]; reg = reg[keep]
+used = np.unique(F); remap = -np.ones(len(V), np.int64); remap[used] = np.arange(len(used)); V = V[used]; F = remap[F]
+geo.createPoints(V.astype(np.float64).tolist())
+geo.createPolygons(F.tolist(), True)
+geo.addAttrib(hou.attribType.Prim, "region", 0)
+geo.setPrimIntAttribValuesFromString("region", reg.astype(np.int32).tobytes(), hou.numericData.Int32)
+'''
+
+GROUP_VEX = r'''
+// 29 October 2026 : an edge between two faces of different components is a line : constrained ; borders (openings) too
+int h0 = primhedge(0, @primnum); int h = h0;
+do {
+    int e = hedge_nextequiv(0, h); int o = hedge_prim(0, e);
+    int p0 = hedge_srcpoint(0, h), p1 = hedge_dstpoint(0, h);
+    if (e == h || o < 0) setedgegroup(0, "constrained", p0, p1, 1);
+    else if (prim(0, "region", o) != i@region) setedgegroup(0, "constrained", p0, p1, 1);
+    h = hedge_next(0, h);
+} while (h != h0);
+'''
+
+EXPORT_CODE = r'''
+# 29 October 2026 : write the quad car to numpy (points, polygons, region per polygon)
+import numpy as np
+geo = hou.pwd().geometry()
+P = np.array(geo.pointFloatAttribValues("P"), np.float64).reshape(-1, 3)
+polys = [tuple(v.point().number() for v in pr.vertices()) for pr in geo.prims()]
+n = np.array([len(p) for p in polys]); reg = np.array(geo.primIntAttribValues("region"), np.int64)
+Q = np.array([p if len(p) == 4 else (p + (p[-1],) * 4)[:4] for p in polys], np.int64)
+np.savez(hou.pwd().parm("out_path").eval(), P=P, Q=Q, nverts=n, region=reg, region_names=np.load(hou.pwd().parm("embed_path").eval(), allow_pickle=True)["region_names"])
+'''
+
+
+def _python_sop(parent, name, code, parms):
+    n = parent.createNode("python", name)
+    tg = n.parmTemplateGroup()
+    for k, v in parms.items():
+        tg.append(hou.StringParmTemplate(k, k, 1, default_value=(str(v),)) if isinstance(v, str) else hou.FloatParmTemplate(k, k, 1, default_value=(float(v),)))
+    n.setParmTemplateGroup(tg); n.parm("python").set(code)
+    return n
+
+
+def build(tag="v001", quad_m=None, prm=PARAMS):
+    t0 = time.time(); quad_m = quad_m or prm["quad_m"]; out = f"{ROOT}/work/lines/car_{tag}.npz"
+    old = hou.node(prm["net"])
+    if old: old.destroy()
+    g = hou.node("/obj").createNode("geo", prm["net"].split("/")[-1])
+    load = _python_sop(g, "load_embed", LOAD_CODE, {"embed_path": prm["embed"], "half_margin": prm["half_margin_m"]})
+    clip = g.createNode("clip", "clip_left_half"); clip.setInput(0, load)
+    clip.parmTuple("dir").set((1, 0, 0)); clip.parm("dist").set(0.0); clip.parm("clipop").set("above")
+    mir = g.createNode("mirror", "mirror_right"); mir.setInput(0, clip)
+    mir.parmTuple("dir").set((1, 0, 0)); mir.parm("consolidatepts").set(1)
+    clean = g.createNode("fuse::2.0", "fuse_seam"); clean.setInput(0, mir); clean.parm("tol3d").set(1e-5)
+    grp = g.createNode("attribwrangle", "constrained_lines"); grp.setInput(0, clean); grp.parm("class").set("primitive"); grp.parm("snippet").set(GROUP_VEX)
+    qr = g.createNode("quadremesh", "quad_remesh"); qr.setInput(0, grp)
+    qr.parm("resolution").set(1)                       # target quad area
+    qr.parm("targetquadarea").set(quad_m * quad_m)
+    qr.parm("constrainededgesgroup").set("constrained")
+    qr.parm("featureboundaries").set(1)
+    qr.parm("symmetry").set(1) if qr.parm("symmetry") else None
+    for pn, v in (("xaxis", 1), ("mirroroutput", 1), ("enableadaptivity", 0), ("decimationlevel", prm["decimation_level"])):
+        if qr.parm(pn): qr.parm(pn).set(v)
+    tr = g.createNode("attribtransfer", "region_to_quads"); tr.setInput(0, qr); tr.setInput(1, grp)
+    tr.parm("primitiveattribs").set(1); tr.parm("primattriblist").set("region"); tr.parm("pointattribs").set(0)
+    ex = _python_sop(g, "export_numpy", EXPORT_CODE, {"embed_path": prm["embed"], "out_path": out}); ex.setInput(0, tr)
+    ex.setDisplayFlag(True); ex.setRenderFlag(True)
+    info = {}
+    for n in (load, clip, mir, clean, grp, qr, tr, ex):
+        t = time.time(); geo = n.geometry(); info[n.name()] = {"s": round(time.time() - t, 2), "points": len(geo.points()), "prims": len(geo.prims()), "errors": list(n.errors())[:2], "warnings": list(n.warnings())[:2]}
+    info["total_s"] = round(time.time() - t0, 1); info["out"] = out
+    return info
