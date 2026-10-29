@@ -1,0 +1,72 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY ASSEMBLY : the components that pass the 100 percent gate replace their old parts in the car,
+the left ones mirrored onto the right (x -> -x, faces reversed : exact symmetry) ; every other part stays from the validated car, greyed
+on the board so that what is finished and what is not can be read at a glance. Writes work/retopo/car_retopo_<tag>.npz (P, C, I, T, names)
+and versions/Retopo_Car_<tag>.png (new panels in colour with their wireframe, old parts in grey, reflection lines on the whole car).
+python ZrrAssemble.py <tag>       FR : l'assemblage : les composants à 100 % remplacent leurs anciennes pièces, le reste en gris."""
+import glob, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo")
+import ZrrData as D, ZrrColorMap as CM, ZrrSheet as S
+from Raster import Renderer
+
+
+def mirror_name(n):
+    return n[:-2] + "_R" if n.endswith("_L") else n[:-2] + "_L" if n.endswith("_R") else n
+
+
+def finished():
+    out = {}
+    for f in sorted(glob.glob(f"{ROOT}/work/retopo/CAR_*/judge.json")):
+        j = json.load(open(f)); name = os.path.basename(os.path.dirname(f))
+        if j["judge"]["score"]["ok"]: out[name] = np.load(os.path.join(os.path.dirname(f), "panel.npz"), allow_pickle=True)
+    return out
+
+
+def assemble(tag):
+    car = D.load(); done = finished(); new = {}
+    for n, d in done.items():
+        new[n] = (d["P"], d["Q"])
+        if n.endswith("_L") and mirror_name(n) not in done: new[mirror_name(n)] = (d["P"] * np.array([-1.0, 1.0, 1.0]), d["Q"][:, ::-1])
+    keep = ~np.isin(car["T"], [car["names"].index(n) for n in new if n in car["names"]])
+    P = [car["P"]]; C = [car["C"][keep]]; I = []; T = [car["T"][keep]]; off = car["off"]
+    I.append(np.concatenate([car["I"][off[p]:off[p + 1]] for p in np.flatnonzero(keep)])); base = len(car["P"]); names = list(car["names"])
+    for n, (Pn, Qn) in new.items():
+        P.append(Pn); C.append(np.full(len(Qn), 4)); I.append((Qn + base).ravel()); T.append(np.full(len(Qn), names.index(n) if n in names else len(names))); base += len(Pn)
+        if n not in names: names.append(n)
+    A = {"P": np.vstack(P), "C": np.concatenate(C), "I": np.concatenate(I), "T": np.concatenate(T), "names": names}
+    A["off"] = np.concatenate([[0], np.cumsum(A["C"])]); np.savez(f"{ROOT}/work/retopo/car_retopo_{tag}.npz", P=A["P"], C=A["C"], I=A["I"], T=A["T"], names=np.array(names))
+    return A, new, car
+
+
+def board(A, new, tag):
+    pm = D.body_poly_mask(A); tri, owner = D.triangulate(A, pm); isnew = np.isin(A["T"], [A["names"].index(n) for n in new])
+    R = Renderer(A["P"], tri, smooth_deg=45.0); lo, hi = A["P"].min(0), A["P"].max(0); ctr = (lo + hi) / 2; res = 1400; s = 260.0; tiles = []
+    cols = np.array([CM.colour(n) for n in A["names"]])
+    for title, d, zebra in (("Left", (1, 0, 0), False), ("Top", (0, 1, 0), False), ("Three quarter", (0.62, 0.45, 0.64), False), ("Three quarter, reflection lines", (0.62, 0.45, 0.64), True)):
+        rx, uy, tz = D.frame(np.array(d, float)); mask, depth, N, fid = R.render(ctr, s, (rx, uy, tz), res); ok = fid >= 0; img = np.full(mask.shape + (3,), 250.0)
+        poly = owner[fid[ok]]; lam = (0.5 + 0.5 * np.clip(N[ok] @ np.array([0.3, 0.5, 0.81]), 0, 1))[:, None]
+        if zebra:
+            r = 2 * N[..., 2:3] * N - np.array([0, 0, 1.0]); ph = np.arctan2(r[..., 1], np.sqrt(r[..., 0] ** 2 + r[..., 2] ** 2)); st = (np.floor((ph / np.pi + 0.5) * 28) % 2)
+            img[ok] = (st[ok] * 225 + 30)[:, None] * np.ones(3)
+        else:
+            img[ok] = np.where(isnew[poly][:, None], cols[A["T"][poly]] * lam, np.array([205, 205, 205]) * lam)
+        im = Image.fromarray(img.astype(np.uint8)); dr = ImageDraw.Draw(im)
+        if not zebra:
+            for n, (Pn, Qn) in new.items():
+                G = None
+                for q in Qn[: len(Qn) // 2]:
+                    for k in range(4):
+                        a, b = Pn[q[k]], Pn[q[(k + 1) % 4]]; m = (a + b) / 2 - ctr; x = m @ rx * s + res / 2 - 0.5; y = res / 2 - 0.5 - m @ uy * s
+                        xi, yi = int(x), int(y)
+                        if 0 <= xi < res and 0 <= yi < res and np.isfinite(depth[yi, xi]) and m @ tz > depth[yi, xi] - 0.004:
+                            pa = a - ctr; pb = b - ctr; dr.line([(pa @ rx * s + res / 2 - 0.5, res / 2 - 0.5 - pa @ uy * s), (pb @ rx * s + res / 2 - 0.5, res / 2 - 0.5 - pb @ uy * s)], fill=(25, 25, 25), width=1)
+        a = np.asarray(im); ys, xs = np.nonzero(mask); tiles.append((title, Image.fromarray(a[max(ys.min() - 8, 0):ys.max() + 9, max(xs.min() - 8, 0):xs.max() + 9])))
+    R.release()
+    legend = [(n.replace("CAR_", "") + "  100 %", CM.colour(n)) for n in sorted(new)] + [("old part, not finished yet", np.array([205, 205, 205]))]
+    return CM.sheet(tiles, legend, f"{ROOT}/versions/Retopo_Car_{tag}.png", f"ZenRay Meshes Retopology, car {tag} : {len(new)} components at 100 % in colour with their wireframe, old parts in grey, 29 October 2026")
+
+
+if __name__ == "__main__":
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v001"; A, new, car = assemble(tag); print(sorted(new)); print(board(A, new, tag))
