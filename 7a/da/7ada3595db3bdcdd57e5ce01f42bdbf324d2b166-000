@@ -4,7 +4,7 @@ reading the OBJ (one group per component), the component name copied to a "name"
 server endpoint POST /houdini ; usable alone : python ZrlHoudiniLink.py <obj path>.
 FR : la finition dans Houdini : le maillage de ZenRay Lines chargé dans la session ouverte, un groupe et un nom par component."""
 import json, socket, sys
-PARAMS = {"host": "127.0.0.1", "port": 18812, "timeout_s": 60.0, "net": "/obj/ZRL_Retopo"}   # 29 October 2026
+PARAMS = {"host": "127.0.0.1", "port": 18812, "timeout_s": 60.0, "net": "/obj/ZRL_Retopo", "split": True, "max_split": 200}   # 29 October 2026 : split = one COMP_<name> output per component (for ZenRay UV)
 
 HOM = r'''
 import hou
@@ -17,12 +17,20 @@ w.parm("snippet").set('string gs[] = detailintrinsic(0, "primitivegroups"); s@na
 o = net.node("OUT") or net.createNode("output", "OUT"); o.setInput(0, w); o.setDisplayFlag(True); o.setRenderFlag(True); net.layoutChildren()
 f.parm("reload").pressButton(); geo = o.geometry()
 names = sorted(set(geo.primStringAttribValues("name"))) if geo.findPrimAttrib("name") else []
-result = {"node": net.path(), "prims": len(geo.prims()), "points": len(geo.points()), "components": len(names), "quads": sum(1 for p in geo.prims() if len(p.vertices()) == 4)}
+for c in [c for c in net.children() if c.name().startswith(("COMP_", "keep_"))]: c.destroy()      # 29 October 2026 : one blast and one null per component, rebuilt each time
+comps = {}
+if %(split)r and 0 < len(names) <= %(max_split)d:
+    for nm in names:
+        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in nm) or "unnamed"
+        b = net.createNode("blast", "keep_" + safe); b.setInput(0, o.inputs()[0]); b.parm("group").set('@name="%%s"' %% nm); b.parm("grouptype").set("prims"); b.parm("negate").set(1)
+        n = net.createNode("null", "COMP_" + safe); n.setInput(0, b); comps[n.name()] = len(n.geometry().prims())
+    net.layoutChildren()
+result = {"node": net.path(), "prims": len(geo.prims()), "points": len(geo.points()), "components": len(names), "quads": sum(1 for p in geo.prims() if len(p.vertices()) == 4), "outputs": comps}
 '''
 
 
 def send(obj_path, prm=PARAMS):
-    code = HOM % {"path": obj_path, "net": prm["net"], "name": prm["net"].rsplit("/", 1)[-1]}
+    code = HOM % {"path": obj_path, "net": prm["net"], "name": prm["net"].rsplit("/", 1)[-1], "split": bool(prm["split"]), "max_split": int(prm["max_split"])}
     with socket.create_connection((prm["host"], prm["port"]), timeout=prm["timeout_s"]) as sock:
         sock.sendall((json.dumps({"op": "hom", "code": code}) + "\n").encode("utf-8")); raw = b""
         while not raw.endswith(b"\n"):
