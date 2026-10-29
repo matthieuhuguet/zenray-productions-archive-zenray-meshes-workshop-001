@@ -1,0 +1,138 @@
+"""29 October 2026 : ZenRay Lines CREASE SNAP, a whole curve network moved onto the creases of its model, then its doubled curves merged.
+EN: for every arc, the view that faces it best (six axis views, visibility checked by depth) is rendered in a window around it (Raster.py through
+ZrlCreases.crease_map) ; the cheapest path along the creases between its two ends is searched inside a corridor around the arc (corridor_mm), so
+it can only settle on the crease it already runs beside, never jump to another one ; the snap is kept when enough of the new path lies on a crease
+(min_share) and its length stays close (len_ratio). The new path is lifted by the rendered depth and fitted to the same cubic B-spline form, the
+end nodes unchanged. Then two curves that now run together (median gap under dup_gap_mm over dup_overlap of the shorter) are merged : the shorter
+one is removed, the doctor of ZrlNetMesh reattaches the curves that ended on it. Every arc is independent : a pool of workers.
+    python -I ZrlCreaseSnap.py --doc lines.json --out lines_creases.json [--ref v752] [--workers 12]       (or POST /snap_creases)
+FR : tout un réseau de courbes recalé sur les creux de son modèle, chaque courbe dans un couloir autour d'elle, puis ses courbes doublées fusionnées.
+"""
+import argparse, json, os, sys, time
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+for p in (HERE, os.path.join(ROOT, "Scripts")):
+    if p not in sys.path: sys.path.insert(0, p)
+
+PARAMS = {   # 29 October 2026 : every tunable value of the snap and of the merge
+    "corridor_mm": 20.0,          # the crease path stays this close to the curve it replaces
+    "corridor_weight": 1.0,       # cost multiplier 1 + weight * (distance / corridor) ** 2 : prefer the crease nearest to the curve
+    "min_share": 0.6,             # share of the new path on a crease (curvature above half of min_curv) to keep the snap
+    "len_ratio": [0.8, 1.25],     # new length / old length
+    "visible_mm": 25.0,           # an arc sample is seen from a view when its depth matches the rendered one within this (the curves float up to 11 mm off the skin)
+    "px_per_m": 900.0,            # window resolution (1.1 mm per pixel)
+    "crop_mm": 45.0,              # only the skin within this distance of the curve is rendered : other parts (wheels, overlapping shells) cannot hide it
+    "max_res": 1400,
+    "ctrl_step_m": 0.03,
+    "dup_gap_mm": 8.0, "dup_overlap": 0.8,
+    "workers": 12,
+}
+AXES = {"+x": ([0, 0, -1], [0, 1, 0], [1, 0, 0]), "-x": ([0, 0, 1], [0, 1, 0], [-1, 0, 0]), "+z": ([1, 0, 0], [0, 1, 0], [0, 0, 1]),
+        "-z": ([-1, 0, 0], [0, 1, 0], [0, 0, -1]), "+y": ([1, 0, 0], [0, 0, -1], [0, 1, 0]), "-y": ([1, 0, 0], [0, 0, 1], [0, -1, 0])}
+_W = {}
+
+
+def _init(src):
+    import ZrlNetMesh as NM
+    ref = NM.load_ref(src); _W["ref"] = ref; _W["tri"] = np.stack([ref.A, ref.B, ref.C], 1); _W["cent"] = _W["tri"].mean(1)
+
+
+def snap_arc(job):
+    """one arc : {"id", "pts" (n, 3) samples, "prm"} -> {"id", "pts" new samples or None, "view", "share", "reason"}."""
+    import ZrlCreases as ZC
+    from scipy import ndimage
+    from skimage.graph import route_through_array
+    aid, pts, prm = job["id"], np.asarray(job["pts"], float), job["prm"]; ref, tri, cent = _W["ref"], _W["tri"], _W["cent"]
+    if len(pts) < 2 or np.linalg.norm(pts[-1] - pts[0]) < 1e-6 and len(pts) < 4: return {"id": aid, "pts": None, "reason": "too short"}
+    n = ref.normals_at(pts)                                                  # outward normals (away from the model's box centre)
+    order = sorted(AXES, key=lambda k: -float((n.mean(0) @ np.array(AXES[k][2], float))))
+    tz0 = n.mean(0); tz0 = tz0 / max(np.linalg.norm(tz0), 1e-9); ch = pts[-1] - pts[0]; ch = ch - (ch @ tz0) * tz0                 # 29 October 2026 : first a camera on the curve's mean normal
+    if np.linalg.norm(ch) < 1e-6: ch = np.cross(tz0, [0.0, 1.0, 0.0]) if abs(tz0[1]) < 0.9 else np.cross(tz0, [1.0, 0.0, 0.0])
+    rx0 = ch / np.linalg.norm(ch); views = {"normal": (rx0.tolist(), np.cross(tz0, rx0).tolist(), tz0.tolist())}; views.update(AXES)
+    L0 = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()); cor = prm["corridor_mm"] / 1000.0
+    for vk in ["normal"] + order[:2]:
+        rx, uy, tz = (np.array(a, float) for a in views[vk]); c = pts.mean(0); uv = (pts - c) @ np.stack([rx, uy], 1)
+        ext = float(np.abs(uv).max()) * 2 + 4 * cor + 0.02; res = int(min(prm["max_res"], max(160, ext * prm["px_per_m"])))
+        keep = np.abs((cent - c) @ np.stack([rx, uy], 1)).max(1) < ext
+        if keep.any():                                                   # 29 October 2026 : the local skin only
+            from scipy.spatial import cKDTree
+            idx = np.flatnonzero(keep); dk, _ = cKDTree(pts).query(cent[idx], distance_upper_bound=prm["crop_mm"] / 1000.0); keep[idx[~np.isfinite(dk)]] = False
+        if not keep.any(): continue
+        cp = dict(ZC.PARAMS, view_axes=[rx.tolist(), uy.tolist(), tz.tolist()], center=c.tolist(), px_per_m=res / ext, res=res, sigma_mm=max(ZC.PARAMS["sigma_mm"], 1.5 * 1000.0 * ext / res))
+        cm = ZC.crease_map(tri[keep].reshape(-1, 3), np.arange(int(keep.sum()) * 3).reshape(-1, 3), cp)
+        px = ZC.world_to_pixel(cp, pts); r = np.clip(np.round(px[:, 1]).astype(int), 0, res - 1); cc = np.clip(np.round(px[:, 0]).astype(int), 0, res - 1)
+        d = (pts - c) @ tz; seen = cm["mask"][r, cc] & (np.abs(d - np.nan_to_num(cm["depth"][r, cc], nan=-9)) < prm["visible_mm"] / 1000.0)
+        if seen.mean() < 0.7: continue
+        line = np.zeros((res, res), bool)
+        for k in range(len(px) - 1):                                         # the old arc drawn in the window, densely
+            m = int(np.ceil(np.linalg.norm(px[k + 1] - px[k]))) + 1; t = np.linspace(0, 1, m)[:, None]; q = px[k] * (1 - t) + px[k + 1] * t
+            line[np.clip(np.round(q[:, 1]).astype(int), 0, res - 1), np.clip(np.round(q[:, 0]).astype(int), 0, res - 1)] = True
+        dist = ndimage.distance_transform_edt(~line) / cp["px_per_m"]; curv = np.nan_to_num(cm["curv"], nan=0.0)
+        cost = 1.0 / (0.15 + np.clip(curv / 80.0, 0, 1)) * (1 + prm["corridor_weight"] * (dist / cor) ** 2); cost[(dist > cor) | ~cm["mask"]] = 1e4
+        path, _ = route_through_array(cost, (r[0], cc[0]), (r[-1], cc[-1]), fully_connected=True, geometric=True); path = np.array(path)
+        dep = cm["depth"][path[:, 0], path[:, 1]]; ok = np.isfinite(dep)
+        if ok.mean() < 0.9: continue
+        dep = ndimage.median_filter(np.interp(np.arange(len(dep)), np.flatnonzero(ok), dep[ok]), size=9, mode="nearest")   # 29 October 2026 : no depth jump across a panel gap
+        W = ZC.pixel_to_world(cp, path[:, 0].astype(float), path[:, 1].astype(float)) + dep[:, None] * tz
+        share = float((curv[path[:, 0], path[:, 1]] >= cp["min_curv"] * 0.5).mean()); W = np.vstack([pts[0], W, pts[-1]])
+        flat = lambda X: float(np.linalg.norm(np.diff(X @ np.stack([rx, uy], 1), axis=0), axis=1).sum()); L1 = flat(W); L0 = flat(pts)   # lengths seen by the camera
+        if share < prm["min_share"]: return {"id": aid, "pts": None, "view": vk, "share": round(share, 3), "reason": "no crease in the corridor"}
+        if not (prm["len_ratio"][0] <= L1 / max(L0, 1e-9) <= prm["len_ratio"][1]): return {"id": aid, "pts": None, "view": vk, "share": round(share, 3), "reason": "length %.2f" % (L1 / L0)}
+        dmax = float(np.max(np.min(np.linalg.norm(W[:, None, :] - pts[None, ::max(1, len(pts) // 60), :], axis=2), axis=1)))
+        return {"id": aid, "pts": W.tolist(), "view": vk, "share": round(share, 3), "moved_mm": round(dmax * 1000, 1), "reason": "snapped"}
+    return {"id": aid, "pts": None, "reason": "not seen from an axis view"}
+
+
+def merge_doubles(doc, prm=PARAMS):
+    """the shorter of two curves running together (median gap under dup_gap_mm along dup_overlap of it) is removed ; returns the removed ids."""
+    import ZrlSpline as SP
+    from scipy.spatial import cKDTree
+    S = {A["id"]: SP.sample(np.array(A["ctrl"], float), 20) for A in doc["arcs"]}; L = {k: float(np.linalg.norm(np.diff(v, axis=0), axis=1).sum()) for k, v in S.items()}
+    lo = {k: v.min(0) - 0.02 for k, v in S.items()}; hi = {k: v.max(0) + 0.02 for k, v in S.items()}; gone = set(); trees = {k: cKDTree(v) for k, v in S.items()}
+    ids = sorted(S, key=lambda k: L[k])
+    for i, a in enumerate(ids):
+        if a in gone: continue
+        for b in ids[i + 1:]:
+            if b in gone or (lo[a] > hi[b]).any() or (lo[b] > hi[a]).any(): continue
+            d, _ = trees[b].query(S[a])
+            if (d <= prm["dup_gap_mm"] / 1000.0).mean() >= prm["dup_overlap"]: gone.add(a); break
+    doc = dict(doc, arcs=[A for A in doc["arcs"] if A["id"] not in gone]); return doc, sorted(gone)
+
+
+def snap_doc(doc, src="v752", prm=PARAMS):
+    import ZrlSpline as SP
+    from multiprocessing import get_context
+    t = time.time(); arcs = {A["id"]: A for A in doc["arcs"]}
+    jobs = [{"id": A["id"], "pts": SP.sample(np.array(A["ctrl"], float), 30).tolist(), "prm": prm} for A in doc["arcs"] if A.get("a") != A.get("b")]
+    with get_context("spawn").Pool(prm["workers"], initializer=_init, initargs=(src,)) as pool: out = pool.map(snap_arc, jobs, chunksize=4)
+    new = json.loads(json.dumps(doc)); by = {A["id"]: A for A in new["arcs"]}; rep = {"snapped": 0, "kept": 0, "reasons": {}, "moved_mm_median": None}; moved = []
+    for r in out:
+        rep["reasons"][r["reason"]] = rep["reasons"].get(r["reason"], 0) + 1
+        if r["pts"] is None: rep["kept"] += 1; continue
+        A = by[r["id"]]; W = SP.clean_polyline(np.array(r["pts"], float)); m = max(4, len(A["ctrl"]), int(round(SP.polyline_length(W) / prm["ctrl_step_m"])) + 1)
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(W, axis=0), axis=1))]; tt = np.linspace(0, cum[-1], max(4 * m, 16)); W = np.stack([np.interp(tt, cum, W[:, k]) for k in range(3)], 1)
+        C = SP.fit(W, m); C[0], C[-1] = A["ctrl"][0], A["ctrl"][-1]; A["ctrl"] = np.round(C, 6).tolist(); rep["snapped"] += 1; moved.append(r["moved_mm"])
+    if moved: rep["moved_mm_median"] = float(np.median(moved))
+    new, gone = merge_doubles(new, prm); rep["merged"] = gone; rep["seconds"] = round(time.time() - t, 1)
+    return new, rep
+
+
+def handle(req):
+    """POST /snap_creases : {"lines": document, "ref": optional, "params": optional overrides} -> {"lines": new document, "report"}."""
+    src = req.get("ref") or json.load(open(os.path.join(ROOT, "lines/data/ref_mesh.json"))).get("source") or "v752"
+    new, rep = snap_doc(req["lines"], src, dict(PARAMS, **(req.get("params") or {}))); return {"ok": True, "lines": new, "report": rep}
+
+
+def main():
+    if "--handle" in sys.argv:
+        print(json.dumps(handle(json.loads(sys.stdin.read())))); return
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--doc", required=True); ap.add_argument("--out", required=True)
+    ap.add_argument("--ref", default="v752"); ap.add_argument("--workers", type=int, default=PARAMS["workers"]); a = ap.parse_args()
+    if os.path.realpath(a.out) == os.path.realpath(os.path.join(ROOT, "lines/data/lines.json")): raise SystemExit("never overwrite lines/data/lines.json")
+    new, rep = snap_doc(json.load(open(a.doc)), a.ref, dict(PARAMS, workers=a.workers)); json.dump(new, open(a.out, "w")); print(json.dumps(rep))
+
+
+if __name__ == "__main__":
+    main()
