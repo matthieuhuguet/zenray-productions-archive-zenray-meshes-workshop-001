@@ -38,6 +38,7 @@ PARAMS = {   # 29 October 2026 : the interface of the micro-component finisher, 
     "edge_m": 0.02,
     "thickness_m": 0.002, "hem_steps": 4,
     "out_dir": f"{ROOT}/work/retopo",
+    "partition": f"{ROOT}/work/retopo/shell.npz",          # 29 October 2026 : regions read on the clean partition ; "" = the raw part
 }
 
 
@@ -70,8 +71,22 @@ def to3d(v, x, y, h):
 
 
 # ---------- 2 region ----------
-def region(v, params):
-    M = v["lab"] == v["pid"]
+_SHELL = {}
+
+
+def partition_labels(v, car, params):
+    """29 October 2026 : the clean partition (ZrrShell) seen in the same view : every pixel of the closed shell carries ONE component,
+    holes and gaps included, so a region read here is complete and meets its neighbours on the partition borders."""
+    if "S" not in _SHELL:
+        S = np.load(params["partition"], allow_pickle=True); V, F, lab = S["verts"], S["faces"], S["lab"]
+        tl = lab[F]; fl = np.where(tl[:, 1] == tl[:, 2], tl[:, 1], tl[:, 0]); nm = [str(n) for n in S["names"]]
+        _SHELL["S"] = (V, F, np.array([car["names"].index(n) if n in car["names"] else -1 for n in nm])[fl])
+    V, F, fpart = _SHELL["S"]; R = Renderer(V, F); mask, depth, N, fid = R.render(v["c3"], v["s"], (v["rx"], v["uy"], v["tz"]), v["res"]); R.release()
+    L = np.full(mask.shape, -1); ok = fid >= 0; L[ok] = fpart[fid[ok]]; return L
+
+
+def region(v, params, car=None):
+    M = (partition_labels(v, car, params) == v["pid"]) if params.get("partition") and car is not None else v["lab"] == v["pid"]
     if params["open_px"]: M = ndi.binary_opening(M, iterations=params["open_px"])
     L, n = ndi.label(M)
     if n == 0: raise ValueError("component not visible in its own view")
@@ -84,11 +99,13 @@ class Field:
     """h(x, y) on a regular plane grid, bilinear, fitted by thin plate smoothing with a deviation bound."""
 
     def __init__(self, v, M, params):
+        if params.get("partition"): M = M & (v["lab"] == v["pid"])     # data : only where the validated car shows this very component
         self.p = params; c = params["cell_m"]
         rows, cols = np.nonzero(M); x, y = px_to_plane(v, rows, cols)
         m = params["margin_m"]; self.x0, self.y0 = x.min() - m, y.min() - m
         self.nx = int(np.ceil((x.max() + m - self.x0) / c)) + 1; self.ny = int(np.ceil((y.max() + m - self.y0) / c)) + 1; self.c = c
-        Me = ndi.binary_erosion(M, iterations=params["erode_px"]); st = params["data_step_px"]
+        er = max(params["erode_px"], int(round(params.get("data_border_m", 0.0) * v["s"])))   # 29 October 2026 : edge roll offs of the old part ignored
+        Me = ndi.binary_erosion(M, iterations=er); st = params["data_step_px"]
         sub = np.zeros_like(Me); sub[::st, ::st] = True; rows, cols = np.nonzero(Me & sub & np.isfinite(v["depth"]))
         self.dx, self.dy = px_to_plane(v, rows, cols); self.dh = v["depth"][rows, cols].astype(float)
         self.solve()
@@ -203,6 +220,16 @@ def grid(v, field, curves, params):
     if len(rows):
         A = coo_matrix((vals, (rows, cols)), shape=(len(rhs), len(rhs))).tocsc(); sol = np.column_stack([spsolve(A, rhs[:, k]) for k in range(2)])
         P2[1:-1, 1:-1] = sol.reshape(nu - 1, nv - 1, 2)
+    # 29 October 2026 : the Tutte embedding of the grid folds as soon as the region is concave (rocker, quarter, fender around their
+    # arches : folds of 180 degrees) ; the interior is now the inverse of the HARMONIC map of the region onto the unit square, a
+    # diffeomorphism for any Jordan region (Rado Kneser Choquet), the Tutte nodes only fill a node the inverse cannot reach.
+    if params.get("harmonic", True):
+        import ZrrCar as ZC
+        loop = np.vstack([P2[:, 0], P2[-1, 1:], P2[-2::-1, -1], P2[0, -2:0:-1]])
+        dense = np.vstack([loop[k] + np.outer(np.linspace(0, 1, 6)[:-1], loop[(k + 1) % len(loop)] - loop[k]) for k in range(len(loop))])
+        cs = [0, nu * 5, (nu + nv) * 5, (2 * nu + nv) * 5]
+        G2 = ZC.harmonic_grid(dense, cs, None, nu, nv, params.get("harmonic_cell_m", 0.004))
+        okn = np.isfinite(G2).all(-1); inner = okn[1:-1, 1:-1]; P2i = P2[1:-1, 1:-1]; P2i[inner] = G2[1:-1, 1:-1][inner]
     H = field(P2[..., 0].ravel(), P2[..., 1].ravel()).reshape(nu + 1, nv + 1)
     inner = to3d(v, P2[1:-1, 1:-1, 0].ravel(), P2[1:-1, 1:-1, 1].ravel(), H[1:-1, 1:-1].ravel()).reshape(nu - 1, nv - 1, 3)
     X[1:-1, 1:-1] = inner
@@ -245,7 +272,7 @@ def panel(X, outward, params):
 # ---------- the whole micro-component ----------
 def build(name, params=PARAMS, car=None, vis=None, verbose=True):
     car = car or D.load(); vis = vis or json.load(open(f"{D.ROOT}/work/retopo/visibility.json"))
-    v = component_view(car, name, vis, params); M = region(v, params); F = Field(v, M, params)
+    v = component_view(car, name, vis, params); M = region(v, params, car); F = Field(v, M, params)
     sides, Q2, C2, turns = outline(v, M, F, params); curves = fair_sides(sides, params, v, F)
     X, P2, nu, nv = grid(v, F, curves, params); ff = fold_free_2d(P2)
     P, Q, G = panel(X, v["tz"], params)

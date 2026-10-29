@@ -1,0 +1,46 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY TOURNAMENT of one micro-component : the same component built with every variant of the
+finisher (grid by Tutte or by harmonic map, data kept or not near the border, two smoothing cut-offs), every variant judged by ZrrCheck,
+the best one kept (most lines passed, then the smallest kink, then the smallest deviation), its proof board drawn.
+python ZrrBest.py <component> [...]      writes work/retopo/<component>/ and versions/Retopo_<component>.png, prints the ranking
+FR : le tournoi d'un micro-composant, toutes les variantes jugées, la meilleure gardée avec sa planche."""
+import itertools, json, os, sys
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrSheet as S, ZrrRun as RN
+import RigLib as RL
+
+VARIANTS = {"harmonic": [False, True], "data_border_m": [0.004, 0.03], "fair_cut_m": [0.30, 0.60]}   # 29 October 2026
+
+
+def rank(j):
+    return (j["score"]["passed"], -j["kink"]["max_deg"], -(j.get("shape", {}).get("p99_mm", 0)))
+
+
+def best(name, car, vis, base=None):
+    base = dict(base or Z.PARAMS); rows = []; top = None
+    for vals in itertools.product(*VARIANTS.values()):
+        prm = dict(base); prm.update(dict(zip(VARIANTS.keys(), vals)))
+        try:
+            res = Z.build(name, prm, car, vis, verbose=False); dev = RN.deviation(res, prm)
+            j = K.check(res["P"], res["Q"], res["G"], dev=dev, sides=[RL.evaluate(c["CV"], 400) if not c.get("dense") else c["CV"] for c in res["curves"]])
+        except Exception as e:
+            rows.append({"variant": dict(zip(VARIANTS.keys(), vals)), "error": f"{type(e).__name__}: {e}"}); continue
+        rows.append({"variant": dict(zip(VARIANTS.keys(), vals)), "percent": j["score"]["percent"], "kink": j["kink"]["max_deg"], "failed": [k for k, v in j.items() if k != "score" and not v["ok"]]})
+        if top is None or rank(j) > rank(top[1]): top = (res, j, prm)
+    if top is None: return None, rows
+    res, j, prm = top; d = Z.save(res)
+    pid = car["names"].index(name); T, _ = D.triangulate(car, car["T"] == pid)
+    S.board(res, j, os.path.join(f"{ROOT}/versions", f"Retopo_{name}.png"), old=(car["P"], T),
+            title=f"ZenRay Meshes Retopology, {name}, {res['info']['nu']} x {res['info']['nv']} quads, score {j['score']['percent']} %, 29 October 2026")
+    json.dump({"info": res["info"], "judge": j, "params": {k: prm[k] for k in VARIANTS}, "tournament": rows}, open(os.path.join(d, "judge.json"), "w"), indent=1, default=float)
+    return (res, j, prm), rows
+
+
+if __name__ == "__main__":
+    car = D.load(); vis = json.load(open(f"{D.ROOT}/work/retopo/visibility.json"))
+    for nm in sys.argv[1:]:
+        top, rows = best(nm, car, vis)
+        if top is None: print(nm, "NO VARIANT BUILT", rows[0].get("error")); continue
+        res, j, prm = top
+        print(f"{nm:30s} {j['score']['percent']:5.1f} %  kink {j['kink']['max_deg']:6.3f}  {res['info']['nu']}x{res['info']['nv']}  best {dict((k, prm[k]) for k in VARIANTS)}  failed {[k for k, v in j.items() if k != 'score' and not v['ok']]}", flush=True)

@@ -1,0 +1,261 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY CAR, every skin component of the clean partition finished the same way, borders shared.
+For each component : its loop of shared arcs (ZrrNet), four corners (nodes first, then the sharpest turns), four sides made of arc pieces ;
+the number of quads of every arc piece is solved ONCE for the whole car (opposite sides of every component equal), so two neighbours
+sample a shared piece with the same points : welded by construction. The grid is the inverse of a HARMONIC map of the component onto the
+unit square (Rado Kneser Choquet : the harmonic extension of a border homeomorphism onto a convex domain is a diffeomorphism, so even a
+concave component, a fender around its arch, gets a grid without fold ; discrete five point Laplacian = convex combinations, Floater 2003).
+Heights come from the fair field of the component (validated shape, thin plate, borders held on the shared arcs). Borders of separate
+panels (doors, hood, decklid, glass, bumper) are pulled in by half the gap ; the panel is closed with its rolled edge (ZrrPatch.panel).
+python ZrrCar.py [names...]      default : the skin components of the left side and of the centre ; the right side is their mirror
+FR : toute la caisse composant par composant, bords partagés soudés par construction, grille sans pli par application harmonique."""
+import fnmatch, json, os, sys, time
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import spsolve
+from skimage.draw import polygon2mask
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K
+from Raster import Renderer
+
+PARAMS = {   # 29 October 2026 : the interface of the whole car pass
+    "edge_m": 0.02, "gap_m": 0.0035, "gap_parts": ["*door*", "*hood*", "*decklid*", "*glass*", "*bumper_front*"],
+    "skip": ["*wheelwell*", "*under*", "*splitter*", "*grille*", "*fascia_front_band*"],
+    "corner_snap_m": 0.035, "corner_scale": 0.04, "corner_sep": 0.12,
+    "harmonic_cell_m": 0.004, "arc_weight": 0, "loop_join_m": 0.04,
+    "network": f"{ROOT}/work/retopo/network.npz", "out_dir": f"{ROOT}/work/retopo/car",
+}
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def load_net(prm):
+    N = np.load(prm["network"], allow_pickle=True)
+    arcs = [dict(pair=tuple(N["pair"][i]), a=int(N["ab"][i, 0]), b=int(N["ab"][i, 1]), dense=np.asarray(N["dense"][i], float)) for i in range(len(N["pair"]))]
+    return arcs, N["nodes"], [str(n) for n in N["names"]]
+
+
+def loop_of(name, arcs, prm):
+    """The closed loop of the component : its arcs chained end to end (shared nodes, or ends closer than loop_join_m)."""
+    mine = [i for i, A in enumerate(arcs) if name in A["pair"]]
+    if not mine: return None, None
+    big = max(mine, key=lambda i: np.linalg.norm(np.diff(arcs[i]["dense"], axis=0), axis=1).sum())
+    if np.linalg.norm(arcs[big]["dense"][0] - arcs[big]["dense"][-1]) < 1e-6: return [(big, 1)], arcs[big]["dense"]
+    used = {big}; chain = [(big, 1)]; cur = arcs[big]["dense"][-1]; start = arcs[big]["dense"][0]
+    for _ in range(len(mine)):
+        if np.linalg.norm(cur - start) < prm["loop_join_m"] and len(chain) > 1: break
+        best = None
+        for i in mine:
+            if i in used: continue
+            d0 = np.linalg.norm(arcs[i]["dense"][0] - cur); d1 = np.linalg.norm(arcs[i]["dense"][-1] - cur)
+            for d, s in ((d0, 1), (d1, -1)):
+                if d < prm["loop_join_m"] and (best is None or d < best[0]): best = (d, i, s)
+        if best is None: break
+        _, i, s = best; used.add(i); chain.append((i, s)); cur = arcs[i]["dense"][-1] if s == 1 else arcs[i]["dense"][0]
+    if np.linalg.norm(cur - start) >= prm["loop_join_m"]: return None, None
+    pts = np.vstack([arcs[i]["dense"][:: s] if s == 1 else arcs[i]["dense"][::-1] for i, s in chain])
+    return chain, pts
+
+
+def corners_of(loop2, nodes2, prm):
+    """Four corners on the projected loop : the four sharpest convex turns measured over corner_scale (a share of the perimeter),
+    at least corner_sep apart ; a corner then snaps to a junction node closer than corner_snap_m, so neighbours share it.
+    29 October 2026 : a bonus for every node chose wrong corners on loops with many small neighbours (hood 71 x 7, roof 200 x 68)."""
+    L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(loop2, axis=0), axis=1))]; step = 0.004; n = int(L[-1] / step); t = np.linspace(0, L[-1], n, endpoint=False)
+    Q = np.stack([np.interp(t, L, loop2[:, 0]), np.interp(t, L, loop2[:, 1])], 1)
+    if 0.5 * np.sum(Q[:, 0] * np.roll(Q[:, 1], -1) - np.roll(Q[:, 0], -1) * Q[:, 1]) < 0: Q = Q[::-1]
+    k = max(3, int(prm["corner_scale"] * n)); a = Q - np.roll(Q, k, 0); b = np.roll(Q, -k, 0) - Q
+    turn = np.degrees(np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(1)))
+    sep = int(prm["corner_sep"] * n); cs = []
+    for i in np.argsort(-turn):
+        if all(min(abs(i - c), n - abs(i - c)) >= sep for c in cs): cs.append(int(i))
+        if len(cs) == 4: break
+    if len(nodes2):
+        kd = cKDTree(nodes2); kq = cKDTree(Q)
+        for q, i in enumerate(cs):
+            d, j = kd.query(Q[i])
+            if d < prm["corner_snap_m"]: cs[q] = int(kq.query(nodes2[j])[1])
+    cs = sorted(cs); c0 = min(range(4), key=lambda q: Q[cs[q], 0] + Q[cs[q], 1]); cs = cs[c0:] + cs[:c0]
+    return Q, cs
+
+
+def harmonic_grid(Q, cs, sides3_2d, nu, nv, cell):
+    """Inverse harmonic map : the region (polygon Q) mapped onto the unit square, border sides onto the square sides by arc length."""
+    lo = Q.min(0) - 3 * cell; nx, ny = (np.ceil((Q.max(0) + 3 * cell - lo) / cell).astype(int) + 1)
+    pix = (Q - lo) / cell; inside = polygon2mask((nx, ny), pix)
+    ii, jj = np.nonzero(inside); P = lo + np.stack([ii, jj], 1) * cell
+    edge = np.zeros_like(inside); edge[ii, jj] = ~(inside[np.clip(ii - 1, 0, nx - 1), jj] & inside[np.clip(ii + 1, 0, nx - 1), jj] & inside[ii, np.clip(jj - 1, 0, ny - 1)] & inside[ii, np.clip(jj + 1, 0, ny - 1)])
+    # border parameter : nearest point of the loop, its side and its fraction along the side
+    n = len(Q); side = np.zeros(n, int); frac = np.zeros(n)
+    for q in range(4):
+        a, b = cs[q], cs[(q + 1) % 4]; ids = np.arange(a, b + 1) if b > a else np.r_[np.arange(a, n), np.arange(0, b + 1)]
+        seg = Q[ids]; s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))]; side[ids] = q; frac[ids] = s / max(s[-1], 1e-12)
+    sq = lambda q, f: np.where(q == 0, f, np.where(q == 1, 1.0, np.where(q == 2, 1 - f, 0.0))), lambda q, f: np.where(q == 0, 0.0, np.where(q == 1, f, np.where(q == 2, 1.0, 1 - f)))
+    kd = cKDTree(Q); be = edge[ii, jj]; _, nn = kd.query(P[be]); ub = sq[0](side[nn], frac[nn]); vb = sq[1](side[nn], frac[nn])
+    idx = -np.ones((nx, ny), int); fr = ~be; idx[ii[fr], jj[fr]] = np.arange(fr.sum()); bidx = -np.ones((nx, ny), int); bidx[ii[be], jj[be]] = np.arange(be.sum())
+    rows, cols, vals = [], [], []; ru = np.zeros(fr.sum()); rv = np.zeros(fr.sum())
+    fi, fj = ii[fr], jj[fr]; r = np.arange(fr.sum()); rows.append(r); cols.append(r); vals.append(np.full(len(r), 4.0))
+    for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        a_, b_ = fi + di, fj + dj; k1 = idx[a_, b_]; k2 = bidx[a_, b_]
+        m = k1 >= 0; rows.append(r[m]); cols.append(k1[m]); vals.append(np.full(m.sum(), -1.0))
+        m2 = (k1 < 0) & (k2 >= 0); np.add.at(ru, r[m2], ub[k2[m2]]); np.add.at(rv, r[m2], vb[k2[m2]])
+    A = coo_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(fr.sum(), fr.sum())).tocsc()
+    u = np.zeros(len(P)); v = np.zeros(len(P)); u[be] = ub; v[be] = vb; u[fr] = spsolve(A, ru); v[fr] = spsolve(A, rv)
+    uq = sq[0](side, frac); vq = sq[1](side, frac)
+    f = LinearNDInterpolator(np.r_[np.stack([u, v], 1), np.stack([uq, vq], 1)], np.r_[P, Q])
+    U, V = np.meshgrid(np.linspace(0, 1, nu + 1), np.linspace(0, 1, nv + 1), indexing="ij"); G2 = f(np.stack([U.ravel(), V.ravel()], 1)).reshape(nu + 1, nv + 1, 2)
+    return G2
+
+
+def solve_counts(comps, pieces, edge_m, max_iter=20000):
+    for p in pieces.values(): p["n"] = max(1, int(round(p["L"] / edge_m)))
+    side_n = lambda s: sum(pieces[k]["n"] for k, _ in s)
+    for it in range(max_iter):
+        changed = False
+        for c in comps:
+            for a, b in ((0, 2), (1, 3)):
+                na, nb = side_n(c["sides"][a]), side_n(c["sides"][b])
+                if na == nb: continue
+                small = c["sides"][a] if na < nb else c["sides"][b]; k = max((k for k, _ in small), key=lambda q: pieces[q]["L"] / pieces[q]["n"]); pieces[k]["n"] += 1; changed = True
+        if not changed: return it
+    raise ValueError("piece counts did not converge")
+
+
+def setup(names, prm, arcs, nodes, car, vis):
+    """Loops, corners and sides of every component ; arcs split at the corners into pieces shared by both neighbours."""
+    comps = []; cuts = {}   # arc index -> list of split points (3D)
+    for nm in names:
+        chain, loop3 = loop_of(nm, arcs, prm)
+        if chain is None: log("skip", nm, "no closed loop"); continue
+        tz = np.array(vis[nm]["normal"], float) if nm in vis else np.cross(loop3[1] - loop3[0], loop3[2] - loop3[0])
+        rx, uy, tz = D.frame(tz); c3 = loop3.mean(0); L2 = np.stack([(loop3 - c3) @ rx, (loop3 - c3) @ uy], 1)
+        if 0.5 * np.sum(L2[:, 0] * np.roll(L2[:, 1], -1) - np.roll(L2[:, 0], -1) * L2[:, 1]) < 0:   # the chain runs counter clockwise in the plane, like the corners
+            chain = [(i, -s) for i, s in reversed(chain)]; loop3 = loop3[::-1]; L2 = L2[::-1]
+        n2 = np.stack([(nodes - c3) @ rx, (nodes - c3) @ uy], 1) if len(nodes) else np.zeros((0, 2))
+        near = np.linalg.norm(nodes[:, None] - loop3[None], axis=2).min(1) < prm["corner_snap_m"] if len(nodes) else np.zeros(0, bool)
+        Q2, cs = corners_of(L2, n2[near], prm); kd = cKDTree(L2); _, li = kd.query(Q2[cs])
+        corners3 = loop3[li]
+        for p in corners3:   # the corner splits the arc it lies on (and the neighbour sees the same split)
+            best = min(((np.linalg.norm(arcs[i]["dense"] - p, axis=1).min(), i) for i, _ in chain))
+            cuts.setdefault(best[1], []).append(p)
+        comps.append(dict(name=nm, chain=chain, loop3=loop3, frame=(rx, uy, tz), c3=c3, corners3=corners3, Q2=Q2, cs=cs))
+    pieces = {}
+    for i, A in enumerate(arcs):   # split every arc at its cut points (corners), ends excluded
+        X = A["dense"]; s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]; at = []
+        for p in cuts.get(i, []):
+            j = int(np.argmin(np.linalg.norm(X - p, axis=1)))
+            if 2 < j < len(X) - 3: at.append(j)
+        at = sorted(set(at)); bounds = [0] + at + [len(X) - 1]
+        for q in range(len(bounds) - 1):
+            seg = X[bounds[q]:bounds[q + 1] + 1]; pieces[(i, q)] = dict(X=seg, L=float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum()), pair=A["pair"])
+    for c in comps:   # sides : the pieces of the loop between consecutive corners, in loop order, with their direction
+        seq = []
+        for i, s in c["chain"]:
+            ks = sorted(k for k in pieces if k[0] == i); seq += [(k, s) for k in (ks if s == 1 else ks[::-1])]
+        first = lambda k, s: pieces[k]["X"][0] if s == 1 else pieces[k]["X"][-1]
+        start = [min(range(len(seq)), key=lambda t: np.linalg.norm(first(*seq[t]) - p)) for p in c["corners3"]]
+        c["sides"] = []
+        for q in range(4):
+            a, b = start[q], start[(q + 1) % 4]; idx = list(range(a, b)) if b > a else list(range(a, len(seq))) + list(range(0, b))
+            c["sides"].append([seq[t] for t in idx])
+        flat = [k for sd in c["sides"] for k, _ in sd]
+        c["ok"] = all(len(sd) > 0 for sd in c["sides"]) and len(flat) == len(set(flat)) == len(seq)
+        if not c["ok"]: log("skip", c["name"], "sides do not split the loop once", [len(sd) for sd in c["sides"]], len(seq))
+    return comps, pieces
+
+
+def sample_side(side, pieces):
+    pts = []
+    for k, s in side:
+        X = Z.poly_sample(pieces[k]["X"], pieces[k]["n"]); X = X if s == 1 else X[::-1]; pts.append(X if not pts else X[1:])
+    return np.vstack(pts)
+
+
+def finish(c, pieces, prm, car, vis):
+    rx, uy, tz = c["frame"]; c3 = c["c3"]; nu = sum(pieces[k]["n"] for k, _ in c["sides"][0]); nv = sum(pieces[k]["n"] for k, _ in c["sides"][1])
+    B = sample_side(c["sides"][0], pieces); Rr = sample_side(c["sides"][1], pieces); T = sample_side(c["sides"][2], pieces)[::-1]; Ll = sample_side(c["sides"][3], pieces)[::-1]
+    X = np.zeros((nu + 1, nv + 1, 3)); X[:, 0] = B; X[:, -1] = T; X[0, :] = Ll; X[-1, :] = Rr
+    # the view of the component on the validated car : depth where the car shows this component (or its parts), for the fair field
+    Pl = c["loop3"]; x, y = (Pl - c3) @ rx, (Pl - c3) @ uy; ext = max(x.max() - x.min(), y.max() - y.min()) + 0.2
+    s = 1000.0; res = int(min(4096, 2 ** np.ceil(np.log2(ext * s)))); s = min(s, res / ext); cc = c3 + rx * (x.max() + x.min()) / 2 + uy * (y.max() + y.min()) / 2
+    pm = D.body_poly_mask(car); tri, owner = D.triangulate(car, pm); R_ = Renderer(car["P"], tri); mask, depth, N, fid = R_.render(cc, s, (rx, uy, tz), res); R_.release()
+    v = dict(rx=rx, uy=uy, tz=tz, c3=cc, s=s, res=res, depth=depth, pid=car["names"].index(c["name"]) if c["name"] in car["names"] else -1)
+    lab = np.full(mask.shape, -1); ok = fid >= 0; lab[ok] = car["T"][owner[fid[ok]]]
+    Lp = np.stack(Z.plane_to_px(v, (Pl - cc) @ rx, (Pl - cc) @ uy), 1); inside = polygon2mask(mask.shape, Lp)
+    M = inside & (lab == v["pid"]) if v["pid"] >= 0 else inside
+    if M.sum() < 500: M = inside & ok
+    prmF = dict(Z.PARAMS); F = Z.Field.__new__(Z.Field); F.p = prmF; F.c = prmF["cell_m"]
+    xx, yy = Z.px_to_plane(v, *np.nonzero(inside)); m = prmF["margin_m"]; F.x0, F.y0 = xx.min() - m, yy.min() - m
+    F.nx = int(np.ceil((xx.max() + m - F.x0) / F.c)) + 1; F.ny = int(np.ceil((yy.max() + m - F.y0) / F.c)) + 1
+    Me = ndi.binary_erosion(M, iterations=prmF["erode_px"]); st = prmF["data_step_px"]; sub = np.zeros_like(Me); sub[::st, ::st] = True
+    rr, cl = np.nonzero(Me & sub & np.isfinite(depth)); F.dx, F.dy = Z.px_to_plane(v, rr, cl); F.dh = depth[rr, cl].astype(float)
+    Bd = np.vstack([B, T, Ll, Rr]); q = Bd - cc; nb = len(Bd); rep = int(prm["arc_weight"])
+    if rep > 0:
+        F.dx = np.r_[F.dx, np.tile(q @ rx, rep)]; F.dy = np.r_[F.dy, np.tile(q @ uy, rep)]; F.dh = np.r_[F.dh, np.tile(q @ tz, rep)]
+    if len(F.dx) < 50: raise ValueError("no data of the validated car inside the component")
+    F.solve()
+    # 29 October 2026 : the shared arcs lie on the voxel shell (+- 3 mm) ; their place in the plane is kept, their height is read on the
+    # fair field of the component, so the border lies ON its surface (held on the shell, the door kinked by 8 degrees along its border)
+    def lift(Xs):
+        qq = Xs - cc; return Z.to3d(v, qq @ rx, qq @ uy, F(qq @ rx, qq @ uy))
+    B, T, Ll, Rr = lift(B), lift(T), lift(Ll), lift(Rr); X[:, 0] = B; X[:, -1] = T; X[0, :] = Ll; X[-1, :] = Rr
+    Q2 = np.stack([(c["Q2"][:, 0]), c["Q2"][:, 1]], 1)   # loop in the frame centred at c3 ; move it to cc
+    Q2 = Q2 - np.array([(cc - c3) @ rx, (cc - c3) @ uy])
+    G2 = harmonic_grid(Q2, c["cs"], None, nu, nv, prm["harmonic_cell_m"])
+    bad = ~np.isfinite(G2).all(-1); Hn = F(np.nan_to_num(G2[..., 0]).ravel(), np.nan_to_num(G2[..., 1]).ravel()).reshape(nu + 1, nv + 1)
+    inner = Z.to3d(v, G2[1:-1, 1:-1, 0].ravel(), G2[1:-1, 1:-1, 1].ravel(), Hn[1:-1, 1:-1].ravel()).reshape(nu - 1, nv - 1, 3)
+    X[1:-1, 1:-1] = inner
+    if bad[1:-1, 1:-1].any(): log(c["name"], "grid nodes outside the harmonic map", int(bad.sum()))
+    # gaps : a side of a separate panel is pulled in by half the gap, along the surface
+    gap = [any(any(fnmatch.fnmatch(n, p) for p in prm["gap_parts"]) for n in pieces[side[0][0]]["pair"]) for side in c["sides"]]
+    Xg = X.copy(); Nn = Z.grid_normals(X, tz); h = prm["gap_m"] / 2
+    def pull(idx_a, idx_b):
+        for (i, j), (i2, j2) in zip(idx_a, idx_b):
+            d = X[i2, j2] - X[i, j]; d -= (d @ Nn[i, j]) * Nn[i, j]; Xg[i, j] = X[i, j] + h * d / (np.linalg.norm(d) + 1e-12)
+    if gap[0]: pull([(i, 0) for i in range(nu + 1)], [(i, 1) for i in range(nu + 1)])
+    if gap[2]: pull([(i, nv) for i in range(nu + 1)], [(i, nv - 1) for i in range(nu + 1)])
+    if gap[3]: pull([(0, j) for j in range(nv + 1)], [(1, j) for j in range(nv + 1)])
+    if gap[1]: pull([(nu, j) for j in range(nv + 1)], [(nu - 1, j) for j in range(nv + 1)])
+    P, Qf, G = Z.panel(Xg, tz, Z.PARAMS)
+    dev = np.full(G.size, np.nan); qq = Xg.reshape(-1, 3) - cc; r_, c_ = Z.plane_to_px(v, qq @ rx, qq @ uy)
+    ri = np.clip(np.round(r_).astype(int), 0, res - 1); ci = np.clip(np.round(c_).astype(int), 0, res - 1); okd = Me[ri, ci]; dev[okd] = (qq @ tz)[okd] - depth[ri, ci][okd]
+    sides = [np.vstack([pieces[k]["X"] if s == 1 else pieces[k]["X"][::-1] for k, s in sd]) for sd in c["sides"]]
+    j = K.check(P, Qf, G, dev=dev, sides=sides)
+    return dict(P=P, Q=Qf, G=G, X=Xg, view=v, judge=j, nu=nu, nv=nv, gap=gap)
+
+
+def run(names=None, prm=PARAMS):
+    car = D.load(); vis = json.load(open(f"{D.ROOT}/work/retopo/visibility.json")); arcs, nodes, net_names = load_net(prm)
+    if names is None:
+        names = [n for n in net_names if not n.endswith("_R") and not any(fnmatch.fnmatch(n, p) for p in prm["skip"])]
+    comps, pieces = setup(names, prm, arcs, nodes, car, vis); good = [c for c in comps if c["ok"]]
+    try:
+        it = solve_counts(good, pieces, prm["edge_m"]); log("counts solved in", it, "rounds,", len(pieces), "pieces, shared by the neighbours")
+    except ValueError:   # 29 October 2026 : a conflict between neighbours : every component samples its own copy of the pieces (still ON the same arcs)
+        priv = {}
+        for c in good:
+            for sd in c["sides"]:
+                for t, (k, s_) in enumerate(sd):
+                    nk = (c["name"],) + k; priv[nk] = dict(pieces[k]); sd[t] = (nk, s_)
+        pieces.clear(); pieces.update(priv)
+        for c in good: solve_counts([c], {k: pieces[k] for sd in c["sides"] for k, _ in sd}, prm["edge_m"])
+        log("counts decoupled per component (shared arcs, own samples)")
+    os.makedirs(prm["out_dir"], exist_ok=True); out = {}
+    for c in good:
+        try:
+            r = finish(c, pieces, prm, car, vis); out[c["name"]] = r; sc = r["judge"]["score"]
+            failed = [k for k, v in r["judge"].items() if k != "score" and not v["ok"]]
+            log(f"{c['name']:30s} {r['nu']:3d} x {r['nv']:3d}  score {sc['percent']:5.1f} %  failed {failed}")
+            np.savez(os.path.join(prm["out_dir"], c["name"] + ".npz"), P=r["P"], Q=r["Q"], G=r["G"])
+        except Exception as e:
+            log(f"{c['name']:30s} ERROR {type(e).__name__}: {e}")
+    json.dump({k: v["judge"] for k, v in out.items()}, open(os.path.join(prm["out_dir"], "judges.json"), "w"), indent=1, default=float)
+    return out, comps, pieces
+
+
+if __name__ == "__main__":
+    run(sys.argv[1:] or None)
