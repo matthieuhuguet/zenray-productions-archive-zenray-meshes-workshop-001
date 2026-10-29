@@ -1,0 +1,43 @@
+"""29 October 2026 : ZenRay Lines REFERENCE MESH, the model the curves are drawn on, written for the browser 3D view : one binary file
+(float32 positions, float32 normals, uint32 triangle indices, uint16 part per triangle) and its JSON header (counts, byte offsets,
+bounding box, part names). Default : every part of the validated car v752 ; --obj <path> : any other model (generic retopology).
+python ZrlRefMesh.py [--obj model.obj] [--out lines/data/ref_mesh]        FR : le modèle de référence pour la vue 3D, en binaire."""
+import argparse, json, os, sys
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts/retopo")
+PARAMS = {"out": f"{ROOT}/lines/data/ref_mesh"}   # 29 October 2026
+
+
+def from_v752():
+    import ZrrData as D
+    car = D.load(); tri, owner = D.triangulate(car); return car["P"], tri, car["T"][owner], car["names"]
+
+
+def from_obj(path):
+    V, F, G, names, cur = [], [], [], [], 0
+    for line in open(path):
+        if line.startswith("v "): V.append([float(x) for x in line.split()[1:4]])
+        elif line.startswith("g ") or line.startswith("o "):
+            nm = line.split(None, 1)[1].strip(); cur = names.index(nm) if nm in names else (names.append(nm) or len(names) - 1)
+        elif line.startswith("f "):
+            ids = [int(t.split("/")[0]) - 1 for t in line.split()[1:]]
+            for j in range(1, len(ids) - 1): F.append([ids[0], ids[j], ids[j + 1]]); G.append(cur)
+    return np.array(V), np.array(F), np.array(G), names or ["model"]
+
+
+def write(P, F, part, names, out):
+    P = np.asarray(P, np.float32); F = np.asarray(F, np.uint32); n = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]])
+    N = np.zeros_like(P); [np.add.at(N, F[:, k], n) for k in range(3)]; N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-20
+    pid = np.asarray(part, np.uint16); blobs = [P.ravel().tobytes(), N.astype(np.float32).ravel().tobytes(), F.ravel().tobytes(), pid.tobytes()]
+    off = np.r_[0, np.cumsum([len(b) for b in blobs])].tolist()
+    with open(out + ".bin", "wb") as f:
+        for b in blobs: f.write(b)
+    head = {"date": "29 October 2026", "vertices": int(len(P)), "triangles": int(len(F)), "offsets": {"positions": off[0], "normals": off[1], "indices": off[2], "parts": off[3]},
+            "bytes": off[4], "bbox": [P.min(0).tolist(), P.max(0).tolist()], "parts": list(names)}
+    json.dump(head, open(out + ".json", "w")); return head
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--obj"); ap.add_argument("--out", default=PARAMS["out"]); a = ap.parse_args()
+    h = write(*(from_obj(a.obj) if a.obj else from_v752()), a.out); print({k: h[k] for k in ("vertices", "triangles", "bytes")})

@@ -1,0 +1,432 @@
+// 29 October 2026 : ZenRay Lines 3D EDITOR, curves drawn and edited ON the model, then converted to a welded quad mesh.
+// EN: reuses the document model of the 2D editor (app.js createModel : history, mirror pairs, drags, smoothing, save format) and the
+// WebGL engine (view3d.js). Tools : select and move (handles, nodes, box selection), draw a curve on the surface (ends snap onto nodes
+// or split the curve they land on), insert a control point, split a curve, tweak the generated mesh. Operations : delete, smooth,
+// round, simplify, reverse, join at a node, weld ends, project on the surface, select by component name. The server converts the
+// network to quads (POST /mesh) and checks it (POST /doctor). Exports JSON, SVG (current camera), PNG, OBJ.
+// FR : l'éditeur 3D de ZenRay Lines : courbes posées et éditées sur le modèle, puis converties en maillage quad soudé.
+'use strict';
+(() => {
+  const Z = window.ZRL, V = View3D.V;
+  const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor' },
+    colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
+      nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
+      meshOk: [0.18, 0.55, 0.32, 1], meshWarn: [0.9, 0.6, 0.12, 1], meshBad: [0.82, 0.18, 0.18, 1], meshFill: [0.35, 0.7, 0.45, 0.28], meshFillBad: [0.85, 0.3, 0.25, 0.32] },
+    sizes: { arc: 2.0, arcSel: 3.2, node: 7, nodeSel: 11, handle: 9, poly: 1.2, mesh: 1.0, draw: 2.4, drawPt: 9 },
+    pick: { arcPx: 8, handlePx: 11, nodePx: 11, snapNodePx: 14, snapArcPx: 10, meshVertexPx: 10, hiddenTolM: 0.02, dragStartPx: 3 },
+    edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5 },
+    perSpan: 24,
+  };
+  const $ = (id) => document.getElementById(id);
+  const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false };
+  let model = null, view = null;
+  const P = () => ({ mirror: $('pMirror').checked, snap: $('pSnap').checked });
+  const status = (m, kind) => { $('status').textContent = m; $('status').className = kind || ''; };
+  const safe = (fn) => (...a) => { try { return fn(...a); } catch (e) { console.error(e); status('Error: ' + (e && e.message ? e.message : e), 'error'); } };
+  const clone3 = (p) => [p[0], p[1], p[2]], mir = (p) => [-p[0], p[1], p[2]], d3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const nextArcId = () => 1 + Math.max(-1, ...model.doc.arcs.map((a) => a.id));
+  const nextNodeId = () => 1 + Math.max(-1, ...model.doc.nodes.map((n) => n.id));
+
+  // ------------------------------------------------------------------ rendering
+  function arcPts(id) { const s = model.samples(id); return s; }
+  function refresh() {
+    const polys = [], pts = [], handles = [], ctrlPolys = [];
+    for (const a of model.doc.arcs) {
+      const sel = S.sel.has(a.id), hov = S.hover && S.hover.type === 'arc' && S.hover.id === a.id;
+      polys.push({ pts: arcPts(a.id), color: sel ? CFG.colors.sel : hov ? CFG.colors.hover : (a.mirror === a.id ? CFG.colors.arcMirror : CFG.colors.arc) });
+      if (sel && $('pHandles').checked) {
+        const c = a.ctrl, f = []; for (const p of c) f.push(p[0], p[1], p[2]); ctrlPolys.push({ pts: f, color: CFG.colors.poly });
+        c.forEach((p, i) => handles.push({ p, color: S.handle && S.handle.arc === a.id && S.handle.i === i ? CFG.colors.handleSel : CFG.colors.handle, size: CFG.sizes.handle }));
+      }
+    }
+    view.setRibbons('arcs', polys.filter((p) => !S.sel.has(p.id)), { width: CFG.sizes.arc });
+    // selected arcs drawn thicker and above
+    const selPolys = model.doc.arcs.filter((a) => S.sel.has(a.id)).map((a) => ({ pts: arcPts(a.id), color: CFG.colors.sel }));
+    view.setRibbons('arcsSel', selPolys, { width: CFG.sizes.arcSel, order: 2 });
+    view.setRibbons('ctrlPoly', ctrlPolys, { width: CFG.sizes.poly, order: 3, noHidden: true });
+    if ($('pNodes').checked) for (const n of model.doc.nodes) pts.push({ p: n.p, color: S.node === n.id ? CFG.colors.nodeSel : CFG.colors.node, size: S.node === n.id ? CFG.sizes.nodeSel : CFG.sizes.node });
+    view.setPoints('nodes', pts, { order: 4 });
+    view.setPoints('handles', handles, { onTop: true, order: 5 });
+    if (S.draw && S.draw.pts.length) {
+      const f = []; for (const q of S.draw.pts) f.push(q.p[0], q.p[1], q.p[2]); if (S.draw.cursor) f.push(...S.draw.cursor);
+      view.setRibbons('draw', [{ pts: f, color: CFG.colors.draw }], { width: CFG.sizes.draw, order: 6, noHidden: true });
+      view.setPoints('drawPts', S.draw.pts.map((q) => ({ p: q.p, color: CFG.colors.draw, size: CFG.sizes.drawPt })), { onTop: true, order: 7 });
+    } else { view.clearLayer('draw'); view.clearLayer('drawPts'); }
+    view.st.showMesh = $('pModel').checked; view.st.xray = $('pXray').checked;
+    view.setVisible('mesh', $('pMesh').checked); view.setVisible('meshFill', $('pMesh').checked);
+    view.draw(); updateInfo();
+    document.title = (S.dirty ? '* ' : '') + 'ZenRay Lines 3D';
+  }
+  let rafPending = false;
+  const redraw = () => { if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; safe(refresh)(); }); } };
+
+  // ------------------------------------------------------------------ picking (CPU, screen space ; hidden things are skipped)
+  function surfaceDist(x, y) { const h = view.pickSurface(x, y); return h ? d3(h.p, view.st.eye) : Infinity; }
+  function visible(p, sd) { return d3(p, view.st.eye) <= sd + CFG.pick.hiddenTolM; }
+  function pickHandle(x, y, sd) {
+    let best = null, bd = CFG.pick.handlePx;
+    for (const id of S.sel) { const a = model.arc(id); if (!a) continue; a.ctrl.forEach((p, i) => { const q = view.project(p); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd) { bd = d; best = { arc: id, i }; } }); }
+    return best;
+  }
+  function pickNode(x, y, sd, px) {
+    let best = null, bd = px || CFG.pick.nodePx;
+    for (const n of model.doc.nodes) { const q = view.project(n.p); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd && visible(n.p, sd)) { bd = d; best = n.id; } }
+    return best;
+  }
+  function pickArc(x, y, sd, px) {
+    let best = null, bd = px || CFG.pick.arcPx;
+    for (const a of model.doc.arcs) {
+      const s = arcPts(a.id);
+      for (let i = 0; i < s.length; i += 3) {
+        const p = [s[i], s[i + 1], s[i + 2]], q = view.project(p); const d = Math.hypot(q[0] - x, q[1] - y);
+        if (d < bd && q[3] > 0 && visible(p, sd)) { bd = d; best = { id: a.id, k: i / 3, p }; }
+      }
+    }
+    return best;
+  }
+  function hitTest(x, y) {
+    const sd = surfaceDist(x, y);
+    if (S.tool === 'select') { const h = pickHandle(x, y, sd); if (h) return { type: 'handle', ...h }; }
+    const n = pickNode(x, y, sd); if (n !== null) return { type: 'node', id: n };
+    const a = pickArc(x, y, sd); if (a) return { type: 'arc', ...a };
+    return null;
+  }
+  function surfacePoint(x, y, through) {
+    if (P().snap) { const h = view.pickSurface(x, y); if (h) return h.p; }
+    return view.planePoint(x, y, through || view.cam.target);
+  }
+
+  // ------------------------------------------------------------------ edits (each takes a checkpoint first)
+  function edit(label, fn) { model.checkpoint(); const r = fn(); model.buildNodeMirror(); S.dirty = true; status(label); redraw(); return r; }
+  function mirrorArcOf(id) { const a = model.arc(id); return a && a.mirror >= 0 && a.mirror !== id ? model.arc(a.mirror) : null; }
+  function ensureMinCtrl(ctrl) {
+    const c = ctrl.map(clone3);
+    while (c.length < CFG.edit.minCtrl) {               // insert midpoints on the longest control segment
+      let k = 0, L = -1; for (let i = 0; i + 1 < c.length; i++) { const l = d3(c[i], c[i + 1]); if (l > L) { L = l; k = i; } }
+      c.splice(k + 1, 0, c[k].map((v, j) => 0.5 * (v + c[k + 1][j])));
+    }
+    return c;
+  }
+  function nearestSeg(ctrl, p) { let k = 0, bd = Infinity; for (let i = 0; i + 1 < ctrl.length; i++) { const a = ctrl[i], b = ctrl[i + 1], ab = V.sub(b, a); const t = Math.max(0, Math.min(1, V.dot(V.sub(p, a), ab) / (V.dot(ab, ab) || 1))); const d = d3(V.add(a, V.mul(ab, t)), p); if (d < bd) { bd = d; k = i; } } return k; }
+  function removeArcIds(ids) { const gone = new Set(ids); model.doc.arcs = model.doc.arcs.filter((a) => !gone.has(a.id)); for (const id of ids) { model.arcMap.delete(id); model.cache.delete(id); model.ver.delete(id); } for (const a of model.doc.arcs) if (gone.has(a.mirror)) a.mirror = -1; }
+  function addNode(p) { const n = { id: nextNodeId(), p: clone3(p) }; model.doc.nodes.push(n); model.nodeMap.set(n.id, n); return n.id; }
+  function addArc(a, b, ctrl, pair) { const arc = { id: nextArcId(), a, b, closed: false, pair: pair || ['', ''], ctrl: ensureMinCtrl(ctrl), mirror: -1 }; model.doc.arcs.push(arc); model.arcMap.set(arc.id, arc); model.touch(arc.id); return arc; }
+
+  function deleteSelection() {
+    if (S.handle) {
+      const { arc, i } = S.handle; const a = model.arc(arc); if (!a || a.ctrl.length <= 2 || i === 0 || i === a.ctrl.length - 1) { status('End control points stay : delete the curve instead.'); return; }
+      edit('Control point removed', () => {
+        const t = P().mirror ? model.mirrorTarget(a, i) : null; a.ctrl.splice(i, 1); model.touch(a.id);
+        if (t && t.arc && t.arc !== a && t.arc.ctrl.length > 2) { t.arc.ctrl.splice(t.index, 1); model.touch(t.arc.id); }
+        S.handle = null;
+      }); return;
+    }
+    if (S.sel.size) {
+      edit(S.sel.size + ' curve(s) deleted', () => {
+        const ids = new Set(); for (const id of S.sel) { ids.add(id); const m = mirrorArcOf(id); if (P().mirror && m) ids.add(m.id); }
+        removeArcIds([...ids]); S.sel.clear(); S.handle = null;
+      }); return;
+    }
+    if (S.node !== null) {
+      edit('Node and its curves deleted', () => {
+        const ns = [S.node]; const mn = P().mirror ? model.nodeMirror.get(S.node) : null; if (mn != null && mn !== S.node) ns.push(mn);
+        const ids = model.doc.arcs.filter((a) => ns.includes(a.a) || ns.includes(a.b)).map((a) => a.id); removeArcIds(ids);
+        model.doc.nodes = model.doc.nodes.filter((n) => !ns.includes(n.id)); for (const n of ns) model.nodeMap.delete(n); S.node = null;
+      });
+    }
+  }
+  const forSel = (fn) => { const ids = new Set(); for (const id of S.sel) { ids.add(id); const m = mirrorArcOf(id); if (P().mirror && m) ids.add(m.id); } for (const id of ids) { const a = model.arc(id); if (a) { fn(a); model.touch(id); } } };
+  function smoothSel(passes) { if (!S.sel.size) return status('Select curves first.'); const lam = parseFloat($('pSmooth').value); edit('Smoothed ' + S.sel.size + ' curve(s)', () => { for (let k = 0; k < passes; k++) for (const id of S.sel) model.smooth(id, lam, P().mirror); }); }
+  function resample(a, n) {
+    const s = model.samples(a.id), pts = []; for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]);
+    const L = [0]; for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + d3(pts[i], pts[i - 1]));
+    const out = []; for (let k = 0; k < n; k++) { const t = L[L.length - 1] * k / (n - 1); let j = 1; while (j < L.length - 1 && L[j] < t) j++; const u = (t - L[j - 1]) / ((L[j] - L[j - 1]) || 1); out.push(pts[j - 1].map((v, c) => v + u * (pts[j][c] - v))); }
+    out[0] = clone3(a.ctrl[0]); out[n - 1] = clone3(a.ctrl[a.ctrl.length - 1]); a.ctrl = out;
+  }
+  function simplifySel() { if (!S.sel.size) return status('Select curves first.'); const n = parseInt($('pCtrl').value, 10); edit('Simplified to ' + n + ' control points', () => forSel((a) => resample(a, n))); }
+  function reverseSel() { if (!S.sel.size) return status('Select curves first.'); edit('Reversed', () => forSel((a) => { a.ctrl.reverse(); [a.a, a.b] = [a.b, a.a]; })); }
+  function weldSel() { if (!S.sel.size) return status('Select curves first.'); edit('Ends welded on their nodes', () => { for (const id of S.sel) model.weld(id, P().mirror); }); }
+  function projectSel() {
+    if (!S.sel.size) return status('Select curves first.');
+    edit('Projected on the surface (visible control points)', () => forSel((a) => { a.ctrl = a.ctrl.map((p) => { const q = view.project(p); const h = view.pickSurface(q[0], q[1]); return h && d3(h.p, p) < 0.1 ? h.p : p; }); }));
+  }
+  function joinAtNode(nodeId) {
+    const doJoin = (nid) => {
+      const arcs = model.nodeArcs(nid); if (arcs.length !== 2 || arcs[0] === arcs[1]) return false;
+      let [a1, a2] = arcs; if (a1.b !== nid) { a1.ctrl.reverse(); [a1.a, a1.b] = [a1.b, a1.a]; } if (a2.a !== nid) { a2.ctrl.reverse(); [a2.a, a2.b] = [a2.b, a2.a]; }
+      a1.ctrl = a1.ctrl.concat(a2.ctrl.slice(1)); a1.b = a2.b; model.touch(a1.id); removeArcIds([a2.id]);
+      model.doc.nodes = model.doc.nodes.filter((n) => n.id !== nid); model.nodeMap.delete(nid); return true;
+    };
+    const mn = P().mirror ? model.nodeMirror.get(nodeId) : null;
+    edit('Curves joined at the node', () => { if (!doJoin(nodeId)) status('A join needs a node with exactly two curves.'); if (mn != null && mn !== nodeId && model.node(mn)) doJoin(mn); S.node = null; });
+  }
+  function splitArcAt(id, p, mirrorToo) {
+    const a = model.arc(id); if (!a) return null;
+    const k = nearestSeg(a.ctrl, p), first = a.ctrl.slice(0, k + 1).concat([clone3(p)]), second = [clone3(p)].concat(a.ctrl.slice(k + 1));
+    const nid = addNode(p), oldB = a.b; a.ctrl = ensureMinCtrl(first); a.b = nid; model.touch(a.id);
+    const b2 = addArc(nid, oldB, second, a.pair.slice()); let mnid = null;
+    const m = mirrorToo ? mirrorArcOf(id) : null;
+    if (m) {
+      const mp = mir(p), mk = nearestSeg(m.ctrl, mp), mf = m.ctrl.slice(0, mk + 1).concat([mp]), ms = [clone3(mp)].concat(m.ctrl.slice(mk + 1));
+      mnid = addNode(mp); const mOldB = m.b; m.ctrl = ensureMinCtrl(mf); m.b = mnid; model.touch(m.id);
+      const mb2 = addArc(mnid, mOldB, ms, m.pair.slice()); b2.mirror = mb2.id; mb2.mirror = b2.id;
+    }
+    return { node: nid, mirrorNode: mnid };
+  }
+  function insertCtrl(id, p) {
+    const a = model.arc(id); if (!a) return;
+    edit('Control point inserted', () => {
+      const k = nearestSeg(a.ctrl, p); a.ctrl.splice(k + 1, 0, clone3(p)); model.touch(a.id);
+      const m = P().mirror ? mirrorArcOf(id) : null; if (m) { const mp = mir(p), mk = nearestSeg(m.ctrl, mp); m.ctrl.splice(mk + 1, 0, mp); model.touch(m.id); }
+      S.sel = new Set([id]); S.handle = { arc: id, i: k + 1 };
+    });
+  }
+  function finishDraw() {
+    const D = S.draw; if (!D || D.pts.length < 2) { S.draw = null; redraw(); return status('A curve needs at least two points.'); }
+    edit('Curve drawn', () => {
+      const endNode = (q) => { if (q.node != null) return q.node; if (q.arc != null && model.arc(q.arc)) return splitArcAt(q.arc, q.p, P().mirror).node; return addNode(q.p); };
+      const a = endNode(D.pts[0]), b = endNode(D.pts[D.pts.length - 1]);
+      const ctrl = D.pts.map((q) => clone3(q.p)); ctrl[0] = clone3(model.node(a).p); ctrl[ctrl.length - 1] = clone3(model.node(b).p);
+      const arc = addArc(a, b, ctrl, ['', '']);
+      const side = ctrl.every((p) => p[0] > 0.01) || ctrl.every((p) => p[0] < -0.01);
+      if (P().mirror && side) {
+        model.buildNodeMirror();
+        const mnode = (nid) => { const m = model.nodeMirror.get(nid); if (m != null && m !== nid) return m; const p = mir(model.node(nid).p); const ex = model.doc.nodes.find((n) => d3(n.p, p) < CFG.edit.nodeMergeM); return ex ? ex.id : addNode(p); };
+        const ma = mnode(a), mb = mnode(b), mc = arc.ctrl.map(mir); mc[0] = clone3(model.node(ma).p); mc[mc.length - 1] = clone3(model.node(mb).p);
+        const m = addArc(ma, mb, mc, ['', '']); m.mirror = arc.id; arc.mirror = m.id;
+      }
+      S.sel = new Set([arc.id]); S.draw = null;
+    });
+  }
+
+  // ------------------------------------------------------------------ mesh (server conversion, display, tweak, relax, export)
+  function flat(a, k) { if (!a) return []; return Array.isArray(a[0]) ? a.flat() : a; }
+  function setMesh(res) {
+    const Pm = flat(res.P), Qm = flat(res.Q), fq = res.face_of_quad || [], faces = res.faces || [];
+    const bad = new Set((faces || []).filter((f) => f.status && f.status !== 'ok' && f.status !== 'meshed').map((f) => f.id));
+    S.mesh = { P: Float64Array.from(Pm), Q: Uint32Array.from(Qm), fq, faces, res };
+    buildMeshLayers(); status('Mesh : ' + (Qm.length / 4) + ' quads');
+  }
+  function quadQuality(Pm, Q, q) {
+    const v = [0, 1, 2, 3].map((k) => [Pm[3 * Q[4 * q + k]], Pm[3 * Q[4 * q + k] + 1], Pm[3 * Q[4 * q + k] + 2]]);
+    const n = V.norm(V.cross(V.sub(v[2], v[0]), V.sub(v[3], v[1]))); let J = 1;
+    for (let k = 0; k < 4; k++) { const e1 = V.sub(v[(k + 1) % 4], v[k]), e2 = V.sub(v[(k + 3) % 4], v[k]); J = Math.min(J, V.dot(V.cross(e1, e2), n) / ((V.len(e1) * V.len(e2)) || 1)); }
+    return J;
+  }
+  function buildMeshLayers() {
+    const M = S.mesh; if (!M) { view.clearLayer('mesh'); view.clearLayer('meshFill'); return; }
+    const nq = M.Q.length / 4, seen = new Set(), polys = [], tri = new Uint32Array(nq * 6), col = new Float32Array(M.P.length / 3 * 4), pos = Float32Array.from(M.P);
+    let bad = 0, warn = 0, Jmin = 1;
+    for (let q = 0; q < nq; q++) {
+      const J = quadQuality(M.P, M.Q, q); Jmin = Math.min(Jmin, J); const c = J < 0 ? CFG.colors.meshBad : J < 0.5 ? CFG.colors.meshWarn : CFG.colors.meshOk; if (J < 0) bad++; else if (J < 0.5) warn++;
+      for (let k = 0; k < 4; k++) {
+        const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4], key = a < b ? a + ',' + b : b + ',' + a; if (seen.has(key)) continue; seen.add(key);
+        polys.push({ pts: [M.P[3 * a], M.P[3 * a + 1], M.P[3 * a + 2], M.P[3 * b], M.P[3 * b + 1], M.P[3 * b + 2]], color: c });
+      }
+      tri.set([M.Q[4 * q], M.Q[4 * q + 1], M.Q[4 * q + 2], M.Q[4 * q], M.Q[4 * q + 2], M.Q[4 * q + 3]], q * 6);
+      const fc = J < 0 ? CFG.colors.meshFillBad : CFG.colors.meshFill; for (let k = 0; k < 4; k++) col.set(fc, M.Q[4 * q + k] * 4);
+    }
+    view.setRibbons('mesh', polys, { width: CFG.sizes.mesh, order: 1 }); view.setFill('meshFill', pos, tri, col);
+    M.stats = { quads: nq, vertices: M.P.length / 3, folded: bad, below05: warn, jacobianMin: +Jmin.toFixed(3) };
+    const f = M.faces || [], by = {}; for (const x of f) by[x.status || 'ok'] = (by[x.status || 'ok'] || 0) + 1;
+    $('meshInfo').textContent = 'Quads ' + nq + ', vertices ' + M.stats.vertices + '\nFolded ' + bad + ', Jacobian under 0.5 : ' + warn + ', min ' + M.stats.jacobianMin +
+      '\nFaces : ' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + (M.res && M.res.stats ? '\n' + JSON.stringify(M.res.stats) : '');
+    redraw();
+  }
+  async function convertToMesh() {
+    status('Converting the network to quads...');
+    const body = { lines: JSON.parse(model.serialize()), params: { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10) } };
+    const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
+    if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
+    setMesh(res); status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
+  }
+  async function checkNetwork() {
+    const r = await fetch(CFG.files.doctor, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: {} }) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status }));
+    if (!r.ok || res.ok === false) return status('Check failed : ' + (res.error || r.status), 'error');
+    const issues = res.issues || [], by = {}; for (const i of issues) by[i.kind] = (by[i.kind] || 0) + 1;
+    $('meshInfo').textContent = 'Network check : ' + issues.length + ' issue(s)\n' + Object.entries(by).map(([k, v]) => k + ' ' + v).join('\n');
+    const ids = new Set(issues.filter((i) => i.arc != null).map((i) => i.arc)); if (ids.size) { S.sel = ids; S.handle = null; }
+    status('Network checked : ' + issues.length + ' issue(s), the curves concerned are selected'); redraw();
+  }
+  function relaxMesh() {
+    const M = S.mesh; if (!M) return status('Convert to a mesh first.');
+    const nv = M.P.length / 3, nb = Array.from({ length: nv }, () => new Set()), edgeFaces = new Map(), nq = M.Q.length / 4;
+    for (let q = 0; q < nq; q++) for (let k = 0; k < 4; k++) { const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4]; nb[a].add(b); nb[b].add(a); const key = a < b ? a + ',' + b : b + ',' + a; if (!edgeFaces.has(key)) edgeFaces.set(key, []); edgeFaces.get(key).push(M.fq[q] != null ? M.fq[q] : 0); }
+    const fixed = new Uint8Array(nv); for (const [key, fs] of edgeFaces) if (fs.length !== 2 || fs[0] !== fs[1]) { const [a, b] = key.split(',').map(Number); fixed[a] = 1; fixed[b] = 1; }
+    const N = new Float64Array(nv * 3); for (let q = 0; q < nq; q++) { const v = [0, 1, 2, 3].map((k) => M.Q[4 * q + k]); const pp = v.map((i) => [M.P[3 * i], M.P[3 * i + 1], M.P[3 * i + 2]]); const n = V.cross(V.sub(pp[2], pp[0]), V.sub(pp[3], pp[1])); for (const i of v) { N[3 * i] += n[0]; N[3 * i + 1] += n[1]; N[3 * i + 2] += n[2]; } }
+    for (let it = 0; it < 10; it++) {
+      const Pn = Float64Array.from(M.P);
+      for (let i = 0; i < nv; i++) {
+        if (fixed[i] || nb[i].size === 0) continue; let c = [0, 0, 0]; for (const j of nb[i]) { c[0] += M.P[3 * j]; c[1] += M.P[3 * j + 1]; c[2] += M.P[3 * j + 2]; } c = V.mul(c, 1 / nb[i].size);
+        const p = [M.P[3 * i], M.P[3 * i + 1], M.P[3 * i + 2]], n = V.norm([N[3 * i], N[3 * i + 1], N[3 * i + 2]]); let d = V.mul(V.sub(c, p), CFG.edit.relaxStep); d = V.sub(d, V.mul(n, V.dot(d, n)));   // tangential only : stays on the surface
+        Pn[3 * i] = p[0] + d[0]; Pn[3 * i + 1] = p[1] + d[1]; Pn[3 * i + 2] = p[2] + d[2];
+      }
+      M.P = Pn;
+    }
+    buildMeshLayers(); status('Mesh relaxed (10 tangential passes, face borders held)');
+  }
+  function exportObj() {
+    const M = S.mesh; if (!M) return status('Convert to a mesh first.');
+    const L = ['# 29 October 2026 ZenRay Lines quad mesh']; for (let i = 0; i < M.P.length; i += 3) L.push('v ' + M.P[i].toFixed(6) + ' ' + M.P[i + 1].toFixed(6) + ' ' + M.P[i + 2].toFixed(6));
+    let cur = null; for (let q = 0; q < M.Q.length / 4; q++) { const f = M.fq[q]; if (f !== cur) { L.push('g face_' + f); cur = f; } L.push('f ' + [0, 1, 2, 3].map((k) => M.Q[4 * q + k] + 1).join(' ')); }
+    download('zenray_lines_mesh.obj', L.join('\n'), 'text/plain'); status('OBJ exported : ' + M.Q.length / 4 + ' quads');
+  }
+
+  // ------------------------------------------------------------------ files and exports
+  function download(name, data, type) { const a = document.createElement('a'); a.href = typeof data === 'string' && data.startsWith('data:') ? data : URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click(); }
+  function exportSvg() {
+    view.matrices(); const W = view.st.W, H = view.st.H, out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><!-- 29 October 2026 ZenRay Lines 3D, current camera -->`];
+    for (const a of model.doc.arcs) { const s = arcPts(a.id); let d = ''; for (let i = 0; i < s.length; i += 3) { const q = view.project([s[i], s[i + 1], s[i + 2]]); d += (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1); } out.push(`<path id="arc_${a.id}" d="${d}" fill="none" stroke="#222" stroke-width="1.6"/>`); }
+    for (const n of model.doc.nodes) { const q = view.project(n.p); out.push(`<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="3" fill="#c03"/>`); }
+    out.push('</svg>'); download('zenray_lines_view.svg', out.join('\n'), 'image/svg+xml'); status('SVG exported (current camera)');
+  }
+  function exportPng() { refresh(); download('zenray_lines_view.png', view.canvas.toDataURL('image/png')); status('PNG exported'); }
+  async function save() {
+    const body = model.serialize(); const r = await fetch(CFG.files.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    const res = await r.json().catch(() => ({})); if (!r.ok || !res.ok) return status('Save failed : ' + (res.error || r.status), 'error');
+    S.dirty = false; status('Saved to the atelier : ' + res.arcs + ' curves, ' + res.nodes + ' nodes'); redraw();
+  }
+  async function loadDoc(url, label) {
+    const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) return status(label + ' not found (HTTP ' + r.status + ')', 'error');
+    const doc = await r.json(); model = Z.createModel(doc); model.buildNodeMirror(); S.sel.clear(); S.node = null; S.handle = null; S.dirty = false; status(label + ' loaded : ' + doc.arcs.length + ' curves, ' + doc.nodes.length + ' nodes'); redraw();
+  }
+
+  // ------------------------------------------------------------------ selection info
+  function updateInfo() {
+    const parts = [];
+    if (S.sel.size) {
+      const arcs = [...S.sel].map((id) => model.arc(id)).filter(Boolean); let L = 0; for (const a of arcs) L += model.length(a.id);
+      parts.push(arcs.length + ' curve(s), ' + L.toFixed(3) + ' m');
+      if (arcs.length === 1) { const a = arcs[0]; parts.push('id ' + a.id + ', nodes ' + a.a + ' to ' + a.b + ', ' + a.ctrl.length + ' control points, mirror ' + a.mirror + '\n' + (a.pair || []).filter(Boolean).join(' / ')); }
+    }
+    if (S.node !== null && model.node(S.node)) parts.push('node ' + S.node + ', ' + model.nodeArcs(S.node).length + ' curves');
+    if (S.handle) parts.push('control point ' + S.handle.i + ' of curve ' + S.handle.arc);
+    $('selInfo').textContent = parts.join('\n') || 'Nothing selected.';
+  }
+  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.' };
+  function setTool(t) { S.tool = t; S.draw = t === 'draw' ? (S.draw || { pts: [] }) : null; document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === t)); $('toolHint').textContent = HINTS[t] || ''; redraw(); }
+
+  // ------------------------------------------------------------------ mouse
+  const cv = () => view.canvas;
+  function local(ev) { const r = cv().getBoundingClientRect(); return [ev.clientX - r.left, ev.clientY - r.top]; }
+  function onDown(ev) {
+    const [x, y] = local(ev); cv().focus();
+    const nav = ev.altKey || ev.button === 1 || ev.button === 2;
+    if (nav) { S.drag = { kind: ev.button === 1 ? 'pan' : (ev.button === 2 ? (ev.altKey ? 'zoom' : 'orbit') : 'orbit'), x, y }; ev.preventDefault(); return; }
+    if (ev.button !== 0) return;
+    if (S.tool === 'draw') {
+      const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
+      const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
+      S.draw.pts.push({ p, node: n, arc: a ? a.id : null }); status('Point ' + S.draw.pts.length + (n !== null ? ' on node ' + n : a ? ' on curve ' + a.id : '')); redraw(); return;
+    }
+    if (S.tool === 'insert' || S.tool === 'split') {
+      const sd = surfaceDist(x, y), a = pickArc(x, y, sd, CFG.pick.arcPx * 1.5); if (!a) return status('Click on a curve.');
+      if (S.tool === 'insert') insertCtrl(a.id, a.p); else edit('Curve split, new node', () => { const r = splitArcAt(a.id, a.p, P().mirror); S.sel = new Set(); S.node = r.node; });
+      return;
+    }
+    if (S.tool === 'tweak') {
+      if (!S.mesh) return status('Convert to a mesh first.');
+      let best = -1, bd = CFG.pick.meshVertexPx; for (let i = 0; i < S.mesh.P.length; i += 3) { const q = view.project([S.mesh.P[i], S.mesh.P[i + 1], S.mesh.P[i + 2]]); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd) { bd = d; best = i / 3; } }
+      if (best >= 0) S.drag = { kind: 'meshVertex', v: best, x, y }; return;
+    }
+    const hit = hitTest(x, y);
+    if (hit && hit.type === 'handle') { S.handle = { arc: hit.arc, i: hit.i }; S.drag = { kind: 'ctrl', hit, x, y, started: false }; redraw(); return; }
+    if (hit && hit.type === 'node') { S.node = hit.id; if (!ev.shiftKey) { S.sel.clear(); S.handle = null; } S.drag = { kind: 'node', hit, x, y, started: false }; redraw(); return; }
+    if (hit && hit.type === 'arc') { if (ev.shiftKey) { S.sel.has(hit.id) ? S.sel.delete(hit.id) : S.sel.add(hit.id); } else S.sel = new Set([hit.id]); S.node = null; S.handle = null; redraw(); return; }
+    S.drag = { kind: 'box', x, y, add: ev.shiftKey };
+  }
+  function onMove(ev) {
+    const [x, y] = local(ev), D = S.drag;
+    if (!D) {
+      if (S.tool === 'draw' && S.draw && S.draw.pts.length) { S.draw.cursor = surfacePoint(x, y); redraw(); }
+      const h = view.pickSurface(x, y); $('coords').textContent = h ? h.p.map((v) => v.toFixed(3)).join('  ') : '-';
+      if (S.tool === 'select') { const prev = S.hover && S.hover.id; S.hover = hitTest(x, y); if ((S.hover && S.hover.id) !== prev) redraw(); }
+      return;
+    }
+    const dx = x - D.x, dy = y - D.y;
+    if (D.kind === 'orbit') { view.orbit(dx, dy); D.x = x; D.y = y; redraw(); return; }
+    if (D.kind === 'pan') { view.pan(dx, dy); D.x = x; D.y = y; redraw(); return; }
+    if (D.kind === 'zoom') { view.zoom(-dx + dy); D.x = x; D.y = y; redraw(); return; }
+    if (D.kind === 'box') { const b = $('boxSel'); Object.assign(b.style, { display: 'block', left: Math.min(x, D.x) + 'px', top: Math.min(y, D.y) + 'px', width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px' }); return; }
+    if (D.kind === 'meshVertex') { const h = view.pickSurface(x, y); if (h) { S.mesh.P[3 * D.v] = h.p[0]; S.mesh.P[3 * D.v + 1] = h.p[1]; S.mesh.P[3 * D.v + 2] = h.p[2]; buildMeshLayers(); } return; }
+    if ((D.kind === 'ctrl' || D.kind === 'node') && !D.started) {
+      if (Math.hypot(dx, dy) < CFG.pick.dragStartPx) return;
+      model.checkpoint(); D.started = true; S.dirty = true;
+      D.op = D.kind === 'ctrl' ? model.beginCtrlDrag(D.hit.arc, D.hit.i, P().mirror) : model.beginNodeDrag(D.hit.id, P().mirror);
+      D.through = D.kind === 'ctrl' ? clone3(model.arc(D.hit.arc).ctrl[D.hit.i]) : clone3(model.node(D.hit.id).p);
+    }
+    if (D.started) { D.op.apply(surfacePoint(x, y, D.through)); redraw(); }
+  }
+  function onUp(ev) {
+    const D = S.drag; S.drag = null; if (!D) return;
+    if (D.kind === 'box') {
+      $('boxSel').style.display = 'none'; const [x, y] = local(ev), x0 = Math.min(x, D.x), x1 = Math.max(x, D.x), y0 = Math.min(y, D.y), y1 = Math.max(y, D.y);
+      if (x1 - x0 < 3 && y1 - y0 < 3) { if (!D.add) { S.sel.clear(); S.node = null; S.handle = null; } redraw(); return; }
+      if (!D.add) S.sel.clear();
+      for (const a of model.doc.arcs) { const s = arcPts(a.id); for (let i = 0; i < s.length; i += 9) { const q = view.project([s[i], s[i + 1], s[i + 2]]); if (q[3] > 0 && q[0] >= x0 && q[0] <= x1 && q[1] >= y0 && q[1] <= y1) { S.sel.add(a.id); break; } } }
+      S.handle = null; status(S.sel.size + ' curve(s) selected'); redraw(); return;
+    }
+    if (D.started) { model.buildNodeMirror(); status(D.kind === 'ctrl' ? 'Control point moved' + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
+    if (D.kind === 'meshVertex') status('Mesh vertex moved');
+  }
+  function onWheel(ev) { ev.preventDefault(); view.zoom(ev.deltaY); redraw(); }
+  function onKey(ev) {
+    if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
+    const k = ev.key.toLowerCase(), mod = ev.metaKey || ev.ctrlKey;
+    if (mod && k === 'z') { ev.preventDefault(); (ev.shiftKey ? model.redo() : model.undo()) && (model.buildNodeMirror(), S.handle = null, redraw()); return; }
+    if (mod && k === 's') { ev.preventDefault(); safe(save)(); return; }
+    if (mod) return;
+    const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
+    if (views[k]) { view.preset(views[k]); redraw(); return; }
+    if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
+    else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
+    else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
+    else if (k === 'r') smoothSel(CFG.edit.roundPasses); else if (k === 'j') { if (S.node !== null) joinAtNode(S.node); else status('Select a node with two curves.'); }
+    else if (k === 'delete' || (k === 'backspace' && S.tool !== 'draw')) { ev.preventDefault(); deleteSelection(); }
+    else if (k === 'backspace' && S.tool === 'draw' && S.draw) { S.draw.pts.pop(); redraw(); }
+    else if (k === 'enter' && S.tool === 'draw') finishDraw();
+    else if (k === 'escape') { if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
+  }
+  function frameSel() {
+    const pts = []; for (const id of S.sel) { const s = arcPts(id); for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); }
+    if (S.node !== null && model.node(S.node)) { const p = model.node(S.node).p; pts.push(V.add(p, [0.15, 0.15, 0.15]), V.sub(p, [0.15, 0.15, 0.15])); }
+    if (!pts.length) { const b = view.st.mesh.head.bbox; pts.push(b[0], b[1]); } view.frame(pts); redraw();
+  }
+
+  // ------------------------------------------------------------------ boot
+  async function boot() {
+    view = View3D.create($('cv'));
+    if (!view.floatOk) status('Float render targets are missing : snapping to the surface is off in this browser', 'error');
+    const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json').then((r) => r.json()), fetch(CFG.files.ref + '.bin').then((r) => r.arrayBuffer())]);
+    view.setMesh(head, buf);
+    const src = new URLSearchParams(location.search).get('src');
+    let doc = null; for (const u of src ? [src] : [CFG.files.edit, CFG.files.lines]) { const r = await fetch(u, { cache: 'no-store' }); if (r.ok) { doc = await r.json(); break; } }
+    model = Z.createModel(doc); model.buildNodeMirror();
+    const c = cv(); c.tabIndex = 0;
+    c.addEventListener('mousedown', safe(onDown)); window.addEventListener('mousemove', safe(onMove)); window.addEventListener('mouseup', safe(onUp));
+    c.addEventListener('wheel', safe(onWheel), { passive: false }); c.addEventListener('contextmenu', (e) => e.preventDefault()); window.addEventListener('keydown', safe(onKey));
+    c.addEventListener('dblclick', safe(() => { if (S.tool === 'draw') finishDraw(); }));
+    document.querySelectorAll('.tool').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
+    document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => { view.preset(b.dataset.view); redraw(); }));
+    const on = (id, fn) => $(id).addEventListener('click', safe(fn));
+    on('bOrtho', () => { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }); on('bFrame', frameSel);
+    on('bDelete', deleteSelection); on('bSmooth', () => smoothSel(1)); on('bRound', () => smoothSel(CFG.edit.roundPasses)); on('bSimplify', simplifySel); on('bReverse', reverseSel);
+    on('bJoin', () => (S.node !== null ? joinAtNode(S.node) : status('Select a node with two curves.'))); on('bWeld', weldSel); on('bProject', projectSel);
+    on('bSelText', () => { const t = $('selText').value.trim().toLowerCase(); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).some((n) => n && n.toLowerCase().includes(t)) || String(a.id) === t).map((a) => a.id)); status(S.sel.size + ' curve(s) selected'); redraw(); });
+    on('bSelAll', () => { S.sel = new Set(model.doc.arcs.map((a) => a.id)); redraw(); }); on('bSelNone', () => { S.sel.clear(); S.node = null; S.handle = null; redraw(); });
+    on('bSelInvert', () => { S.sel = new Set(model.doc.arcs.filter((a) => !S.sel.has(a.id)).map((a) => a.id)); redraw(); });
+    on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
+    on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
+    on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
+    on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network'));
+    for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
+    for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh']) $(id).addEventListener('change', redraw);
+    window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
+    view.preset('persp'); setTool('select'); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh } };
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
+})();

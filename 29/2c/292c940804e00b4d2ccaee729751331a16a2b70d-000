@@ -1,0 +1,224 @@
+// 29 October 2026 : ZenRay Lines 3D VIEW, the WebGL2 engine of the 3D editor (no dependency).
+// EN: renders the reference model (shaded, optional X-ray), screen-space ribbons for curves and meshes, round points for nodes and
+// handles ; a Maya-like orbit camera (Alt or right drag orbit, middle or Alt+middle drag pan, wheel or Alt+right drag zoom), view
+// presets, perspective or orthographic ; pickSurface(x, y) renders world positions and normals into a float target under the cursor
+// (exact point ON the model) ; project(p) gives screen coordinates for CPU picking of curves and points.
+// FR : le moteur 3D de ZenRay Lines : modèle ombré, courbes en rubans, points, caméra façon Maya, accroche exacte à la surface.
+'use strict';
+const View3D = (() => {
+  const CFG = {   // 29 October 2026 : every tunable value of the engine
+    fov: 32, near: 0.02, far: 60, bg: [0.965, 0.965, 0.96, 1], meshColor: [0.80, 0.82, 0.86], xrayAlpha: 0.28, highlight: [0.95, 0.55, 0.2],
+    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.05, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.22,
+  };
+  const V = {
+    sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+    dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+    len: (a) => Math.hypot(a[0], a[1], a[2]), norm: (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+  };
+  function perspective(fovy, aspect, n, f) { const t = 1 / Math.tan(fovy / 2); return new Float32Array([t / aspect, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0]); }
+  function ortho(h, aspect, n, f) { const w = h * aspect; return new Float32Array([1 / w, 0, 0, 0, 0, 1 / h, 0, 0, 0, 0, -2 / (f - n), 0, 0, 0, -(f + n) / (f - n), 1]); }
+  function lookAt(e, t, u) {
+    const z = V.norm(V.sub(e, t)), x = V.norm(V.cross(u, z)), y = V.cross(z, x);
+    return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -V.dot(x, e), -V.dot(y, e), -V.dot(z, e), 1]);
+  }
+  function mmul(a, b) { const o = new Float32Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k]; o[i * 4 + j] = s; } return o; }
+
+  const SH = {
+    meshV: `#version 300 es
+layout(location=0) in vec3 aP; layout(location=1) in vec3 aN; layout(location=2) in float aPart;
+uniform mat4 uMVP; out vec3 vN; out vec3 vP; flat out float vPart;
+void main(){ vN=aN; vP=aP; vPart=aPart; gl_Position=uMVP*vec4(aP,1.0); }`,
+    meshF: `#version 300 es
+precision highp float; in vec3 vN; in vec3 vP; flat in float vPart;
+uniform vec3 uEye; uniform vec3 uColor; uniform float uAlpha; uniform float uHiPart; uniform vec3 uHi; out vec4 o;
+void main(){ vec3 n=normalize(vN); vec3 v=normalize(uEye-vP); float d=abs(dot(n,v)); vec3 c=uColor*(0.32+0.68*d)+0.10*pow(1.0-d,3.0);
+ if(abs(vPart-uHiPart)<0.5) c=mix(c,uHi,0.35); o=vec4(c,uAlpha); }`,
+    pickF: `#version 300 es
+precision highp float; in vec3 vN; in vec3 vP; flat in float vPart;
+layout(location=0) out vec4 oP; layout(location=1) out vec4 oN; void main(){ oP=vec4(vP,1.0); oN=vec4(normalize(vN), vPart); }`,
+    ribV: `#version 300 es
+layout(location=0) in vec3 a0; layout(location=1) in vec3 a1; layout(location=2) in vec2 aTS; layout(location=3) in vec4 aC;
+uniform mat4 uMVP; uniform vec2 uVP; uniform float uW; uniform float uBias; out vec4 vC;
+void main(){ vec4 c0=uMVP*vec4(a0,1.0), c1=uMVP*vec4(a1,1.0); vec2 d=(c1.xy/c1.w-c0.xy/c0.w)*uVP; if(length(d)<1e-6) d=vec2(1.0,0.0);
+ vec2 n=normalize(vec2(-d.y,d.x)); vec4 c=aTS.x<0.5?c0:c1; c.xy+=n*aTS.y*uW/uVP*c.w; c.z-=uBias*c.w; vC=aC; gl_Position=c; }`,
+    colF: `#version 300 es
+precision highp float; in vec4 vC; uniform float uAlpha; out vec4 o; void main(){ o=vec4(vC.rgb, vC.a*uAlpha); }`,
+    ptV: `#version 300 es
+layout(location=0) in vec3 aP; layout(location=1) in vec4 aC; layout(location=2) in float aS;
+uniform mat4 uMVP; uniform float uBias; out vec4 vC; void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; gl_PointSize=aS; vC=aC; }`,
+    ptF: `#version 300 es
+precision highp float; in vec4 vC; uniform float uAlpha; out vec4 o;
+void main(){ vec2 q=gl_PointCoord*2.0-1.0; float r=dot(q,q); if(r>1.0) discard; float e=smoothstep(0.55,0.75,r); o=vec4(mix(vC.rgb,vec3(1.0),e*0.0)*(1.0-0.35*e), vC.a*uAlpha); }`,
+    fillV: `#version 300 es
+layout(location=0) in vec3 aP; layout(location=1) in vec4 aC; uniform mat4 uMVP; uniform float uBias; out vec4 vC;
+void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
+  };
+
+  function create(canvas) {
+    const gl = canvas.getContext('webgl2', { antialias: true, preserveDrawingBuffer: true, alpha: false });
+    if (!gl) throw new Error('WebGL2 is not available in this browser');
+    const floatOk = !!gl.getExtension('EXT_color_buffer_float');
+    const prog = (vs, fs) => {
+      const p = gl.createProgram();
+      for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh)); gl.attachShader(p, sh); }
+      gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name; u[nm] = gl.getUniformLocation(p, nm); }
+      return { p, u };
+    };
+    const P = { mesh: prog(SH.meshV, SH.meshF), pick: prog(SH.meshV, SH.pickF), rib: prog(SH.ribV, SH.colF), pt: prog(SH.ptV, SH.ptF), fill: prog(SH.fillV, SH.colF) };
+    const cam = { target: [0, 0.6, 0], yaw: 0.9, pitch: 0.35, dist: 7, ortho: false };
+    const st = { mesh: null, layers: {}, xray: false, showMesh: true, hiPart: -1, W: 1, H: 1, dpr: 1, MVP: null, eye: null, pickFbo: null, pickSize: [0, 0] };
+
+    function setMesh(head, buf) {
+      const o = head.offsets, nv = head.vertices, nt = head.triangles;
+      const pos = new Float32Array(buf, o.positions, nv * 3), nrm = new Float32Array(buf, o.normals, nv * 3), idx = new Uint32Array(buf, o.indices, nt * 3), part = new Uint16Array(buf, o.parts, nt);
+      const vpart = new Float32Array(nv); for (let t = 0; t < nt; t++) { vpart[idx[3 * t]] = part[t]; vpart[idx[3 * t + 1]] = part[t]; vpart[idx[3 * t + 2]] = part[t]; }
+      const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+      const bind = (data, loc, n) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); };
+      bind(pos, 0, 3); bind(nrm, 1, 3); bind(vpart, 2, 1);
+      const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+      gl.bindVertexArray(null);
+      st.mesh = { vao, count: nt * 3, head, pos, idx, part };
+      const b = head.bbox; cam.target = [(b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2, (b[0][2] + b[1][2]) / 2];
+      cam.dist = 1.6 * Math.max(b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]);
+    }
+
+    // a ribbon layer : list of polylines (flat [x,y,z,...]) with one colour each
+    function setRibbons(name, polys, opts) {
+      let nseg = 0; for (const p of polys) nseg += Math.max(0, p.pts.length / 3 - 1);
+      const A0 = new Float32Array(nseg * 12), A1 = new Float32Array(nseg * 12), TS = new Float32Array(nseg * 8), C = new Float32Array(nseg * 16), I = new Uint32Array(nseg * 6);
+      let s = 0;
+      for (const p of polys) {
+        const q = p.pts, c = p.color;
+        for (let i = 0; i + 5 < q.length; i += 3) {
+          for (let k = 0; k < 4; k++) {
+            const v = s * 4 + k; A0.set([q[i], q[i + 1], q[i + 2]], v * 3); A1.set([q[i + 3], q[i + 4], q[i + 5]], v * 3);
+            TS.set([k < 2 ? 0 : 1, k % 2 ? 1 : -1], v * 2); C.set(c, v * 4);
+          }
+          I.set([s * 4, s * 4 + 1, s * 4 + 2, s * 4 + 2, s * 4 + 1, s * 4 + 3], s * 6); s++;
+        }
+      }
+      const L = st.layers[name] || (st.layers[name] = { kind: 'rib', vao: gl.createVertexArray(), bufs: [gl.createBuffer(), gl.createBuffer(), gl.createBuffer(), gl.createBuffer(), gl.createBuffer()] });
+      gl.bindVertexArray(L.vao);
+      [[A0, 0, 3], [A1, 1, 3], [TS, 2, 2], [C, 3, 4]].forEach(([d, loc, n], k) => { gl.bindBuffer(gl.ARRAY_BUFFER, L.bufs[k]); gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); });
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, L.bufs[4]); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, I, gl.DYNAMIC_DRAW); gl.bindVertexArray(null);
+      Object.assign(L, { count: nseg * 6, width: (opts && opts.width) || 2, hidden: !(opts && opts.noHidden), visible: true, order: (opts && opts.order) || 0 });
+    }
+    // a point layer : [{p, color, size}]
+    function setPoints(name, pts, opts) {
+      const Pp = new Float32Array(pts.length * 3), C = new Float32Array(pts.length * 4), S = new Float32Array(pts.length);
+      pts.forEach((q, i) => { Pp.set(q.p, i * 3); C.set(q.color, i * 4); S[i] = q.size * st.dpr; });
+      const L = st.layers[name] || (st.layers[name] = { kind: 'pt', vao: gl.createVertexArray(), bufs: [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()] });
+      gl.bindVertexArray(L.vao);
+      [[Pp, 0, 3], [C, 1, 4], [S, 2, 1]].forEach(([d, loc, n], k) => { gl.bindBuffer(gl.ARRAY_BUFFER, L.bufs[k]); gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); });
+      gl.bindVertexArray(null);
+      Object.assign(L, { count: pts.length, onTop: !!(opts && opts.onTop), visible: true, order: (opts && opts.order) || 0 });
+    }
+    // a filled layer : triangles with per vertex colour (generated quads)
+    function setFill(name, P3, tris, colors) {
+      const L = st.layers[name] || (st.layers[name] = { kind: 'fill', vao: gl.createVertexArray(), bufs: [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()] });
+      gl.bindVertexArray(L.vao);
+      [[P3, 0, 3], [colors, 1, 4]].forEach(([d, loc, n], k) => { gl.bindBuffer(gl.ARRAY_BUFFER, L.bufs[k]); gl.bufferData(gl.ARRAY_BUFFER, d, gl.DYNAMIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); });
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, L.bufs[2]); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, tris, gl.DYNAMIC_DRAW); gl.bindVertexArray(null);
+      Object.assign(L, { count: tris.length, visible: true, order: -1 });
+    }
+    const setVisible = (name, v) => { if (st.layers[name]) st.layers[name].visible = v; };
+    const clearLayer = (name) => { if (st.layers[name]) st.layers[name].visible = false; };
+
+    function eye() { const c = Math.cos(cam.pitch); return [cam.target[0] + cam.dist * c * Math.sin(cam.yaw), cam.target[1] + cam.dist * Math.sin(cam.pitch), cam.target[2] + cam.dist * c * Math.cos(cam.yaw)]; }
+    function matrices() {
+      const e = eye(), up = Math.abs(Math.cos(cam.pitch)) < 1e-4 ? [0, 0, -Math.sign(cam.pitch)] : [0, 1, 0];
+      const Vw = lookAt(e, cam.target, up), a = st.W / st.H;
+      const Pr = cam.ortho ? ortho(cam.dist * Math.tan(CFG.fov * Math.PI / 360), a, -CFG.far, CFG.far) : perspective(CFG.fov * Math.PI / 180, a, CFG.near, CFG.far);
+      st.MVP = mmul(Pr, Vw); st.eye = e; st.V = Vw; st.Pr = Pr;
+    }
+    function resize() {
+      st.dpr = window.devicePixelRatio || 1; const r = canvas.getBoundingClientRect(); st.W = Math.max(1, r.width); st.H = Math.max(1, r.height);
+      canvas.width = Math.round(st.W * st.dpr); canvas.height = Math.round(st.H * st.dpr);
+    }
+    function draw() {
+      resize(); matrices(); gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(...CFG.bg); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      if (st.mesh && st.showMesh) {
+        gl.useProgram(P.mesh.p); gl.uniformMatrix4fv(P.mesh.u.uMVP, false, st.MVP); gl.uniform3fv(P.mesh.u.uEye, st.eye); gl.uniform3fv(P.mesh.u.uColor, CFG.meshColor);
+        gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : 1.0);
+        gl.depthMask(!st.xray); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0); gl.depthMask(true);
+      }
+      const layers = Object.values(st.layers).filter((L) => L.visible && L.count > 0).sort((a, b) => a.order - b.order);
+      const vp = [canvas.width, canvas.height];
+      for (const L of layers) {
+        if (L.kind === 'fill') {
+          gl.useProgram(P.fill.p); gl.uniformMatrix4fv(P.fill.u.uMVP, false, st.MVP); gl.uniform1f(P.fill.u.uBias, CFG.lineDepthBias * 0.5); gl.uniform1f(P.fill.u.uAlpha, 1.0);
+          gl.bindVertexArray(L.vao); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0);
+        } else if (L.kind === 'rib') {
+          gl.useProgram(P.rib.p); gl.uniformMatrix4fv(P.rib.u.uMVP, false, st.MVP); gl.uniform2fv(P.rib.u.uVP, vp); gl.uniform1f(P.rib.u.uW, L.width * st.dpr); gl.uniform1f(P.rib.u.uBias, CFG.lineDepthBias);
+          gl.bindVertexArray(L.vao);
+          if (L.hidden) { gl.disable(gl.DEPTH_TEST); gl.uniform1f(P.rib.u.uAlpha, CFG.hiddenAlpha); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0); gl.enable(gl.DEPTH_TEST); }
+          gl.uniform1f(P.rib.u.uAlpha, 1.0); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0);
+        } else {
+          gl.useProgram(P.pt.p); gl.uniformMatrix4fv(P.pt.u.uMVP, false, st.MVP); gl.uniform1f(P.pt.u.uBias, CFG.lineDepthBias * 2); gl.bindVertexArray(L.vao);
+          if (L.onTop) gl.disable(gl.DEPTH_TEST); else { gl.disable(gl.DEPTH_TEST); gl.uniform1f(P.pt.u.uAlpha, CFG.hiddenAlpha); gl.drawArrays(gl.POINTS, 0, L.count); gl.enable(gl.DEPTH_TEST); }
+          gl.uniform1f(P.pt.u.uAlpha, 1.0); gl.drawArrays(gl.POINTS, 0, L.count); gl.enable(gl.DEPTH_TEST);
+        }
+      }
+      gl.bindVertexArray(null);
+    }
+
+    // exact surface point under (x, y) css pixels : world position and normal, or null
+    function pickSurface(x, y) {
+      if (!st.mesh || !floatOk) return null;
+      const w = canvas.width, h = canvas.height;
+      if (!st.pickFbo || st.pickSize[0] !== w || st.pickSize[1] !== h) {
+        const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+        const tex = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, w, h); return t; };
+        const t0 = tex(), t1 = tex(), rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t0, 0); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, t1, 0);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); st.pickFbo = fb; st.pickSize = [w, h];
+      }
+      const px = Math.round(x * st.dpr), py = Math.round(h - y * st.dpr - 1);
+      if (px < 0 || py < 0 || px >= w || py >= h) return null;
+      matrices(); gl.bindFramebuffer(gl.FRAMEBUFFER, st.pickFbo); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+      gl.viewport(0, 0, w, h); gl.enable(gl.SCISSOR_TEST); gl.scissor(px, py, 1, 1);
+      gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, -1]); gl.clear(gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.useProgram(P.pick.p); gl.uniformMatrix4fv(P.pick.u.uMVP, false, st.MVP); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0);
+      const a = new Float32Array(4), b = new Float32Array(4);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0); gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, a); gl.readBuffer(gl.COLOR_ATTACHMENT1); gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, b);
+      gl.disable(gl.SCISSOR_TEST); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.enable(gl.BLEND); gl.bindVertexArray(null);
+      if (a[3] < 0.5) return null;
+      return { p: [a[0], a[1], a[2]], n: [b[0], b[1], b[2]], part: Math.round(b[3]) };
+    }
+    function project(p) {
+      const m = st.MVP; const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
+      const z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14];
+      return [(x / w * 0.5 + 0.5) * st.W, (1 - (y / w * 0.5 + 0.5)) * st.H, z / w, w];
+    }
+    // the point on the plane through `through` facing the camera, under (x, y) : moves without a surface under the cursor
+    function planePoint(x, y, through) {
+      const e = st.eye, f = V.norm(V.sub(cam.target, e)); const ndc = [x / st.W * 2 - 1, 1 - y / st.H * 2];
+      const r = V.norm(V.cross(f, [0, 1, 0])), u = V.cross(r, f), th = Math.tan(CFG.fov * Math.PI / 360), a = st.W / st.H;
+      let o, d;
+      if (cam.ortho) { const hh = cam.dist * th; o = V.add(V.add(e, V.mul(r, ndc[0] * hh * a)), V.mul(u, ndc[1] * hh)); d = f; }
+      else { o = e; d = V.norm(V.add(f, V.add(V.mul(r, ndc[0] * th * a), V.mul(u, ndc[1] * th)))); }
+      const t = V.dot(V.sub(through, o), f) / V.dot(d, f); return V.add(o, V.mul(d, t));
+    }
+    const orbit = (dx, dy) => { cam.yaw -= dx * CFG.orbit; cam.pitch = Math.max(-CFG.pitchLimit, Math.min(CFG.pitchLimit, cam.pitch + dy * CFG.orbit)); };
+    const pan = (dx, dy) => {
+      const e = eye(), f = V.norm(V.sub(cam.target, e)), r = V.norm(V.cross(f, [0, 1, 0])), u = V.cross(r, f), s = 2 * cam.dist * Math.tan(CFG.fov * Math.PI / 360) / st.H * CFG.pan;
+      cam.target = V.add(cam.target, V.add(V.mul(r, -dx * s), V.mul(u, dy * s)));
+    };
+    const zoom = (d) => { cam.dist = Math.max(CFG.minDist, Math.min(CFG.maxDist, cam.dist * Math.exp(d * CFG.zoom))); };
+    function frame(pts) {
+      if (!pts.length) return; let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (const p of pts) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
+      cam.target = V.mul(V.add(lo, hi), 0.5); cam.dist = Math.max(0.2, 1.4 * V.len(V.sub(hi, lo)) / (2 * Math.tan(CFG.fov * Math.PI / 360)) * 0.6);
+    }
+    function preset(name) {
+      const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, CFG.pitchLimit], bottom: [0, -CFG.pitchLimit], persp: [0.9, 0.35] }[name];
+      if (t) { cam.yaw = t[0]; cam.pitch = t[1]; }
+    }
+    return { gl, CFG, cam, st, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
+  }
+  return { create, CFG, V };
+})();
+if (typeof window !== 'undefined') window.View3D = View3D;
