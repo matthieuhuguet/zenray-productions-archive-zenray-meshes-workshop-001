@@ -1,0 +1,18 @@
+#!/bin/zsh
+# 29 October 2026 : restart the ZenRay Lines server (static lines/ plus POST /save /faces /mesh /doctor /project /houdini) after a code change.
+# EN: the running process caches ZrlNetMesh, so every change of the module needs this restart. It must run with the zenray-meshes venv
+#     (numpy, scipy) : the bare Homebrew python has no numpy and every POST would answer 500. Waits for the old process by its pid.
+# FR : redémarre le serveur ZenRay Lines avec le venv zenray-meshes (numpy, scipy) ; le python Homebrew nu n'a pas numpy.
+ROOT=/Users/zenray/.claude/tmp/tmp-zenray-meshes
+PY=/Users/zenray/.venvs/zenray-meshes/bin/python
+PORT=${1:-8766}
+cd $ROOT || exit 1
+if [[ -f lines/server.pid ]] && ps -p $(cat lines/server.pid) >/dev/null 2>&1; then
+  kill $(cat lines/server.pid)
+  while ps -p $(cat lines/server.pid) >/dev/null 2>&1; do sleep 0.2; done
+fi
+nohup $PY -I -B Scripts/lines/ZrlServe.py --port $PORT --port-file lines/server.port > lines/server.log 2>&1 &
+echo $! > lines/server.pid
+for i in {1..25}; do curl -s -o /dev/null http://127.0.0.1:$PORT/3d.html && break; sleep 0.2; done
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H 'Content-Type: application/json' -d '{"lines":{"nodes":[],"arcs":[]},"params":{}}' http://127.0.0.1:$PORT/faces)
+echo "server pid $(cat lines/server.pid) port $PORT, POST /faces on an empty network answers $code (200 = numpy and the module load)"

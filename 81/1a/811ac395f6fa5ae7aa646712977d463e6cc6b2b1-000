@@ -34,6 +34,9 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "corners_force": {},              # {node id: true|false} forces / forbids a corner
     "snap_corner_m": 0.01,            # extra corners : a split closer than this to an existing node uses that node
     "tjunction_tol_m": 0.03,          # a free arc end this close to another arc is a T junction : that arc is split there, both meet in a new node
+    "soft_corners": True,             # 29 October 2026 : a face short of 4 corners takes the real bends INSIDE its curves (rounded corners) as corners
+    "soft_window_m": 0.04,            # ... turn measured between the tangents this far before and after each point, in the surface tangent plane
+    "soft_corner_deg": 45.0,          # ... a bend turning more than this over the window is a corner
     "max_virtual_corners": 2,         # a face that needs more virtual corners than this (rings, round faces without real corners) is skipped
     "min_compactness": 0.08,          # faces thinner than this (area / (perimeter^2 / 4 pi)) are skipped as slivers
     "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
@@ -470,6 +473,9 @@ class Net:
                 if is_c: f["corner_nodes"].add(v)
             if not explicit: self._fill_corners(f)
             f["reflex"] = int(sum(1 for k, tn, sg in f["turns"] if self.tail(he[k]) in f["corner_nodes"] and sg < 0 and tn > prm["corner_deg"]))
+        if prm.get("soft_corners"):                                  # 29 October 2026 : real bends inside the curves before the rotate option and the virtual corners
+            for f in self.faces:
+                if f["status"] == "pending" and "corners" not in opts.get(f["id"], {}) and self._ncorners(f) < 4: self._soft_corners(f)
         for f in self.faces:                                         # rotate : which corners pair up as opposite sides
             r = opts.get(f["id"], {}).get("rotate")
             if f["status"] != "pending" or r is None: continue
@@ -501,6 +507,44 @@ class Net:
             if turn < prm["corner_min_deg"] or v in f["corner_nodes"] or self.force.get(v) is False: continue
             if any(min(abs(pos[k] - c), P - abs(pos[k] - c)) < prm["corner_min_gap_frac"] * P for c in chosen): continue
             f["corner_nodes"].add(v); chosen.append(pos[k])
+
+    def _soft_corners(self, f, target=4):
+        """29 October 2026 : a face short of `target` corners looks for real bends INSIDE its curves : a rounded door corner turns 90 degrees over a
+        few centimetres between two nodes. The turn of the loop is measured between the tangents soft_window_m before and after each point, in the
+        surface tangent plane ; the strongest bend above soft_corner_deg, spaced like the other corners, becomes a corner (its node when one is within
+        snap_corner_m, else the curve is split there, and the new node counts as a real corner). Repeated until `target` corners or no bend left."""
+        prm = self.prm; w = prm["soft_window_m"]; snap = prm["snap_corner_m"]; gap = prm["corner_min_gap_frac"]
+        for _ in range(target):
+            he = f["he"]; ci = self._cidx(f)
+            if len(ci) >= target: return
+            P, owner, start = [], [], []
+            for aid, d in he:
+                A = self.arcs[aid]; pts, cum = A["pts"], A["cum"]; start.append(len(P))
+                for k in (range(len(pts) - 1) if d > 0 else range(len(pts) - 1, 0, -1)): P.append(pts[k]); owner.append((aid, float(cum[k])))
+            P = np.asarray(P, float); n = len(P)
+            if n < 12: return
+            seg = np.linalg.norm(np.roll(P, -1, 0) - P, axis=1); L = float(seg.sum()); pos = np.concatenate([[0.0], np.cumsum(seg)])[:n]
+            if L < 8 * w: return
+            ext = np.concatenate([pos - L, pos, pos + L]); Pext = np.vstack([P, P, P])
+            ib = np.clip(np.searchsorted(ext, pos + L - w), 0, 3 * n - 1); ia = np.clip(np.searchsorted(ext, pos + L + w), 0, 3 * n - 1)
+            N = self.ref.normals_at(P); tin = P - Pext[ib]; tout = Pext[ia] - P
+            tin -= (tin * N).sum(1)[:, None] * N; tout -= (tout * N).sum(1)[:, None] * N
+            tin /= np.maximum(np.linalg.norm(tin, axis=1), 1e-12)[:, None]; tout /= np.maximum(np.linalg.norm(tout, axis=1), 1e-12)[:, None]
+            turn = np.degrees(np.arccos(np.clip((tin * tout).sum(1), -1.0, 1.0)))
+            chosen = [pos[start[k]] for k in ci]; best = None
+            for i in np.argsort(-turn):
+                if turn[i] < prm["soft_corner_deg"]: break
+                lo, hi = ib[i] - n, ia[i] - n                         # a peak : the largest turn of its own window
+                win = turn[np.arange(lo, hi + 1) % n] if hi >= lo else turn[i:i + 1]
+                if turn[i] < win.max() - 1e-9: continue
+                if any(min(abs(pos[i] - c), L - abs(pos[i] - c)) < gap * L for c in chosen): continue
+                best = i; break
+            if best is None: return
+            aid, s_on = owner[best]; A = self.arcs[aid]
+            if s_on <= snap and A["a"] >= 0 and self.force.get(A["a"]) is not False: v = A["a"]
+            elif A["len"] - s_on <= snap and A["b"] >= 0 and self.force.get(A["b"]) is not False: v = A["b"]
+            else: v = self._split_arc(aid, s_on); self.real_nodes.add(v)
+            f["corner_nodes"].add(v); f.setdefault("soft_corners", []).append(round(float(turn[best]), 1))
 
     def _cidx(self, f): return [k for k, h in enumerate(f["he"]) if self.tail(h) in f["corner_nodes"]]
     def _ncorners(self, f): return len(self._cidx(f))

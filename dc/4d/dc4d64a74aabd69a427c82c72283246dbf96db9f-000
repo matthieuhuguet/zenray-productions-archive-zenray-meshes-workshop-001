@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', seeds: 'data/seeds_v752.json' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', seeds: 'data/seeds_v752.json' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -17,7 +17,8 @@
       bad: [0.88, 0.14, 0.14, 1], forced: [0.98, 0.42, 0.04, 1], forbidden: [0.32, 0.33, 0.38, 1], corner: [0.95, 0.5, 0.1, 1] },
     sizes: { arc: 2.0, arcSel: 3.2, node: 7, nodeSel: 11, handle: 9, poly: 1.2, mesh: 1.0, draw: 2.4, drawPt: 9 },
     pick: { arcPx: 8, handlePx: 11, nodePx: 11, snapNodePx: 14, snapArcPx: 10, meshVertexPx: 10, hiddenTolM: 0.02, dragStartPx: 3 },
-    edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01 },
+    edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01, weldMinM: 0.0005, weldMaxM: 0.12 },
+    repair: { snapM: 0.03, endGuardM: 0.03, dupM: 0.01 },   // 29 October 2026 : Repair network : a far end attaches to what lies within snapM ; duplicates closer than dupM
     perSpan: 24,
   };
   const $ = (id) => document.getElementById(id);
@@ -154,7 +155,68 @@
   }
   function simplifySel() { if (!S.sel.size) return status('Select curves first.'); const n = parseInt($('pCtrl').value, 10); edit('Simplified to ' + n + ' control points', () => forSel((a) => resample(a, n))); }
   function reverseSel() { if (!S.sel.size) return status('Select curves first.'); edit('Reversed', () => forSel((a) => { a.ctrl.reverse(); [a.a, a.b] = [a.b, a.a]; })); }
-  function weldSel() { if (!S.sel.size) return status('Select curves first.'); edit('Ends welded on their nodes', () => { for (const id of S.sel) model.weld(id, P().mirror); }); }
+  function weldBlend(a) {   // 29 October 2026 : each end onto its node, the move fading linearly to zero at the other end (the curve keeps its shape)
+    const n = a.ctrl.length, moves = []; let moved = 0;
+    for (const [nid, i] of [[a.a, 0], [a.b, n - 1]]) { const nd = nid >= 0 ? model.node(nid) : null; if (!nd) continue; const d = V.sub(nd.p, a.ctrl[i]), l = V.len(d);
+      if (l > CFG.edit.weldMinM && l <= CFG.edit.weldMaxM) { moves.push([i, d]); moved = Math.max(moved, l); } }
+    if (!moves.length) return 0;
+    a.ctrl = a.ctrl.map((p, k) => { let q = clone3(p); for (const [i, d] of moves) { const w = n > 1 ? 1 - Math.abs(k - i) / (n - 1) : 1; q = V.add(q, V.mul(d, w)); } return q; });
+    model.touch(a.id); return moved;
+  }
+  function weldSel() { if (!S.sel.size) return status('Select curves first.'); let n = 0, mx = 0; edit('Ends welded on their nodes', () => { for (const id of S.sel) for (const m of model.mirrorIds(id, P().mirror)) { const d = weldBlend(model.arc(m)); if (d) { n++; mx = Math.max(mx, d); } } }); status(n + ' curve(s) welded on their nodes, largest move ' + (mx * 100).toFixed(1) + ' cm'); }
+  function weldAll() { let n = 0, mx = 0; edit('Every end welded on its node', () => { for (const a of model.doc.arcs) { const d = weldBlend(a); if (d) { n++; mx = Math.max(mx, d); } } }); status(n + ' curve(s) welded on their nodes, largest move ' + (mx * 100).toFixed(1) + ' cm (Cmd Z to undo)'); }
+  // 29 October 2026 : REPAIR the network in one undo step. A far end (beyond weldMaxM from its node) goes to the node or the curve it really touches
+  // (T junction), else becomes free (red) ; near ends are welded with a fade ; a curve that retraces another between the same two nodes is removed.
+  function nearestOnArcs(p, skip, maxD) { let hit = null, bd = maxD; for (const b of model.doc.arcs) { if (skip.has(b.id)) continue; const sm = arcPts(b.id); for (let k = 0; k < sm.length; k += 3) { const d = Math.hypot(sm[k] - p[0], sm[k + 1] - p[1], sm[k + 2] - p[2]); if (d < bd) { bd = d; hit = { id: b.id, p: [sm[k], sm[k + 1], sm[k + 2]], k: k / 3, n: sm.length / 3 }; } } } return hit; }
+  function meanDist(sa, sb) { let t = 0, n = 0; for (let i = 0; i < sa.length; i += 3) { let m = Infinity; for (let j = 0; j < sb.length; j += 3) m = Math.min(m, Math.hypot(sa[i] - sb[j], sa[i + 1] - sb[j + 1], sa[i + 2] - sb[j + 2])); t += m; n++; } return n ? t / n : Infinity; }
+  async function snapToSurface() {   // 29 October 2026 : every node and control point onto the reference surface (server closest point), one undo step
+    status('Snapping the curves onto the surface...');
+    const r = await fetch(CFG.files.project, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: {} }) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Snap failed : ' + (res.error || r.status), 'error');
+    const D = res.doc, nodes = new Map(D.nodes.map((n) => [n.id, n.p])), arcs = new Map(D.arcs.map((a) => [a.id, a.ctrl])), mv = res.moved || {};
+    edit('Curves snapped on the surface : median move ' + ((mv.median_m || 0) * 1000).toFixed(1) + ' mm, largest ' + ((mv.max_m || 0) * 100).toFixed(1) + ' cm', () => {
+      for (const n of model.doc.nodes) if (nodes.has(n.id)) n.p = nodes.get(n.id);
+      for (const a of model.doc.arcs) if (arcs.has(a.id)) { a.ctrl = arcs.get(a.id); model.touch(a.id); } });
+    return mv;
+  }
+  function repairNetwork() {
+    const R = CFG.repair, c = { retarget: 0, tjunction: 0, freed: 0, welded: 0, maxWeld: 0, duplicates: 0 };
+    edit('Network repaired', () => {
+      for (const a of model.doc.arcs.slice()) {
+        for (const end of ['a', 'b']) {
+          const i = end === 'a' ? 0 : a.ctrl.length - 1, p = a.ctrl[i], nd = a[end] >= 0 ? model.node(a[end]) : null;
+          if (nd && d3(nd.p, p) <= CFG.edit.weldMaxM) continue;
+          let bn = null, bd = R.snapM; for (const q of model.doc.nodes) { const d = d3(q.p, p); if (d < bd) { bd = d; bn = q.id; } }
+          if (bn !== null) { a[end] = bn; a.ctrl[i] = clone3(model.node(bn).p); model.touch(a.id); c.retarget++; continue; }
+          const hit = nearestOnArcs(p, new Set([a.id]), R.snapM);
+          if (hit) { const hb = model.arc(hit.id), near = (j) => { const e = hb[j] >= 0 ? model.node(hb[j]) : null; return e && d3(e.p, hit.p) < R.endGuardM ? hb[j] : null; };
+            const en = near('a') ?? near('b'); const nid = en !== null ? en : splitArcAt(hit.id, hit.p, false).node; a[end] = nid; a.ctrl[i] = clone3(model.node(nid).p); model.touch(a.id); c.tjunction++; continue; }
+          if (nd) { a[end] = -1; model.touch(a.id); c.freed++; }
+        }
+      }
+      for (const a of model.doc.arcs) { const m = weldBlend(a); if (m) { c.welded++; c.maxWeld = Math.max(c.maxWeld, m); } }
+      const byPair = new Map(); for (const a of model.doc.arcs) { if (a.a < 0 || a.b < 0) continue; const key = Math.min(a.a, a.b) + '-' + Math.max(a.a, a.b); (byPair.get(key) || byPair.set(key, []).get(key)).push(a.id); }
+      for (const ids of byPair.values()) for (let x = 0; x < ids.length; x++) for (let y = x + 1; y < ids.length; y++) {
+        const A = model.arc(ids[x]), B = model.arc(ids[y]); if (!A || !B || A.a === A.b) continue;
+        if (meanDist(arcPts(B.id), arcPts(A.id)) < R.dupM) { model.removeArcs(B.id, false); c.duplicates++; } }
+    });
+    status('Repaired : ' + c.retarget + ' end(s) moved to the node they touch, ' + c.tjunction + ' T junction(s), ' + c.welded + ' welded (largest ' + (c.maxWeld * 100).toFixed(1) + ' cm), ' + c.freed + ' left free (red), ' + c.duplicates + ' duplicate(s) removed. Cmd Z undoes it.');
+    return c;
+  }
+  function attachDroppedEnd(arcId, i, x, y) {   // 29 October 2026 : an END control point dropped on a node attaches there, on a curve it splits it (T junction), in the void it is free ; the mirror curve follows
+    const a = model.arc(arcId); if (!a || (i !== 0 && i !== a.ctrl.length - 1)) return null;
+    const end = i === 0 ? 'a' : 'b', sd = surfaceDist(x, y), m = P().mirror ? mirrorArcOf(arcId) : null, own = new Set([arcId]); if (m) own.add(m.id);
+    const mi = m ? (end === 'a' ? 0 : m.ctrl.length - 1) : -1;
+    const put = (arc, k, e, nid) => { arc[e] = nid; arc.ctrl[k] = clone3(model.node(nid).p); model.touch(arc.id); };
+    const n = pickNode(x, y, sd, CFG.pick.snapNodePx);
+    if (n !== null) { put(a, i, end, n); model.buildNodeMirror(); const mn = m ? (Math.abs(model.node(n).p[0]) < CFG.edit.centreSnapM ? n : model.nodeMirror.get(n)) : null; if (m && mn != null) put(m, mi, end, mn); return 'attached to node ' + n + (m && mn == null ? ' (mirror curve left as is : no mirror node)' : ''); }
+    let hit = null, bd = CFG.pick.snapArcPx;
+    for (const b of model.doc.arcs) { if (own.has(b.id)) continue; const sm = arcPts(b.id); for (let k = 0; k < sm.length; k += 3) { const p = [sm[k], sm[k + 1], sm[k + 2]], q = view.project(p), d = Math.hypot(q[0] - x, q[1] - y); if (d < bd && q[3] > 0 && visible(p, sd)) { bd = d; hit = { id: b.id, p }; } } }
+    if (hit) { const r = splitArcAt(hit.id, hit.p, !!m); put(a, i, end, r.node); if (m && r.mirrorNode != null) put(m, mi, end, r.mirrorNode); return 'T junction on curve ' + hit.id + ' (new node ' + r.node + ')'; }
+    const nd = a[end] >= 0 ? model.node(a[end]) : null;
+    if (nd && d3(nd.p, a.ctrl[i]) > CFG.edit.weldMinM * 4) { a[end] = -1; model.touch(a.id); if (m) { m[end] = -1; model.touch(m.id); } return 'free end (red) : drop it on a node or a curve to connect it'; }
+    return null;
+  }
   function projectSel() {
     if (!S.sel.size) return status('Select curves first.');
     edit('Projected on the surface (visible control points)', () => forSel((a) => { a.ctrl = a.ctrl.map((p) => { const q = view.project(p); const h = view.pickSurface(q[0], q[1]); return h && d3(h.p, p) < 0.1 ? h.p : p; }); }));
@@ -267,11 +329,12 @@
   }
   async function convertToMesh() {
     status('Converting the network to quads...');
-    const body = { lines: JSON.parse(model.serialize()), params: meshParams() };
+    const body = { lines: docForServer(), params: meshParams() };
     const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
     if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
-    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], k: S.doctor ? S.doctor.k : null };
+    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], euler: (res.stats && res.stats.euler_network) || (S.doctor && S.doctor.euler) || null, k: S.doctor ? S.doctor.k : null };
+    $('doctorInfo').textContent = problemSummary();
     status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
   }
   async function checkNetwork() {
@@ -422,7 +485,7 @@
       }
       S.handle = null; status(S.sel.size + ' curve(s) selected'); redraw(); return;
     }
-    if (D.started) { schedulePreview(); model.buildNodeMirror(); status(D.kind === 'ctrl' ? 'Control point moved' + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
+    if (D.started) { const [ux, uy] = local(ev), how = D.kind === 'ctrl' ? attachDroppedEnd(D.hit.arc, D.hit.i, ux, uy) : null; schedulePreview(); model.buildNodeMirror(); status(D.kind === 'ctrl' ? (how ? 'End ' + how : 'Control point moved') + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
     if (D.kind === 'meshVertex') status('Mesh vertex moved');
   }
   function onWheel(ev) { ev.preventDefault(); view.zoom(ev.deltaY); redraw(true); }
@@ -532,13 +595,40 @@
     const next = cur === undefined ? !isCorner : cur === !isCorner ? !cur : undefined;
     edit('Node ' + id + (next === undefined ? ' : corner automatic again' : next ? ' : forced corner' : ' : never a corner'), () => { const m = model.doc.corners_force || (model.doc.corners_force = {}); if (next === undefined) delete m[id]; else m[id] = next; });
   }
-  function nextProblem() {   // 29 October 2026 : N : the curves the faces cannot use, one after the other
-    const ids = ((S.doctor && S.doctor.dangling) || []).filter((id) => model.arc(id));
-    if (!ids.length) return status(S.doctor ? 'No loose curve : every curve borders two faces.' : 'Preview the faces first (P).');
-    S.doctor.k = ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % ids.length; const id = ids[S.doctor.k];
-    S.sel = new Set([id]); S.node = null; S.handle = null; frameSel();
-    status('Loose curve ' + (S.doctor.k + 1) + ' of ' + ids.length + ' (curve ' + id + ') : drag its free end onto a node or a curve, or delete it.');
+  const FIXES = {   // 29 October 2026 : why a face is refused, and the gesture that repairs it
+    sliver: 'too thin : two curves run side by side ; delete one (Del) or move it away',
+    round_face: 'not enough real corners ; press K on a node of its border, or split a curve (S) to make one',
+    few_corners: 'not enough corners ; press K on a node of its border, or split a curve (S)',
+    too_many_sides: 'more than 6 corners ; press K on a corner to forbid it, or draw a curve across it (D)',
+    wraps_around: 'it wraps around the body ; draw a curve across it (D)',
+    area: 'too large ; draw a curve across it (D)',
+    complement: 'an island : these curves touch nothing else ; draw a curve (D) from one of them to a neighbour',
+    infeasible: 'its side counts cannot close ; change a density (Denser, Coarser) or add a curve',
+    judge: 'folded or squashed quads ; try Next pattern, move a corner, or split it with a curve',
+  };
+  function problems() {
+    const out = [], meshFaces = new Map(((S.mesh && S.mesh.faces) || []).map((f) => [f.id, f]));
+    for (const id of ((S.doctor && S.doctor.dangling) || [])) if (model.arc(id)) out.push({ kind: 'loose', arc: id });
+    for (const f of S.faces || []) {
+      const key = (f.reason || '').split(' ')[0], mf = meshFaces.get(f.id);
+      if (f.status === 'infeasible') out.push({ kind: 'infeasible', face: f });
+      else if (f.status === 'skipped' && FIXES[key] && key !== 'complement') out.push({ kind: key, face: f });
+      else if (mf && mf.judge_ok === false) out.push({ kind: 'judge', face: f, detail: (mf.folded || 0) + ' folded, min Jacobian ' + (+mf.min_jac).toFixed(2) });
+    }
+    const outer = (S.faces || []).filter((f) => (f.reason || '') === 'complement').sort((a, b) => (b.perimeter || 0) - (a.perimeter || 0)); for (const f of outer.slice(1)) out.push({ kind: 'complement', face: f });   // the longest outer loop is the border of the main network, the others are islands
+    return out;
   }
+  function framePoints(flat) { const pts = []; for (let i = 0; i < flat.length; i += 3) pts.push([flat[i], flat[i + 1], flat[i + 2]]); if (pts.length) view.frame(pts); }
+  function nextProblem() {   // 29 October 2026 : N : every problem in turn, loose curves first, then the faces, each with the gesture that fixes it
+    const list = problems(); if (!S.faces) return status('Preview the faces first (P).');
+    if (!list.length) return status('No problem left : every curve borders two faces and every face meshes cleanly.');
+    S.doctor.k = ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % list.length; const it = list[S.doctor.k], head = 'Problem ' + (S.doctor.k + 1) + ' of ' + list.length + ' : ';
+    if (it.kind === 'loose') { S.sel = new Set([it.arc]); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'loose curve ' + it.arc + ' ; drag its free end onto a node or a curve, or delete it.'); }
+    const f = it.face; S.sel.clear(); S.face = { id: f.id, p: f.centroid }; S.comp = f.component || null; framePoints(f.boundary || []); renderCompList(); redraw();
+    status(head + 'face ' + f.id + (f.component ? ' (' + f.component.replace(/^CAR_/, '') + ')' : '') + ' is ' + FIXES[it.kind] + (it.detail ? ' [' + it.detail + ']' : '') + '.');
+  }
+  function problemSummary() { const by = {}; for (const it of problems()) by[it.kind] = (by[it.kind] || 0) + 1; const names = { loose: 'loose curves', sliver: 'thin faces', round_face: 'round faces', few_corners: 'faces short of corners', too_many_sides: 'faces with too many sides', wraps_around: 'wrapping faces', area: 'too large faces', complement: 'islands', infeasible: 'faces that cannot close', judge: 'faces with bad quads' };
+    const parts = Object.entries(by).map(([k, v]) => v + ' ' + names[k]); return parts.length ? parts.join(', ') + ' : N goes to the next one' : 'No problem : every face meshes'; }
   function freeEnds(id) { const a = model.arc(id), out = []; if (!a) return out; for (const [nid, p] of [[a.a, a.ctrl[0]], [a.b, a.ctrl[a.ctrl.length - 1]]]) { if (nid == null || nid < 0) out.push(p); else if (model.node(nid) && model.nodeArcs(nid).length < 2) out.push(model.node(nid).p); } return out; }
   function renderDoctor() {
     const ids = ((S.doctor && S.doctor.dangling) || []).filter((id) => model.arc(id));
@@ -574,17 +664,22 @@
     facesTimer = setTimeout(() => safe(previewFaces)(), CFG.preview.facesDelayMs);
     if ($('pLiveMesh').checked) meshTimer = setTimeout(() => safe(convertToMesh)(), CFG.preview.meshDelayMs);
   }
+  function docForServer() {   // 29 October 2026 : the whole network, or with 'Selected curves only' the selected curves and their nodes (small, perfect, then the next)
+    const doc = JSON.parse(model.serialize()); if (!$('pSolo').checked || !S.sel.size) return doc;
+    const arcs = doc.arcs.filter((a) => S.sel.has(a.id)), used = new Set(); for (const a of arcs) { used.add(a.a); used.add(a.b); }
+    return { ...doc, arcs, nodes: doc.nodes.filter((n) => used.has(n.id)) };
+  }
   function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), face_options: faceOptions(), corners_force: model.doc.corners_force || {} }; }
   async function previewFaces() {
     const seq = ++previewSeq; const t0 = performance.now();
-    const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: meshParams() }) });
+    const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: docForServer(), params: meshParams() }) });
     if (r.status === 404 || r.status === 501) { if (!S.noFaces) { S.noFaces = true; status('Live preview needs the updated server (POST /faces)', 'error'); } return; }   // 29 October 2026 : said once
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (seq !== previewSeq) return;
     if (!r.ok || res.ok === false) return status('Preview failed : ' + (res.error || r.status), 'error');
     S.faces = res.faces || []; const by = {}; for (const f of S.faces) by[f.status] = (by[f.status] || 0) + 1;
     S.doctor = { dangling: res.dangling_arcs || [], issues: res.issues || [], euler: res.euler || null, k: S.doctor ? S.doctor.k : null };
     if (S.face) { const f = faceAt(S.face.p); S.face = f ? { id: f.id, p: S.face.p } : null; }
-    const nd = S.doctor.dangling.filter((id) => model.arc(id)).length; $('doctorInfo').textContent = nd ? nd + ' loose curve(s) in red : N goes to the next one' : 'Every curve borders two faces';
+    $('doctorInfo').textContent = problemSummary();
     status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
     renderCompList(); redraw();
   }
@@ -626,7 +721,7 @@
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
     on('bCompCurves', () => { if (!S.comp) return status('Select a component first.'); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).includes(S.comp)).map((a) => a.id)); status(S.sel.size + ' curve(s) border ' + S.comp); redraw(); });
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
-    on('bNextProblem', nextProblem); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
+    on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
@@ -635,7 +730,7 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
