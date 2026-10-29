@@ -40,6 +40,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "cross_tol_m": 0.006,             # 29 October 2026 : two curves passing closer than this away from their nodes cross : both are split there, one node
     "cross_min_deg": 20.0,            # ... only when their directions differ by more than this (below, they overlap : reported, not split)
     "annulus_check": True,
+    "untangle_iters": 400,            # 29 October 2026 : folded patches get a Winslow pass in their own plane (0 = off) ; kept only when the face folds less
     "overlap_check": True,            # 29 October 2026 : two meshable faces covering the same place (doubled curves) : the named one, else the smaller, is kept
     "overlap_plane_m": 0.05,          # ... a face's centroid inside the other's loop, this close to its plane            # 29 October 2026 : a face whose loop contains another piece of the network (an island) is skipped as annulus
     "max_virtual_corners": 2,         # a face that needs more virtual corners than this (rings, round faces without real corners) is skipped
@@ -373,7 +374,7 @@ class Net:
                     if (i, j) in done or np.any(A["lo"] > B["hi"] + tol) or np.any(B["lo"] > A["hi"] + tol): continue
                     if j not in trees: trees[j] = cKDTree(B["pts"])
                     d, k = trees[j].query(A["pts"], k=1); m = int(np.argmin(d))
-                    if d[m] > tol: continue
+                    if d[m] > tol: done.add((i, j)); continue                  # 29 October 2026 : a pair seen apart is never scanned again (new arcs have new ids)
                     pa, pb = A["pts"][m], B["pts"][k[m]]
                     ends = [self.nodes[v] for v in (A["a"], A["b"], B["a"], B["b"]) if v >= 0 and v in self.nodes]
                     if ends and min(min(np.linalg.norm(pa - e), np.linalg.norm(pb - e)) for e in ends) < guard: done.add((i, j)); continue
@@ -541,7 +542,7 @@ class Net:
         for f in self.faces:                                         # rotate : which corners pair up as opposite sides
             r = opts.get(f["id"], {}).get("rotate")
             if f["status"] != "pending" or r is None: continue
-            r = int(r); ci = self._cidx(f); n = len(ci)
+            r = int(r); ci = self._cidx(f); n = len(ci); f["native_corners"] = n       # 29 October 2026 : the client cycles the variants over the native count
             if n >= 5: f["corner_nodes"] = {self.tail(f["he"][ci[(r + round(k * n / 4)) % n]]) for k in range(4)}
             elif n == 4: f["rot"] = r % 4                              # a triangle has no 4 sided alternative (a flat 4th corner would be a degenerate quad)
         if prm.get("overlap_check"): self._overlaps()
@@ -740,7 +741,7 @@ class Net:
                 elif k == c: ids.append(vid(("n", A["b"]), self.nodes[A["b"]]))
                 else: ids.append(vid(("a", aid, k), S[k]))
             self.arc_vs[aid] = ids
-        self.Q = []; self.face_of_quad = []; self.corner_quads = collections.defaultdict(list)
+        self.Q = []; self.face_of_quad = []; self.corner_quads = collections.defaultdict(list); self.grids = []
         def side_vs(side):
             out = []
             for aid, d in side:
@@ -760,7 +761,7 @@ class Net:
             q0 = len(self.Q)
             for i in range(m):
                 for j in range(n): self.Q.append([int(G[i, j]), int(G[i + 1, j]), int(G[i + 1, j + 1]), int(G[i, j + 1])]); self.face_of_quad.append(fid)
-            return q0, m, n
+            self.grids.append((fid, G.copy(), q0)); return q0, m, n
         self.meshed = []
         for f in self.faces:
             if f["status"] != "ok": continue
@@ -812,6 +813,41 @@ class Net:
             if (it + 1) % prm["project_every"] == 0 or it == iters - 1:
                 q, ti, _ = self.ref.closest(P[free], guide=G[free]); P[free] = q; N = self.ref.outward(ti, q)
         self.timing["conform"] = time.time() - t
+
+    # ---- untangle : Winslow in the patch's own plane (Radó-Kneser-Choquet : the inverse harmonic map of a planar domain does not fold)
+    def _jac_grid(self, G, n):
+        X = self.V[G]; a, b, c, d = X[:-1, :-1], X[1:, :-1], X[1:, 1:], X[:-1, 1:]; J = np.full(a.shape[:2], np.inf)
+        for p, q, r in ((a, b, d), (b, c, a), (c, d, b), (d, a, c)):
+            e1, e2 = q - p, r - p; J = np.minimum(J, (np.cross(e1, e2) @ n) / np.maximum(np.linalg.norm(e1, axis=-1) * np.linalg.norm(e2, axis=-1), 1e-12))
+        return J
+
+    def untangle(self):
+        """29 October 2026 : a patch with folded quads after conform is laid in the plane of its face, smoothed by plain Winslow iterations
+        (border fixed, no refusal so that a folded start can unfold), lifted back onto the surface by closest point along the face normal, and
+        kept only when it has fewer folded quads and not more quads below jac_min. Counted in self.untangled."""
+        t = time.time(); iters = int(self.prm.get("untangle_iters") or 0); self.untangled = []
+        if iters <= 0 or not len(self.Q): self.timing["untangle"] = time.time() - t; return
+        nm = {f["id"]: f["nm"] for f in self.faces}; jmin = self.prm["jac_min"]
+        for fid, G, q0 in self.grids:
+            if G.shape[0] < 3 or G.shape[1] < 3: continue
+            n = nm[fid]; J0 = self._jac_grid(G, n); f0, b0 = int((J0 < 0).sum()), int((J0 < jmin).sum())
+            if f0 == 0: continue
+            X = self.V[G].copy(); c = X.reshape(-1, 3).mean(0); e1 = np.cross(n, [1.0, 0.0, 0.0])
+            if np.linalg.norm(e1) < 0.1: e1 = np.cross(n, [0.0, 1.0, 0.0])
+            e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1); P2 = np.stack([(X - c) @ e1, (X - c) @ e2], -1)
+            for _ in range(iters):
+                xe = 0.5 * (P2[2:, 1:-1] - P2[:-2, 1:-1]); xn = 0.5 * (P2[1:-1, 2:] - P2[1:-1, :-2])
+                al = (xn ** 2).sum(-1)[..., None]; ga = (xe ** 2).sum(-1)[..., None]; be = (xe * xn).sum(-1)[..., None]
+                P2[1:-1, 1:-1] = (al * (P2[2:, 1:-1] + P2[:-2, 1:-1]) + ga * (P2[1:-1, 2:] + P2[1:-1, :-2]) - 0.5 * be * (P2[2:, 2:] - P2[2:, :-2] - P2[:-2, 2:] + P2[:-2, :-2])) / (2 * (al + ga) + 1e-30)
+            inner = (slice(1, -1), slice(1, -1)); free = ~self.fixed_v[G[inner]]
+            plane = c + P2[inner][..., 0:1] * e1 + P2[inner][..., 1:2] * e2
+            h = ((X[inner] - c) @ n)[..., None]; guess = plane + h * n                       # keep each point's height over the plane, then snap
+            q, _, _ = self.ref.closest(guess.reshape(-1, 3), guide=np.repeat(n[None], guess.size // 3, 0)); q = q.reshape(guess.shape)
+            old = self.V[G[inner]].copy(); new = np.where(free[..., None], q, old); self.V[G[inner]] = new
+            J1 = self._jac_grid(G, n); f1, b1 = int((J1 < 0).sum()), int((J1 < jmin).sum())
+            if f1 < f0 and b1 <= b0: self.untangled.append([int(fid), f0, f1, b0, b1])
+            else: self.V[G[inner]] = old
+        self.timing["untangle"] = time.time() - t
 
     # ---- judge
     def judge(self):
@@ -868,7 +904,7 @@ class Net:
             cn = [self.tail(h) for h in f["he"] if self.tail(h) in f["corner_nodes"]]
             r = {"id": f["id"], "component": f.get("component"), "status": f["status"], "reason": f["reason"], "area": round(f["area"], 6), "perimeter": round(f["perimeter"], 6),
                  "centroid": f["centroid"], "arcs": [list(h) for h in f["he"]], "corners": cn, "corner_points": [self.nodes[v] for v in cn],
-                 "corner_virtual": [v not in self.real_nodes for v in cn]}
+                 "corner_virtual": [v not in self.real_nodes for v in cn], "native_corners": int(f.get("native_corners", len(cn)))}
             if f.get("extra_seeds"): r["extra_seeds"] = f["extra_seeds"]
             if f.get("reflex"): r["reflex_corners"] = f["reflex"]
             if "sides" in f: r["sides"] = [[h[0] for h in s] for s in f["sides"]]; r["n_sides"] = len(f["sides"])
@@ -911,7 +947,7 @@ def write_obj(net, path, name="ZenRayLines"):
 
 def _run(doc, params):
     net = Net(doc, (params or {}).get("ref"), params)
-    net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.judge(); return net
+    net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.untangle(); net.judge(); return net
 
 
 def build(doc, params=None):
@@ -937,7 +973,7 @@ def build(doc, params=None):
                   "quads_below_jac_min": int((net.quad_stats["jmin"] < net.prm["jac_min"]).sum()) if getattr(net, "quad_stats", None) else 0})
     stats.update({"faces_total": len(net.faces), "faces_meshed": st.get("meshed", 0), "faces_skipped": st.get("skipped", 0), "faces_infeasible": st.get("infeasible", 0),
                   "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
-                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "crossings": len(getattr(net, "crossings", [])), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
+                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "crossings": len(getattr(net, "crossings", [])), "untangled": getattr(net, "untangled", []), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
                   "issues_by_kind": dict(collections.Counter(i["kind"] for i in net.issues)), "timing": net.timing})
     if hasattr(net, "count_stats"): stats["count_deviation"] = net.count_stats
     obj_path = latest = None
