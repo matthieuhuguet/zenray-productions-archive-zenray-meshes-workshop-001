@@ -1,0 +1,136 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY NETWORK, the border curves shared by the components of the clean partition (ZrrShell).
+  arcs      : the shell edges whose two vertices carry different components ; inside a triangle of two components its two border edges
+              follow each other, so the border is a chain ; a triangle of three components is a JUNCTION, where chains end.
+  nodes     : junction triangles closer than junction_merge_m are one node ; every chain end is moved onto its node, so the arcs of one
+              component close exactly and two neighbours read the SAME arc (welded, or a gap of known width, by construction).
+  fairing   : every arc becomes a fair clamped B-spline (RigLib.fit_fair, ends held on their nodes) ; the left arcs are mirrored onto
+              the right ones and the centre arcs made symmetric : exact symmetry.
+python ZrrNet.py        writes work/retopo/network.npz and versions/Retopo_Network.png
+FR : le réseau des bords partagés : une courbe par frontière entre deux composants, nœuds aux jonctions, symétrie exacte."""
+import json, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import RigLib as RL
+
+PARAMS = {"junction_merge_m": 0.03, "min_arc_m": 0.02, "ctrl_per_m": 5.0, "ctrl_min": 3, "ctrl_max": 18, "l0": 0.02, "lam": 0.05,
+          "shell": f"{ROOT}/work/retopo/shell.npz", "out": f"{ROOT}/work/retopo/network.npz", "sheet": f"{ROOT}/versions/Retopo_Network.png"}  # 29 October 2026
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def mirror_name(n):
+    return n[:-2] + "_R" if n.endswith("_L") else n[:-2] + "_L" if n.endswith("_R") else n
+
+
+def chains(verts, faces, lab):
+    nv, nf = len(verts), len(faces)
+    E = np.r_[faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]; bnd = lab[E[:, 0]] != lab[E[:, 1]]
+    key = np.sort(E, axis=1); ek = key[:, 0] * nv + key[:, 1]
+    uk, inv = np.unique(ek[bnd], return_inverse=True); eid = np.full(len(E), -1); eid[np.flatnonzero(bnd)] = inv
+    a, b = uk // nv, uk % nv; mid = 0.5 * (verts[a] + verts[b]); pair = np.sort(np.stack([lab[a], lab[b]], 1), axis=1)
+    fe = eid.reshape(3, nf).T; fl = lab[faces]
+    distinct = 1 + (fl[:, 1] != fl[:, 0]) + ((fl[:, 2] != fl[:, 0]) & (fl[:, 2] != fl[:, 1]))
+    two = (distinct == 2); f2 = fe[two]; f2 = np.sort(f2, axis=1)[:, 1:]          # the two border edges (the third is -1)
+    G = coo_matrix((np.ones(len(f2)), (f2[:, 0], f2[:, 1])), shape=(len(uk), len(uk))); G = G + G.T
+    junc_faces = np.flatnonzero(distinct == 3); jc = verts[faces[junc_faces]].mean(1)
+    end_edges = fe[junc_faces].ravel(); end_edges = end_edges[end_edges >= 0]
+    deg = np.asarray((G > 0).sum(1)).ravel(); n, comp = connected_components(G, directed=False)
+    Gc = (G > 0).tocsr(); out = []
+    for c in range(n):
+        ids = np.flatnonzero(comp == c)
+        if len(ids) < 2: continue
+        ends = [i for i in ids if deg[i] < 2]; start = ends[0] if ends else ids[0]; order = [start]; seen = {start}; cur = start
+        while True:
+            nb = [j for j in Gc.indices[Gc.indptr[cur]:Gc.indptr[cur + 1]] if j not in seen]
+            if not nb: break
+            cur = nb[0]; order.append(cur); seen.add(cur)
+        out.append(dict(ids=np.array(order), pair=tuple(pair[order[0]]), closed=not ends))
+    return out, mid, jc
+
+
+def nodes_from_junctions(jc, merge):
+    if len(jc) == 0: return np.zeros((0, 3)), np.zeros(0, int)
+    kd = cKDTree(jc); pr = np.array(list(kd.query_pairs(merge)))
+    if len(pr) == 0: return jc.copy(), np.arange(len(jc))
+    G = coo_matrix((np.ones(len(pr)), (pr[:, 0], pr[:, 1])), shape=(len(jc), len(jc))); n, lbl = connected_components(G, directed=False)
+    nodes = np.array([jc[lbl == k].mean(0) for k in range(n)]); return nodes, lbl
+
+
+def build(prm=PARAMS):
+    S = np.load(prm["shell"], allow_pickle=True); V, F, lab, names = S["verts"], S["faces"], S["lab"], [str(n) for n in S["names"]]
+    ch, mid, jc = chains(V, F, lab); nodes, _ = nodes_from_junctions(jc, prm["junction_merge_m"]); kd = cKDTree(nodes) if len(nodes) else None
+    log("chains", len(ch), "junction faces", len(jc), "nodes", len(nodes))
+    arcs = []
+    for c in ch:
+        P = mid[c["ids"]]; na = nb = -1
+        if not c["closed"] and kd is not None:
+            da, ia = kd.query(P[0]); db, ib = kd.query(P[-1])
+            if da < 3 * prm["junction_merge_m"]: na = int(ia); P = np.vstack([nodes[ia], P])
+            if db < 3 * prm["junction_merge_m"]: nb = int(ib); P = np.vstack([P, nodes[ib]])
+        L = float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
+        if L < prm["min_arc_m"]: continue
+        arcs.append(dict(pair=(names[c["pair"][0]], names[c["pair"][1]]), a=na, b=nb, closed=c["closed"], raw=P, L=L))
+    # fairing, ends held
+    for A in arcs:
+        k = int(np.clip(round(A["L"] * prm["ctrl_per_m"]), prm["ctrl_min"], prm["ctrl_max"]))
+        X = A["raw"] if not A["closed"] else np.vstack([A["raw"], A["raw"][:1]])
+        A["CV"] = RL.fit_fair(X, k, l0=prm["l0"], lam=prm["lam"]); A["dense"] = RL.evaluate(A["CV"], max(50, int(A["L"] / 0.002)))
+    # symmetry : the arc of a right pair is the mirror of the arc of the left pair ; a centre arc is averaged with its own mirror
+    M = np.array([-1.0, 1.0, 1.0]); byp = {}
+    for i, A in enumerate(arcs): byp.setdefault(A["pair"], []).append(i)
+    for i, A in enumerate(arcs):
+        mp = tuple(sorted((mirror_name(A["pair"][0]), mirror_name(A["pair"][1]))))
+        cand = [j for j in byp.get(mp, []) if j != i] if mp != A["pair"] else [i]
+        if not cand: continue
+        j = min(cand, key=lambda j: np.linalg.norm(arcs[j]["dense"].mean(0) * M - A["dense"].mean(0)))
+        Bm = arcs[j]["dense"] * M
+        if np.linalg.norm(Bm[0] - A["dense"][0]) > np.linalg.norm(Bm[-1] - A["dense"][0]): Bm = Bm[::-1]
+        t = np.linspace(0, 1, len(A["dense"])); tb = np.linspace(0, 1, len(Bm))
+        Bi = np.stack([np.interp(t, tb, Bm[:, k]) for k in range(3)], 1)
+        if mp == A["pair"]: A["dense"] = 0.5 * (A["dense"] + Bi)                  # centre arc : symmetric by averaging
+        elif A["dense"].mean(0)[0] < 0: A["dense"] = Bi                            # right arc : the mirror of the left one
+    log("arcs kept", len(arcs))
+    return dict(nodes=nodes, arcs=arcs, names=names)
+
+
+def save(net, prm=PARAMS):
+    A = net["arcs"]
+    np.savez(prm["out"], nodes=net["nodes"], names=np.array(net["names"]), pair=np.array([a["pair"] for a in A]), ab=np.array([[a["a"], a["b"]] for a in A]),
+             closed=np.array([a["closed"] for a in A]), L=np.array([a["L"] for a in A]), dense=np.array([a["dense"] for a in A], dtype=object), allow_pickle=True)
+
+
+def sheet(net, prm=PARAMS):
+    import ZrrData as D, ZrrColorMap as CM
+    from PIL import Image, ImageDraw
+    S = np.load(prm["shell"], allow_pickle=True); V, F, lab = S["verts"], S["faces"], S["lab"]; names = net["names"]
+    tl = lab[F]; fl = np.where(tl[:, 1] == tl[:, 2], tl[:, 1], tl[:, 0])
+    car = {"P": V, "C": np.full(len(F), 3), "I": F.ravel(), "T": fl, "off": np.arange(0, 3 * len(F) + 1, 3), "names": names}
+    old = D.PARAMS["exclude"]; D.PARAMS["exclude"] = []; prmv = dict(CM.PARAMS); prmv["views"] = CM.PARAMS["views"][:5] + [CM.PARAMS["views"][6]]
+    lo, hi = V.min(0), V.max(0); ctr = (lo + hi) / 2; tiles = []
+    from Raster import Renderer
+    T3 = F; R_ = Renderer(V, T3); cols = np.array([CM.colour(n) for n in names])
+    for title, d in prmv["views"]:
+        rx, uy, tz = D.frame(np.array(d, float)); res = prmv["res"]; s = prmv["px_per_m"]
+        mask, depth, N, fid = R_.render(ctr, s, (rx, uy, tz), res); img = np.full(mask.shape + (3,), 250.0); ok = fid >= 0
+        img[ok] = cols[fl[fid[ok]]] * (0.55 + 0.45 * np.clip(N[ok] @ np.array([0.3, 0.5, 0.81]), 0, 1))[:, None] * 0.55 + 250 * 0.45
+        im = Image.fromarray(img.astype(np.uint8)); dr = ImageDraw.Draw(im)
+        for A in net["arcs"]:
+            X = A["dense"]; q = X - ctr; x = q @ rx * s + res / 2 - 0.5; y = res / 2 - 0.5 - q @ uy * s; d_ = q @ tz
+            xi = np.clip(x.astype(int), 0, res - 1); yi = np.clip(y.astype(int), 0, res - 1); vis = np.isfinite(depth[yi, xi]) & (d_ > depth[yi, xi] - 0.02)
+            for k in range(len(X) - 1):
+                if vis[k] and vis[k + 1]: dr.line([(x[k], y[k]), (x[k + 1], y[k + 1])], fill=(20, 20, 20), width=2)
+        for p in net["nodes"]:
+            q = p - ctr; x = q @ rx * s + res / 2 - 0.5; y = res / 2 - 0.5 - q @ uy * s; xi, yi = int(x), int(y)
+            if 0 <= xi < res and 0 <= yi < res and np.isfinite(depth[yi, xi]) and q @ tz > depth[yi, xi] - 0.03: dr.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(220, 30, 30))
+        a = np.asarray(im); ys, xs = np.nonzero(mask); tiles.append((title, Image.fromarray(a[max(ys.min() - 8, 0):ys.max() + 9, max(xs.min() - 8, 0):xs.max() + 9])))
+    R_.release(); D.PARAMS["exclude"] = old
+    return CM.sheet(tiles, [], prm["sheet"], "ZenRay Meshes Retopology, shared border network : %d fair arcs, %d junction nodes (red), 29 October 2026" % (len(net["arcs"]), len(net["nodes"])))
+
+
+if __name__ == "__main__":
+    net = build(); save(net); print(sheet(net))

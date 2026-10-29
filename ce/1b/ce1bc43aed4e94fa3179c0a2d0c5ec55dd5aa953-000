@@ -1,0 +1,150 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY SHELL and PARTITION. The validated car has holes, gaps of 15 to 19 mm and stacked parts,
+so its components are neither well cut nor well placed (Matthieu, 29 October 2026). This module makes the support of a perfect cut :
+  1 shell     : the body (wheels and suspension out) sampled every sample_m, voxelised at voxel_m, closed by a morphological closing of
+                radius close_m (dilate, flood the outside, erode) and turned into ONE closed surface by marching cubes : no hole left.
+  2 labels    : every shell vertex takes the part of the nearest VISIBLE point of the validated car (26 views), when it is closer than
+                label_max_dist_m ; the others (holes, hidden faces) receive the label of their neighbours by propagation over the shell.
+  3 partition : only the skin components are kept (visible enough, outward), the small ones join their main neighbour, the labels are
+                smoothed by majority votes, then the left side is copied on the right by mirror : exact symmetry.
+Every point of the shell belongs to exactly one component : the boundaries between components are shared by construction.
+python ZrrShell.py            writes work/retopo/shell.npz and versions/Retopo_Partition.png
+FR : la coque fermée et la partition propre : plus aucun trou, chaque point appartient à un seul composant, symétrie exacte."""
+import json, sys, time, fnmatch
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from skimage import measure
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo")
+import ZrrData as D
+import ZrrVisible as V
+from Raster import Renderer
+
+PARAMS = {   # 29 October 2026 : the interface of the shell and of the partition
+    "voxel_m": 0.006, "close_m": 0.025, "sample_m": 0.003, "exclude": ["*wheel_*", "*susp_*"],
+    "label_px_per_m": 400.0, "label_res": 2048, "label_voxel_m": 0.004, "label_max_dist_m": 0.03,
+    "skin_min_px": 60000, "skin_exclude": ["*sill*", "*belt*", "*liner*", "*closer*", "*under_*"], "keep_extra": ["CAR_body_under_floor_C"],
+    "min_area_m2": 0.004, "smooth_iters": 8,
+    "out": f"{ROOT}/work/retopo/shell.npz", "sheet": f"{ROOT}/versions/Retopo_Partition.png",
+}
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def sample_surface(P, T, step):
+    out = []
+    a, b, c = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    L = np.maximum(np.maximum(np.linalg.norm(b - a, axis=1), np.linalg.norm(c - b, axis=1)), np.linalg.norm(a - c, axis=1))
+    n = np.clip(np.ceil(L / step).astype(int), 1, 80)
+    for k in np.unique(n):
+        s = n == k; i, j = np.meshgrid(np.arange(k + 1), np.arange(k + 1), indexing="ij"); m = i + j <= k
+        u = (i[m] / k)[None, :, None]; v = (j[m] / k)[None, :, None]
+        out.append((a[s][:, None] + u * (b[s] - a[s])[:, None] + v * (c[s] - a[s])[:, None]).reshape(-1, 3))
+    return np.concatenate(out)
+
+
+def build_shell(car, prm):
+    h = prm["voxel_m"]; R = prm["close_m"]
+    ex = set(D.part_ids(car, prm["exclude"])); pm = ~np.isin(car["T"], list(ex)); T, _ = D.triangulate(car, pm)
+    pts = sample_surface(car["P"], T, prm["sample_m"]); log("surface samples", len(pts))
+    lo = car["P"][np.unique(T)].min(0) - R - 3 * h; hi = car["P"][np.unique(T)].max(0) + R + 3 * h
+    dims = np.ceil((hi - lo) / h).astype(int) + 1; log("voxels", dims.tolist(), int(np.prod(dims)))
+    occ = np.zeros(dims, bool); ijk = np.floor((pts - lo) / h).astype(int); occ[ijk[:, 0], ijk[:, 1], ijk[:, 2]] = True; del pts, ijk
+    band = ndi.distance_transform_edt(~occ) <= (R / h); del occ; log("dilated")
+    lab, n = ndi.label(~band); border = np.unique(np.r_[lab[0].ravel(), lab[-1].ravel(), lab[:, 0].ravel(), lab[:, -1].ravel(), lab[:, :, 0].ravel(), lab[:, :, -1].ravel()])
+    ext = np.isin(lab, border[border > 0]); del lab, band; log("outside flooded, pieces", n)
+    din = ndi.distance_transform_edt(~ext).astype(np.float32) * h; del ext; log("eroded field")
+    verts, faces, _, _ = measure.marching_cubes(din, level=R + h / 2, spacing=(h, h, h)); del din
+    verts = verts + lo; log("shell", len(verts), "vertices", len(faces), "triangles")
+    return verts, faces.astype(np.int64)
+
+
+def visible_points(car, prm):
+    pm = ~np.isin(car["T"], list(set(D.part_ids(car, prm["exclude"])))); T, owner = D.triangulate(car, pm); R_ = Renderer(car["P"], T)
+    lo, hi = car["P"].min(0), car["P"].max(0); ctr = (lo + hi) / 2; s = prm["label_px_per_m"]; res = prm["label_res"]; P, L = [], []
+    for d in V.directions():
+        rx, uy, tz = D.frame(d); mask, depth, N, fid = R_.render(ctr, s, (rx, uy, tz), res); ok = fid >= 0; r, c = np.nonzero(ok)
+        P.append(ctr + np.outer((c + 0.5 - res / 2) / s, rx) + np.outer((res / 2 - r - 0.5) / s, uy) + np.outer(depth[ok], tz)); L.append(car["T"][owner[fid[ok]]])
+    R_.release(); P = np.concatenate(P); L = np.concatenate(L)
+    key = np.floor(P / prm["label_voxel_m"]).astype(np.int64); _, first = np.unique(key, axis=0, return_index=True)
+    return P[first], L[first]
+
+
+def adjacency(nv, F):
+    e = np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]; A = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(nv, nv)).tocsr()
+    A = ((A + A.T) > 0).astype(np.float32); return A
+
+
+def skin_components(car, vis, prm):
+    keep = []
+    for nm, v in vis.items():
+        if any(fnmatch.fnmatch(nm, p) for p in prm["skin_exclude"]) and nm not in prm["keep_extra"]: continue
+        if v["pixels"] >= prm["skin_min_px"] or nm in prm["keep_extra"]: keep.append(nm)
+    return sorted(keep)
+
+
+def mirror_name(n):
+    return n[:-2] + "_R" if n.endswith("_L") else n[:-2] + "_L" if n.endswith("_R") else n
+
+
+def partition(car, verts, faces, prm, vis):
+    names = skin_components(car, vis, prm); idx = {n: i for i, n in enumerate(names)}; K = len(names); log("skin components", K)
+    VP, VL = visible_points(car, prm); log("visible points", len(VP))
+    part2skin = np.full(len(car["names"]), -1)
+    for i, n in enumerate(car["names"]):
+        if n in idx: part2skin[i] = idx[n]
+    keep = part2skin[VL] >= 0; kd = cKDTree(VP[keep]); dist, nn = kd.query(verts, k=1)
+    lab = part2skin[VL[keep][nn]]; lab[dist > prm["label_max_dist_m"]] = -1; log("labelled directly", float((lab >= 0).mean()))
+    A = adjacency(len(verts), faces)
+    def votes(lab):
+        oh = coo_matrix((np.ones((lab >= 0).sum(), np.float32), (np.flatnonzero(lab >= 0), lab[lab >= 0])), shape=(len(lab), K)).tocsr(); return A @ oh
+    for it in range(400):   # propagation into the holes and the hidden faces
+        un = lab < 0
+        if not un.any(): break
+        Vt = votes(lab)[un]; has = np.asarray(Vt.sum(1)).ravel() > 0
+        if not has.any(): break
+        new = lab.copy(); ui = np.flatnonzero(un); new[ui[has]] = np.asarray(Vt[has].argmax(1)).ravel(); lab = new
+    log("propagated", it, "unlabelled left", int((lab < 0).sum()))
+    for it in range(prm["smooth_iters"]):   # majority smoothing, the vertex itself counts once
+        Vt = votes(lab).toarray(); Vt[np.arange(len(lab)), lab] += 1.0; lab = Vt.argmax(1)
+    # small pieces join their main neighbour : connected pieces per label, area below min_area_m2
+    area = np.zeros(len(verts)); fa = 0.5 * np.linalg.norm(np.cross(verts[faces[:, 1]] - verts[faces[:, 0]], verts[faces[:, 2]] - verts[faces[:, 0]]), axis=1)
+    np.add.at(area, faces.ravel(), np.repeat(fa / 3, 3))
+    for rnd in range(3):
+        same = A.multiply(lab[:, None] == lab[None, :]) if False else None
+        e = np.r_[faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]; e = e[lab[e[:, 0]] == lab[e[:, 1]]]
+        G = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(len(lab), len(lab))); nc, comp = __import__("scipy.sparse.csgraph", fromlist=["x"]).connected_components(G, directed=False)
+        ca = np.bincount(comp, weights=area); small = ca[comp] < prm["min_area_m2"]
+        if not small.any(): break
+        lab2 = lab.copy(); lab2[small] = -1
+        for it in range(200):
+            un = lab2 < 0
+            if not un.any(): break
+            Vt = votes(lab2)[un]; has = np.asarray(Vt.sum(1)).ravel() > 0; ui = np.flatnonzero(un); lab2[ui[has]] = np.asarray(Vt[has].argmax(1)).ravel()
+        lab = lab2
+    # exact symmetry : the right half copies the left half through the mirror x -> -x
+    kd = cKDTree(verts); right = verts[:, 0] < 0; _, mm = kd.query(verts[right] * np.array([-1, 1, 1]), k=1)
+    mirror_idx = np.array([idx.get(mirror_name(n), i) for i, n in enumerate(names)]); lab[right] = mirror_idx[lab[mm]]
+    log("partition done")
+    return lab, names
+
+
+def colour_sheet(verts, faces, lab, names, out):
+    import ZrrColorMap as CM
+    from PIL import Image
+    fl = np.array([np.bincount(lab[f], minlength=len(names)).argmax() for f in faces]) if len(faces) < 0 else None
+    tl = lab[faces]; fl = np.where(tl[:, 1] == tl[:, 2], tl[:, 1], tl[:, 0])
+    car = {"P": verts, "C": np.full(len(faces), 3), "I": faces.ravel(), "T": fl, "off": np.arange(0, 3 * len(faces) + 1, 3), "names": names}
+    old = D.PARAMS["exclude"]; D.PARAMS["exclude"] = []
+    tiles = CM.render_views(car); D.PARAMS["exclude"] = old
+    legend = sorted({(CM.base_name(n), tuple(CM.colour(n))) for n in names})
+    return CM.sheet(tiles, [(n, np.array(c)) for n, c in legend], out, "ZenRay Meshes Retopology, clean partition on the closed shell : no hole, one component per point, exact symmetry, 29 October 2026")
+
+
+if __name__ == "__main__":
+    prm = dict(PARAMS); car = D.load(); vis = json.load(open(f"{D.ROOT}/work/retopo/visibility.json"))
+    verts, faces = build_shell(car, prm); lab, names = partition(car, verts, faces, prm, vis)
+    np.savez(prm["out"], verts=verts, faces=faces, lab=lab, names=np.array(names)); log("saved", prm["out"])
+    print(colour_sheet(verts, faces, lab, names, prm["sheet"]))
