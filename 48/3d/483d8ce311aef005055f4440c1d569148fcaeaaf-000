@@ -1,0 +1,134 @@
+"""29 October 2026 : ZenRay Lines CREASES, the forms a senior tech artist lays edges on : the concave creases of a model seen from one view.
+EN: renders the depth of the model toward the viewer on the GPU (Scripts/Raster.py), smooths it (sigma in mm, mask aware), takes the Hessian of
+the depth and keeps the valleys : pixels whose curvature across the crease (largest eigenvalue, slope corrected) is above min_curv and is a local
+maximum across the crease (non maximum suppression along its eigenvector), in pieces longer than min_len_mm. Also scores a quad mesh against them :
+the share of crease length, inside the mesh footprint, lying within tol_mm of a mesh edge seen from the same view (1.0 = every crease carries an edge).
+    python -I ZrlCreases.py --obj model.obj [--mesh quads.obj] [--doc lines.json] [--out board.png]
+FR : les plis (creux) d'un modèle vus d'une vue, et la part de ces plis qu'une arête du maillage suit ; une retopologie senior pose ses boucles dessus.
+"""
+import argparse, json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy import ndimage
+from scipy.spatial import cKDTree
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+for p in (HERE, os.path.join(ROOT, "Scripts")):
+    if p not in sys.path: sys.path.insert(0, p)
+
+PARAMS = {   # 29 October 2026 : every tunable value of the crease map and of the alignment score
+    "view_axes": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],   # front view : x right, y up, z toward the viewer
+    "center": [0.0, 1.26, 0.0],                      # metres, centre of the window
+    "px_per_m": 1000.0,                               # 1 mm per pixel
+    "res": 560,                                       # square window, 0.56 m
+    "sigma_mm": 2.5,                                  # smoothing of the depth before the Hessian
+    "min_curv": 25.0,                                 # 1/m, curvature across the crease (radius 4 cm)
+    "max_slope": 1.2,                                 # surfaces steeper than about 50 degrees to the view are ignored
+    "edge_guard_px": 6,                               # pixels kept away from the silhouette
+    "min_len_mm": 14.0,                               # shorter crease pieces are noise
+    "tol_mm": 4.0,                                    # a crease point is carried when a mesh edge passes within this distance
+    "edge_sample_mm": 0.75,
+}
+
+
+def pixel_to_world(prm, rows, cols):
+    s, r = prm["px_per_m"], prm["res"]; c = np.asarray(prm["center"], float); rx, uy, _ = (np.asarray(a, float) for a in prm["view_axes"])
+    u = (cols + 0.5 - r / 2) / s; v = (r / 2 - 0.5 - rows) / s
+    return c[None, :] + u[:, None] * rx[None, :] + v[:, None] * uy[None, :]
+
+
+def world_to_pixel(prm, P):
+    s, r = prm["px_per_m"], prm["res"]; c = np.asarray(prm["center"], float); rx, uy, _ = (np.asarray(a, float) for a in prm["view_axes"])
+    d = np.asarray(P, float) - c; return np.stack([(d @ rx) * s + r / 2 - 0.5, r / 2 - 0.5 - (d @ uy) * s], 1)   # (col, row)
+
+
+def crease_map(V, F, prm=PARAMS):
+    """depth, normals and the valley strength (1/m) with its direction ; returns a dict of images and the crease points."""
+    import Raster
+    R = Raster.Renderer(V, F); mask, depth, N, _ = R.render(prm["center"], prm["px_per_m"], prm["view_axes"], prm["res"]); R.release()
+    h = 1.0 / prm["px_per_m"]; sig = prm["sigma_mm"] / 1000.0 / h
+    W = mask.astype(float); D0 = np.where(mask, depth, 0.0); ws = ndimage.gaussian_filter(W, sig); D = ndimage.gaussian_filter(D0, sig) / np.maximum(ws, 1e-9)
+    gr, gc = np.gradient(D, h); Hrr = np.gradient(gr, h, axis=0); Hcc = np.gradient(gc, h, axis=1); Hcr = np.gradient(gr, h, axis=1)
+    half = (Hcc + Hrr) / 2; rad = np.sqrt(((Hcc - Hrr) / 2) ** 2 + Hcr ** 2); lam = half + rad          # largest eigenvalue, across the crease
+    ec, er = Hcr, lam - Hcc; alt = np.abs(ec) + np.abs(er) < 1e-12; ec = np.where(alt, 1.0, ec); er = np.where(alt, 0.0, er)
+    n = np.hypot(ec, er); ec, er = ec / n, er / n                                                     # (col, row) direction across the crease
+    slope = np.hypot(gr, gc); curv = lam / (1 + slope ** 2) ** 1.5
+    inner = ndimage.binary_erosion(mask, iterations=int(prm["edge_guard_px"])) & (ws > 0.98) & (slope < prm["max_slope"])
+    rows, cols = np.mgrid[0:prm["res"], 0:prm["res"]].astype(float)
+    a = ndimage.map_coordinates(curv, [rows + er, cols + ec], order=1, mode="nearest"); b = ndimage.map_coordinates(curv, [rows - er, cols - ec], order=1, mode="nearest")
+    keep = inner & (curv >= prm["min_curv"]) & (curv >= a) & (curv >= b)
+    lab, nlab = ndimage.label(keep, structure=np.ones((3, 3)))
+    if nlab:
+        size = ndimage.sum(np.ones_like(curv), lab, index=np.arange(1, nlab + 1))
+        keep &= np.isin(lab, 1 + np.flatnonzero(size * prm["px_per_m"] ** -1 * 1000 >= prm["min_len_mm"]))
+    rr, cc = np.nonzero(keep); Pw = pixel_to_world(prm, rr.astype(float), cc.astype(float)); Pw[:, 2] = depth[rr, cc] + np.asarray(prm["center"])[2]
+    return {"mask": mask, "depth": depth, "normal": N, "curv": curv, "keep": keep, "rows": rr, "cols": cc, "points": Pw, "strength": curv[rr, cc],
+            "dir": np.stack([ec[rr, cc], -er[rr, cc]], 1)}
+
+
+def read_quads(path):
+    V, Q = [], []
+    for line in open(path):
+        t = line.split()
+        if not t: continue
+        if t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t[0] == "f": Q.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V, float), Q
+
+
+def footprint(prm, P, faces):
+    img = Image.new("L", (prm["res"], prm["res"]), 0); d = ImageDraw.Draw(img); px = world_to_pixel(prm, P)
+    for f in faces: d.polygon([tuple(px[i]) for i in f], fill=255)
+    return np.asarray(img) > 0
+
+
+def alignment(cm, P, faces, prm=PARAMS):
+    """share of the crease points inside the mesh footprint lying within tol_mm of a mesh edge (front view), strength weighted."""
+    E = set()
+    for f in faces:
+        for k in range(len(f)): a, b = f[k], f[(k + 1) % len(f)]; E.add((min(a, b), max(a, b)))
+    px = world_to_pixel(prm, P); step = prm["edge_sample_mm"] / 1000.0 * prm["px_per_m"]; S = []
+    for a, b in E:
+        n = max(2, int(np.ceil(np.linalg.norm(px[b] - px[a]) / step)) + 1); t = np.linspace(0, 1, n)[:, None]; S.append(px[a] * (1 - t) + px[b] * t)
+    tree = cKDTree(np.concatenate(S)); fp = footprint(prm, P, faces)
+    inside = fp[cm["rows"], cm["cols"]]; pts = np.stack([cm["cols"], cm["rows"]], 1)[inside].astype(float); w = cm["strength"][inside]
+    if not len(pts): return {"crease_points": 0, "aligned": None}
+    d, _ = tree.query(pts); d_mm = d / prm["px_per_m"] * 1000; ok = d_mm <= prm["tol_mm"]
+    return {"crease_points": int(len(pts)), "aligned": round(float((w * ok).sum() / w.sum()), 3), "aligned_unweighted": round(float(ok.mean()), 3),
+            "median_gap_mm": round(float(np.median(d_mm)), 2), "tol_mm": prm["tol_mm"], "far": pts[~ok], "far_strength": w[~ok]}
+
+
+def board(cm, prm, out, P=None, faces=None, arcs=None, far=None):
+    """grey shading, red creases, green mesh edges, dark network curves, orange crease points no edge carries."""
+    N = cm["normal"]; L = np.array([-0.35, 0.45, 0.82]); L /= np.linalg.norm(L); shade = np.clip((N * L).sum(2), 0, 1) * 0.75 + 0.2
+    rgb = np.where(cm["mask"][..., None], (shade[..., None] * np.array([235, 235, 240])), np.array([246, 246, 244])).astype(np.uint8)
+    img = Image.fromarray(rgb, "RGB").convert("RGBA"); lay = Image.new("RGBA", img.size, (0, 0, 0, 0)); d = ImageDraw.Draw(lay)
+    if P is not None:
+        px = world_to_pixel(prm, P)
+        for f in faces: d.line([tuple(px[i]) for i in list(f) + [f[0]]], fill=(40, 150, 80, 200), width=1)
+    if arcs is not None:
+        for A in arcs: d.line([tuple(p) for p in world_to_pixel(prm, A)], fill=(20, 20, 30, 255), width=2)
+    s = np.clip((cm["strength"] - prm["min_curv"]) / (4 * prm["min_curv"]), 0.25, 1.0)
+    for r, c, a in zip(cm["rows"], cm["cols"], s): d.point((c, r), fill=(215, 40, 40, int(255 * a)))
+    if far is not None:
+        for c, r in far: d.ellipse((c - 1.5, r - 1.5, c + 1.5, r + 1.5), fill=(255, 140, 0, 255))
+    Image.alpha_composite(img, lay).convert("RGB").save(out); return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--mesh"); ap.add_argument("--doc")
+    ap.add_argument("--out", default=os.path.join(ROOT, "work/lines/creases/creases.png")); ap.add_argument("--min-curv", type=float, default=PARAMS["min_curv"]); a = ap.parse_args()
+    import ZrlRefMesh as RM, ZrlSpline as SP
+    prm = dict(PARAMS, min_curv=a.min_curv); V, F, _, _ = RM.from_obj(a.obj); cm = crease_map(V, F, prm)
+    rep = {"crease_points": int(len(cm["rows"])), "curv_p50": round(float(np.median(cm["strength"])), 1) if len(cm["rows"]) else None}
+    P = faces = arcs = far = None
+    if a.mesh:
+        P, faces = read_quads(a.mesh); al = alignment(cm, P, faces, prm); far = al.pop("far"); al.pop("far_strength"); rep["alignment"] = al
+    if a.doc:
+        doc = json.load(open(a.doc)); arcs = [SP.sample(np.array(A["ctrl"], float), 30) for A in doc["arcs"]]
+    os.makedirs(os.path.dirname(a.out), exist_ok=True); rep["board"] = board(cm, prm, a.out, P, faces, arcs, far); print(json.dumps(rep, indent=1))
+
+
+if __name__ == "__main__":
+    main()
