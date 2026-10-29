@@ -18,7 +18,7 @@
     sizes: { arc: 2.0, arcSel: 3.2, node: 7, nodeSel: 11, handle: 9, poly: 1.2, mesh: 1.0, draw: 2.4, drawPt: 9 },
     pick: { arcPx: 8, handlePx: 11, nodePx: 11, snapNodePx: 14, snapArcPx: 10, meshVertexPx: 10, hiddenTolM: 0.02, dragStartPx: 3 },
     edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01, weldMinM: 0.0005, weldMaxM: 0.12 },
-    repair: { snapM: 0.03, endGuardM: 0.03, dupM: 0.01 },   // 29 October 2026 : Repair network : a far end attaches to what lies within snapM ; duplicates closer than dupM
+    repair: { snapM: 0.03, endGuardM: 0.03, dupM: 0.01, bridgeSnapM: 0.12 },   // bridgeSnapM : face borders come projected, the curves may float a few centimetres   // 29 October 2026 : Repair network : a far end attaches to what lies within snapM ; duplicates closer than dupM
     perSpan: 24,
     sheet: { behindM: 1.6 },   // 29 October 2026 : the blueprint planes sit this far behind the view centre, past the model
   };
@@ -384,6 +384,28 @@
     const par = S.arcParents || {}, ids = new Set(); for (const f of fs) for (const [aid] of f.arcs || []) { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; if (model.arc(id)) ids.add(id); }
     S.sel = ids; S.handle = null; status(ids.size + ' curve(s) border ' + (S.comp || 'face ' + S.face.id)); redraw();
   }
+  // 29 October 2026 : BRIDGE ISLANDS : a loop of curves alone inside a face (a window inside a panel) makes that face a ring, which cannot be quads.
+  // Two bridges join each island to the border around it : at the closest pair of points, then at the closest pair on the far side of both loops ;
+  // their ends split the curves they land on, their middle is put on the surface (POST /project of the bridges only). The ring becomes two faces.
+  async function bridgeIslands() {
+    if (!S.faces) return status('Preview the faces first (P).');
+    const rings = S.faces.filter((f) => /^annulus/.test(f.reason || '') && f.boundary), loops = S.faces.filter((f) => (f.reason || '') === 'complement' && f.boundary);
+    const pts = (b) => { const o = []; for (let i = 0; i + 2 < b.length; i += 3) o.push([b[i], b[i + 1], b[i + 2]]); return o; }, plan = [];
+    for (const R of rings) { const pl = facePlane(R); const Bf = pts(R.boundary);
+      for (const C of loops) { const Ic = pts(C.boundary); if (Ic.length < 8 || C.perimeter > 0.9 * R.perimeter) continue; const d = V.sub(Ic[0], pl.c); if (Math.abs(V.dot(d, pl.n)) > Math.max(0.05, pl.size) || !insidePoly(pl.poly, pl.m, V.dot(d, pl.u), V.dot(d, pl.w))) continue;
+        let best = null; for (let i = 0; i < Ic.length; i += 2) for (let j = 0; j < Bf.length; j += 2) { const dd = d3(Ic[i], Bf[j]); if (!best || dd < best.d) best = { d: dd, i, j }; }
+        const far = (k, n, frac) => (a) => { const g = Math.abs(a - k); return Math.min(g, n - g) >= frac * n; }; const okI = far(best.i, Ic.length, 0.35), okJ = far(best.j, Bf.length, 0.2); let second = null;
+        for (let i = 0; i < Ic.length; i += 2) { if (!okI(i)) continue; for (let j = 0; j < Bf.length; j += 2) { if (!okJ(j)) continue; const dd = d3(Ic[i], Bf[j]); if (!second || dd < second.d) second = { d: dd, i, j }; } }
+        if (second) plan.push([Ic[best.i], Bf[best.j]], [Ic[second.i], Bf[second.j]]); } }
+    if (!plan.length) return status('No island inside a ring face : nothing to bridge.');
+    const made = []; edit(plan.length / 2 + ' island(s) bridged by ' + plan.length + ' curves', () => {
+      for (const [p, q] of plan) { const ends = [p, q].map((x) => { const hit = nearestOnArcs(x, new Set(made), CFG.repair.bridgeSnapM); if (!hit) return addNode(x); const hb = model.arc(hit.id), near = (k) => { const e = hb[k] >= 0 ? model.node(hb[k]) : null; return e && d3(e.p, hit.p) < CFG.repair.endGuardM ? hb[k] : null; }; const en = near('a') ?? near('b'); return en !== null ? en : splitArcAt(hit.id, hit.p, false).node; });
+        const a = model.node(ends[0]).p, b = model.node(ends[1]).p, ctrl = [0, 0.25, 0.5, 0.75, 1].map((t) => V.add(a, V.mul(V.sub(b, a), t))); made.push(addArc(ends[0], ends[1], ctrl, ['', '']).id); } });
+    const sub = { version: 1, nodes: [], arcs: made.map((id) => { const a = model.arc(id); return { id, a: -1, b: -1, closed: false, pair: ['', ''], ctrl: a.ctrl, mirror: -1 }; }) };
+    const r = await fetch(CFG.files.project, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: sub, params: modelRef() ? { ref: modelRef() } : {} }) }).then((x) => x.json()).catch(() => null);
+    if (r && r.ok) for (const a of r.doc.arcs) { const arc = model.arc(a.id); if (!arc) continue; for (let k = 1; k < arc.ctrl.length - 1; k++) arc.ctrl[k] = a.ctrl[k]; model.touch(arc.id); }
+    S.sel = new Set(made); redraw(); schedulePreview(); status(plan.length / 2 + ' island(s) bridged : ' + made.length + ' new curves (selected), each ring is now two faces ; Cmd Z undoes it'); return { islands: plan.length / 2, curves: made.length };
+  }
   function attachDroppedEnd(arcId, i, x, y) {   // 29 October 2026 : an END control point dropped on a node attaches there, on a curve it splits it (T junction), in the void it is free ; the mirror curve follows
     const a = model.arc(arcId); if (!a || (i !== 0 && i !== a.ctrl.length - 1)) return null;
     const end = i === 0 ? 'a' : 'b', sd = surfaceDist(x, y), m = P().mirror ? mirrorArcOf(arcId) : null, own = new Set([arcId]); if (m) own.add(m.id);
@@ -506,7 +528,7 @@
     const nq = M.Q.length / 4, seen = new Set(), polys = [], tri = new Uint32Array(nq * 6), col = new Float32Array(M.P.length / 3 * 4), pos = Float32Array.from(M.P);
     let bad = 0, warn = 0, Jmin = 1; const byComp = $('pCompColour') && $('pCompColour').checked, compOf = new Map((M.faces || []).map((f) => [f.id, f.component || 'face_' + f.id]));   // 29 October 2026 : fills by component, lines keep the quality colours
     for (let q = 0; q < nq; q++) {
-      const J = M.res && M.res.quad_jac && M.res.quad_jac.length === nq && !M.edited ? M.res.quad_jac[q] : quadQuality(M.P, M.Q, q); Jmin = Math.min(Jmin, J);   // 29 October 2026 : the server's judge (surface normals) until the mesh is retouched here const c = J < 0 ? CFG.colors.meshBad : J < 0.5 ? CFG.colors.meshWarn : CFG.colors.meshOk; if (J < 0) bad++; else if (J < 0.5) warn++;
+      const J = M.res && M.res.quad_jac && M.res.quad_jac.length === nq && !M.edited ? M.res.quad_jac[q] : quadQuality(M.P, M.Q, q); Jmin = Math.min(Jmin, J); const c = J < 0 ? CFG.colors.meshBad : J < 0.5 ? CFG.colors.meshWarn : CFG.colors.meshOk; if (J < 0) bad++; else if (J < 0.5) warn++;   // 29 October 2026 : the server's judge (surface normals) until the mesh is retouched here
       for (let k = 0; k < 4; k++) {
         const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4], key = a < b ? a + ',' + b : b + ',' + a; if (seen.has(key)) continue; seen.add(key);
         polys.push({ pts: [M.P[3 * a], M.P[3 * a + 1], M.P[3 * a + 2], M.P[3 * b], M.P[3 * b + 1], M.P[3 * b + 2]], color: c });
@@ -962,7 +984,7 @@
     on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
-    on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
+    on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bBridge', () => safe(bridgeIslands)()); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
@@ -972,7 +994,7 @@
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
