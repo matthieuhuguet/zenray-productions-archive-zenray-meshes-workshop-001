@@ -1,0 +1,278 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY (ZRR), the micro-component finisher : one component of the validated shape becomes
+ONE clean, closed, quads-only panel whose edge loops follow its own four border curves, never the lofts nor the wrinkles of the source.
+  1 view    : the component seen along its OUTWARD mean normal (visibility survey), the body rendered on the GPU at px_per_m :
+              part label and depth toward the viewer for every pixel.
+  2 region  : the pixels of the component, largest piece, holes filled, opened.
+  3 field   : the validated shape as a FAIR height field over the plane : thin plate smoothing of the depth on a regular grid
+              (cell_m), data inside the eroded region only, wavelengths shorter than fair_cut_m removed, the deviation to the
+              validated shape bounded by dev_max_m (constraint based fairing, Hildebrandt and Polthier 2007, by reweighting).
+  4 outline : marching squares contour of the region, four corners at its sharpest convex turns, four sides lifted on the field,
+              each side a fair clamped B-spline (RigLib.fit_fair), checked by CurveFair.
+  5 grid    : n_u x n_v quads from the side lengths (edge_m), borders sampled once by arc length, interior = Tutte embedding of
+              the grid graph in the plane (a convex combination map is one to one when the border is convex, Tutte 1963,
+              Floater 2003), heights read on the fair field : quads only, every interior vertex of valence 4, no fold.
+  6 panel   : outer skin, rolled edge (half round of radius thickness / 2 in hem_steps), inner skin at thickness : one closed,
+              manifold, consistently oriented, quads-only solid.
+python ZrrPatch.py <component> [--edge-m 0.02] [--json overrides]       writes work/retopo/<component>/ (npz, obj, json)
+FR : le finisseur de micro-composant : un composant de la forme validée devient un panneau fermé, en quads, tiré de ses bords."""
+import argparse, json, os, sys
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import spsolve
+from skimage import measure
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D
+import RigLib as RL
+import CurveFair as CF
+from Raster import Renderer
+
+PARAMS = {   # 29 October 2026 : the interface of the micro-component finisher, one place
+    "px_per_m": 1000.0, "res_max": 4096, "margin_m": 0.08,
+    "open_px": 2, "erode_px": 4,
+    "cell_m": 0.005, "fair_cut_m": 0.30, "dev_max_m": 0.006, "irls_iters": 6, "data_step_px": 2,
+    "corner_scale": 0.025, "corner_sep": 0.10, "corners": 4, "contour_step_m": 0.002,
+    "side_ctrl_per_m": 5.0, "side_ctrl_min": 4, "side_ctrl_max": 14, "side_l0": 0.02, "side_lam": 0.05,
+    "edge_m": 0.02,
+    "thickness_m": 0.002, "hem_steps": 4,
+    "out_dir": f"{ROOT}/work/retopo",
+}
+
+
+# ---------- 1 view ----------
+def component_view(car, name, vis, params):
+    pid = car["names"].index(name)
+    tz = np.array(vis[name]["normal"], float); rx, uy, tz = D.frame(tz)
+    m = car["T"] == pid; off = car["off"]; ids = np.concatenate([car["I"][off[p]:off[p + 1]] for p in np.flatnonzero(m)])
+    Pc = car["P"][np.unique(ids)]; x, y, z = (Pc - Pc.mean(0)) @ rx, (Pc - Pc.mean(0)) @ uy, (Pc - Pc.mean(0)) @ tz
+    c3 = Pc.mean(0) + rx * (x.max() + x.min()) / 2 + uy * (y.max() + y.min()) / 2
+    ext = max(x.max() - x.min(), y.max() - y.min()) + 2 * params["margin_m"]
+    s = params["px_per_m"]; res = int(min(params["res_max"], 2 ** np.ceil(np.log2(ext * s))))
+    if res < ext * s: s = res / ext                     # a large component : fewer pixels per metre, never cropped
+    pm = D.body_poly_mask(car); tri, owner = D.triangulate(car, pm)
+    R = Renderer(car["P"], tri); mask, depth, N, fid = R.render(c3, s, (rx, uy, tz), res); R.release()
+    lab = np.full(mask.shape, -1); ok = fid >= 0; lab[ok] = car["T"][owner[fid[ok]]]
+    return dict(pid=pid, rx=rx, uy=uy, tz=tz, c3=c3, s=s, res=res, lab=lab, depth=depth)
+
+
+def px_to_plane(v, rows, cols):
+    return (np.asarray(cols) + 0.5 - v["res"] / 2) / v["s"], (v["res"] / 2 - np.asarray(rows) - 0.5) / v["s"]
+
+
+def plane_to_px(v, x, y):
+    return v["res"] / 2 - 0.5 - np.asarray(y) * v["s"], np.asarray(x) * v["s"] + v["res"] / 2 - 0.5   # rows, cols (float)
+
+
+def to3d(v, x, y, h):
+    return v["c3"] + np.outer(x, v["rx"]) + np.outer(y, v["uy"]) + np.outer(h, v["tz"])
+
+
+# ---------- 2 region ----------
+def region(v, params):
+    M = v["lab"] == v["pid"]
+    if params["open_px"]: M = ndi.binary_opening(M, iterations=params["open_px"])
+    L, n = ndi.label(M)
+    if n == 0: raise ValueError("component not visible in its own view")
+    M = L == (np.argmax(np.bincount(L.ravel())[1:]) + 1); M = ndi.binary_fill_holes(M)
+    return M
+
+
+# ---------- 3 fair height field ----------
+class Field:
+    """h(x, y) on a regular plane grid, bilinear, fitted by thin plate smoothing with a deviation bound."""
+
+    def __init__(self, v, M, params):
+        self.p = params; c = params["cell_m"]
+        rows, cols = np.nonzero(M); x, y = px_to_plane(v, rows, cols)
+        m = params["margin_m"]; self.x0, self.y0 = x.min() - m, y.min() - m
+        self.nx = int(np.ceil((x.max() + m - self.x0) / c)) + 1; self.ny = int(np.ceil((y.max() + m - self.y0) / c)) + 1; self.c = c
+        Me = ndi.binary_erosion(M, iterations=params["erode_px"]); st = params["data_step_px"]
+        sub = np.zeros_like(Me); sub[::st, ::st] = True; rows, cols = np.nonzero(Me & sub & np.isfinite(v["depth"]))
+        self.dx, self.dy = px_to_plane(v, rows, cols); self.dh = v["depth"][rows, cols].astype(float)
+        self.solve()
+
+    def weights(self, x, y):
+        gx = (np.asarray(x) - self.x0) / self.c; gy = (np.asarray(y) - self.y0) / self.c
+        i = np.clip(np.floor(gx).astype(int), 0, self.nx - 2); j = np.clip(np.floor(gy).astype(int), 0, self.ny - 2)
+        fx = gx - i; fy = gy - j; k = i * self.ny + j
+        idx = np.stack([k, k + self.ny, k + 1, k + self.ny + 1], 1); w = np.stack([(1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy], 1)
+        return idx, w
+
+    def smooth_op(self):
+        nx, ny = self.nx, self.ny; rows, cols, vals = [], [], []; r = 0
+        def add(terms, wt=1.0):
+            nonlocal r
+            for k, a in terms: rows.append(r); cols.append(k); vals.append(a * wt)
+            r += 1
+        K = lambda i, j: i * ny + j
+        for i in range(1, nx - 1):
+            for j in range(ny): add([(K(i - 1, j), 1), (K(i, j), -2), (K(i + 1, j), 1)])
+        for i in range(nx):
+            for j in range(1, ny - 1): add([(K(i, j - 1), 1), (K(i, j), -2), (K(i, j + 1), 1)])
+        s2 = np.sqrt(2.0)
+        for i in range(nx - 1):
+            for j in range(ny - 1): add([(K(i, j), 1), (K(i + 1, j), -1), (K(i, j + 1), -1), (K(i + 1, j + 1), 1)], s2)
+        return coo_matrix((vals, (rows, cols)), shape=(r, nx * ny)).tocsr()
+
+    def solve(self):
+        n = self.nx * self.ny; idx, w = self.weights(self.dx, self.dy)
+        A = coo_matrix((w.ravel(), (np.repeat(np.arange(len(self.dx)), 4), idx.ravel())), shape=(len(self.dx), n)).tocsr()
+        per_node = len(self.dx) / max(1, n); a0 = 1.0 / max(per_node, 1e-9)       # data term ~ one sample per node
+        mu = (self.p["fair_cut_m"] / (2 * np.pi * self.c)) ** 4                      # cut-off of the thin plate filter
+        S = self.smooth_op(); StS = (S.T @ S) * mu; wd = np.full(len(self.dx), a0)
+        for it in range(self.p["irls_iters"]):
+            M = (A.T @ diags(wd) @ A + StS + diags(np.full(n, 1e-9))).tocsc(); self.h = spsolve(M, A.T @ (wd * self.dh))
+            r = A @ self.h - self.dh; over = np.abs(r) > self.p["dev_max_m"]
+            if not over.any(): break
+            wd[over] *= 4.0
+        self.res = A @ self.h - self.dh
+        self.stats = {"dev_mean_mm": round(float(np.abs(self.res).mean() * 1000), 3), "dev_p99_mm": round(float(np.percentile(np.abs(self.res), 99) * 1000), 3),
+                      "dev_max_mm": round(float(np.abs(self.res).max() * 1000), 3), "irls_iters": it + 1, "nodes": n, "samples": int(len(self.dx))}
+
+    def __call__(self, x, y):
+        idx, w = self.weights(x, y); return (self.h[idx] * w).sum(1)
+
+
+# ---------- 4 outline ----------
+def outline(v, M, field, params):
+    cs = measure.find_contours(M.astype(np.uint8), 0.5); C = max(cs, key=len)
+    x, y = px_to_plane(v, C[:, 0], C[:, 1]); Pt = np.stack([x, y], 1)
+    if Pt[0].tolist() != Pt[-1].tolist(): Pt = np.vstack([Pt, Pt[:1]])
+    area = 0.5 * np.sum(Pt[:-1, 0] * Pt[1:, 1] - Pt[1:, 0] * Pt[:-1, 1])
+    if area < 0: Pt = Pt[::-1]
+    L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Pt, axis=0), axis=1))]; n = int(L[-1] / params["contour_step_m"])
+    t = np.linspace(0, L[-1], n, endpoint=False); Q = np.stack([np.interp(t, L, Pt[:, 0]), np.interp(t, L, Pt[:, 1])], 1)
+    k = max(3, int(params["corner_scale"] * n)); a = Q - np.roll(Q, k, 0); b = np.roll(Q, -k, 0) - Q
+    turn = np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(1))            # signed, positive = convex for a CCW loop
+    sep = int(params["corner_sep"] * n); order = np.argsort(-turn); corners = []
+    for i in order:
+        if turn[i] <= 0: break
+        if all(min(abs(i - c), n - abs(i - c)) >= sep for c in corners): corners.append(int(i))
+        if len(corners) == params["corners"]: break
+    if len(corners) < params["corners"]: raise ValueError("outline has fewer than %d convex corners" % params["corners"])
+    corners = sorted(corners); c0 = min(range(len(corners)), key=lambda q: Q[corners[q], 0] + Q[corners[q], 1])   # bottom left first
+    corners = corners[c0:] + corners[:c0]
+    sides = []
+    for q in range(len(corners)):
+        a_, b_ = corners[q], corners[(q + 1) % len(corners)]; ids = np.arange(a_, b_ + 1) if b_ > a_ else np.r_[np.arange(a_, n), np.arange(0, b_ + 1)]
+        X2 = Q[ids]; X3 = to3d(v, X2[:, 0], X2[:, 1], field(X2[:, 0], X2[:, 1])); sides.append(X3)
+    return sides, Q, [Q[c] for c in corners], turn[corners].tolist()
+
+
+def fair_sides(sides, params, v=None, field=None):
+    """29 October 2026 : each side is faired IN THE PLANE (x, y) and then lifted on the fair field, so the border lies exactly on the
+    surface : a side faired in 3D left the first row of quads bent by 8 degrees to meet it (zebra kinks along the border)."""
+    out = []; P0 = [s[0] for s in sides]
+    for q, X in enumerate(sides):
+        X = X.copy(); X[0] = P0[q]; X[-1] = P0[(q + 1) % len(sides)]
+        Lm = float(np.linalg.norm(np.diff(X, axis=0), axis=1).sum())
+        k = int(np.clip(round(Lm * params["side_ctrl_per_m"]), params["side_ctrl_min"], params["side_ctrl_max"]))
+        if v is None:
+            CV = RL.fit_fair(X, k, l0=params["side_l0"], lam=params["side_lam"])
+        else:
+            q2 = X - v["c3"]; X2 = np.stack([q2 @ v["rx"], q2 @ v["uy"], np.zeros(len(X))], 1)
+            CV2 = RL.fit_fair(X2, k, l0=params["side_l0"], lam=params["side_lam"]); D2 = RL.evaluate(CV2, 600)
+            CV = to3d(v, D2[:, 0], D2[:, 1], field(D2[:, 0], D2[:, 1]))     # dense polyline on the field : sampled by arc length later
+        out.append(dict(CV=CV, L=Lm, k=k, src=X, dense=v is not None))
+    return out
+
+
+# ---------- 5 grid ----------
+def poly_sample(D3, n):
+    L = np.r_[0, np.cumsum(np.linalg.norm(np.diff(D3, axis=0), axis=1))]; t = np.linspace(0, L[-1], n + 1)
+    return np.stack([np.interp(t, L, D3[:, k]) for k in range(3)], 1)
+
+
+def grid(v, field, curves, params):
+    L = [c["L"] for c in curves]; e = params["edge_m"]
+    nu = max(2, int(round((L[0] + L[2]) / 2 / e))); nv = max(2, int(round((L[1] + L[3]) / 2 / e)))
+    smp = lambda c, n: poly_sample(c["CV"], n) if c.get("dense") else RL.sample(c["CV"], n)
+    B = smp(curves[0], nu); Rr = smp(curves[1], nv); T = smp(curves[2], nu)[::-1]; Ll = smp(curves[3], nv)[::-1]
+    X = np.zeros((nu + 1, nv + 1, 3)); X[:, 0] = B; X[:, -1] = T; X[0, :] = Ll; X[-1, :] = Rr
+    P2 = np.stack([(X - v["c3"]) @ v["rx"], (X - v["c3"]) @ v["uy"]], -1)
+    # Tutte embedding of the grid graph : every interior node is the mean of its four neighbours, border fixed
+    ii, jj = np.meshgrid(np.arange(1, nu), np.arange(1, nv), indexing="ij"); idx = -np.ones((nu + 1, nv + 1), int)
+    idx[1:-1, 1:-1] = np.arange((nu - 1) * (nv - 1)).reshape(nu - 1, nv - 1); rows, cols, vals = [], [], []; rhs = np.zeros(((nu - 1) * (nv - 1), 2))
+    for i, j in zip(ii.ravel(), jj.ravel()):
+        r = idx[i, j]; rows.append(r); cols.append(r); vals.append(4.0)
+        for a, b in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+            if idx[a, b] >= 0: rows.append(r); cols.append(idx[a, b]); vals.append(-1.0)
+            else: rhs[r] += P2[a, b]
+    if len(rows):
+        A = coo_matrix((vals, (rows, cols)), shape=(len(rhs), len(rhs))).tocsc(); sol = np.column_stack([spsolve(A, rhs[:, k]) for k in range(2)])
+        P2[1:-1, 1:-1] = sol.reshape(nu - 1, nv - 1, 2)
+    H = field(P2[..., 0].ravel(), P2[..., 1].ravel()).reshape(nu + 1, nv + 1)
+    inner = to3d(v, P2[1:-1, 1:-1, 0].ravel(), P2[1:-1, 1:-1, 1].ravel(), H[1:-1, 1:-1].ravel()).reshape(nu - 1, nv - 1, 3)
+    X[1:-1, 1:-1] = inner
+    return X, P2, nu, nv
+
+
+def fold_free_2d(P2):
+    a = P2[:-1, :-1]; b = P2[1:, :-1]; c = P2[1:, 1:]; d = P2[:-1, 1:]
+    cr = lambda p, q, r: (q[..., 0] - p[..., 0]) * (r[..., 1] - p[..., 1]) - (q[..., 1] - p[..., 1]) * (r[..., 0] - p[..., 0])
+    return float(min(cr(a, b, c).min(), cr(a, c, d).min(), cr(b, c, d).min(), cr(a, b, d).min()))
+
+
+# ---------- 6 panel ----------
+def grid_normals(X, outward):
+    du = np.gradient(X, axis=0); dv = np.gradient(X, axis=1); n = np.cross(du, dv); n /= np.linalg.norm(n, axis=-1, keepdims=True) + 1e-20
+    if (n.reshape(-1, 3) @ outward).mean() < 0: n = -n
+    return n
+
+
+def panel(X, outward, params):
+    """Outer skin grid X (nu+1, nv+1, 3) -> closed solid : skin, rolled edge, inner skin. Returns P, Q, the skin index grid."""
+    nu, nv = X.shape[0] - 1, X.shape[1] - 1; t = params["thickness_m"]; r = t / 2; K = params["hem_steps"]
+    N = grid_normals(X, outward); P = [X.reshape(-1, 3)]; G = np.arange((nu + 1) * (nv + 1)).reshape(nu + 1, nv + 1)
+    loop = [G[i, 0] for i in range(nu)] + [G[nu, j] for j in range(nv)] + [G[i, nv] for i in range(nu, 0, -1)] + [G[0, j] for j in range(nv, 0, -1)]
+    loop = np.array(loop); Pf = X.reshape(-1, 3); Nf = N.reshape(-1, 3); Bp = Pf[loop]; Bn = Nf[loop]
+    tng = np.roll(Bp, -1, 0) - np.roll(Bp, 1, 0); o = np.cross(tng, Bn); o /= np.linalg.norm(o, axis=1, keepdims=True) + 1e-20
+    base = len(Pf); rings = [loop]
+    for k in range(1, K):
+        th = np.pi * k / K; Pk = Bp - r * Bn + r * (np.sin(th)[None] * o + np.cos(th) * Bn) if False else Bp - r * Bn + r * (np.sin(th) * o + np.cos(th) * Bn)
+        P.append(Pk); rings.append(np.arange(base, base + len(loop))); base += len(loop)
+    Xi = Pf - t * Nf; P.append(Xi); Gi = G + base; rings.append(Gi.reshape(-1)[loop])
+    Q = [[G[i, j], G[i + 1, j], G[i + 1, j + 1], G[i, j + 1]] for i in range(nu) for j in range(nv)]
+    Q += [[Gi[i, j], Gi[i, j + 1], Gi[i + 1, j + 1], Gi[i + 1, j]] for i in range(nu) for j in range(nv)]
+    m = len(loop)
+    for k in range(K):
+        a, b = rings[k], rings[k + 1]; Q += [[a[(q + 1) % m], a[q], b[q], b[(q + 1) % m]] for q in range(m)]
+    return np.vstack(P), np.array(Q, np.int64), G
+
+
+# ---------- the whole micro-component ----------
+def build(name, params=PARAMS, car=None, vis=None, verbose=True):
+    car = car or D.load(); vis = vis or json.load(open(f"{D.ROOT}/work/retopo/visibility.json"))
+    v = component_view(car, name, vis, params); M = region(v, params); F = Field(v, M, params)
+    sides, Q2, C2, turns = outline(v, M, F, params); curves = fair_sides(sides, params, v, F)
+    X, P2, nu, nv = grid(v, F, curves, params); ff = fold_free_2d(P2)
+    P, Q, G = panel(X, v["tz"], params)
+    info = {"component": name, "nu": nu, "nv": nv, "quads_skin": nu * nv, "quads_total": int(len(Q)), "points": int(len(P)),
+            "field": F.stats, "fold_free_2d_min_cross": ff, "corner_turn_deg": [round(float(np.degrees(t)), 1) for t in turns],
+            "side_lengths_m": [round(c["L"], 3) for c in curves], "side_ctrl": [c["k"] for c in curves], "px_per_m": round(v["s"], 1), "res": v["res"]}
+    if verbose: print(json.dumps(info))
+    return dict(P=P, Q=Q, G=G, X=X, P2=P2, view=v, M=M, field=F, curves=curves, info=info, outline2d=Q2)
+
+
+def save(res, out_dir=None):
+    name = res["info"]["component"]; d = os.path.join(out_dir or PARAMS["out_dir"], name); os.makedirs(d, exist_ok=True)
+    v = res["view"]
+    np.savez(os.path.join(d, "panel.npz"), P=res["P"], Q=res["Q"], G=res["G"], X=res["X"], P2=res["P2"], rx=v["rx"], uy=v["uy"], tz=v["tz"], c3=v["c3"],
+             curves=np.array([c["CV"] for c in res["curves"]], dtype=object), allow_pickle=True)
+    with open(os.path.join(d, "panel.obj"), "w") as f:
+        f.write("# ZRR %s, 29 October 2026\n" % name)
+        for p in res["P"]: f.write("v %.6f %.6f %.6f\n" % tuple(p))
+        f.write("g %s\n" % name)
+        for q in res["Q"]: f.write("f %d %d %d %d\n" % tuple(int(k) + 1 for k in q))
+    json.dump(res["info"], open(os.path.join(d, "info.json"), "w"), indent=1)
+    return d
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("component"); ap.add_argument("--edge-m", type=float); ap.add_argument("--json", default=None)
+    a = ap.parse_args(); prm = dict(PARAMS)
+    if a.edge_m: prm["edge_m"] = a.edge_m
+    if a.json: prm.update(json.loads(a.json))
+    r = build(a.component, prm); print(save(r))

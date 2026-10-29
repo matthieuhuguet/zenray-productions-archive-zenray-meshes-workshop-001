@@ -1,0 +1,79 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY SHEET, the proof board of one micro-component : its new wireframe seen along its normal,
+reflection lines (zebra) on the new panel and on the old part of the validated car from the same oblique view, a close view of a corner
+with the rolled edge, and every line of the 100 percent judge. FR : la planche de preuve d'un micro-composant."""
+import sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo")
+import ZrrData as D
+from Raster import Renderer
+
+PARAMS = {"tile": 900, "stripes": 14, "tilt": (0.55, 0.35), "wire_eps_m": 0.003, "smooth_deg": 50.0,
+          "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf", "num_font": "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"}   # 29 October 2026
+
+
+def tris(Q):
+    Q = np.asarray(Q); return np.r_[Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]]
+
+
+def view(P, T, axes, center, s, res, zebra=False):
+    R = Renderer(P, T, smooth_deg=PARAMS["smooth_deg"]); mask, depth, N, fid = R.render(center, s, axes, res); R.release()
+    img = np.full((res, res, 3), 248.0)
+    if zebra:
+        r = 2 * N[..., 2:3] * N - np.array([0, 0, 1.0]); ph = np.arctan2(r[..., 1], np.sqrt(r[..., 0] ** 2 + r[..., 2] ** 2))
+        st = (np.floor((ph / np.pi + 0.5) * PARAMS["stripes"] * 2) % 2)[..., None]
+        img[mask] = (st * 235 + (1 - st) * 25)[mask] * np.ones(3)
+    else:
+        lam = np.clip(N @ np.array([0.25, 0.45, 0.86]), 0, 1)[..., None]; img[mask] = ((0.35 + 0.65 * lam) * np.array([175, 190, 215]))[mask]
+    return img, depth, mask
+
+
+def wire(img, P, edges, axes, center, s, res, depth, colour=(30, 30, 30)):
+    rx, uy, tz = axes; im = Image.fromarray(img.astype(np.uint8)); dr = ImageDraw.Draw(im)
+    def px(p): q = p - center; return q @ rx * s + res / 2 - 0.5, res / 2 - 0.5 - q @ uy * s, q @ tz
+    for a, b in edges:
+        pa, pb = P[a], P[b]; ok = True
+        for t in (0.25, 0.5, 0.75):
+            x, y, d = px(pa + t * (pb - pa)); xi, yi = int(round(x)), int(round(y))
+            if not (0 <= xi < res and 0 <= yi < res) or not np.isfinite(depth[yi, xi]) or d < depth[yi, xi] - PARAMS["wire_eps_m"]: ok = False; break
+        if ok:
+            x0, y0, _ = px(pa); x1, y1, _ = px(pb); dr.line([(x0, y0), (x1, y1)], fill=colour, width=1)
+    return np.asarray(im).astype(float)
+
+
+def grid_edges(G):
+    e = [(G[i, j], G[i + 1, j]) for i in range(G.shape[0] - 1) for j in range(G.shape[1])]
+    return e + [(G[i, j], G[i, j + 1]) for i in range(G.shape[0]) for j in range(G.shape[1] - 1)]
+
+
+def fit(P, axes, res):
+    rx, uy, tz = axes; c = (P.max(0) + P.min(0)) / 2; x, y = (P - c) @ rx, (P - c) @ uy
+    s = 0.9 * res / max(x.max() - x.min(), y.max() - y.min()); c = c + rx * (x.max() + x.min()) / 2 + uy * (y.max() + y.min()) / 2; return c, s
+
+
+def board(patch, judge, out, old=None, title=""):
+    P, Q, G = patch["P"], patch["Q"], patch["G"]; v = patch["view"]; res = PARAMS["tile"]; T = tris(Q)
+    A = (v["rx"], v["uy"], v["tz"]); c, s = fit(P, A, res)
+    shaded, dep, _ = view(P, T, A, c, s, res); t1 = wire(shaded, P, grid_edges(G), A, c, s, res, dep)
+    a, b = PARAMS["tilt"]; d = v["tz"] + a * v["uy"] + b * v["rx"]; Ao = D.frame(d / np.linalg.norm(d)); co, so = fit(P, Ao, res)
+    t2, _, _ = view(P, T, Ao, co, so, res, zebra=True)
+    if old is not None:
+        t3, _, _ = view(old[0], old[1], Ao, co, so, res, zebra=True)
+    else:
+        t3 = np.full((res, res, 3), 248.0)
+    corner = P[G[0, 0]]; dc = v["tz"] - 0.6 * v["rx"] - 0.5 * v["uy"]; Ac = D.frame(dc / np.linalg.norm(dc)); sc = res / 0.06
+    sh, dp, _ = view(P, T, Ac, corner, sc, res); ring = np.arange(G.size, len(P))
+    E = [(int(q[k]), int(q[(k + 1) % 4])) for q in Q for k in range(4) if np.linalg.norm(P[q[k]] - corner) < 0.05]
+    t4 = wire(sh, P, E, Ac, corner, sc, res, dp)
+    f = ImageFont.truetype(PARAMS["font"], 24); fs = ImageFont.truetype(PARAMS["font"], 19); fn = ImageFont.truetype(PARAMS["num_font"], 19)
+    W = 2 * res + 60; H = 2 * res + 140 + 26 * (len(judge) + 1); S = Image.new("RGB", (W, H), (248, 248, 248)); dr = ImageDraw.Draw(S)
+    dr.text((20, 16), title, fill=(20, 20, 20), font=f)
+    caps = ["New skin, edge loops along its own four border curves", "New panel, reflection lines (zebra)", "Old part of v752, same view, same zebra", "Corner close up, rolled edge, 2 mm thickness"]
+    for k, t in enumerate((t1, t2, t3, t4)):
+        x0 = 20 + (k % 2) * (res + 20); y0 = 60 + (k // 2) * (res + 40); S.paste(Image.fromarray(t.astype(np.uint8)), (x0, y0 + 26)); dr.text((x0, y0), caps[k], fill=(70, 70, 70), font=fs)
+    y = 60 + 2 * (res + 40) + 10
+    for k, val in judge.items():
+        ok = val.get("ok"); extra = ", ".join(f"{a} {b}" for a, b in val.items() if a not in ("ok",) and not isinstance(b, (dict, list)))
+        dr.text((20, y), ("PASS  " if ok else "FAIL  ") + k, fill=(30, 120, 60) if ok else (190, 40, 40), font=fs); dr.text((330, y), extra, fill=(60, 60, 60), font=fn); y += 26
+    S.save(out); return out

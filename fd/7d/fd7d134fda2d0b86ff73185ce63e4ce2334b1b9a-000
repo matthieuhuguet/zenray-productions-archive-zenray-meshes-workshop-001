@@ -1,0 +1,35 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY, one command per micro-component : build (ZrrPatch), judge (ZrrCheck, the 100 percent
+gate), proof board (ZrrSheet), files in work/retopo/<component>/. Exit 0 only when the component passes every line.
+python ZrrRun.py <component> [--json '{"edge_m": 0.02}']   FR : une commande par micro-composant, construit, juge, planche."""
+import argparse, json, os, sys
+import numpy as np
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrSheet as S
+import RigLib as RL
+
+
+def deviation(res, params):
+    v = res["view"]; X = res["X"]; M = ndi.binary_erosion(res["M"], iterations=params["erode_px"])
+    q = X.reshape(-1, 3) - v["c3"]; x, y, h = q @ v["rx"], q @ v["uy"], q @ v["tz"]
+    r, c = Z.plane_to_px(v, x, y); ri = np.clip(np.round(r).astype(int), 0, v["res"] - 1); ci = np.clip(np.round(c).astype(int), 0, v["res"] - 1)
+    ok = M[ri, ci] & np.isfinite(v["depth"][ri, ci]); dev = np.full(len(q), np.nan); dev[ok] = h[ok] - v["depth"][ri, ci][ok]; return dev
+
+
+def run(name, prm, car=None, vis=None):
+    car = car or D.load(); res = Z.build(name, prm, car, vis, verbose=False); d = Z.save(res)
+    dev = deviation(res, prm); sides = [RL.evaluate(c["CV"], 400) for c in res["curves"]]
+    j = K.check(res["P"], res["Q"], res["G"], dev=dev, sides=sides)
+    pid = car["names"].index(name); T, own = D.triangulate(car, car["T"] == pid)
+    out = S.board(res, j, os.path.join(f"{ROOT}/versions", f"Retopo_{name}.png"), old=(car["P"], T),
+                  title=f"ZenRay Meshes Retopology, {name}, {res['info']['nu']} x {res['info']['nv']} quads, score {j['score']['percent']} %, 29 October 2026")
+    json.dump({"info": res["info"], "judge": j}, open(os.path.join(d, "judge.json"), "w"), indent=1, default=float)
+    return res, j, out
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("component"); ap.add_argument("--json", default=None); a = ap.parse_args()
+    prm = dict(Z.PARAMS); prm.update(json.loads(a.json) if a.json else {})
+    res, j, out = run(a.component, prm)
+    print(json.dumps({k: v for k, v in j.items()}, default=float)); print(out); sys.exit(0 if j["score"]["ok"] else 1)

@@ -1,0 +1,116 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY CHECK, the 100 percent gate of ONE micro-component. A component is finished only when
+EVERY line passes ; the score is the share of lines passed, 100 percent means finished. Lines :
+  quads_only    every face has four distinct corners
+  closed        every edge is shared by exactly two faces (watertight)
+  oriented      every directed edge appears once (consistent normals)
+  one_shell     Euler V - E + F = 2 : one closed piece, no handle
+  no_degenerate smallest face area above min_area_m2
+  valence       every interior vertex of the outer skin has four faces (a pure grid, poles only at the four corners)
+  jacobian      smallest scaled Jacobian of the skin quads above jacobian_min (1 = square corners, 0 = collapsed, < 0 = folded)
+  edge_ratio    longest over shortest skin edge below edge_ratio_max (even quads)
+  fold          largest angle between neighbouring skin quads below fold_max_deg
+  iso_fair      every edge loop of the skin (rows and columns) passes CurveFair with at most iso_flips inflections : a regular zebra
+  side_fair     the four border curves pass CurveFair as rig curves
+  shape         mean and 99th percentile distance to the validated shape below dev_mean_max_mm and dev_p99_max_mm
+python ZrrCheck.py selftest        green on a clean cylinder panel, red on a bump, a ripple, a fold, a hole, a triangle, an offset
+FR : le juge à 100 % d'un micro-composant ; une ligne ratée suffit à refuser."""
+import json, os, sys
+from collections import Counter
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import CurveFair as CF
+
+PARAMS = {"min_area_m2": 1e-8, "jacobian_min": 0.5, "edge_ratio_max": 2.5, "fold_max_deg": 10.0, "iso_flips": 1, "kink_max_deg": 1.5,
+          "dev_mean_max_mm": 2.0, "dev_p99_max_mm": 6.0}   # 29 October 2026
+
+
+class _NoCrease:
+    """29 October 2026 : inside one micro-component no crease is allowed, so every concentrated turn of an edge loop is a fold."""
+    def query(self, p): return (np.inf, -1)
+
+
+def quad_normals(P, Q):
+    a, b, c, d = (P[Q[:, k]] for k in range(4)); n = np.cross(c - a, d - b); ar = 0.5 * np.linalg.norm(n, axis=1)
+    return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-20), ar
+
+
+def scaled_jacobian(P, Q):
+    n, _ = quad_normals(P, Q); J = np.full(len(Q), np.inf)
+    for k in range(4):
+        p = P[Q[:, k]]; e1 = P[Q[:, (k + 1) % 4]] - p; e2 = P[Q[:, (k - 1) % 4]] - p
+        j = (np.cross(e1, e2) * n).sum(1) / (np.linalg.norm(e1, axis=1) * np.linalg.norm(e2, axis=1) + 1e-20); J = np.minimum(J, j)
+    return J
+
+
+def check(P, Q, G, dev=None, sides=None, params=PARAMS):
+    P = np.asarray(P, float); Q = np.asarray(Q, np.int64); r = {}
+    r["quads_only"] = {"ok": bool(Q.shape[1] == 4 and all(len(set(q)) == 4 for q in Q.tolist()))}
+    und = Counter(); dire = Counter()
+    for q in Q.tolist():
+        for k in range(4):
+            a, b = q[k], q[(k + 1) % 4]; und[(min(a, b), max(a, b))] += 1; dire[(a, b)] += 1
+    bad = sum(1 for v in und.values() if v != 2); r["closed"] = {"ok": bad == 0, "bad_edges": bad}
+    dup = sum(1 for v in dire.values() if v > 1); r["oriented"] = {"ok": dup == 0, "repeated_directed_edges": dup}
+    used = np.unique(Q); chi = len(used) - len(und) + len(Q); r["one_shell"] = {"ok": chi == 2, "euler": int(chi)}
+    _, ar = quad_normals(P, Q); r["no_degenerate"] = {"ok": bool(ar.min() >= params["min_area_m2"]), "min_area_m2": float(ar.min())}
+    nu, nv = G.shape[0] - 1, G.shape[1] - 1
+    S = np.array([[G[i, j], G[i + 1, j], G[i + 1, j + 1], G[i, j + 1]] for i in range(nu) for j in range(nv)], np.int64)
+    inc = Counter(S.ravel().tolist()); inner = G[1:-1, 1:-1].ravel(); val_bad = int(sum(1 for v in inner if inc[int(v)] != 4))
+    r["valence"] = {"ok": val_bad == 0, "irregular_interior": val_bad}
+    J = scaled_jacobian(P, S); r["jacobian"] = {"ok": bool(J.min() >= params["jacobian_min"]), "min": round(float(J.min()), 3), "p1": round(float(np.percentile(J, 1)), 3)}
+    E = np.r_[np.linalg.norm(P[G[1:, :]] - P[G[:-1, :]], axis=-1).ravel(), np.linalg.norm(P[G[:, 1:]] - P[G[:, :-1]], axis=-1).ravel()]
+    r["edge_ratio"] = {"ok": bool(E.max() / E.min() <= params["edge_ratio_max"]), "ratio": round(float(E.max() / E.min()), 3), "min_mm": round(float(E.min() * 1000), 2), "max_mm": round(float(E.max() * 1000), 2)}
+    n, _ = quad_normals(P, S); Nq = n.reshape(nu, nv, 3)
+    a1 = np.degrees(np.arccos(np.clip((Nq[1:] * Nq[:-1]).sum(-1), -1, 1))); a2 = np.degrees(np.arccos(np.clip((Nq[:, 1:] * Nq[:, :-1]).sum(-1), -1, 1)))
+    fm = float(max(a1.max() if a1.size else 0, a2.max() if a2.size else 0)); r["fold"] = {"ok": fm <= params["fold_max_deg"], "max_deg": round(fm, 3)}
+    # kink : the bend between neighbouring quads must change slowly along every loop (a crease row, or a border row bent to meet a
+    # border curve, jumps) ; 29 October 2026, the first door passed fold at 8 degrees with a kinked border row
+    k1 = np.abs(np.diff(a1, axis=0)) if a1.shape[0] > 1 else np.zeros(1); k2 = np.abs(np.diff(a2, axis=1)) if a2.shape[1] > 1 else np.zeros(1)
+    km = float(max(k1.max(), k2.max())); r["kink"] = {"ok": km <= params["kink_max_deg"], "max_deg": round(km, 3)}
+    worst = None; nbad = 0; lines = [P[G[i, :]] for i in range(nu + 1)] + [P[G[:, j]] for j in range(nv + 1)]
+    for k, L in enumerate(lines):
+        c = CF.check_polyline(L, params["iso_flips"], creases=_NoCrease())
+        if not c["ok"]: nbad += 1; worst = worst or {"line": k, "lobes": c["lobes_max"], "flips": c["flips_max"], "corners": c["corners"]}
+    r["iso_fair"] = {"ok": nbad == 0, "bad_lines": nbad, "lines": len(lines), "first_bad": worst}
+    if sides is not None:
+        sb = [k for k, s in enumerate(sides) if not CF.check_polyline(s, 1)["ok"]]; r["side_fair"] = {"ok": not sb, "bad_sides": sb}
+    if dev is not None:
+        d = np.abs(np.asarray(dev, float)); d = d[np.isfinite(d)] * 1000
+        r["shape"] = {"ok": bool(d.mean() <= params["dev_mean_max_mm"] and np.percentile(d, 99) <= params["dev_p99_max_mm"]),
+                      "mean_mm": round(float(d.mean()), 3), "p99_mm": round(float(np.percentile(d, 99)), 3), "max_mm": round(float(d.max()), 3), "samples": int(len(d))}
+    passed = sum(1 for v in r.values() if v["ok"]); r["score"] = {"passed": passed, "lines": len(r), "percent": round(100.0 * passed / len(r), 1), "ok": passed == len(r)}
+    return r
+
+
+def selftest():
+    import ZrrPatch as Z
+    nu, nv, Rc = 40, 20, 3.0; u = np.linspace(-0.6, 0.6, nu + 1); v = np.linspace(0, 0.5, nv + 1); U, V = np.meshgrid(u, v, indexing="ij")
+    def cyl(U, V, extra=0.0):
+        a = U / Rc; return np.stack([np.sin(a) * (Rc + extra), V, np.cos(a) * (Rc + extra) - Rc], -1)
+    X = cyl(U, V); prm = dict(Z.PARAMS); res = {}
+    def run(tag, X, dev=None, mutate=None, expect=True):
+        P, Q, G = Z.panel(X, np.array([0.0, 0.0, 1.0]), prm)
+        if mutate: P, Q = mutate(P.copy(), Q.copy(), G)
+        c = check(P, Q, G, dev=np.zeros(G.size) if dev is None else dev)
+        res[tag] = {"expected_ok": expect, "got_ok": c["score"]["ok"], "failed": [k for k, v in c.items() if k != "score" and not v["ok"]]}
+    run("clean", X)
+    bump = X.copy(); g = np.exp(-((U - 0.1) ** 2 + (V - 0.25) ** 2) / (2 * 0.03 ** 2)) * 0.004; bump[..., 2] += g; run("bump_4mm", bump, expect=False)
+    rip = X.copy(); rip[..., 2] += 0.001 * np.sin(2 * np.pi * U / 0.15); run("ripple_1mm_15cm", rip, expect=False)   # 5 samples a period (a 6 cm wave sat on the zeros of a 3 cm grid)
+    def fold(P, Q, G):
+        i, j = 20, 10; P[G[i, j]] = P[G[i + 2, j]] + (P[G[i + 2, j]] - P[G[i, j]]); return P, Q
+    run("fold", X, mutate=fold, expect=False)
+    run("hole", X, mutate=lambda P, Q, G: (P, np.delete(Q, 5, 0)), expect=False)
+    kink = X.copy(); w = np.clip((V - 0.04) / 0.02, 0, 1) * 0 + (V < 0.04) * (0.04 - V) * np.tan(np.radians(6)); kink[..., 2] -= w; run("kink_border_6deg", kink, expect=False)
+    def tri(P, Q, G):
+        Q = Q.copy(); Q[7, 3] = Q[7, 2]; return P, Q
+    run("triangle", X, mutate=tri, expect=False)
+    run("offset_10mm", X, dev=np.full((nu + 1) * (nv + 1), 0.010), expect=False)
+    ok = all(v["expected_ok"] == v["got_ok"] for v in res.values())
+    for k, v in res.items(): print(f"{k:16s} expected_ok={v['expected_ok']!s:5s} got_ok={v['got_ok']!s:5s} failed={v['failed']}")
+    print("SELFTEST", "GREEN" if ok else "RED"); return ok
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        sys.exit(0 if selftest() else 1)
