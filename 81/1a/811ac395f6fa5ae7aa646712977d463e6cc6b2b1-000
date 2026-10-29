@@ -37,6 +37,9 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "soft_corners": True,             # 29 October 2026 : a face short of 4 corners takes the real bends INSIDE its curves (rounded corners) as corners
     "soft_window_m": 0.04,            # ... turn measured between the tangents this far before and after each point, in the surface tangent plane
     "soft_corner_deg": 45.0,          # ... a bend turning more than this over the window is a corner
+    "cross_tol_m": 0.006,             # 29 October 2026 : two curves passing closer than this away from their nodes cross : both are split there, one node
+    "cross_min_deg": 20.0,            # ... only when their directions differ by more than this (below, they overlap : reported, not split)
+    "annulus_check": True,            # 29 October 2026 : a face whose loop contains another piece of the network (an island) is skipped as annulus
     "max_virtual_corners": 2,         # a face that needs more virtual corners than this (rings, round faces without real corners) is skipped
     "min_compactness": 0.08,          # faces thinner than this (area / (perimeter^2 / 4 pi)) are skipped as slivers
     "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
@@ -345,12 +348,51 @@ class Net:
                     self._set_end(aid, end, nv); self.tj.append({"arc": aid, "end": end, "onto": bid, "dist": round(d, 6), "node": nv})
             if len(self.tj) == n0: break
 
+    def _merge_node(self, keep, drop):
+        p = (self.nodes[keep] + self.nodes[drop]) / 2; self.nodes[keep] = p
+        for aid, A in self.arcs.items():
+            for end in ("a", "b"):
+                if A[end] == drop: self._set_end(aid, end, keep)
+            if A["a"] == keep: A["pts"][0] = p
+            if A["b"] == keep: A["pts"][-1] = p
+        del self.nodes[drop]
+
+    def _crossings(self):
+        """29 October 2026 : curves that cross without a node there make overlapping faces. Each crossing (closest approach below cross_tol_m,
+        away from the ends, directions differing by more than cross_min_deg) splits both curves and joins them in one node ; near parallel
+        contacts are overlaps, reported as issues and left to the user."""
+        tol, guard = self.prm["cross_tol_m"], 1.5 * self.prm["snap_corner_m"]; self.crossings = []; done = set()
+        for _ in range(200):
+            found = None; ids = sorted(self.arcs); trees = {}
+            for x, i in enumerate(ids):
+                A = self.arcs[i]
+                for j in ids[x + 1:]:
+                    B = self.arcs[j]
+                    if (i, j) in done or np.any(A["lo"] > B["hi"] + tol) or np.any(B["lo"] > A["hi"] + tol): continue
+                    if j not in trees: trees[j] = cKDTree(B["pts"])
+                    d, k = trees[j].query(A["pts"], k=1); m = int(np.argmin(d))
+                    if d[m] > tol: continue
+                    pa, pb = A["pts"][m], B["pts"][k[m]]
+                    ends = [self.nodes[v] for v in (A["a"], A["b"], B["a"], B["b"]) if v >= 0 and v in self.nodes]
+                    if ends and min(min(np.linalg.norm(pa - e), np.linalg.norm(pb - e)) for e in ends) < guard: done.add((i, j)); continue
+                    ta = A["pts"][min(m + 1, len(A["pts"]) - 1)] - A["pts"][max(m - 1, 0)]; tb = B["pts"][min(k[m] + 1, len(B["pts"]) - 1)] - B["pts"][max(k[m] - 1, 0)]
+                    ang = math.degrees(math.acos(min(1.0, abs(float(ta @ tb)) / max(np.linalg.norm(ta) * np.linalg.norm(tb), 1e-30))))
+                    if ang < self.prm["cross_min_deg"]:
+                        done.add((i, j)); self.issues.append({"kind": "overlap", "arc": int(A["parent"]), "value": round(float(d[m]), 6), "fix": "runs along arc %d : delete one of them" % B["parent"]}); continue
+                    found = (i, j, float(A["cum"][m]), float(B["cum"][k[m]]), pa); break
+                if found: break
+            if not found: return
+            i, j, sa, sb, pa = found
+            va = self._split_arc(i, sa); vb = self._split_arc(j, sb); self._merge_node(va, vb); self.real_nodes.add(va)
+            self.crossings.append([round(float(c), 4) for c in self.nodes[va]])
+
     def _prepare_graph(self):
-        self._tjunctions()
+        self._tjunctions(); self.crossings = []
         for aid in list(self.arcs):                                  # islands (closed, no node) become loop arcs on a virtual node
             A = self.arcs[aid]
             if A["a"] < 0 and A["b"] < 0 and A["closed"]:
                 vn = self.next_node; self.next_node += 1; self.nodes[vn] = A["pts"][0].copy(); A["pts"][-1] = A["pts"][0]; A["a"] = A["b"] = vn
+        if self.prm.get("cross_tol_m", 0) > 0: self._crossings()     # 29 October 2026 : after the islands got their node, before the pruning
         changed = True
         while changed:                                               # dangling arcs (free end or degree one node) are pruned
             changed = False; deg = collections.Counter()
@@ -414,6 +456,23 @@ class Net:
         self.euler = {"V": len(nodes_used), "E": len(self.arcs), "F": len(self.faces), "components": comps}
         self.euler["chi"] = self.euler["V"] - self.euler["E"] + self.euler["F"]; self.euler["expected_closed_surface"] = 2 * comps
         for f in self.faces: self._geometry(f)
+        if self.prm.get("annulus_check"):                           # 29 October 2026 : a face that contains an island of the network would be meshed over it
+            comp_nodes = collections.defaultdict(list)
+            for v in nodes_used: comp_nodes[find(v)].append(v)
+            reps = {c: self.nodes[vs[0]] for c, vs in comp_nodes.items()}
+            for f in self.faces:
+                f["holes"] = []
+                if f["area_signed"] <= 0 or f["normal_mean_len"] < 0.3 or len(reps) < 2: continue
+                own = find(self.tail(f["he"][0])); n = f["vec_area"] / max(np.linalg.norm(f["vec_area"]), 1e-30); e1 = np.cross(n, [1.0, 0.0, 0.0])
+                if np.linalg.norm(e1) < 0.1: e1 = np.cross(n, [0.0, 1.0, 0.0])
+                e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1); Q = f["poly"] - f["centroid"]; xs, ys = Q @ e1, Q @ e2; xn, yn = np.roll(xs, -1), np.roll(ys, -1)
+                tolp = max(0.05, 0.25 * math.sqrt(max(f["area"], 1e-9)))
+                for c, p in reps.items():
+                    if c == own: continue
+                    d = p - f["centroid"]
+                    if abs(d @ n) > tolp: continue
+                    x, y = d @ e1, d @ e2; cr = (ys > y) != (yn > y); xi = xs + (y - ys) * (xn - xs) / np.where(yn != ys, yn - ys, 1e-30)
+                    if int(np.sum(cr & (x < xi))) % 2 == 1: f["holes"].append(int(c))
         self.assign_components()
         self.timing["trace"] = time.time() - t
 
@@ -457,6 +516,7 @@ class Net:
             if f["id"] in skip or opts.get(f["id"], {}).get("skip"): f["status"], f["reason"] = "skipped", "user"
             elif f["normal_mean_len"] < 0.3 and f["area"] > 0: f["status"], f["reason"] = "skipped", "wraps_around"
             elif f["area_signed"] <= 0: f["status"], f["reason"] = "skipped", "complement"
+            elif f.get("holes"): f["status"], f["reason"] = "skipped", "annulus (%d island%s inside)" % (len(f["holes"]), "s" if len(f["holes"]) > 1 else "")
             elif f["area"] > prm["max_face_area_m2"]: f["status"], f["reason"] = "skipped", "area"
             elif f["area"] < prm["min_compactness"] * f["perimeter"] ** 2 / (4 * math.pi): f["status"], f["reason"] = "skipped", "sliver"
         for f in self.faces:
@@ -852,7 +912,7 @@ def build(doc, params=None):
                   "quads_below_jac_min": int((net.quad_stats["jmin"] < net.prm["jac_min"]).sum()) if getattr(net, "quad_stats", None) else 0})
     stats.update({"faces_total": len(net.faces), "faces_meshed": st.get("meshed", 0), "faces_skipped": st.get("skipped", 0), "faces_infeasible": st.get("infeasible", 0),
                   "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
-                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
+                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "crossings": len(getattr(net, "crossings", [])), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
                   "issues_by_kind": dict(collections.Counter(i["kind"] for i in net.issues)), "timing": net.timing})
     if hasattr(net, "count_stats"): stats["count_deviation"] = net.count_stats
     obj_path = latest = None

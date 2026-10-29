@@ -22,6 +22,9 @@ PARAMS = {   # 29 October 2026 : the interface of the server, every tunable valu
     "max_body_mb": 24,
     "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini", "/project": "project"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
     "lines_dir": f"{ROOT}/Scripts/lines",
+    "export_path": "/export",            # 29 October 2026 : the editor's exports (PNG, SVG, OBJ, JSON) land in the atelier, never in Downloads
+    "export_dir": f"{ROOT}/work/lines/exports",
+    "export_exts": [".png", ".svg", ".obj", ".json"],
 }
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 
@@ -63,6 +66,21 @@ def save_edit(body, root, prm=PARAMS):
         f.write(body)
     os.replace(tmp, target)
     return {"ok": True, "path": target, "bytes": len(body), "arcs": len(doc["arcs"]), "nodes": len(doc["nodes"]), "backup": backup}
+
+
+def save_export(body, prm=PARAMS):
+    """29 October 2026 : POST /export {"name": "view.png", "data": data URL or text} : written to work/lines/exports/<stem>_<date>.<ext>."""
+    import base64, re
+    req = json.loads(body.decode("utf-8")); name = os.path.basename(str(req.get("name") or "export")); data = req.get("data")
+    stem, ext = os.path.splitext(name); ext = ext.lower()
+    if ext not in prm["export_exts"]: raise ValueError("extension %s refused" % (ext or "(none)"))
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)[:80] or "export"
+    if isinstance(data, str) and data.startswith("data:"): raw = base64.b64decode(data.split(",", 1)[1])
+    elif isinstance(data, str): raw = data.encode("utf-8")
+    else: raise ValueError("data must be a string")
+    os.makedirs(prm["export_dir"], exist_ok=True); path = os.path.join(prm["export_dir"], "%s_%s%s" % (stem, stamp(), ext))
+    with open(path, "wb") as f: f.write(raw)
+    return {"ok": True, "path": path, "bytes": len(raw)}
 
 
 def run_netmesh(kind, body, prm=PARAMS):
@@ -107,6 +125,15 @@ def make_handler(root, prm):
                     self.reply(200, run_netmesh(prm["mesh_paths"][path], self.rfile.read(n), prm))
                 except BaseException as e:
                     import traceback; traceback.print_exc(); sys.stderr.flush()
+                    try: self.reply(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+                    except Exception: pass
+                return
+            if path == prm["export_path"]:
+                try:
+                    n = int(self.headers.get("Content-Length", ""))
+                    if n <= 0 or n > prm["max_body_mb"] * 1024 * 1024: raise ValueError("body size out of range")
+                    self.reply(200, save_export(self.rfile.read(n), prm))
+                except BaseException as e:
                     try: self.reply(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
                     except Exception: pass
                 return

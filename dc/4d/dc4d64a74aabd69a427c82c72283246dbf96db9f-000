@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', seeds: 'data/seeds_v752.json' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', seeds: 'data/seeds_v752.json' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -320,7 +320,7 @@
       tri.set([M.Q[4 * q], M.Q[4 * q + 1], M.Q[4 * q + 2], M.Q[4 * q], M.Q[4 * q + 2], M.Q[4 * q + 3]], q * 6);
       const fc = J < 0 ? CFG.colors.meshFillBad : CFG.colors.meshFill; for (let k = 0; k < 4; k++) col.set(fc, M.Q[4 * q + k] * 4);
     }
-    view.setRibbons('mesh', polys, { width: CFG.sizes.mesh, order: 1 }); view.setFill('meshFill', pos, tri, col);
+    view.setRibbons('mesh', polys, { width: CFG.sizes.mesh, order: 1, noHidden: !$('pXray').checked }); view.setFill('meshFill', pos, tri, col);   // 29 October 2026 : the far side's wireframe seen through the body read as an overlap
     M.stats = { quads: nq, vertices: M.P.length / 3, folded: bad, below05: warn, jacobianMin: +Jmin.toFixed(3) };
     const f = M.faces || [], by = {}; for (const x of f) by[x.status || 'ok'] = (by[x.status || 'ok'] || 0) + 1;
     $('meshInfo').textContent = 'Quads ' + nq + ', vertices ' + M.stats.vertices + '\nFolded ' + bad + ', Jacobian under 0.5 : ' + warn + ', min ' + M.stats.jacobianMin +
@@ -366,19 +366,26 @@
   function exportObj() {
     const M = S.mesh; if (!M) return status('Convert to a mesh first.');
     const L = ['# 29 October 2026 ZenRay Lines quad mesh']; for (let i = 0; i < M.P.length; i += 3) L.push('v ' + M.P[i].toFixed(6) + ' ' + M.P[i + 1].toFixed(6) + ' ' + M.P[i + 2].toFixed(6));
-    let cur = null; for (let q = 0; q < M.Q.length / 4; q++) { const f = M.fq[q]; if (f !== cur) { L.push('g face_' + f); cur = f; } L.push('f ' + [0, 1, 2, 3].map((k) => M.Q[4 * q + k] + 1).join(' ')); }
-    download('zenray_lines_mesh.obj', L.join('\n'), 'text/plain'); status('OBJ exported : ' + M.Q.length / 4 + ' quads');
+    const names = new Map((M.faces || []).map((f) => [f.id, f.component ? f.component.replace(/\s+/g, '_') : 'face_' + f.id]));   // 29 October 2026 : one group per component, as sent to Houdini
+    const order = Array.from({ length: M.Q.length / 4 }, (_, q) => q).sort((a, b) => String(names.get(M.fq[a]) || M.fq[a]).localeCompare(String(names.get(M.fq[b]) || M.fq[b])));
+    let cur = null; for (const q of order) { const g = names.get(M.fq[q]) || 'face_' + M.fq[q]; if (g !== cur) { L.push('g ' + g); cur = g; } L.push('f ' + [0, 1, 2, 3].map((k) => M.Q[4 * q + k] + 1).join(' ')); }
+    return download('zenray_lines_mesh.obj', L.join('\n'), 'text/plain');
   }
 
   // ------------------------------------------------------------------ files and exports
-  function download(name, data, type) { const a = document.createElement('a'); a.href = typeof data === 'string' && data.startsWith('data:') ? data : URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click(); }
+  async function download(name, data, type) {   // 29 October 2026 : saved in the atelier by the server (work/lines/exports) ; the browser download is only the fallback
+    try { const r = await fetch(CFG.files.export, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, data }) }); const res = await r.json();
+      if (r.ok && res.ok) { status('Saved ' + name.split('.').pop().toUpperCase() + ' : ' + res.path); return res.path; } } catch (e) { console.warn(e); }
+    const a = document.createElement('a'); a.href = typeof data === 'string' && data.startsWith('data:') ? data : URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click();
+    status('Downloaded ' + name + ' (the server could not save it in the atelier)'); return null;
+  }
   function exportSvg() {
     view.matrices(); const W = view.st.W, H = view.st.H, out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><!-- 29 October 2026 ZenRay Lines 3D, current camera -->`];
     for (const a of model.doc.arcs) { const s = arcPts(a.id); let d = ''; for (let i = 0; i < s.length; i += 3) { const q = view.project([s[i], s[i + 1], s[i + 2]]); d += (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1); } out.push(`<path id="arc_${a.id}" d="${d}" fill="none" stroke="#222" stroke-width="1.6"/>`); }
     for (const n of model.doc.nodes) { const q = view.project(n.p); out.push(`<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="3" fill="#c03"/>`); }
-    out.push('</svg>'); download('zenray_lines_view.svg', out.join('\n'), 'image/svg+xml'); status('SVG exported (current camera)');
+    out.push('</svg>'); return download('zenray_lines_view.svg', out.join('\n'), 'image/svg+xml');
   }
-  function exportPng() { refresh(); download('zenray_lines_view.png', view.canvas.toDataURL('image/png')); status('PNG exported'); }
+  function exportPng(name) { refresh(); return download((typeof name === 'string' && name) || 'zenray_lines_view.png', view.canvas.toDataURL('image/png')); }
   async function save() {
     const body = model.serialize(); const r = await fetch(CFG.files.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     const res = await r.json().catch(() => ({})); if (!r.ok || !res.ok) return status('Save failed : ' + (res.error || r.status), 'error');
