@@ -40,6 +40,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "corner_min_gap_frac": 0.05,      # ... but never closer than this fraction of the face perimeter to another corner
     "drop_failed": False,             # True : quads of faces failing the judge are left out of the mesh (status "rejected")
     "edge_m": 0.02,                   # target edge length (counts = length / edge_m)
+    "min_spoke": 2,                   # counts : spokes of a 3, 5, 6 sided face have at least this many edges (1 gives a pole stuck on the boundary)
     "min_loop_count": 3,              # a loop arc (both ends on one node) needs at least this many edges
     "harmonic": True,                 # before the relaxation, the interior is solved as a harmonic (Tutte) map with the boundary fixed : unfolds a Coons patch
     "auto_fallback": True,            # faces of 5 or 6 sides that fail the judge are meshed again as 4 sided patches (face option rotate = 0)
@@ -70,7 +71,7 @@ def native(x):
     if isinstance(x, (list, tuple, set)): return [native(v) for v in x]
     if isinstance(x, np.ndarray): return native(x.tolist())
     if isinstance(x, (np.integer,)): return int(x)
-    if isinstance(x, (np.floating,)): return float(x)
+    if isinstance(x, (np.floating, float)): x = float(x); return x if math.isfinite(x) else None      # NaN and infinity are not JSON
     if isinstance(x, (np.bool_,)): return bool(x)
     return x
 
@@ -553,7 +554,7 @@ class Net:
             return L
         self.infeasible = []; self.mirror_dropped = []
         if cand:
-            L = layout_of(cand); r = CT.solve(L, self.prm["edge_m"], elastic=True)
+            L = layout_of(cand); r = CT.solve(L, self.prm["edge_m"], elastic=True, min_spoke=self.prm["min_spoke"])
             if not r["ok"]:
                 for f in cand: f["status"], f["reason"] = "infeasible", "solver: %s" % r.get("status")
                 self.infeasible = [f["id"] for f in cand]; cand = []
@@ -564,7 +565,7 @@ class Net:
                 cand = [f for f in cand if f["status"] == "ok"]
                 if cand:
                     L = layout_of(cand); L["mirror"] = [m for m in L["mirror"] if m not in self.mirror_dropped and m[::-1] not in self.mirror_dropped]
-                    r = CT.solve(L, self.prm["edge_m"], elastic=False)
+                    r = CT.solve(L, self.prm["edge_m"], elastic=False, min_spoke=self.prm["min_spoke"])
                     if not r["ok"]:
                         for f in cand: f["status"], f["reason"] = "infeasible", "solver: %s" % r.get("status")
                         self.infeasible += [f["id"] for f in cand]; cand = []
@@ -685,6 +686,7 @@ class Net:
                     if th < prm["sharp_deg"] or th > 180.0 - prm["sharp_deg"]: thr[pos[cq]] = min(prm["jac_min"], prm["sharp_factor"] * math.sin(math.radians(th)))
             f["quads"] = int(len(qs)); f["min_jac"] = float(jm.min()); f["edge_ratio"] = float(ratio[qs].max()); f["folded"] = int((jm <= 0).sum())
             f["jac_margin"] = float((jm - thr).min()); f["judge_ok"] = bool(f["folded"] == 0 and f["jac_margin"] >= 0)
+            f["bad_quads"] = int((jm < thr).sum()); f["bad_fraction"] = round(float((jm < thr).mean()), 4)
             if prm["drop_failed"] and not f["judge_ok"]: f["status"], f["reason"] = "rejected", "failed the judge (min Jacobian %.2f, %d folded)" % (f["min_jac"], f["folded"]); drop.append(f["id"])
         if drop:                                                    # drop_failed : rebuild the quad list without the rejected faces, then judge again
             keep = ~np.isin(foq, drop); self.Q = self.Q[keep]; self.face_of_quad = [x for x, k in zip(self.face_of_quad, keep) if k]
@@ -715,7 +717,7 @@ class Net:
             if f.get("extra_seeds"): r["extra_seeds"] = f["extra_seeds"]
             if f.get("reflex"): r["reflex_corners"] = f["reflex"]
             if "sides" in f: r["sides"] = [[h[0] for h in s] for s in f["sides"]]; r["n_sides"] = len(f["sides"])
-            for k in ("side_counts", "quads", "min_jac", "edge_ratio", "folded", "jac_margin", "judge_ok"):
+            for k in ("side_counts", "quads", "min_jac", "edge_ratio", "folded", "jac_margin", "judge_ok", "bad_quads", "bad_fraction"):
                 if k in f: r[k] = f[k]
             out.append(r)
         return out
@@ -737,7 +739,7 @@ def faces_report(doc, params=None):
         r["side_counts"] = f.get("side_counts")
     st = collections.Counter(f["status"] for f in net.faces)
     return native({"ok": True, "faces": out, "euler": net.euler, "dangling_arcs": net.dangling, "issues": net.issues, "unplaced_seeds": net.unplaced_seeds,
-                   "arc_counts": net.counts_by_arc, "counts": {"faces": len(net.faces), "ok": st.get("ok", 0), "skipped": st.get("skipped", 0), "infeasible": st.get("infeasible", 0)},
+                   "arc_counts": net.counts_by_arc, "face_counts": {"faces": len(net.faces), "ok": st.get("ok", 0), "skipped": st.get("skipped", 0), "infeasible": st.get("infeasible", 0)},
                    "timing": net.timing, "time_s": round(time.time() - net.t0, 3)})
 
 
@@ -766,8 +768,13 @@ def build(doc, params=None):
             p2 = dict(params or {}); fo = {str(k): dict(v) for k, v in (p2.get("face_options") or {}).items()}
             for i in bad: fo.setdefault(str(i), {})["rotate"] = 0
             p2["face_options"] = fo; net2 = _run(doc, p2)
-            nfail = lambda n: sum(1 for f in n.faces if f["status"] == "meshed" and not f.get("judge_ok", True))
-            if nfail(net2) < nfail(net): net = net2; fallback = bad
+            fold = lambda n, i: n.faces[i].get("folded", 10 ** 9) if n.faces[i]["status"] == "meshed" else 10 ** 9
+            better = [i for i in bad if fold(net2, i) < fold(net, i)]                # keep the 4 sided retry only where it unfolds the face
+            if better and len(better) == len(bad): net = net2; fallback = bad
+            elif better:
+                p3 = dict(params or {}); fo3 = {str(k): dict(v) for k, v in (p3.get("face_options") or {}).items()}
+                for i in better: fo3.setdefault(str(i), {})["rotate"] = 0
+                p3["face_options"] = fo3; net = _run(doc, p3); fallback = better
     fr = net.face_report(); st = collections.Counter(f["status"] for f in net.faces)
     stats = dict(net.stats)
     meshed = [f for f in net.faces if f["status"] == "meshed" or (f.get("quads") and f["status"] == "rejected")]
@@ -777,7 +784,7 @@ def build(doc, params=None):
                   "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
                   "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
                   "issues_by_kind": dict(collections.Counter(i["kind"] for i in net.issues)), "timing": net.timing})
-    if hasattr(net, "count_stats"): stats["counts"] = net.count_stats
+    if hasattr(net, "count_stats"): stats["count_deviation"] = net.count_stats
     obj_path = latest = None
     if net.prm["write_obj"] and len(net.Q):
         obj_path = write_obj(net, os.path.join(net.prm["out_dir"], "mesh_%s.obj" % stamp()))

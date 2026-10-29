@@ -13,14 +13,15 @@
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
-      meshOk: [0.18, 0.55, 0.32, 1], meshWarn: [0.9, 0.6, 0.12, 1], meshBad: [0.82, 0.18, 0.18, 1], meshFill: [0.35, 0.7, 0.45, 0.28], meshFillBad: [0.85, 0.3, 0.25, 0.32] },
+      meshOk: [0.18, 0.55, 0.32, 1], meshWarn: [0.9, 0.6, 0.12, 1], meshBad: [0.82, 0.18, 0.18, 1], meshFill: [0.35, 0.7, 0.45, 0.28], meshFillBad: [0.85, 0.3, 0.25, 0.32],
+      bad: [0.88, 0.14, 0.14, 1], forced: [0.98, 0.42, 0.04, 1], forbidden: [0.32, 0.33, 0.38, 1], corner: [0.95, 0.5, 0.1, 1] },
     sizes: { arc: 2.0, arcSel: 3.2, node: 7, nodeSel: 11, handle: 9, poly: 1.2, mesh: 1.0, draw: 2.4, drawPt: 9 },
     pick: { arcPx: 8, handlePx: 11, nodePx: 11, snapNodePx: 14, snapArcPx: 10, meshVertexPx: 10, hiddenTolM: 0.02, dragStartPx: 3 },
     edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01 },
     perSpan: 24,
   };
   const $ = (id) => document.getElementById(id);
-  const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null };
+  const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null, face: null, doctor: null };
   let model = null, view = null;
   const P = () => ({ mirror: $('pMirror').checked, snap: $('pSnap').checked });
   const status = (m, kind) => { $('status').textContent = m; $('status').className = kind || ''; };
@@ -270,7 +271,8 @@
     const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
     if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
-    setMesh(res); status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
+    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], k: S.doctor ? S.doctor.k : null };
+    status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
   }
   async function checkNetwork() {
     const r = await fetch(CFG.files.doctor, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: {} }) });
@@ -336,7 +338,7 @@
     if (S.handle) parts.push('control point ' + S.handle.i + ' of curve ' + S.handle.arc);
     $('selInfo').textContent = parts.join('\n') || 'Nothing selected.';
   }
-  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', seed: 'Click on the model to place the component named in the Components field.' };
+  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', seed: 'Click on the model to place the component named in the Components field.', face: 'Click inside a face : its sides, corners and status. The component buttons then change its quads ; Rotate pattern cycles its variants ; K on a node forces or forbids a corner.' };
   function setTool(t) { S.tool = t; S.draw = t === 'draw' ? (S.draw || { pts: [] }) : null; document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === t)); $('toolHint').textContent = HINTS[t] || ''; redraw(); }
 
   // ------------------------------------------------------------------ mouse
@@ -358,6 +360,7 @@
       return;
     }
     if (S.tool === 'seed') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); addSeed(h.p); return; }
+    if (S.tool === 'face') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); selectFaceAt(h.p); return; }
     if (S.tool === 'patch') {                                             // 29 October 2026 : four clicks, one quad patch (Quad Draw)
       const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
       const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
@@ -431,7 +434,7 @@
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
     if (views[k]) { view.preset(views[k]); redraw(); return; }
-    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
+    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
     else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
     else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
     else if (k === 'h') { if (ev.shiftKey) { view.showAllParts(); status('Every part shown'); } else { const h = view.pickSurface(S.mouse ? S.mouse[0] : 0, S.mouse ? S.mouse[1] : 0); if (h) { view.setPartHidden(h.part, true); status('Part hidden : ' + (view.st.mesh.head.parts[h.part] || h.part) + ' (Shift H shows all)'); } } redraw(true); }
@@ -471,7 +474,11 @@
     const list = await r.json(); edit(list.length + ' components imported', () => { const have = new Set(seeds().map((q) => q.name)); for (const q of list) if (!have.has(q.name)) seeds().push({ name: q.name, p: q.p }); });
     renderCompList();
   }
-  function setCompOption(key, value) { if (!S.comp) return status('Select a component first.'); edit('Option ' + key + ' of ' + S.comp + ' set to ' + value, () => { const o = compOpts()[S.comp] || (compOpts()[S.comp] = {}); o[key] = value; }); renderCompList(); }
+  function ensureComp() {   // 29 October 2026 : a face without a component gets one (part_NN, renamable) at the point where it was picked
+    if (S.comp || !S.face) return S.comp; let k = seeds().length + 1, name; do { name = 'part_' + String(k++).padStart(2, '0'); } while (seeds().some((q) => q.name === name));
+    seeds().push({ name, p: clone3(S.face.p) }); S.comp = name; $('compName').value = name; return name;
+  }
+  function setCompOption(key, value) { if (!S.comp && !S.face) return status('Select a component or pick a face (G) first.'); edit('Option ' + key + ' set to ' + value, () => { const c = ensureComp(); const o = compOpts()[c] || (compOpts()[c] = {}); if (value === undefined) delete o[key]; else o[key] = value; }); renderCompList(); }
   function faceOptions() { const out = {}; if (!S.faces) return out; for (const f of S.faces) { const o = f.component && compOpts()[f.component]; if (o) out[f.id] = o; } return out; }
   function renderCompList() {
     const list = $('compList'); if (!list) return; const faces = S.faces || [], byComp = {}; for (const f of faces) if (f.component) (byComp[f.component] = byComp[f.component] || []).push(f);
@@ -483,16 +490,76 @@
     $('compCount').textContent = seeds().length;
     list.querySelectorAll('.row-c').forEach((el) => el.addEventListener('click', () => { S.comp = el.dataset.name; $('compName').value = S.comp; const q = seeds().find((z) => z.name === S.comp); if (q && q.p) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]); renderCompList(); redraw(); }));
   }
+  // 29 October 2026 : FACES of the network under a surface point : the loop's plane (Newell normal), point inside the projected loop, smallest face wins
+  const facePlanes = new WeakMap();
+  function facePlane(f) {
+    let pl = facePlanes.get(f); if (pl) return pl;
+    const b = f.boundary, m = Math.floor(b.length / 3), c = [0, 0, 0]; let n = [0, 0, 0];
+    for (let i = 0; i < m; i++) { c[0] += b[3 * i] / m; c[1] += b[3 * i + 1] / m; c[2] += b[3 * i + 2] / m; }
+    for (let i = 0; i < m; i++) { const j = (i + 1) % m; n[0] += (b[3 * i + 1] - b[3 * j + 1]) * (b[3 * i + 2] + b[3 * j + 2]); n[1] += (b[3 * i + 2] - b[3 * j + 2]) * (b[3 * i] + b[3 * j]); n[2] += (b[3 * i] - b[3 * j]) * (b[3 * i + 1] + b[3 * j + 1]); }
+    n = V.norm(n); const u = V.norm(Math.abs(n[0]) < 0.9 ? V.cross(n, [1, 0, 0]) : V.cross(n, [0, 1, 0])), w = V.cross(n, u), poly = new Float64Array(2 * m);
+    for (let i = 0; i < m; i++) { const d = [b[3 * i] - c[0], b[3 * i + 1] - c[1], b[3 * i + 2] - c[2]]; poly[2 * i] = V.dot(d, u); poly[2 * i + 1] = V.dot(d, w); }
+    pl = { c, n, u, w, poly, m, size: Math.sqrt(Math.max(f.area || 0, 1e-6)) }; facePlanes.set(f, pl); return pl;
+  }
+  function insidePoly(poly, m, x, y) { let inside = false; for (let i = 0, j = m - 1; i < m; j = i++) { const xi = poly[2 * i], yi = poly[2 * i + 1], xj = poly[2 * j], yj = poly[2 * j + 1]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside; } return inside; }
+  function faceAt(p) {
+    let best = null;
+    for (const f of S.faces || []) {
+      if (!f.boundary || f.boundary.length < 9 || f.reason === 'complement') continue;
+      const pl = facePlane(f), d = V.sub(p, pl.c); if (Math.abs(V.dot(d, pl.n)) > Math.max(0.05, pl.size)) continue;
+      if (insidePoly(pl.poly, pl.m, V.dot(d, pl.u), V.dot(d, pl.w)) && (!best || (f.area || 0) < (best.area || 0))) best = f;
+    }
+    return best;
+  }
+  const faceOf = (id) => (S.faces || []).find((f) => f.id === id);
+  function faceText(f) { return 'Face ' + f.id + (f.component ? ' (' + f.component.replace(/^CAR_/, '') + ')' : ' (no component)') + ' : ' + f.status + (f.reason ? ', ' + f.reason.replace(/_/g, ' ') : '') + (f.side_counts ? ', ' + f.side_counts.length + ' sides of ' + f.side_counts.join(' x ') + ' quads' : '') + (f.corners ? ', ' + f.corners.length + ' corners' : ''); }
+  function selectFaceAt(p) {
+    if (!S.faces) return status('Preview the faces first (P).');
+    const f = faceAt(p); if (!f) { S.face = null; redraw(); return status('No face here : the curves around this point do not close a loop.'); }
+    S.face = { id: f.id, p: clone3(p) }; S.comp = f.component || null; $('compName').value = S.comp || '';
+    renderCompList(); redraw(); status(faceText(f));
+  }
+  function cyclePattern(step) {   // 29 October 2026 : the variants of a face : its own n sided pattern, then every choice of the four corners that pair up
+    const f = S.face ? faceOf(S.face.id) : (S.faces || []).find((z) => z.component && z.component === S.comp);
+    if (!f) return status('Pick a face (G) or select a component that has one.');
+    const n = (f.corners || []).length; if (n < 4) return status('A face with ' + n + ' corners has a single pattern : add a corner with K on a node of its border.');
+    const o = (S.comp && compOpts()[S.comp]) || {}, cur = o.rotate == null ? -1 : o.rotate, next = cur + step >= n ? -1 : cur + step < -1 ? n - 1 : cur + step;
+    setCompOption('rotate', next < 0 ? undefined : next); status('Pattern ' + (next < 0 ? 'native (' + n + ' sides)' : 'variant ' + (next + 1) + ' of ' + n) + ' for ' + S.comp); schedulePreview();
+  }
+  function toggleCorner() {   // 29 October 2026 : K : a node of the hovered or selected place becomes a corner, is forbidden as one, or goes back to automatic
+    const id = S.node !== null ? S.node : S.hover && S.hover.type === 'node' ? S.hover.id : null; if (id === null) return status('Hover or select a node, then press K.');
+    const isCorner = (S.faces || []).some((f) => (f.corners || []).includes(id)), cf = model.doc.corners_force || {}, cur = cf[id];
+    const next = cur === undefined ? !isCorner : cur === !isCorner ? !cur : undefined;
+    edit('Node ' + id + (next === undefined ? ' : corner automatic again' : next ? ' : forced corner' : ' : never a corner'), () => { const m = model.doc.corners_force || (model.doc.corners_force = {}); if (next === undefined) delete m[id]; else m[id] = next; });
+  }
+  function nextProblem() {   // 29 October 2026 : N : the curves the faces cannot use, one after the other
+    const ids = ((S.doctor && S.doctor.dangling) || []).filter((id) => model.arc(id));
+    if (!ids.length) return status(S.doctor ? 'No loose curve : every curve borders two faces.' : 'Preview the faces first (P).');
+    S.doctor.k = ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % ids.length; const id = ids[S.doctor.k];
+    S.sel = new Set([id]); S.node = null; S.handle = null; frameSel();
+    status('Loose curve ' + (S.doctor.k + 1) + ' of ' + ids.length + ' (curve ' + id + ') : drag its free end onto a node or a curve, or delete it.');
+  }
+  function freeEnds(id) { const a = model.arc(id), out = []; if (!a) return out; for (const [nid, p] of [[a.a, a.ctrl[0]], [a.b, a.ctrl[a.ctrl.length - 1]]]) { if (nid == null || nid < 0) out.push(p); else if (model.node(nid) && model.nodeArcs(nid).length < 2) out.push(model.node(nid).p); } return out; }
+  function renderDoctor() {
+    const ids = ((S.doctor && S.doctor.dangling) || []).filter((id) => model.arc(id));
+    if (!ids.length || !$('pDoctor').checked) { view.clearLayer('dangling'); view.clearLayer('freeEnds'); return; }
+    view.setRibbons('dangling', ids.map((id) => ({ pts: arcPts(id), color: CFG.colors.bad })), { width: CFG.sizes.arcSel, order: 2.5 });
+    view.setPoints('freeEnds', ids.flatMap((id) => freeEnds(id).map((p) => ({ p, color: CFG.colors.bad, size: CFG.sizes.nodeSel }))), { onTop: true, order: 6 });
+  }
+  function renderForced() { const cf = model.doc.corners_force || {}, pts = [];
+    for (const [k, v] of Object.entries(cf)) { const n = model.node(+k); if (n) pts.push({ p: n.p, color: v ? CFG.colors.forced : CFG.colors.forbidden, size: CFG.sizes.nodeSel + 3 }); }
+    view.setPoints('forced', pts, { onTop: true, order: 6.5 }); }
   function renderComponents() {
     const pts = seeds().map((q) => ({ p: q.p, color: S.comp === q.name ? CFG.colors.sel : hashColour(q.name), size: CFG.preview.seedSize * (S.comp === q.name ? 1.4 : 1) }));
     view.setPoints('seeds', pts, { onTop: true, order: 8 });
     if (S.faces && $('pFaces').checked) {
       const polys = [], corners = [];
       for (const f of S.faces) { if (!f.boundary || f.boundary.length < 6) continue; const col = f.status === 'skipped' || f.status === 'infeasible' ? [0.6, 0.6, 0.6, 1] : f.component ? hashColour(f.component) : [0.85, 0.2, 0.6, 1];
-        polys.push({ pts: f.boundary, color: S.comp && f.component === S.comp ? CFG.colors.sel : col }); for (const c of f.corner_points || []) corners.push({ p: c, color: [0.95, 0.5, 0.1, 1], size: CFG.preview.cornerSize }); }
+        polys.push({ pts: f.boundary, color: S.comp && f.component === S.comp ? CFG.colors.sel : col }); for (const c of f.corner_points || []) corners.push({ p: c, color: CFG.colors.corner, size: CFG.preview.cornerSize }); }
       view.setRibbons('faces', polys, { width: CFG.preview.faceWidth, order: 1.5 }); view.setPoints('corners', corners, { order: 9 });
     } else { view.clearLayer('faces'); view.clearLayer('corners'); }
-    renderTags();
+    const fs = S.face && faceOf(S.face.id); if (fs && fs.boundary) view.setRibbons('faceSel', [{ pts: fs.boundary, color: CFG.colors.sel }], { width: CFG.preview.faceWidth * 2, order: 2.6 }); else view.clearLayer('faceSel');
+    renderDoctor(); renderForced(); renderTags();
   }
   function renderTags() {   // 29 October 2026 : name tags of the seeds, an HTML layer over the canvas, hidden when the seed faces away
     const host = $('tags'); if (!host) return; const show = $('pTags').checked, c3 = view.st.mesh ? view.st.mesh.head.bbox : null; let html = '';
@@ -507,7 +574,7 @@
     facesTimer = setTimeout(() => safe(previewFaces)(), CFG.preview.facesDelayMs);
     if ($('pLiveMesh').checked) meshTimer = setTimeout(() => safe(convertToMesh)(), CFG.preview.meshDelayMs);
   }
-  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), face_options: faceOptions() }; }
+  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), face_options: faceOptions(), corners_force: model.doc.corners_force || {} }; }
   async function previewFaces() {
     const seq = ++previewSeq; const t0 = performance.now();
     const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: meshParams() }) });
@@ -515,6 +582,9 @@
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (seq !== previewSeq) return;
     if (!r.ok || res.ok === false) return status('Preview failed : ' + (res.error || r.status), 'error');
     S.faces = res.faces || []; const by = {}; for (const f of S.faces) by[f.status] = (by[f.status] || 0) + 1;
+    S.doctor = { dangling: res.dangling_arcs || [], issues: res.issues || [], euler: res.euler || null, k: S.doctor ? S.doctor.k : null };
+    if (S.face) { const f = faceAt(S.face.p); S.face = f ? { id: f.id, p: S.face.p } : null; }
+    const nd = S.doctor.dangling.filter((id) => model.arc(id)).length; $('doctorInfo').textContent = nd ? nd + ' loose curve(s) in red : N goes to the next one' : 'Every curve borders two faces';
     status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
     renderCompList(); redraw();
   }
@@ -550,12 +620,13 @@
     on('bSelInvert', () => { S.sel = new Set(model.doc.arcs.filter((a) => !S.sel.has(a.id)).map((a) => a.id)); redraw(); });
     on('bCompImport', importSeeds); on('bCompRename', renameComp); on('bCompDelete', deleteComp); on('bCompAdd', () => setTool('seed'));
     on('bCompSkip', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('skip', !(o && o.skip)); schedulePreview(); });
-    on('bCompRotate', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('rotate', ((o && o.rotate) || 0) + 1 & 3); schedulePreview(); });
+    on('bCompRotate', () => cyclePattern(+1));
     on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
     on('bCompCurves', () => { if (!S.comp) return status('Select a component first.'); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).includes(S.comp)).map((a) => a.id)); status(S.sel.size + ' curve(s) border ' + S.comp); redraw(); });
-    for (const id of ['pFaces', 'pTags']) $(id).addEventListener('change', redraw);
+    for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
+    on('bNextProblem', nextProblem); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
