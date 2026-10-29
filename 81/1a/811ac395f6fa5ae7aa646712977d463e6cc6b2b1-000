@@ -34,6 +34,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "corners_force": {},              # {node id: true|false} forces / forbids a corner
     "snap_corner_m": 0.01,            # extra corners : a split closer than this to an existing node uses that node
     "tjunction_tol_m": 0.03,          # a free arc end this close to another arc is a T junction : that arc is split there, both meet in a new node
+    "max_virtual_corners": 2,         # a face that needs more virtual corners than this (rings, round faces without real corners) is skipped
     "min_compactness": 0.08,          # faces thinner than this (area / (perimeter^2 / 4 pi)) are skipped as slivers
     "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
     "corner_min_gap_frac": 0.05,      # ... but never closer than this fraction of the face perimeter to another corner
@@ -41,7 +42,8 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "edge_m": 0.02,                   # target edge length (counts = length / edge_m)
     "min_loop_count": 3,              # a loop arc (both ends on one node) needs at least this many edges
     "harmonic": True,                 # before the relaxation, the interior is solved as a harmonic (Tutte) map with the boundary fixed : unfolds a Coons patch
-    "auto_fallback": True,            # faces of 3, 5 or 6 sides that fail the judge are meshed again as 4 sided patches (face option rotate = 0)
+    "auto_fallback": True,            # faces of 5 or 6 sides that fail the judge are meshed again as 4 sided patches (face option rotate = 0)
+    "tangential": False,              # relaxation moves a vertex along the surface only (the normal part of the Laplacian step is removed) : no jam on creases
     "relax_iters": 30,                # Laplacian relaxation rounds of the interior
     "project_k": 8,                   # nearest triangles (by centroid) tested by the exact point-triangle projection
     "project_every": 3,               # the relaxed interior is re-projected every N rounds (and at the last one)
@@ -450,16 +452,16 @@ class Net:
             if f["status"] != "pending" or r is None: continue
             r = int(r); ci = self._cidx(f); n = len(ci)
             if n >= 5: f["corner_nodes"] = {self.tail(f["he"][ci[(r + round(k * n / 4)) % n]]) for k in range(4)}
-            elif n == 3: self._add_corners(f, pick=r % 3)
-            elif n == 4: f["rot"] = r % 4
+            elif n == 4: f["rot"] = r % 4                              # a triangle has no 4 sided alternative (a flat 4th corner would be a degenerate quad)
         for f in self.faces:
             if f["status"] == "pending" and self._ncorners(f) > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
         for f in self.faces:
             if f["status"] == "pending" and self._ncorners(f) < 3: self._add_corners(f)
         for f in self.faces:
             if f["status"] != "pending": continue
-            n = self._ncorners(f)
+            n = self._ncorners(f); virt = sum(1 for k in self._cidx(f) if self.tail(f["he"][k]) not in self.real_nodes)
             if n < 3: f["status"], f["reason"] = "skipped", "few_corners"
+            elif virt > prm["max_virtual_corners"] and "corners" not in opts.get(f["id"], {}): f["status"], f["reason"] = "skipped", "round_face (%d virtual corners)" % virt
             elif n > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
             else: self._sides(f)
         self.timing["corners"] = time.time() - t
@@ -648,12 +650,15 @@ class Net:
             fixed = np.flatnonzero(self.fixed_v); Lap = (sps.diags(deg) - W).tocsr(); A = Lap[free][:, free].tocsc(); rhs = -(Lap[free][:, fixed] @ P[fixed])
             try: P[free] = spsolve(A, rhs).reshape(len(free), 3)
             except Exception: pass
-        P[free] = self.ref.closest(P[free], guide=G[free])[0]
+        q, ti, _ = self.ref.closest(P[free], guide=G[free]); P[free] = q; N = self.ref.outward(ti, q)
         W = sps.diags(1.0 / np.maximum(deg, 1)) @ W
         iters = prm["relax_iters"]
         for it in range(iters):
-            Pn = W @ P; P[free] = Pn[free]
-            if (it + 1) % prm["project_every"] == 0 or it == iters - 1: P[free] = self.ref.closest(P[free], guide=G[free])[0]
+            Pn = W @ P; D = Pn[free] - P[free]
+            if prm["tangential"]: D = D - (D * N).sum(1)[:, None] * N
+            P[free] = P[free] + D
+            if (it + 1) % prm["project_every"] == 0 or it == iters - 1:
+                q, ti, _ = self.ref.closest(P[free], guide=G[free]); P[free] = q; N = self.ref.outward(ti, q)
         self.timing["conform"] = time.time() - t
 
     # ---- judge
@@ -755,7 +760,7 @@ def _run(doc, params):
 def build(doc, params=None):
     t0 = time.time(); net = _run(doc, params); fallback = []
     if net.prm["auto_fallback"]:                                    # N sided faces (N = 3, 5, 6) that fail the judge : try a 4 sided patch
-        bad = [f["id"] for f in net.faces if f["status"] == "meshed" and not f.get("judge_ok", True) and len(f["sides"]) != 4
+        bad = [f["id"] for f in net.faces if f["status"] == "meshed" and not f.get("judge_ok", True) and len(f["sides"]) in (5, 6)
                and "rotate" not in (net.prm.get("face_options") or {}).get(f["id"], (net.prm.get("face_options") or {}).get(str(f["id"]), {}))]
         if bad:
             p2 = dict(params or {}); fo = {str(k): dict(v) for k, v in (p2.get("face_options") or {}).items()}
@@ -765,6 +770,9 @@ def build(doc, params=None):
             if nfail(net2) < nfail(net): net = net2; fallback = bad
     fr = net.face_report(); st = collections.Counter(f["status"] for f in net.faces)
     stats = dict(net.stats)
+    meshed = [f for f in net.faces if f["status"] == "meshed" or (f.get("quads") and f["status"] == "rejected")]
+    stats.update({"faces_judge_ok": sum(1 for f in net.faces if f.get("judge_ok")), "faces_without_fold": sum(1 for f in meshed if f.get("folded") == 0),
+                  "quads_below_jac_min": int((net.quad_stats["jmin"] < net.prm["jac_min"]).sum()) if getattr(net, "quad_stats", None) else 0})
     stats.update({"faces_total": len(net.faces), "faces_meshed": st.get("meshed", 0), "faces_skipped": st.get("skipped", 0), "faces_infeasible": st.get("infeasible", 0),
                   "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
                   "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
