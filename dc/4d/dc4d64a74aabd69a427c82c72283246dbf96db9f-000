@@ -173,13 +173,17 @@
   // 29 October 2026 : SOURCE OF TRUTH : a new version of the model (OBJ) replaces the reference of both editors (POST /model), then every node and
   // control point is put back on its surface (POST /project with ref = the OBJ) : the lines follow the true shape as the model improves.
   const modelRef = () => model.doc.model_ref || null;
+  function checkModelMatch() {   // 29 October 2026 : a network made on another model than the one shown says so (Use this model aligns them)
+    const shown = (view.st.mesh && view.st.mesh.head.source) || 'v752', made = model.doc.model_ref || 'v752'; $('modelInfo').textContent = 'Model shown : ' + shown + (made !== shown ? '\nThis network was made on ' + made : '');
+    if (made !== shown) status('This network was made on ' + made.split('/').pop() + ' but the model shown is ' + shown.split('/').pop() + ' : type its path and press Use this model to align them.', 'error');
+  }
   async function useModel() {
     const obj = ($('modelPath').value || '').trim(); if (!obj) return status('Type the path of the model (.obj) first.');
     status('Loading ' + obj + ' : reference, views and sheet...');
     const r = await fetch(CFG.files.model, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ obj, views: $('pModelViews').checked }) });
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Model failed : ' + (res.error || r.status), 'error');
     const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json', { cache: 'no-store' }).then((x) => x.json()), fetch(CFG.files.ref + '.bin', { cache: 'no-store' }).then((x) => x.arrayBuffer())]);
-    view.setMesh(head, buf); refGrid = null; loadSheetPlanes(); model.doc.model_ref = res.obj;
+    view.setMesh(head, buf); refGrid = null; loadSheetPlanes(); if (res.obj === 'v752') delete model.doc.model_ref; else model.doc.model_ref = res.obj;   // 29 October 2026 : 'original' goes back to the validated car
     const mv = await snapToSurface(); S.mesh = null; buildMeshLayers();
     status('Source of truth : ' + res.obj.split('/').pop() + ' (' + res.triangles + ' triangles' + (res.views ? ', views ' + res.views : '') + ') ; curves moved onto it : median ' + ((mv && mv.median_m || 0) * 1000).toFixed(1) + ' mm, largest ' + ((mv && mv.max_m || 0) * 100).toFixed(1) + ' cm');
     $('modelInfo').textContent = 'Model : ' + res.obj + '\n' + res.vertices + ' vertices, ' + res.triangles + ' triangles, ' + res.parts + ' parts, ' + res.seconds + ' s';
@@ -580,7 +584,7 @@
   }
   async function loadDoc(url, label) {   // 29 October 2026 : a new document resets the preview and the selected component
     const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) return status(label + ' not found (HTTP ' + r.status + ')', 'error');
-    const doc = await r.json(); model = Z.createModel(doc); model.buildNodeMirror(); S.sel.clear(); S.node = null; S.handle = null; S.dirty = false; S.faces = null; S.comp = null; renderCompList(); status(label + ' loaded : ' + doc.arcs.length + ' curves, ' + doc.nodes.length + ' nodes'); redraw();
+    const doc = await r.json(); model = Z.createModel(doc); model.buildNodeMirror(); setTimeout(checkModelMatch, 0); S.sel.clear(); S.node = null; S.handle = null; S.dirty = false; S.faces = null; S.comp = null; renderCompList(); status(label + ' loaded : ' + doc.arcs.length + ' curves, ' + doc.nodes.length + ' nodes'); redraw();
   }
 
   // ------------------------------------------------------------------ selection info
@@ -949,7 +953,7 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
-    view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
+    view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
     window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();

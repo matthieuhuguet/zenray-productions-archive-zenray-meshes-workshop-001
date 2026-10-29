@@ -35,16 +35,20 @@ def shell_from_obj(V, F, G, names, path):
 
 def run(obj, prm=PARAMS, views=None):
     import ZrlRefMesh as RM, ZrlSheetViews as SV
-    t0 = time.time(); obj = os.path.realpath(obj)
-    if not os.path.isfile(obj): raise FileNotFoundError(obj)
-    V, F, G, names = RM.from_obj(obj); out = {"obj": obj, "vertices": int(len(V)), "triangles": int(len(F)), "parts": len(names)}
+    t0 = time.time(); original = str(obj).strip().lower() in ("original", "v752")   # 29 October 2026 : back to the validated car and its own shell renders
+    if original: P0, F, G, names = RM.from_v752(); V = np.asarray(P0); obj = "v752"
+    else:
+        obj = os.path.realpath(obj)
+        if not os.path.isfile(obj): raise FileNotFoundError(obj)
+        V, F, G, names = RM.from_obj(obj)
+    out = {"obj": obj, "vertices": int(len(V)), "triangles": int(len(F)), "parts": len(names)}
     ref = os.path.join(prm["data"], "ref_mesh"); bdir = os.path.join(prm["data"], "backups"); os.makedirs(bdir, exist_ok=True)
     for ext in (".bin", ".json"):
         if os.path.exists(ref + ext): shutil.copy2(ref + ext, os.path.join(bdir, "ref_mesh_%s%s" % (stamp(), ext)))
-    RM.write(V, F, G, names, ref); out["ref_mesh"] = ref + ".bin"
+    RM.write(V, F, G, names, ref, source=obj); out["ref_mesh"] = ref + ".bin"
     if prm["views"] if views is None else views:
-        os.makedirs(prm["work"], exist_ok=True); sh = shell_from_obj(V, F, G, names, os.path.join(prm["work"], "shell_%s.npz" % stamp()))
-        r = subprocess.run([prm["python"], "-I", "-B", os.path.join(HERE, "ZrlExport.py"), "--skip-lines", "--shell", sh, "--out", prm["data"]], capture_output=True, text=True, timeout=600)
+        os.makedirs(prm["work"], exist_ok=True); extra = [] if original else ["--shell", shell_from_obj(V, F, G, names, os.path.join(prm["work"], "shell_%s.npz" % stamp()))]
+        r = subprocess.run([prm["python"], "-I", "-B", os.path.join(HERE, "ZrlExport.py"), "--skip-lines", "--out", prm["data"]] + extra, capture_output=True, text=True, timeout=600)
         out["views"] = "ok" if r.returncode == 0 else ("failed : " + (r.stderr or r.stdout)[-400:])
         if r.returncode == 0: written, _ = SV.build(dict(SV.PARAMS, views=os.path.join(prm["data"], "views.json"), out_dir=prm["data"])); out["sheet_views"] = sorted(written)
     out["seconds"] = round(time.time() - t0, 1); out["ok"] = True
