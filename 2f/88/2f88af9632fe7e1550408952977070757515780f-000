@@ -1,0 +1,50 @@
+# 29 October 2026 : ZRR visibility survey. EN: renders the body from 26 directions (cube faces, edges, corners) and
+# measures, per part, its visible area and its OUTWARD mean normal (normals of the visible side only), because the
+# parts are closed thin solids whose polygon normals cancel out. FR : relevé de visibilité, normale extérieure par pièce.
+import json, sys, itertools
+import numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts"); sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/retopo")
+import ZrrData as D
+from Raster import Renderer
+
+PARAMS = {"px_per_m": 400.0, "res": 2048, "out": f"{D.ROOT}/work/retopo/visibility.json"}  # 29 October 2026
+
+
+def directions():
+    ds = [np.array(v, float) for v in itertools.product((-1, 0, 1), repeat=3) if any(v)]
+    return [d / np.linalg.norm(d) for d in ds]
+
+
+def survey(car=None, params=PARAMS):
+    car = car or D.load()
+    pm = D.body_poly_mask(car)
+    tri, owner = D.triangulate(car, pm)
+    R = Renderer(car["P"], tri)
+    lo, hi = car["P"].min(0), car["P"].max(0); ctr = (lo + hi) / 2
+    nparts = len(car["names"])
+    nsum = np.zeros((nparts, 3)); cnt = np.zeros(nparts); psum = np.zeros((nparts, 3))
+    for d in directions():
+        rx, uy, tz = D.frame(d)
+        mask, depth, N, fid = R.render(ctr, params["px_per_m"], (rx, uy, tz), params["res"])
+        ok = fid >= 0
+        part = car["T"][owner[fid[ok]]]
+        Nw = N[ok] @ np.stack([rx, uy, tz])          # camera normal (facing viewer) back to world
+        r, c = np.nonzero(ok); res = params["res"]; s = params["px_per_m"]
+        pts = ctr + np.outer((c + 0.5 - res / 2) / s, rx) + np.outer((res / 2 - r - 0.5) / s, uy) + np.outer(depth[ok], tz)
+        np.add.at(nsum, part, Nw); np.add.at(cnt, part, 1); np.add.at(psum, part, pts)
+    R.release()
+    out = {}
+    for i, nm in enumerate(car["names"]):
+        if cnt[i] == 0:
+            continue
+        nn = nsum[i] / (np.linalg.norm(nsum[i]) + 1e-20)
+        out[nm] = {"pixels": int(cnt[i]), "normal": nn.round(4).tolist(), "coherence": round(float(np.linalg.norm(nsum[i]) / cnt[i]), 3),
+                   "centroid": (psum[i] / cnt[i]).round(4).tolist()}
+    json.dump(out, open(params["out"], "w"), indent=1)
+    return out
+
+
+if __name__ == "__main__":
+    o = survey()
+    for k, v in sorted(o.items(), key=lambda kv: -kv[1]["pixels"]):
+        print(f"{k:32s} px {v['pixels']:8d} n {v['normal']} coh {v['coherence']} c {v['centroid']}")

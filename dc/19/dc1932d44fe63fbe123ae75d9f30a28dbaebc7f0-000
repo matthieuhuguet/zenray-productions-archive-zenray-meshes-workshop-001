@@ -1,0 +1,66 @@
+# 29 October 2026 : ZenRay Meshes Retopology (ZRR), data access shared by every ZRR module.
+# EN: loads the frozen validated car (topo npz: P points, C corner counts, I corners, T part per polygon, names),
+# fan-triangulates it for the GPU rasterizer, selects body parts by name patterns, and gives per part frames.
+# FR : accès aux données de la voiture validée, triangulation en éventail, sélection des pièces de caisse par motif.
+import fnmatch, json, os
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {
+    "source_npz": f"{ROOT}/work/car/topo_v752.npz",          # 29 October 2026: frozen validated shape (v752)
+    "exclude": ["*wheel_*", "*susp_*", "*liner_*", "*wheelwell_*", "*under_*", "*closer_*"],  # 29 October 2026
+}
+
+
+def load(path=None):
+    d = np.load(path or PARAMS["source_npz"], allow_pickle=True)
+    P, C, I, T = d["P"], d["C"].astype(np.int64), d["I"].astype(np.int64), d["T"].astype(np.int64)
+    names = [str(n) for n in d["names"]]
+    off = np.concatenate([[0], np.cumsum(C)])
+    return {"P": P, "C": C, "I": I, "T": T, "off": off, "names": names}
+
+
+def triangulate(car, poly_mask=None):
+    """Fan triangulation; returns (tri faces (F,3), tri -> polygon index)."""
+    C, I, off = car["C"], car["I"], car["off"]
+    sel = np.arange(len(C)) if poly_mask is None else np.flatnonzero(poly_mask)
+    tris, owner = [], []
+    for k in np.unique(C[sel]):
+        ps = sel[C[sel] == k]
+        base = off[ps]
+        for j in range(1, k - 1):
+            tris.append(np.stack([I[base], I[base + j], I[base + j + 1]], 1)); owner.append(ps)
+    return np.concatenate(tris), np.concatenate(owner)
+
+
+def part_ids(car, patterns):
+    return [i for i, n in enumerate(car["names"]) if any(fnmatch.fnmatch(n.lower(), p.lower()) for p in patterns)]
+
+
+def body_poly_mask(car, exclude=None):
+    ex = set(part_ids(car, exclude or PARAMS["exclude"]))
+    return ~np.isin(car["T"], list(ex))
+
+
+def poly_normals_areas(car):
+    P, C, I, off = car["P"], car["C"], car["I"], car["off"]
+    n = np.zeros((len(C), 3)); c = np.zeros((len(C), 3))
+    for k in np.unique(C):
+        ps = np.flatnonzero(C == k); base = off[ps]
+        V = np.stack([P[I[base + j]] for j in range(k)], 1)
+        c[ps] = V.mean(1)
+        for j in range(1, k - 1):
+            n[ps] += 0.5 * np.cross(V[:, j] - V[:, 0], V[:, j + 1] - V[:, 0])
+    a = np.linalg.norm(n, axis=1)
+    return n / (a[:, None] + 1e-20), a, c
+
+
+def frame(normal, up_hint=(0.0, 1.0, 0.0)):
+    """Orthonormal view axes (rx, uy, tz) with tz = normal toward the viewer."""
+    tz = np.asarray(normal, float); tz /= np.linalg.norm(tz)
+    up = np.asarray(up_hint, float)
+    if abs(up @ tz) > 0.95:
+        up = np.array([0.0, 0.0, -1.0]) if abs(tz[2]) < 0.95 else np.array([1.0, 0.0, 0.0])
+    rx = np.cross(up, tz); rx /= np.linalg.norm(rx)
+    uy = np.cross(tz, rx)
+    return rx, uy, tz

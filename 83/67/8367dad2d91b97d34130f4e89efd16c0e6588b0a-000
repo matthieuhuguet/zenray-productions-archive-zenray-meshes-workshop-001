@@ -1,0 +1,86 @@
+# 29 October 2026 : ZRR colour map. EN: paints every body component in its own colour (left and right twins share
+# one hue, like ZenRay UV islands) in six orthographic views plus a three-quarter view, with a legend, so the
+# component split can be validated at a glance. FR : carte couleur des composants, six vues et trois quarts.
+import colorsys, json, sys, zlib
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts"); sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/retopo")
+import ZrrData as D
+from Raster import Renderer
+
+PARAMS = {"px_per_m": 260.0, "res": 1400, "out": f"{D.ROOT}/versions/Retopo_ColorMap.png",
+          "views": [("Left", (1, 0, 0)), ("Right", (-1, 0, 0)), ("Front", (0, 0, 1)), ("Back", (0, 0, -1)),
+                    ("Top", (0, 1, 0)), ("Bottom", (0, -1, 0)), ("Three quarter", (0.62, 0.45, 0.64))],
+          "font": "/Users/zenray/Library/Fonts/GT-Standard-L-Standard-Regular.otf"}   # 29 October 2026
+
+
+def base_name(n):
+    b = n.replace("CAR_", "")
+    for s in ("_L", "_R", "_C", "_FL", "_FR", "_RL", "_RR"):
+        if b.endswith(s):
+            return b[: -len(s)]
+    return b
+
+
+def colour(n):
+    h = (zlib.crc32(base_name(n).encode()) % 997) / 997.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.55, 0.92)
+    return np.array([r, g, b]) * 255
+
+
+def render_views(car, labels=None, params=PARAMS, shade=True):
+    pm = D.body_poly_mask(car)
+    tri, owner = D.triangulate(car, pm)
+    R = Renderer(car["P"], tri)
+    lo, hi = car["P"].min(0), car["P"].max(0); ctr = (lo + hi) / 2
+    lab = car["T"] if labels is None else labels
+    cols = np.array([colour(n) for n in car["names"]])
+    tiles = []
+    for title, d in params["views"]:
+        rx, uy, tz = D.frame(np.array(d, float))
+        mask, depth, N, fid = R.render(ctr, params["px_per_m"], (rx, uy, tz), params["res"])
+        img = np.full(mask.shape + (3,), 250.0)
+        ok = fid >= 0
+        part = lab[owner[fid[ok]]]
+        light = 0.55 + 0.45 * np.clip(N[ok] @ np.array([0.3, 0.5, 0.81]), 0, 1) if shade else 1.0
+        img[ok] = cols[part] * (light[:, None] if shade else 1.0)
+        # component borders in dark grey: label changes between neighbours
+        L = np.full(mask.shape, -1); L[ok] = part
+        edge = np.zeros(mask.shape, bool)
+        edge[:-1] |= L[:-1] != L[1:]; edge[:, :-1] |= L[:, :-1] != L[:, 1:]
+        img[edge & ok] = (40, 40, 40)
+        ys, xs = np.nonzero(mask)
+        crop = img[max(ys.min() - 8, 0): ys.max() + 9, max(xs.min() - 8, 0): xs.max() + 9]
+        tiles.append((title, Image.fromarray(crop.astype(np.uint8))))
+    R.release()
+    return tiles
+
+
+def sheet(tiles, legend, out, title):
+    font = ImageFont.truetype(PARAMS["font"], 22); small = ImageFont.truetype(PARAMS["font"], 16)
+    W = 2400; pad = 24; x = pad; y = 70; rowh = 0; placed = []
+    for t, im in tiles:
+        s = min(1.0, 760 / im.width, 520 / im.height); im = im.resize((int(im.width * s), int(im.height * s)), Image.LANCZOS)
+        if x + im.width > W - pad:
+            x = pad; y += rowh + 46; rowh = 0
+        placed.append((t, im, x, y)); x += im.width + pad; rowh = max(rowh, im.height)
+    H = y + rowh + 60 + 22 * ((len(legend) + 5) // 6)
+    S = Image.new("RGB", (W, H), (250, 250, 250)); dr = ImageDraw.Draw(S)
+    dr.text((pad, 20), title, fill=(20, 20, 20), font=font)
+    for t, im, x, y0 in placed:
+        S.paste(im, (x, y0)); dr.text((x, y0 - 28), t, fill=(60, 60, 60), font=small)
+    ly = y + rowh + 40
+    for k, (name, col) in enumerate(legend):
+        cx = pad + (k % 6) * 395; cy = ly + (k // 6) * 22
+        dr.rectangle([cx, cy + 3, cx + 14, cy + 17], fill=tuple(int(v) for v in col)); dr.text((cx + 20, cy), name, fill=(40, 40, 40), font=small)
+    S.save(out)
+    return out
+
+
+if __name__ == "__main__":
+    car = D.load()
+    vis = json.load(open(f"{D.ROOT}/work/retopo/visibility.json"))
+    tiles = render_views(car)
+    seen = sorted({base_name(n) for n in vis}, key=lambda b: -max(v["pixels"] for k, v in vis.items() if base_name(k) == b))
+    legend = [(b, colour("CAR_" + b + "_C")) for b in seen]
+    print(sheet(tiles, legend, PARAMS["out"], "ZenRay Meshes Retopology, components of the validated car v752, 29 October 2026"))
