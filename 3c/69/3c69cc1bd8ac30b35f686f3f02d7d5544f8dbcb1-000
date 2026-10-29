@@ -1,0 +1,319 @@
+"""29 October 2026 : ZenRay Lines TEMPLATES, components recognised on the model and turned into curves whose quads are perfect by construction.
+EN: no hand drawn curve for the parts that are not emergent shapes. Each part of the model is tested against the template library :
+  revolution   the part is unchanged by a rotation about one axis (mean distance of the rotated part to itself under rev_tol of its size) ;
+  radial N     the part is unchanged by a rotation of 360 / N degrees only (spokes) : recognised and reported, built later ;
+The revolution template reads the part's PROFILE (the section by a half plane through the axis, chained into polylines), keeps its corners as
+feature points (plus evenly spaced ones on a smooth loop, at least four), and writes the network a modeller would draw : one PARALLEL circle per
+feature point and SECTORS meridians, every patch a four sided sector (two circle arcs, two profile pieces) with its four corners named, so the
+conversion of ZrlNetMesh gives the lathe grid. Every instance also gets its 2D diagram as SVG (the profile, its features, the sectors).
+    python -I ZrlTemplates.py detect [--ref v752]                        the parts each template recognises
+    python -I ZrlTemplates.py build --parts wheel --out frag.json         the curve network of the recognised parts (name filter)
+    python -I ZrlTemplates.py measure --parts wheel                      build, convert with ZrlNetMesh, print the judge
+    POST /templates {"op": "detect" | "build", ...}                       the same for the 3D editor
+FR : les components qui ne sont pas des formes émergentes reconnus sur le modèle et changés en courbes dont les quads sont parfaits par construction.
+"""
+import argparse, json, math, os, sys, time
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+for p in (HERE, os.path.join(ROOT, "Scripts")):
+    if p not in sys.path: sys.path.insert(0, p)
+
+PARAMS = {   # 29 October 2026 : every tunable value of the library
+    "rev_angles_deg": [7.0, 13.0, 29.0, 61.0],   # test rotations (none a divisor of 360 / N for usual spoke counts)
+    "rev_tol": 0.006,                             # mean distance of the rotated part to its own surface / its diameter, under this = revolution
+    "radial_n": list(range(3, 13)),              # spoke counts tried when the part is not a revolution
+    "radial_tol": 0.006,
+    "min_vertices": 40,
+    "sectors": 16,                                # meridians per revolution part (a multiple of 4 keeps the corners square)
+    "feature_deg": 30.0,                          # a profile turn above this is a parallel (a crease of the part)
+    "feature_merge_m": 0.006,                     # two features closer than this along the profile become one
+    "min_loop_features": 4,
+    "max_band_turn_deg": 40.0,                    # a band of the profile turns at most this much (a sector stays a sector, never wraps around)
+    "arc_samples": 9,
+    "ctrl_step_m": 0.03,
+    "out_dir": f"{ROOT}/work/lines/templates",
+}
+NETMESH = {   # 29 October 2026 : a template network is exact by construction : the doctor's welding and duplicate tolerances go down to a tenth of a millimetre
+    "weld_tol_m": 0.0001, "dup_mid_tol_m": 0.0001, "dup_mean_dist_m": 0.00005, "tjunction_tol_m": 0.0001, "snap_corner_m": 0.0001, "cross_tol_m": 0.00005,
+    "tangent_dist_m": 0.003, "node_normal_band_m": 0.002, "min_compactness": 0.0, "min_arc_len_m": 0.00005, "project_arcs": False, "overlap_check": False,
+    "annulus_check": False, "soft_corners": False, "min_arc_count": 1, "write_obj": False,
+}
+
+
+def load_parts(src="v752"):
+    import ZrlRefMesh as RM
+    P, F, G, names = (RM.from_v752() if str(src).lower() in ("v752", "original") else RM.from_obj(src))
+    return np.asarray(P, float), np.asarray(F, int), np.asarray(G, int), [str(n) for n in names]
+
+
+def frame(a):
+    a = np.asarray(a, float); a = a / np.linalg.norm(a); t = np.array([0.0, 1.0, 0.0]) if abs(a[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(a, t); e1 /= np.linalg.norm(e1); return a, e1, np.cross(a, e1)
+
+
+def rotate(X, c, a, deg):
+    a = a / np.linalg.norm(a); th = math.radians(deg); X = X - c; ca, sa = math.cos(th), math.sin(th)
+    return c + X * ca + np.cross(a, X) * sa + np.outer(X @ a, a) * (1 - ca)
+
+
+def fit(tri, prm=PARAMS):
+    """best axis among the three principal axes through the centroid ; returns (kind, axis, centre, score, n)."""
+    import ZrlNetMesh as NM
+    V = tri.reshape(-1, 3); c = V.mean(0); ref = NM.Ref(tri); diam = float(np.linalg.norm(V.max(0) - V.min(0)))
+    _, _, W = np.linalg.svd(V - c, full_matrices=False); best = None
+    S = V[np.random.default_rng(0).choice(len(V), min(len(V), 1500), replace=False)]
+    for a in W:
+        sc = max(float(ref.closest(rotate(S, c, a, d))[2].mean()) for d in prm["rev_angles_deg"]) / max(diam, 1e-9)
+        if best is None or sc < best[2]: best = (a, c, sc)
+    a, c, sc = best
+    if sc < prm["rev_tol"]: return "revolution", a, c, sc, 0
+    for n in sorted(prm["radial_n"], reverse=True):                     # the finest symmetry : 6 spokes also repeat every 120 degrees
+        s = float(ref.closest(rotate(S, c, a, 360.0 / n))[2].mean()) / max(diam, 1e-9)
+        if s < prm["radial_tol"]: return "radial", a, c, s, n
+    return None, a, c, sc, 0
+
+
+def detect(P, F, G, names, prm=PARAMS, only=None):
+    out = []
+    for i, nm in enumerate(names):
+        if only and not any(o.lower() in nm.lower() for o in only): continue
+        T = F[G == i]
+        if len(np.unique(T)) < prm["min_vertices"]: continue
+        tri = P[T]; kind, a, c, sc, n = fit(tri, prm)
+        if kind: out.append({"part": i, "name": nm, "kind": kind, "axis": np.round(a, 6).tolist(), "centre": np.round(c, 6).tolist(), "score": round(sc, 5), "n": n,
+                             "radius": round(float(np.linalg.norm(np.cross(tri.reshape(-1, 3) - c, a), axis=1).max()), 4)})
+    return out
+
+
+def profile(tri, c, a, e1):
+    """the section of the part by the half plane {c + r e1 + h a, r > 0} : list of (k, 2) polylines in (r, h), chained, each with a closed flag."""
+    n = np.cross(a, e1); d = (tri - c) @ n; segs = []
+    for t, s in zip(tri, d):
+        pts = []
+        for i in range(3):
+            j = (i + 1) % 3
+            if (s[i] > 0) != (s[j] > 0) and s[i] != s[j]: u = s[i] / (s[i] - s[j]); pts.append(t[i] + u * (t[j] - t[i]))
+        if len(pts) == 2:
+            q = np.array(pts) - c; r = q @ e1
+            if (r > 0).all(): segs.append(np.stack([r, q @ a], 1))
+    if not segs: return []
+    key = lambda p: (round(float(p[0]), 6), round(float(p[1]), 6)); adj = {}
+    for k, s in enumerate(segs):
+        for e in (0, 1): adj.setdefault(key(s[e]), []).append((k, e))
+    used = set(); lines = []
+    for k0 in range(len(segs)):
+        if k0 in used: continue
+        used.add(k0); line = [segs[k0][0], segs[k0][1]]
+        for direction in (1, 0):
+            while True:
+                end = line[-1] if direction else line[0]; nxt = [(k, e) for k, e in adj.get(key(end), []) if k not in used]
+                if not nxt: break
+                k, e = nxt[0]; used.add(k); p = segs[k][1 - e]
+                if direction: line.append(p)
+                else: line.insert(0, p)
+        L = np.array(line); closed = len(L) > 3 and np.linalg.norm(L[0] - L[-1]) < 1e-5
+        if closed: L = L[:-1]
+        if len(L) >= 3: lines.append((L, closed))
+    return lines
+
+
+def features(L, closed, prm=PARAMS):
+    """indices of the profile points that carry a parallel : corners above feature_deg, the ends of an open profile, at least four on a loop."""
+    n = len(L); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(np.vstack([L, L[:1]]) if closed else L, axis=0), axis=1))]
+    idx = []
+    for i in range(n):
+        if not closed and i in (0, n - 1): idx.append(i); continue
+        p, q, r = L[i - 1], L[i], L[(i + 1) % n]; u, v = q - p, r - q
+        if np.linalg.norm(u) < 1e-9 or np.linalg.norm(v) < 1e-9: continue
+        ang = math.degrees(math.acos(float(np.clip(u @ v / np.linalg.norm(u) / np.linalg.norm(v), -1, 1))))
+        if ang > prm["feature_deg"]: idx.append(i)
+    tang = np.diff(np.vstack([L, L[:1]]) if closed else L, axis=0); turn, last = 0.0, None        # 29 October 2026 : bands that turn too much are cut
+    for i in range(1, len(tang)):
+        u, v = tang[i - 1], tang[i]
+        if np.linalg.norm(u) < 1e-9 or np.linalg.norm(v) < 1e-9: continue
+        turn += math.degrees(math.acos(float(np.clip(u @ v / np.linalg.norm(u) / np.linalg.norm(v), -1, 1))))
+        if i in idx: turn = 0.0
+        elif turn > prm["max_band_turn_deg"]: idx.append(i); turn = 0.0
+    keep = []
+    for i in sorted(set(idx)):
+        if keep and cum[i] - cum[keep[-1]] < prm["feature_merge_m"] and (closed or i != n - 1): continue
+        keep.append(i)
+    if closed:
+        total = cum[-1]
+        while len(keep) < prm["min_loop_features"]:                  # a smooth loop : add the point farthest (along the profile) from every feature
+            s = sorted(keep) if keep else [0]; gaps = [((cum[s[(k + 1) % len(s)]] - cum[s[k]]) % total or total, s[k]) for k in range(len(s))]
+            g, at = max(gaps); target = (cum[at] + g / 2) % total; keep.append(int(np.argmin(np.abs(cum[:n] - target)))); keep = sorted(set(keep))
+    return sorted(set(keep))
+
+
+def svg(name, L, closed, feats, sectors, path):
+    """the component as a 2D diagram : its profile (r, h) with the parallels, and the polar layout of its sectors."""
+    W, H, m = 520, 260, 20; lo, hi = L.min(0), L.max(0); s = min((W / 2 - 2 * m) / max(hi[0] - lo[0], 1e-6), (H - 2 * m) / max(hi[1] - lo[1], 1e-6))
+    X = lambda p: (m + (p[0] - lo[0]) * s, H - m - (p[1] - lo[1]) * s); pts = " ".join("%.1f,%.1f" % X(p) for p in (np.vstack([L, L[:1]]) if closed else L))
+    dots = "".join('<circle cx="%.1f" cy="%.1f" r="3.5" fill="#d9480f"/>' % X(L[i]) for i in feats); R = H / 2 - m; cx, cy = W * 0.75, H / 2
+    rings = "".join('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="none" stroke="#222" stroke-width="1"/>' % (cx, cy, R * (L[i][0] / max(L[:, 0].max(), 1e-9))) for i in feats)
+    spokes = "".join('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#2f9e44" stroke-width="1"/>' % (cx, cy, cx + R * math.cos(2 * math.pi * j / sectors), cy + R * math.sin(2 * math.pi * j / sectors)) for j in range(sectors))
+    doc = ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d"><rect width="100%%" height="100%%" fill="#fafaf8"/>'
+           '<text x="%d" y="14" font-family="sans-serif" font-size="11">%s : profile (r, h), %d parallels ; %d sectors (29 October 2026)</text>'
+           '<polyline points="%s" fill="none" stroke="#1c7ed6" stroke-width="2"/>%s%s%s</svg>') % (W, H, W, H, m, name, len(feats), sectors, pts, dots, spokes, rings)
+    os.makedirs(os.path.dirname(path), exist_ok=True); open(path, "w").write(doc); return path
+
+
+def build(P, F, G, names, inst, prm=PARAMS):
+    """the network fragment of the revolution instances : nodes, arcs (clamped cubic B-splines), one seed and four named corners per sector patch."""
+    import ZrlSpline as SP
+    nodes, arcs, seeds, copts, svgs = [], [], [], {}, []; M = int(prm["sectors"])
+    def add_node(p): nodes.append({"id": len(nodes), "p": np.round(p, 6).tolist()}); return len(nodes) - 1
+    def add_arc(a, b, pts):
+        pts = SP.clean_polyline(np.asarray(pts, float)); m = max(4, int(round(SP.polyline_length(pts) / prm["ctrl_step_m"])) + 1)
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]; t = np.linspace(0, cum[-1], max(4 * m, 16)); X = np.stack([np.interp(t, cum, pts[:, k]) for k in range(3)], 1)
+        C = SP.fit(X, m); C[0], C[-1] = nodes[a]["p"], nodes[b]["p"]; arcs.append({"id": len(arcs), "a": a, "b": b, "closed": False, "pair": ["", ""], "ctrl": np.round(C, 6).tolist(), "mirror": -1}); return len(arcs) - 1
+    for I in inst:
+        if I["kind"] != "revolution": continue
+        tri = P[F[G == I["part"]]]; c = np.array(I["centre"]); a, e1, e2 = frame(I["axis"]); polys = profile(tri, c, a, e1)
+        if not polys: continue
+        L, closed = max(polys, key=lambda t: len(t[0])); fs = features(L, closed, prm); K = len(fs)
+        if K < 2: continue
+        th = [2 * math.pi * j / M for j in range(M)]; dirs = [math.cos(t) * e1 + math.sin(t) * e2 for t in th]
+        P3 = lambda q, d: c + q[0] * d + q[1] * a
+        nid = {(k, j): add_node(P3(L[fs[k]], dirs[j])) for k in range(K) for j in range(M)}
+        nk = K if closed else K - 1                                            # profile pieces between consecutive features
+        for k in range(nk):
+            i0, i1 = fs[k], fs[(k + 1) % K]; seg = L[i0:i1 + 1] if i1 > i0 else np.vstack([L[i0:], L[:i1 + 1]])
+            for j in range(M): add_arc(nid[(k, j)], nid[((k + 1) % K, j)], [P3(q, dirs[j]) for q in seg])
+        for k in range(K):
+            r, h = L[fs[k]]
+            if r < 1e-4: continue
+            for j in range(M):
+                ts = np.linspace(th[j], th[j] + 2 * math.pi / M, prm["arc_samples"]); add_arc(nid[(k, j)], nid[(k, (j + 1) % M)], [c + r * (math.cos(t) * e1 + math.sin(t) * e2) + h * a for t in ts])
+        for k in range(nk):
+            i0, i1 = fs[k], fs[(k + 1) % K]; seg = L[i0:i1 + 1] if i1 > i0 else np.vstack([L[i0:], L[:i1 + 1]]); mid = seg[len(seg) // 2]
+            for j in range(M):
+                tm = th[j] + math.pi / M; nm = "%s_b%02d_s%02d" % (I["name"].replace("CAR_", ""), k, j)
+                seeds.append({"name": nm, "p": np.round(c + mid[0] * (math.cos(tm) * e1 + math.sin(tm) * e2) + mid[1] * a, 6).tolist()})
+                copts[nm] = {"corners": [nid[(k, j)], nid[(k, (j + 1) % M)], nid[((k + 1) % K, (j + 1) % M)], nid[((k + 1) % K, j)]]}
+        svgs.append(svg(I["name"], L, closed, fs, M, os.path.join(prm["out_dir"], I["name"] + ".svg")))
+    return {"nodes": nodes, "arcs": arcs, "component_seeds": seeds, "component_options": copts, "svgs": svgs}
+
+
+def _resample(seg, n):
+    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))]; t = np.linspace(0, cum[-1], n + 1)
+    return np.stack([np.interp(t, cum, seg[:, k]) for k in range(seg.shape[1])], 1)
+
+
+def lathe(L, closed, fs, c, a, e1, e2, name, prm=PARAMS, edge_m=0.02):
+    """29 October 2026 : the exact conversion of a revolution template : the measured profile turned about the axis, band by band (one band between two
+    feature points, its own edge count), SECTORS x cM angular steps ; an end of the profile on the axis gets a squared disc cap (a 2s x 2s grid mapped
+    on the disc, four valence 3 corners) welded to the first ring, and then every ring uses the cap's boundary angles. Returns P, Q, quad names."""
+    M = int(prm["sectors"]); rmax = float(L[:, 0].max()); cM = max(1, int(round(2 * math.pi * rmax / M / edge_m))); A = M * cM
+    eps = 1e-4 * max(rmax, 1e-9); caps = []
+    if not closed:
+        for end in (0, 1):
+            if (L[0] if end == 0 else L[-1])[0] < eps: caps.append(end)
+    keepL, fs2 = L, list(fs); capprof = {}
+    if caps:                                                             # cut the profile where it leaves the cap region
+        rc = prm.get("cap_frac", 0.35) * rmax; i0, i1 = 0, len(L) - 1
+        if 0 in caps:
+            i0 = int(np.argmax(L[:, 0] >= rc)); capprof[0] = L[:i0 + 1][::-1]
+        if 1 in caps:
+            j = len(L) - 1 - int(np.argmax(L[::-1, 0] >= rc)); i1 = j; capprof[1] = L[j:]
+        keepL = L[i0:i1 + 1]; fs2 = sorted({0, len(keepL) - 1} | {f - i0 for f in fs if i0 < f < i1})
+    bands = []; idx = fs2 + ([fs2[0] + len(keepL)] if closed else [])
+    ext = np.vstack([keepL, keepL]) if closed else keepL
+    for k in range(len(idx) - 1):
+        seg = ext[idx[k]:idx[k + 1] + 1]; n = max(1, int(round(float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum()) / edge_m))); bands.append((k, _resample(seg, n)))
+    prof, band_of = [], []
+    for k, S in bands:
+        for i in range(len(S) - 1): prof.append(S[i]); band_of.append(k)
+    if not closed: prof.append(bands[-1][1][-1])
+    prof = np.array(prof); nP = len(prof)
+    if caps:                                                             # the squared disc : boundary angles of a 2s x 2s grid mapped on the disc
+        s_ = A // 8; g = np.linspace(-1, 1, 2 * s_ + 1); loop = [(g[i], -1.0) for i in range(2 * s_)] + [(1.0, g[i]) for i in range(2 * s_)] + [(g[2 * s_ - i], 1.0) for i in range(2 * s_)] + [(-1.0, g[2 * s_ - i]) for i in range(2 * s_)]
+        sq = lambda u, v: (u * math.sqrt(max(0.0, 1 - v * v / 2)), v * math.sqrt(max(0.0, 1 - u * u / 2)))
+        phis = np.array([math.atan2(*sq(u, v)[::-1]) for u, v in loop]); phis = np.unwrap(phis); phis = phis - phis[0] + math.atan2(*sq(*loop[0])[::-1])
+    else:
+        phis = 2 * math.pi * np.arange(A) / A
+    dirs = np.stack([np.cos(phis), np.sin(phis)], 1); V = []
+    for r, h in prof:
+        for d in dirs: V.append(c + r * (d[0] * e1 + d[1] * e2) + h * a)
+    V = [np.asarray(v) for v in V]; Q, names = [], []; vid = lambda i, t: (i % nP) * A + (t % A)
+    for i in range(nP if closed else nP - 1):
+        for t in range(A): Q.append([vid(i, t), vid(i + 1, t), vid(i + 1, t + 1), vid(i, t + 1)]); names.append("%s_b%02d_s%02d" % (name, band_of[i], t // cM))
+    for end in caps:                                                     # the cap grid, welded to the ring of the cut profile point
+        ring = 0 if end == 0 else nP - 1; cp = capprof[end]; rc = float(prof[ring][0]); rr = cp[:, 0]; hh = cp[:, 1]; o = np.argsort(rr)
+        G2 = {}; s_ = A // 8; g = np.linspace(-1, 1, 2 * s_ + 1); bmap = {}
+        for t, (u, v) in enumerate(loop): bmap[(round(u, 9), round(v, 9))] = vid(ring, t)
+        for iu, u in enumerate(g):
+            for iv, v in enumerate(g):
+                key = (round(u, 9), round(v, 9))
+                if key in bmap: G2[(iu, iv)] = bmap[key]; continue
+                x, y = sq(u, v); rho = rc * math.hypot(x, y); h = float(np.interp(rho, rr[o], hh[o]))
+                V.append(c + rc * (x * e1 + y * e2) + h * a); G2[(iu, iv)] = len(V) - 1
+        for iu in range(2 * s_):
+            for iv in range(2 * s_): Q.append([G2[(iu, iv)], G2[(iu + 1, iv)], G2[(iu + 1, iv + 1)], G2[(iu, iv + 1)]]); names.append("%s_cap%d" % (name, end))
+    return np.array(V), np.array(Q, int), names
+
+
+def mesh_templates(P, F, G, names, inst, prm=PARAMS, edge_m=0.02):
+    """the exact quad mesh of every revolution instance, oriented like the model's own triangles ; returns P, Q, quad names and a report per part."""
+    import ZrlNetMesh as NM, ZrlTutteFill as TF
+    from scipy.spatial import cKDTree
+    allP, allQ, allN, rep = [], [], [], []
+    for I in inst:
+        if I["kind"] != "revolution": continue
+        tri = P[F[G == I["part"]]]; c = np.array(I["centre"]); a, e1, e2 = frame(I["axis"]); polys = profile(tri, c, a, e1)
+        if not polys: continue
+        L, closed = max(polys, key=lambda t: len(t[0])); fs = features(L, closed, prm)
+        V, Q, nm = lathe(L, closed, fs, c, a, e1, e2, I["name"].replace("CAR_", ""), prm, edge_m)
+        nt = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]); nt /= np.maximum(np.linalg.norm(nt, axis=1, keepdims=True), 1e-20)
+        _, k = cKDTree(tri.mean(1)).query(V[Q].mean(1)); qn = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]])
+        flip = (qn * nt[k]).sum(1) < 0; Q[flip] = Q[flip][:, ::-1]                     # the model's orientation
+        J = TF.quad_jacobians(V, Q, nt[k]); _, _, dev = NM.Ref(tri).closest(V)
+        E = np.concatenate([Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]]); Es = np.sort(E, 1); _, cnt = np.unique(Es, axis=0, return_counts=True)
+        rep.append({"part": I["name"], "quads": int(len(Q)), "folded": int((J < 0).sum()), "min_jacobian": round(float(J.min()), 3), "jacobian_p05": round(float(np.percentile(J, 5)), 3),
+                    "below_0.5": int((J < 0.5).sum()), "open_edges": int((cnt == 1).sum()), "non_manifold_edges": int((cnt > 2).sum()), "max_dev_mm": round(float(dev.max()) * 1000, 2), "mean_dev_mm": round(float(dev.mean()) * 1000, 2)})
+        off = sum(len(x) for x in allP); allP.append(V); allQ.append(Q + off); allN += nm
+    if not allP: return np.zeros((0, 3)), np.zeros((0, 4), int), [], rep
+    return np.vstack(allP), np.vstack(allQ), allN, rep
+
+
+def as_doc(frag, src="v752"):
+    return {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"},
+            "nodes": frag["nodes"], "arcs": frag["arcs"], "components": [], "component_seeds": frag["component_seeds"], "component_options": frag["component_options"], "model_ref": src}
+
+
+def measure(frag, src="v752", edge_m=0.02):
+    import ZrlNetMesh as NM
+    t = time.time(); doc = as_doc(frag, src); res = NM.build(doc, dict(NETMESH, ref=src, edge_m=edge_m, component_options=frag["component_options"]))
+    st = res["stats"]; Q = np.array(res["Q"]).reshape(-1, 4); jac = np.array(res.get("quad_jac") or [1.0])
+    return {"faces": len(frag["component_seeds"]), "faces_meshed": st["faces_meshed"], "quads": int(len(Q)), "folded": st["folded_quads"], "min_jacobian": round(float(st["min_jac"]), 3),
+            "below_0.5": st["quads_below_jac_min"], "jacobian_p05": round(float(np.percentile(jac, 5)), 3), "welded": st["welded"], "manifold": st["manifold"], "seconds": round(time.time() - t, 1)}, res
+
+
+def handle(req):
+    """POST /templates : {"op": "detect" | "build", "ref": optional, "parts": optional name filters, "sectors": optional}."""
+    src = req.get("ref") or json.load(open(os.path.join(ROOT, "lines/data/ref_mesh.json"))).get("source") or "v752"
+    prm = dict(PARAMS, **{k: v for k, v in req.items() if k in PARAMS}); P, F, G, names = load_parts(src); inst = detect(P, F, G, names, prm, req.get("parts"))
+    if req.get("op") == "detect": return {"ok": True, "instances": inst}
+    frag = build(P, F, G, names, inst, prm); return {"ok": True, "instances": inst, "fragment": frag}
+
+
+def main():
+    if "--handle" in sys.argv:
+        print(json.dumps(handle(json.loads(sys.stdin.read())))); return
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("op", choices=["detect", "build", "measure"]); ap.add_argument("--ref", default="v752")
+    ap.add_argument("--parts", nargs="*"); ap.add_argument("--out"); ap.add_argument("--sectors", type=int, default=PARAMS["sectors"]); a = ap.parse_args()
+    prm = dict(PARAMS, sectors=a.sectors); P, F, G, names = load_parts(a.ref); t = time.time(); inst = detect(P, F, G, names, prm, a.parts)
+    if a.op == "detect": print(json.dumps({"seconds": round(time.time() - t, 1), "instances": inst}, indent=1)); return
+    frag = build(P, F, G, names, inst, prm)
+    if a.out: json.dump(as_doc(frag, a.ref), open(a.out, "w"))
+    if a.op == "measure":
+        V, Q, nm, rep = mesh_templates(P, F, G, names, inst, prm); tot = {k: sum(r[k] for r in rep) for k in ("quads", "folded", "below_0.5", "open_edges", "non_manifold_edges")}
+        print(json.dumps(dict(tot, parts=len(rep), min_jacobian=min(r["min_jacobian"] for r in rep), max_dev_mm=max(r["max_dev_mm"] for r in rep), per_part=rep, svgs=len(frag["svgs"])), indent=1))
+    else: print(json.dumps({"arcs": len(frag["arcs"]), "nodes": len(frag["nodes"]), "patches": len(frag["component_seeds"]), "svgs": frag["svgs"]}))
+
+
+if __name__ == "__main__":
+    main()
