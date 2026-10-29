@@ -39,7 +39,9 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "soft_corner_deg": 45.0,          # ... a bend turning more than this over the window is a corner
     "cross_tol_m": 0.006,             # 29 October 2026 : two curves passing closer than this away from their nodes cross : both are split there, one node
     "cross_min_deg": 20.0,            # ... only when their directions differ by more than this (below, they overlap : reported, not split)
-    "annulus_check": True,            # 29 October 2026 : a face whose loop contains another piece of the network (an island) is skipped as annulus
+    "annulus_check": True,
+    "overlap_check": True,            # 29 October 2026 : two meshable faces covering the same place (doubled curves) : the named one, else the smaller, is kept
+    "overlap_plane_m": 0.05,          # ... a face's centroid inside the other's loop, this close to its plane            # 29 October 2026 : a face whose loop contains another piece of the network (an island) is skipped as annulus
     "max_virtual_corners": 2,         # a face that needs more virtual corners than this (rings, round faces without real corners) is skipped
     "min_compactness": 0.08,          # faces thinner than this (area / (perimeter^2 / 4 pi)) are skipped as slivers
     "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
@@ -542,6 +544,7 @@ class Net:
             r = int(r); ci = self._cidx(f); n = len(ci)
             if n >= 5: f["corner_nodes"] = {self.tail(f["he"][ci[(r + round(k * n / 4)) % n]]) for k in range(4)}
             elif n == 4: f["rot"] = r % 4                              # a triangle has no 4 sided alternative (a flat 4th corner would be a degenerate quad)
+        if prm.get("overlap_check"): self._overlaps()
         for f in self.faces:
             if f["status"] == "pending" and self._ncorners(f) > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
         for f in self.faces:
@@ -567,6 +570,28 @@ class Net:
             if turn < prm["corner_min_deg"] or v in f["corner_nodes"] or self.force.get(v) is False: continue
             if any(min(abs(pos[k] - c), P - abs(pos[k] - c)) < prm["corner_min_gap_frac"] * P for c in chosen): continue
             f["corner_nodes"].add(v); chosen.append(pos[k])
+
+    def _inside(self, f, p, tol):
+        """29 October 2026 : is point p inside the loop of face f, in the plane of its vector area, within tol of that plane ?"""
+        n = f["vec_area"] / max(np.linalg.norm(f["vec_area"]), 1e-30); e1 = np.cross(n, [1.0, 0.0, 0.0])
+        if np.linalg.norm(e1) < 0.1: e1 = np.cross(n, [0.0, 1.0, 0.0])
+        e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1); d = p - f["centroid"]
+        if abs(d @ n) > tol: return False
+        Q = f["poly"] - f["centroid"]; xs, ys = Q @ e1, Q @ e2; xn, yn = np.roll(xs, -1), np.roll(ys, -1); x, y = d @ e1, d @ e2
+        cr = (ys > y) != (yn > y); xi = xs + (y - ys) * (xn - xs) / np.where(yn != ys, yn - ys, 1e-30)
+        return int(np.sum(cr & (x < xi))) % 2 == 1
+
+    def _overlaps(self):
+        """29 October 2026 : doubled curves make two faces cover the same panel, and both would be meshed. When the centroid of one pending face
+        lies inside the loop of another, the face with a component name is kept (else the smaller), the other is skipped as overlap."""
+        tol = self.prm["overlap_plane_m"]; live = [f for f in self.faces if f["status"] == "pending"]
+        for i, A in enumerate(live):
+            for B in live[i + 1:]:
+                if A["status"] != "pending" or B["status"] != "pending": continue
+                if np.linalg.norm(A["centroid"] - B["centroid"]) > 0.5 * (math.sqrt(A["area"]) + math.sqrt(B["area"])) + tol: continue
+                if not (self._inside(A, B["centroid"], tol) or self._inside(B, A["centroid"], tol)): continue
+                keep, drop = (A, B) if (A.get("component") and not B.get("component")) or (bool(A.get("component")) == bool(B.get("component")) and A["area"] <= B["area"]) else (B, A)
+                drop["status"], drop["reason"] = "skipped", "overlap (face %d)" % keep["id"]; drop["overlaps"] = keep["id"]
 
     def _soft_corners(self, f, target=4):
         """29 October 2026 : a face short of `target` corners looks for real bends INSIDE its curves : a rounded door corner turns 90 degrees over a
