@@ -1,0 +1,46 @@
+"""29 October 2026 : ZenRay Lines TUNE, the automatic tuner of ONE component : every combination of the mini HDA sliders (cut, corners,
+harmonic interior, smoothing wavelength, border band without data) is built in parallel through ZrlBuildOne.py (the same cache the HDA
+reads), judged, ranked (lines passed, then the smallest kink, then the smallest 99th percentile deviation) ; the best combination is
+written into work/lines/components_table.json, so the HDA instance and the assembly pick it up. Nothing is tuned by hand.
+python ZrlTune.py <component> [...]        FR : l'accordeur d'un component : toutes les combinaisons des curseurs, la meilleure gardée."""
+import itertools, json, os, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts/lines")
+import ZrlBuildOne as B1
+PARAMS = {"table": f"{ROOT}/work/lines/components_table.json", "workers": 8, "python": "/Users/zenray/.venvs/zenray-meshes/bin/python",   # 29 October 2026
+          "grid": {"cut": ["voxel", "mbo"], "corners": [4, 3], "harmonic": [0, 1], "fair_cut_m": [0.15, 0.3, 0.6, 1.0], "data_border_m": [0.004, 0.015, 0.03]}}
+
+
+def build(name, prm):
+    p = dict(B1.DEFAULTS); p.update(prm); f = f"{ROOT}/work/lines/hda/{name}_{B1.key(name, p)}.npz"
+    if not os.path.exists(f):
+        subprocess.run([PARAMS["python"], "-I", f"{ROOT}/Scripts/lines/ZrlBuildOne.py", name, json.dumps(p), f], capture_output=True, text=True, timeout=600)
+    if not os.path.exists(f): return p, None
+    j = json.loads(str(np.load(f, allow_pickle=True)["judge"])); return p, j
+
+
+def rank(j):
+    if j is None: return (-1, 0, 0)
+    kink = j.get("kink", {}).get("max_deg", 0) if "per_grid" not in j.get("kink", {}) else max(g["max_deg"] for g in j["kink"]["per_grid"])
+    shape = j.get("shape", {}); p99 = shape.get("p99_mm", 0) if "per_grid" not in shape else max(g.get("p99_mm", 0) for g in shape["per_grid"])
+    return (j["score"]["passed"] / j["score"]["lines"], -kink, -p99)
+
+
+def tune(name):
+    keys = list(PARAMS["grid"]); combos = [dict(zip(keys, v)) for v in itertools.product(*PARAMS["grid"].values())]
+    with ThreadPoolExecutor(PARAMS["workers"]) as ex: res = list(ex.map(lambda c: build(name, c), combos))
+    best = max(res, key=lambda r: rank(r[1]))
+    # 29 October 2026 : second stage, the orthogonal smoothing (Winslow) tried on the best combination only
+    w = dict(best[0]); w["winslow"] = 2; bw = build(name, w)
+    if rank(bw[1]) > rank(best[1]): best = bw
+    table = json.load(open(PARAMS["table"]))
+    old = table.get(name); table[name] = {k: best[0][k] for k in B1.DEFAULTS}; json.dump(table, open(PARAMS["table"], "w"), indent=1)
+    ok = sum(1 for _, j in res if j is not None)
+    return {"component": name, "best_percent": best[1]["score"]["percent"] if best[1] else None, "best": table[name], "built": ok, "of": len(combos),
+            "failed": [k for k, v in best[1].items() if k != "score" and not v["ok"]] if best[1] else None, "was": old}
+
+
+if __name__ == "__main__":
+    for nm in sys.argv[1:]: print(json.dumps(tune(nm)), flush=True)

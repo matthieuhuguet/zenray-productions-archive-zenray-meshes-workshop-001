@@ -1,0 +1,100 @@
+# 29 October 2026 : ZenRay Lines MINI HDA, every component of the car is an instance of ONE digital asset, zrm_component.
+# EN: the asset is a Python SOP that reads its own parameters (component, cut, corners, grid and panel settings), builds the component
+# through ZrlBuildOne.py (cached by the hash of the parameters, so an unchanged component cooks instantly), loads the closed quad panel,
+# tags it (prim attribute "component", detail attributes "score" and "judge") and mirrors a left component onto the right on demand.
+# The master /obj/ZRM_Car_Components holds one instance per component, its parameters taken from the best known build, all merged.
+# FR : chaque component est une instance du même HDA, modifiable par ses curseurs ; le maître les assemble.
+# Use (MCP houdini_hom) : exec(open(this).read()); result = install(); result = master()
+import json, os
+import hou
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : the interface of the HDA pass, one place
+    "hda_file": "/Users/zenray/.claude/skills/zenray-meshes/otls/zrm_component.hda", "type": "zrm_component",
+    "python": "/Users/zenray/.venvs/zenray-meshes/bin/python", "builder": f"{ROOT}/Scripts/lines/ZrlBuildOne.py",
+    "table": f"{ROOT}/work/lines/components_table.json", "master": "/obj/ZRM_Car_Components",
+}
+
+COOK = r'''
+# 29 October 2026 : zrm_component cook : parameters -> cached build -> closed quad panel
+import hashlib, json, os, subprocess
+import numpy as np
+node = hou.pwd(); h = node.parent(); geo = node.geometry()
+name = h.parm("component").evalAsString()
+prm = {"cut": h.parm("cut").evalAsString(), "corners": int(h.parm("corners").evalAsString()), "edge_m": float(h.parm("edge_m").eval()),
+       "fair_cut_m": float(h.parm("fair_cut_m").eval()), "data_border_m": float(h.parm("data_border_m").eval()),
+       "harmonic": int(h.parm("harmonic").eval()), "thickness_m": float(h.parm("thickness_m").eval()), "hem_steps": int(h.parm("hem_steps").eval()),
+       "winslow": int(h.parm("winslow").eval())}
+hp = {k: v for k, v in prm.items() if not (k == "winslow" and not v)}
+key = hashlib.sha1((name + json.dumps(hp, sort_keys=True)).encode()).hexdigest()[:12]
+out = "%ROOT%/work/lines/hda/%s_%s.npz" % (name, key)
+if not os.path.exists(out):
+    r = subprocess.run(["%PY%", "-I", "%BUILDER%", name, json.dumps(prm), out], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or not os.path.exists(out): raise hou.NodeError("build failed : " + (r.stderr or r.stdout)[-600:])
+d = np.load(out, allow_pickle=True); P = d["P"]; Q = d["Q"]; j = json.loads(str(d["judge"]))
+geo.createPoints(P.astype(float).tolist()); geo.createPolygons(Q.tolist(), True)
+geo.addAttrib(hou.attribType.Prim, "component", ""); geo.setPrimStringAttribValues("component", [name] * len(Q))
+geo.addAttrib(hou.attribType.Global, "score", 0.0); geo.setGlobalAttribValue("score", float(j["score"]["percent"]))
+geo.addAttrib(hou.attribType.Global, "judge", ""); geo.setGlobalAttribValue("judge", json.dumps({k: v.get("ok") for k, v in j.items()}))
+h.setComment("%s : %s %%" % (name, j["score"]["percent"])); h.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+'''
+
+
+def _templates():
+    F = hou.FolderParmTemplate
+    comp = F("f_component", "Component", folder_type=hou.folderType.Tabs)
+    comp.addParmTemplate(hou.StringParmTemplate("component", "Component", 1, default_value=("CAR_body_hood_C",), help="29 October 2026 : name of the component in the validated car"))
+    comp.addParmTemplate(hou.MenuParmTemplate("cut", "Cut", ("voxel", "mbo", "raw"), ("Voxel partition (sharp corners)", "MBO cut (smooth borders)", "Own outline of the part (raw)"), default_value=0))
+    comp.addParmTemplate(hou.ToggleParmTemplate("mirror_right", "Mirror onto the right side", default_value=False))
+    grid = F("f_grid", "Grid", folder_type=hou.folderType.Tabs)
+    grid.addParmTemplate(hou.MenuParmTemplate("corners", "Corners", ("4", "3"), ("Four sided grid", "Three grids around a pole of valence 3"), default_value=0))
+    grid.addParmTemplate(hou.FloatParmTemplate("edge_m", "Quad size (m)", 1, default_value=(0.02,), min=0.005, max=0.06))
+    grid.addParmTemplate(hou.FloatParmTemplate("fair_cut_m", "Smoothing wavelength (m)", 1, default_value=(0.30,), min=0.05, max=1.5))
+    grid.addParmTemplate(hou.FloatParmTemplate("data_border_m", "Border band without data (m)", 1, default_value=(0.004,), min=0.0, max=0.06))
+    grid.addParmTemplate(hou.ToggleParmTemplate("harmonic", "Harmonic interior", default_value=False))
+    grid.addParmTemplate(hou.IntParmTemplate("winslow", "Orthogonal smoothing (x 300 Winslow steps)", 1, default_value=(0,), min=0, max=10, help="29 October 2026 : 0 = off"))
+    panel = F("f_panel", "Panel", folder_type=hou.folderType.Tabs)
+    panel.addParmTemplate(hou.FloatParmTemplate("thickness_m", "Thickness (m)", 1, default_value=(0.002,), min=0.0005, max=0.02))
+    panel.addParmTemplate(hou.IntParmTemplate("hem_steps", "Rolled edge steps", 1, default_value=(4,), min=1, max=12))
+    g = hou.ParmTemplateGroup(); g.append(comp); g.append(grid); g.append(panel); return g
+
+
+def install(prm=PARAMS):
+    """29 October 2026 : (re)create the zrm_component definition in its library file."""
+    os.makedirs(os.path.dirname(prm["hda_file"]), exist_ok=True)
+    for d in hou.hda.definitionsInFile(prm["hda_file"]) if os.path.exists(prm["hda_file"]) else []:
+        d.destroy()
+    tmp = hou.node("/obj").createNode("geo", "ZRL_hda_build")
+    sn = tmp.createNode("subnet", "zrm_component_proto")
+    py = sn.createNode("python", "build"); py.parm("python").set(COOK.replace("%ROOT%", ROOT).replace("%PY%", prm["python"]).replace("%BUILDER%", prm["builder"]))
+    mir = sn.createNode("mirror", "mirror_right"); mir.setInput(0, py); mir.parmTuple("dir").set((1, 0, 0))
+    sw = sn.createNode("switch", "mirror_switch"); sw.setInput(0, py); sw.setInput(1, mir); sw.parm("input").setExpression('ch("../mirror_right")')
+    outn = sn.createNode("output", "OUT"); outn.setInput(0, sw); sn.layoutChildren()
+    hda = sn.createDigitalAsset(name=prm["type"], hda_file_name=prm["hda_file"], description="ZenRay Meshes component (29 October 2026)", min_num_inputs=0, max_num_inputs=0)
+    d = hda.type().definition(); d.setParmTemplateGroup(_templates()); d.setComment("29 October 2026 : one component of a ZenRay Meshes model, built from its parameters")
+    d.save(prm["hda_file"], hda); info = {"hda_file": prm["hda_file"], "type": hda.type().name(), "parms": [p.name() for p in d.parmTemplateGroup().entries()]}
+    tmp.destroy(); return info
+
+
+def master(prm=PARAMS, names=None, cook=False):
+    """29 October 2026 : one zrm_component per component, parameters from the best known build ; left ones mirrored onto the right."""
+    table = json.load(open(prm["table"]))
+    if names is None:                                                 # 29 October 2026 : the audit decides : only components that replace a part
+        au = json.load(open(sorted(__import__("glob").glob(f"{ROOT}/work/lines/audit_*.json"))[-1]))
+        names = sorted({(n[:-2] + "_L" if n.endswith("_R") else n) for n, v in au.items() if v["status"] == "replaced"})
+    old = hou.node(prm["master"])
+    if old: old.destroy()
+    g = hou.node("/obj").createNode("geo", prm["master"].split("/")[-1]); merge = g.createNode("merge", "all_components")
+    for k, name in enumerate(names):
+        p = table[name]; n = g.createNode(prm["type"], name.replace("CAR_", "").lower())
+        n.parm("component").set(name); n.parm("cut").set(p["cut"]); n.parm("corners").set("3" if int(p["corners"]) == 3 else "4")
+        for a in ("edge_m", "fair_cut_m", "data_border_m", "thickness_m"): n.parm(a).set(float(p[a]))
+        n.parm("harmonic").set(int(p["harmonic"])); n.parm("hem_steps").set(int(p["hem_steps"])); n.parm("mirror_right").set(1 if name.endswith("_L") else 0)
+        n.parm("winslow").set(int(p.get("winslow", 0)))
+        merge.setInput(k, n)
+    kept = g.createNode("file", "kept_parts_v752"); kept.parm("file").set(f"{ROOT}/work/lines/kept_parts.obj"); merge.setInput(len(names), kept)   # 29 October 2026
+    outn = g.createNode("output", "OUT"); outn.setInput(0, merge); g.layoutChildren(); outn.setDisplayFlag(True); outn.setRenderFlag(True)
+    info = {"master": g.path(), "instances": len(names)}
+    if cook:
+        geo = outn.geometry(); info["prims"] = len(geo.prims()); info["errors"] = {c.name(): list(c.errors())[:1] for c in g.children() if c.errors()}
+    return info

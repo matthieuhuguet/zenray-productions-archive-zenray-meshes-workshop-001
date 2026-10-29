@@ -1,0 +1,41 @@
+"""29 October 2026 : ZenRay Lines BUILD ONE, the cook of the mini HDA zrm_component : ONE component built from its parameters, judged,
+written as a cache file read back by Houdini. The same file is used by the batch (all components at once) and by the HDA (one
+component when a slider moves) ; the cache key is the hash of the parameters, so an unchanged component is never rebuilt.
+EN: python ZrlBuildOne.py <component> '<json params>' <out.npz>        params : cut (voxel | mbo), corners (3 | 4), edge_m,
+fair_cut_m, data_border_m, harmonic, thickness_m, hem_steps.  Output npz : P, Q (closed panel), skin (index grid or -1), judge (json).
+FR : la cuisson du mini HDA : un component construit depuis ses paramètres, jugé, mis en cache pour Houdini."""
+import hashlib, json, os, sys
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig"); sys.path.insert(0, f"{ROOT}/Scripts/lines")
+CUTS = {"voxel": f"{ROOT}/work/retopo/shell.npz", "mbo": f"{ROOT}/work/lines/shell_mbo.npz", "raw": ""}   # 29 October 2026 : raw = the part own outline
+DEFAULTS = {"cut": "voxel", "corners": 4, "edge_m": 0.02, "fair_cut_m": 0.30, "data_border_m": 0.004, "harmonic": 0, "thickness_m": 0.002, "hem_steps": 4, "winslow": 0}
+
+
+def key(name, prm):
+    prm = {k: v for k, v in prm.items() if not (k == "winslow" and not int(v))}   # 29 October 2026 : a new slider left off keeps the old cache keys
+    return hashlib.sha1((name + json.dumps(prm, sort_keys=True)).encode()).hexdigest()[:12]
+
+
+def build(name, prm):
+    import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrRun as RN
+    import RigLib as RL
+    p = dict(Z.PARAMS); p.update({k: prm[k] for k in ("corners", "edge_m", "fair_cut_m", "data_border_m", "thickness_m", "hem_steps")})
+    p["harmonic"] = bool(prm["harmonic"]); p["partition"] = CUTS[prm["cut"]]; p["winslow_iters"] = 300 * int(prm.get("winslow", 0)); Z.PARAMS["partition"] = p["partition"]
+    car = D.load()
+    if int(prm["corners"]) == 3:
+        import ZrlTri as TR
+        tp = dict(TR.PARAMS); tp.update(p); res = TR.build(name, tp, car); j, (Pm, Qm) = TR.judge(res, tp)
+        return Pm, Qm, j
+    res = Z.build(name, p, car, verbose=False); dev = RN.deviation(res, p)
+    j = K.check(res["P"], res["Q"], res["G"], dev=dev, sides=[RL.evaluate(c["CV"], 400) if not c.get("dense") else c["CV"] for c in res["curves"]])
+    return res["P"], res["Q"], j
+
+
+if __name__ == "__main__":
+    name = sys.argv[1]; prm = dict(DEFAULTS); prm.update(json.loads(sys.argv[2]) if len(sys.argv) > 2 else {})
+    out = sys.argv[3] if len(sys.argv) > 3 else f"{ROOT}/work/lines/hda/{name}_{key(name, prm)}.npz"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    P, Q, j = build(name, prm)
+    np.savez(out, P=P, Q=Q, judge=json.dumps(j, default=float), params=json.dumps(prm))
+    print(json.dumps({"component": name, "out": out, "score": j["score"], "failed": [k for k, v in j.items() if k != "score" and not v["ok"]]}))

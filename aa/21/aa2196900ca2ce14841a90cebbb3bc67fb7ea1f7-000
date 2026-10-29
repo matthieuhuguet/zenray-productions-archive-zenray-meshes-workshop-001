@@ -1,0 +1,99 @@
+"""29 October 2026 : ZenRay Lines AUDIT, from a broken model to a finished one, part by part : every part of the validated car (v752) is
+either KEPT (already clean : closed quads, manifold, no folded quad, see ZrlPartAudit.py), REPLACED by its retopology component when
+that component passes the judge at 100 percent (left ones mirrored onto the right), or still TO FIX (its best score is shown).
+Writes work/lines/audit_<tag>.json (status per part), work/lines/car_<tag>.obj and .npz (the assembled car), work/lines/kept_parts.obj
+(v752 parts kept, for the Houdini master) and versions/Lines_Audit_Car_<tag>.png.
+python ZrlAudit.py <tag>        FR : l'audit pièce par pièce : gardée, remplacée à 100 %, ou à finir avec son score."""
+import json, os, sys
+import numpy as np
+from PIL import Image
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/lines")
+import ZrrData as D, ZrrColorMap as CM, ZrlBuildOne as B1
+from Raster import Renderer
+
+PARAMS = {"table": f"{ROOT}/work/lines/components_table.json", "part_audit": f"{ROOT}/work/lines/part_audit.json", "res": 1500, "px_per_m": 280.0,   # 29 October 2026
+          "colours": {"kept": (120, 185, 120), "kept_unfair": (215, 210, 110), "replaced": (90, 140, 230), "repaired": (70, 190, 200), "partial": (240, 150, 60), "broken": (220, 70, 70)},
+          "views": [("Left", (1, 0, 0)), ("Front", (0, 0, 1)), ("Back", (0, 0, -1)), ("Top", (0, 1, 0)), ("Bottom", (0, -1, 0)), ("Three quarter", (0.62, 0.45, 0.64))]}
+
+
+def twin(n):
+    return n[:-2] + "_L" if n.endswith("_R") else n
+
+
+def build_of(name, table):
+    if name not in table: return None
+    p = dict(B1.DEFAULTS); p.update(table[name]); f = f"{ROOT}/work/lines/hda/{name}_{B1.key(name, p)}.npz"
+    if not os.path.exists(f): return None
+    d = np.load(f, allow_pickle=True); return d["P"], d["Q"], json.loads(str(d["judge"]))["score"]["percent"]
+
+
+def audit(tag):
+    car = D.load(); table = json.load(open(PARAMS["table"])); pa = json.load(open(PARAMS["part_audit"])); status = {}
+    parts = []                                                       # (name, P, polys, status)
+    for k, n in enumerate(car["names"]):
+        ps = np.flatnonzero(car["T"] == k)
+        if len(ps) == 0: continue
+        b = build_of(twin(n), table)
+        rp = f"{ROOT}/work/lines/repair/{n}.npz"; rr = np.load(rp, allow_pickle=True) if os.path.exists(rp) else None
+        rclean = rr is not None and json.loads(str(rr["report"]))["clean"]
+        if b is not None and b[2] >= 100.0: st = ("replaced", b[2])          # 29 October 2026 : a 100 % component always wins (fair, not only clean)
+        elif pa.get(n, {}).get("clean") and pa[n].get("fair"): st = ("kept", None)
+        elif pa.get(n, {}).get("clean"): st = ("kept_unfair", None)
+        elif rclean: st = ("repaired", None)
+        elif b is not None: st = ("partial", b[2])
+        else: st = ("broken", None)
+        status[n] = {"status": st[0], "score": st[1]}
+        if st[0] == "repaired":
+            parts.append((n, rr["P"], list(rr["Q"]), st[0])); continue
+        if st[0] == "replaced":
+            P, Q = b[0], b[1]
+            if n.endswith("_R"): P = P * np.array([-1.0, 1.0, 1.0]); Q = Q[:, ::-1]
+            parts.append((n, P, list(Q), st[0]))
+        else:
+            parts.append((n, car["P"], [car["I"][car["off"][p]:car["off"][p + 1]] for p in ps], st[0]))
+    json.dump(status, open(f"{ROOT}/work/lines/audit_{tag}.json", "w"), indent=1)
+    # assembled car : the v752 points once, the replaced parts appended
+    P = [car["P"]]; polys = []; owner = []; stat = []; base = len(car["P"]); names = []
+    for n, Pn, pl, st in parts:
+        names.append(n)
+        if Pn is car["P"]: polys += pl
+        else: polys += [np.asarray(q) + base for q in pl]; P.append(Pn); base += len(Pn)
+        owner += [len(names) - 1] * len(pl); stat += [st] * len(pl)
+    P = np.vstack(P)
+    with open(f"{ROOT}/work/lines/car_{tag}.obj", "w") as f:
+        f.write("# 29 October 2026 ZenRay Meshes car %s\n" % tag); np.savetxt(f, P, fmt="v %.6f %.6f %.6f"); cur = None
+        for q, o in zip(polys, owner):
+            if o != cur: f.write("g %s\n" % names[o]); cur = o
+            f.write("f " + " ".join(str(int(i) + 1) for i in q) + "\n")
+    with open(f"{ROOT}/work/lines/kept_parts.obj", "w") as f:
+        f.write("# 29 October 2026 ZenRay Meshes, every part not replaced by a component (kept, repaired, still to fix)\n"); np.savetxt(f, P, fmt="v %.6f %.6f %.6f"); cur = None
+        for q, o, st in zip(polys, owner, stat):
+            if st == "replaced": continue
+            if o != cur: f.write("g %s\n" % names[o]); cur = o
+            f.write("f " + " ".join(str(int(i) + 1) for i in q) + "\n")
+    return P, polys, np.array(owner), np.array(stat), names, status
+
+
+def board(tag, P, polys, owner, stat, names, status):
+    tri = []; own = []
+    for k, q in enumerate(polys):
+        q = list(q)
+        for j in range(1, len(q) - 1): tri.append((q[0], q[j], q[j + 1])); own.append(k)
+    tri = np.array(tri); own = np.array(own); col = np.array([PARAMS["colours"][s] for s in stat], float)
+    R = Renderer(P, tri, smooth_deg=45.0); ctr = (P.min(0) + P.max(0)) / 2; tiles = []; s = PARAMS["px_per_m"]; res = PARAMS["res"]
+    for t, d in PARAMS["views"]:
+        rx, uy, tz = D.frame(np.array(d, float)); mask, depth, N, fid = R.render(ctr, s, (rx, uy, tz), res); ok = fid >= 0; img = np.full(mask.shape + (3,), 250.0)
+        lam = (0.5 + 0.5 * np.clip(N[ok] @ np.array([0.3, 0.5, 0.81]), 0, 1))[:, None]; img[ok] = col[own[fid[ok]]] * lam
+        a = np.asarray(Image.fromarray(img.astype(np.uint8))); ys, xs = np.nonzero(mask); tiles.append((t, Image.fromarray(a[max(ys.min() - 8, 0):ys.max() + 9, max(xs.min() - 8, 0):xs.max() + 9])))
+    R.release()
+    cnt = {k: sum(1 for v in status.values() if v["status"] == k) for k in PARAMS["colours"]}
+    legend = [(f"kept from v752, clean and fair : {cnt['kept']} parts", PARAMS["colours"]["kept"]), (f"kept, clean but rippled (ripple p99 above 1 degree) : {cnt['kept_unfair']}", PARAMS["colours"]["kept_unfair"]), (f"replaced by a 100 % component : {cnt['replaced']}", PARAMS["colours"]["replaced"]),
+              (f"repaired in place, clean : {cnt['repaired']}", PARAMS["colours"]["repaired"]), (f"retopology below 100 % : {cnt['partial']}", PARAMS["colours"]["partial"]), (f"broken, not handled yet : {cnt['broken']}", PARAMS["colours"]["broken"])]
+    legend += [(f"{n.replace('CAR_', '')}  {v['status']}{'' if v['score'] is None else '  %.1f %%' % v['score']}", PARAMS["colours"][v["status"]]) for n, v in sorted(status.items()) if v["status"] in ("partial", "broken", "replaced", "repaired") and not n.endswith("_R")]
+    return CM.sheet(tiles, legend, f"{ROOT}/versions/Lines_Audit_Car_{tag}.png", f"ZenRay Meshes audit {tag} : {cnt['kept']} kept clean and fair, {cnt['kept_unfair']} clean but rippled, {cnt['replaced']} replaced at 100 %, {cnt['repaired']} repaired, {cnt['partial']} partial, {cnt['broken']} to fix, 29 October 2026")
+
+
+if __name__ == "__main__":
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v003"; A = audit(tag); print(board(tag, *A))
+    print({k: sum(1 for v in A[5].values() if v["status"] == k) for k in PARAMS["colours"]})

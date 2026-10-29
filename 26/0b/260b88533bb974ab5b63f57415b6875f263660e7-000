@@ -80,6 +80,7 @@ def partition_labels(v, car, params):
     if "S" not in _SHELL:
         S = np.load(params["partition"], allow_pickle=True); V, F, lab = S["verts"], S["faces"], S["lab"]
         tl = lab[F]; fl = np.where(tl[:, 1] == tl[:, 2], tl[:, 1], tl[:, 0]); nm = [str(n) for n in S["names"]]
+        if "flab" in S.files: fl = S["flab"]           # 29 October 2026 : exact face labels of the MBO cut (ZenRay Lines)
         _SHELL["S"] = (V, F, np.array([car["names"].index(n) if n in car["names"] else -1 for n in nm])[fl])
     V, F, fpart = _SHELL["S"]; R = Renderer(V, F); mask, depth, N, fid = R.render(v["c3"], v["s"], (v["rx"], v["uy"], v["tz"]), v["res"]); R.release()
     L = np.full(mask.shape, -1); ok = fid >= 0; L[ok] = fpart[fid[ok]]; return L
@@ -233,10 +234,53 @@ def grid(v, field, curves, params):
         cs = [0, nu * 5, (nu + nv) * 5, (2 * nu + nv) * 5]
         G2 = ZC.harmonic_grid(dense, cs, None, nu, nv, params.get("harmonic_cell_m", 0.004))
         okn = np.isfinite(G2).all(-1); inner = okn[1:-1, 1:-1]; P2i = P2[1:-1, 1:-1]; P2i[inner] = G2[1:-1, 1:-1][inner]
+    if params.get("winslow_iters", 0) > 0 and nu > 1 and nv > 1:
+        P2 = winslow(P2, params["winslow_iters"])   # 29 October 2026 : winslow_slide (border nodes sliding) bunched nodes on concave sides, rejected
     H = field(P2[..., 0].ravel(), P2[..., 1].ravel()).reshape(nu + 1, nv + 1)
     inner = to3d(v, P2[1:-1, 1:-1, 0].ravel(), P2[1:-1, 1:-1, 1].ravel(), H[1:-1, 1:-1].ravel()).reshape(nu - 1, nv - 1, 3)
     X[1:-1, 1:-1] = inner
     return X, P2, nu, nv
+
+
+def winslow(P2, iters):
+    """29 October 2026 : Winslow elliptic grid smoothing (Thompson, Thames, Mastin), border fixed : the interior lines tend to meet at
+    right angles, which removes the shear a Tutte or harmonic grid keeps along a side facing a strongly curved side. A step that would
+    fold a quad is refused (the grid never gets worse than the one it starts from)."""
+    X = P2.copy()
+    for _ in range(iters):
+        xe = 0.5 * (X[2:, 1:-1] - X[:-2, 1:-1]); xn = 0.5 * (X[1:-1, 2:] - X[1:-1, :-2])
+        a = (xn ** 2).sum(-1)[..., None]; g = (xe ** 2).sum(-1)[..., None]; b = (xe * xn).sum(-1)[..., None]
+        num = a * (X[2:, 1:-1] + X[:-2, 1:-1]) + g * (X[1:-1, 2:] + X[1:-1, :-2]) - 0.5 * b * (X[2:, 2:] - X[2:, :-2] - X[:-2, 2:] + X[:-2, :-2])
+        Y = X.copy(); Y[1:-1, 1:-1] = num / (2 * (a + g) + 1e-30)
+        if fold_free_2d(Y) <= 0: break
+        X = Y
+    return X
+
+
+def winslow_slide(P2, X, iters, rounds=8):
+    """29 October 2026 : Winslow smoothing with boundary orthogonality : between rounds of interior smoothing, every border node (corners
+    fixed) slides along its own border curve to the foot of the perpendicular from its inner neighbour, so the grid lines meet the
+    border at right angles ; the 3D border point follows by the same curve parameter. Order along a side is kept (monotone)."""
+    nu, nv = P2.shape[0] - 1, P2.shape[1] - 1
+    sides = [(np.s_[:, 0], np.s_[:, 1]), (np.s_[-1, :], np.s_[-2, :]), (np.s_[:, -1], np.s_[:, -2]), (np.s_[0, :], np.s_[1, :])]
+    curves = []
+    for sb, _ in sides:
+        c2 = P2[sb].copy(); c3 = X[sb].copy(); t = np.r_[0, np.cumsum(np.linalg.norm(np.diff(c2, axis=0), axis=1))]; curves.append((c2, c3, t))
+    for r in range(rounds):
+        P2 = winslow(P2, max(1, iters // rounds))
+        for (sb, si), (c2, c3, t) in zip(sides, curves):
+            inner = P2[si]; n = len(c2); tt = np.empty(n)
+            for k in range(n):
+                d = c2[1:] - c2[:-1]; w = np.clip(((inner[k] - c2[:-1]) * d).sum(1) / ((d * d).sum(1) + 1e-30), 0, 1)
+                foot = c2[:-1] + w[:, None] * d; j = int(np.argmin(np.linalg.norm(foot - inner[k], axis=1))); tt[k] = t[j] + w[j] * (t[j + 1] - t[j])
+            tt[0], tt[-1] = t[0], t[-1]; cur = np.array([np.interp(0, [0], [0])]) if False else None
+            old_t = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P2[sb], axis=0), axis=1))]; old_t *= t[-1] / max(old_t[-1], 1e-12)
+            tt = 0.5 * tt + 0.5 * old_t; tt = np.maximum.accumulate(tt); gap = 0.2 * t[-1] / max(n - 1, 1)
+            for k in range(1, n - 1): tt[k] = min(max(tt[k], tt[k - 1] + gap), t[-1] - gap * (n - 1 - k))
+            new2 = np.stack([np.interp(tt, t, c2[:, q]) for q in range(2)], 1); new3 = np.stack([np.interp(tt, t, c3[:, q]) for q in range(3)], 1)
+            Y = P2.copy(); Y[sb] = new2
+            if fold_free_2d(Y) > 0: P2 = Y; X[sb] = new3
+    return winslow(P2, max(1, iters // rounds)), X
 
 
 def fold_free_2d(P2):

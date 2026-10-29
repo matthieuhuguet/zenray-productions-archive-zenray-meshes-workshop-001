@@ -1,0 +1,33 @@
+"""29 October 2026 : ZenRay Lines FAIR, the smoothness of a quad mesh as it is (no grid needed) : at every vertex, the angle between its
+normal and the mean normal of its neighbours ; vertices next to a sharp feature (a neighbour normal more than feature_deg away : rolled
+edges, creases) are left out ; the 99th percentile of the rest is the ripple measure. Ripples and dents raise it, a fair panel keeps it
+low. Used by ZrlPartAudit.py (a kept part must be fair, not only clean).
+python ZrlFair.py selftest        FR : la régularité d'un maillage quad tel quel, ondulations mesurées, arêtes vives exclues."""
+import sys
+import numpy as np
+PARAMS = {"feature_deg": 20.0, "fair_p99_deg": 1.0}   # 29 October 2026
+
+
+def ripple(P, Q):
+    Q = np.asarray(Q, np.int64); n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]])
+    N = np.zeros_like(P); [np.add.at(N, Q[:, k], n) for k in range(4)]; N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-20
+    E = np.unique(np.sort(np.r_[Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]], axis=1), axis=0)
+    acc = np.zeros_like(P); cnt = np.zeros(len(P)); np.add.at(acc, E[:, 0], N[E[:, 1]]); np.add.at(acc, E[:, 1], N[E[:, 0]]); np.add.at(cnt, E[:, 0], 1); np.add.at(cnt, E[:, 1], 1)
+    M = acc / np.maximum(cnt, 1)[:, None]; M /= np.linalg.norm(M, axis=1, keepdims=True) + 1e-20
+    edge_ang = np.degrees(np.arccos(np.clip((N[E[:, 0]] * N[E[:, 1]]).sum(1), -1, 1))); sharp = np.zeros(len(P), bool)
+    big = edge_ang > PARAMS["feature_deg"]; sharp[E[big, 0]] = True; sharp[E[big, 1]] = True
+    a = np.degrees(np.arccos(np.clip((N * M).sum(1), -1, 1)))[~sharp & (cnt > 0)]
+    return float(np.percentile(a, 99)) if len(a) else 0.0
+
+
+def selftest():
+    u = np.linspace(-0.5, 0.5, 51); U, V = np.meshgrid(u, u, indexing="ij"); R = 2.0
+    def grid(Z):
+        P = np.stack([U, V, Z], -1).reshape(-1, 3); G = np.arange(51 * 51).reshape(51, 51)
+        Q = np.array([[G[i, j], G[i + 1, j], G[i + 1, j + 1], G[i, j + 1]] for i in range(50) for j in range(50)]); return P, Q
+    fair = ripple(*grid(-(U ** 2 + V ** 2) / (2 * R))); wavy = ripple(*grid(-(U ** 2 + V ** 2) / (2 * R) + 0.0015 * np.sin(2 * np.pi * U / 0.12)))
+    ok = fair <= PARAMS["fair_p99_deg"] < wavy; print("fair dome p99 %.3f deg, rippled dome (1.5 mm, 12 cm) p99 %.3f deg :" % (fair, wavy), "GREEN" if ok else "RED"); return ok
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["selftest"]: sys.exit(0 if selftest() else 1)

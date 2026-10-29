@@ -1,0 +1,132 @@
+"""29 October 2026 : ZenRay Lines REPAIR, a broken part of the validated car mended IN PLACE, its topology kept : folded or crushed
+quads are untangled by a bounded relaxation (each bad quad pulls its corners toward the mean of their neighbours, every vertex stays
+within max_move_m of where it was), and a part of eight points (a box) is rebuilt as its oriented bounding box. The part is accepted
+only when it is clean (closed quads, manifold, consistent orientation, smallest scaled Jacobian at least jacobian_min) and moved by no
+more than max_move_m. Writes work/lines/repair/<part>.npz (P, Q, report) ; ZrlAudit.py picks it up.
+python ZrlRepair.py <part> [...]        FR : réparer une pièce cassée sur place : quads repliés démêlés, déplacement borné, puis jugée."""
+import json, os, sys
+from collections import Counter, defaultdict
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/lines"); import ZrrData as D, ZrrCheck as K
+PARAMS = {"jacobian_min": 0.3, "max_move_m": 0.004, "iters": 400, "step": 0.35, "out": f"{ROOT}/work/lines/repair",   # 29 October 2026
+          "slide_max_m": 0.03, "slide_iters": 600, "slide_rings": 2, "surface_samples": 7,   # 29 October 2026 : tangential slide on the part itself
+          "fair_max_m": 0.003, "fair_iters": 400, "fair_target_deg": 0.8}   # 29 October 2026 : Taubin fairing in place, features held
+
+
+def part_mesh(car, name):
+    k = car["names"].index(name); ps = np.flatnonzero(car["T"] == k)
+    polys = [car["I"][car["off"][p]:car["off"][p + 1]] for p in ps]; ids = np.unique(np.concatenate(polys)); remap = {int(v): i for i, v in enumerate(ids)}
+    Qs = [[remap[int(v)] for v in q] for q in polys]
+    return car["P"][ids].copy(), (np.array(Qs) if len(set(map(len, Qs))) == 1 else np.array(Qs, dtype=object))
+
+
+def clean_report(P, Q):
+    E = Counter(); Dd = Counter()
+    for q in Q.tolist():
+        for a, b in zip(q, q[1:] + q[:1]): E[(min(a, b), max(a, b))] += 1; Dd[(a, b)] += 1
+    J = K.scaled_jacobian(P, Q)
+    return {"quads": int(len(Q)), "border": sum(1 for c in E.values() if c == 1), "nonmanifold": sum(1 for c in E.values() if c > 2),
+            "repeated_directed": sum(1 for c in Dd.values() if c > 1), "jac_min": round(float(J.min()), 3)}
+
+
+def is_clean(r): return r["border"] == 0 and r["nonmanifold"] == 0 and r["repeated_directed"] == 0 and r["jac_min"] >= PARAMS["jacobian_min"]
+
+
+def obb(P0, Q0):
+    c = P0.mean(0); _, _, Vt = np.linalg.svd(P0 - c); A = Vt; L = (P0 - c) @ A.T; lo, hi = L.min(0), L.max(0)
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]); P = c + corners @ A
+    Q = np.array([[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]])
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]); out = ((P[Q].mean(1) - c) * n).sum(1)
+    Q[out < 0] = Q[out < 0][:, ::-1]; return P, Q
+
+
+def untangle(P0, Q):
+    P = P0.copy(); nb = defaultdict(set)
+    for q in Q.tolist():
+        for a, b in zip(q, q[1:] + q[:1]): nb[a].add(b); nb[b].add(a)
+    nbl = [np.array(sorted(nb[i])) for i in range(len(P))]
+    for it in range(PARAMS["iters"]):
+        J = K.scaled_jacobian(P, Q); bad = np.flatnonzero(J < PARAMS["jacobian_min"] + 0.05)
+        if len(bad) == 0: break
+        vs = np.unique(Q[bad].ravel())
+        for v in vs: P[v] += PARAMS["step"] * (P[nbl[v]].mean(0) - P[v])
+        d = P - P0; m = np.linalg.norm(d, axis=1); over = m > PARAMS["max_move_m"]; P[over] = P0[over] + d[over] * (PARAMS["max_move_m"] / m[over])[:, None]
+    return P
+
+
+def surface_sampler(P0, Q):
+    """29 October 2026 : the part's own surface, densely sampled (7 x 7 per quad, bilinear) : projection = nearest sample."""
+    from scipy.spatial import cKDTree
+    t = np.linspace(0, 1, PARAMS["surface_samples"]); U, V = np.meshgrid(t, t); U = U.ravel(); V = V.ravel()
+    a, b, c, d = (P0[Q[:, k]] for k in range(4))
+    S = (a[:, None] * ((1 - U) * (1 - V))[None, :, None] + b[:, None] * (U * (1 - V))[None, :, None] + c[:, None] * (U * V)[None, :, None] + d[:, None] * ((1 - U) * V)[None, :, None]).reshape(-1, 3)
+    n = np.cross(c - a, d - b); n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20; N = np.repeat(n, len(U), axis=0)
+    tree = cKDTree(S)
+    def proj(X):   # 29 October 2026 : onto the tangent plane of the nearest sample : no two points snap onto one sample
+        k = tree.query(X)[1]; return X - (((X - S[k]) * N[k]).sum(1))[:, None] * N[k]
+    return proj
+
+
+def slide(P0, Q):
+    """29 October 2026 : untangle by sliding ON the surface : the corners of the bad quads (and their rings) move to the mean of their
+    neighbours, then back onto the part's own surface ; the shape stays, only the parametrisation changes."""
+    P = P0.copy(); nb = defaultdict(set)
+    for q in Q.tolist():
+        for a, b in zip(q, q[1:] + q[:1]): nb[a].add(b); nb[b].add(a)
+    nbl = [np.array(sorted(nb[i])) for i in range(len(P))]; proj = surface_sampler(P0, Q)
+    for it in range(PARAMS["slide_iters"]):
+        J = K.scaled_jacobian(P, Q); bad = np.flatnonzero(J < PARAMS["jacobian_min"] + 0.05)
+        if len(bad) == 0: break
+        vs = set(np.unique(Q[bad].ravel()).tolist())
+        for _ in range(PARAMS["slide_rings"] - 1): vs |= set(x for v in list(vs) for x in nbl[v].tolist())
+        vs = np.array(sorted(vs)); M = np.array([P[nbl[v]].mean(0) for v in vs]); P[vs] += PARAMS["step"] * (M - P[vs]); P[vs] = proj(P[vs])
+        d = P - P0; m = np.linalg.norm(d, axis=1); over = m > PARAMS["slide_max_m"]
+        if over.any(): P[over] = proj(P0[over] + d[over] * (PARAMS["slide_max_m"] / m[over])[:, None])
+    return P
+
+
+def fair_in_place(P0, Q):
+    """29 October 2026 : a clean but rippled panel faired IN PLACE : Taubin smoothing (lambda 0.5, mu -0.53) of every vertex away from a
+    sharp feature (rolled edge, crease : a neighbouring normal more than 20 degrees away), each vertex kept within fair_max_m of where it
+    was ; stops when the ripple measure (ZrlFair) reaches fair_target_deg. Topology untouched."""
+    import ZrlFair as FA
+    Q = np.asarray(Q, np.int64); E = np.unique(np.sort(np.r_[Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]], axis=1), axis=0)
+    n = np.cross(P0[Q[:, 2]] - P0[Q[:, 0]], P0[Q[:, 3]] - P0[Q[:, 1]]); N = np.zeros_like(P0); [np.add.at(N, Q[:, k], n) for k in range(4)]
+    N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-20; ang = np.degrees(np.arccos(np.clip((N[E[:, 0]] * N[E[:, 1]]).sum(1), -1, 1)))
+    hold = np.zeros(len(P0), bool); big = ang > FA.PARAMS["feature_deg"]; hold[E[big, 0]] = True; hold[E[big, 1]] = True
+    from scipy.sparse import coo_matrix, diags
+    W = coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(len(P0), len(P0))).tocsr()
+    L = diags(1.0 / np.maximum(np.asarray(W.sum(1)).ravel(), 1)) @ W; P = P0.copy(); r = FA.ripple(P, Q)
+    for it in range(PARAMS["fair_iters"]):
+        for f in (0.5, -0.53):
+            Dl = L @ P - P; Dl[hold] = 0; P = P + f * Dl
+        d = P - P0; m = np.linalg.norm(d, axis=1); over = m > PARAMS["fair_max_m"]; P[over] = P0[over] + d[over] * (PARAMS["fair_max_m"] / m[over])[:, None]
+        if it % 20 == 19:
+            r = FA.ripple(P, Q)
+            if r <= PARAMS["fair_target_deg"]: break
+    return P, r
+
+
+def repair(name, car=None):
+    car = car or D.load(); P0, Q0 = part_mesh(car, name); before = clean_report(P0, Q0); tries = []
+    if len(P0) == 8 and len(Q0) == 6:
+        P, Q = obb(P0, Q0); r = clean_report(P, Q); r["move_mm"] = round(float(np.max(np.min(np.linalg.norm(P0[:, None] - P[None], axis=2), axis=1)) * 1000), 2); tries.append(("obb", P, Q, r))
+    P = untangle(P0, Q0); r = clean_report(P, Q0); r["move_mm"] = round(float(np.linalg.norm(P - P0, axis=1).max() * 1000), 2); tries.append(("untangle", P, Q0, r))
+    if Q0.shape[1] == 4:
+        P = slide(P0, Q0); r = clean_report(P, Q0); r["move_mm"] = round(float(np.linalg.norm(P - P0, axis=1).max() * 1000), 2); r["on_surface"] = True; tries.append(("slide", P, Q0, r))
+    if Q0.shape[1] == 4 and is_clean(before):
+        import ZrlFair as FA
+        P, rp = fair_in_place(P0, Q0); r = clean_report(P, Q0); r["move_mm"] = round(float(np.linalg.norm(P - P0, axis=1).max() * 1000), 2)
+        r["ripple_before_deg"] = round(FA.ripple(P0, Q0), 2); r["ripple_after_deg"] = round(rp, 2)
+        if rp <= FA.PARAMS["fair_p99_deg"]: tries.append(("fair", P, Q0, r))
+    ok = [t for t in tries if is_clean(t[3])]
+    best = min(ok, key=lambda t: t[3]["move_mm"]) if ok else max(tries, key=lambda t: t[3]["jac_min"])
+    rep = {"part": name, "before": before, "method": best[0], "after": best[3], "clean": bool(ok)}
+    os.makedirs(PARAMS["out"], exist_ok=True); np.savez(os.path.join(PARAMS["out"], f"{name}.npz"), P=best[1], Q=best[2], report=json.dumps(rep))
+    return rep
+
+
+if __name__ == "__main__":
+    car = D.load()
+    for nm in sys.argv[1:]: print(json.dumps(repair(nm, car)), flush=True)
