@@ -1,0 +1,126 @@
+"""29 October 2026 : ZenRay Lines, MANNY CHEST at animation retopology level : the curve network a senior tech artist lays on a torso front.
+EN: symmetric layout : the sternum line on x = 0 (sternal notch, bottom of the pectorals, navel), the collarbone line, the armpit line, the lower
+pectoral line that runs from the sternum along the crease up into the armpit, the flank line along the torso silhouette, the waist line. Per side,
+two four sided patches : the pectoral (collarbone, armpit, lower pectoral, sternum) and the abdomen (lower pectoral, flank, waist, linea alba), so
+the loops of the pectoral follow the muscle into the armpit, where the arm loops will join. Every curve is drawn in the front view through the
+landmarks of PARAMS (metres), lifted onto the skin by a front ray cast, then fitted to cubic B-splines ; corners are forced at the eight landmarks.
+The quads come from ZrlNetMesh.build on the model ; the judge measures folds, scaled Jacobian, symmetry, borders on the skin, edge regularity.
+    python -I ZrlMannyChest.py [--edge 0.025]      writes lines/data/manny_chest.json, work/lines/manny/manny_chest.obj and prints the judge
+FR : la mise en page d'un torse par un tech artist senior : sternum, clavicule, aisselle, bas du pectoral jusqu'à l'aisselle, flanc, taille.
+"""
+import argparse, json, os, sys
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlSpline as SP, ZrlRefMesh as RM, ZrlNetMesh as NM
+
+PARAMS = {   # 29 October 2026 : every landmark and setting of the layout, metres in the front view (x to the character's side, y up)
+    "obj": f"{ROOT}/benchmark/gt/manny_character.obj",
+    "out_doc": f"{ROOT}/lines/data/manny_chest.json",
+    "out_obj": f"{ROOT}/work/lines/manny/manny_chest.obj",
+    "edge_m": 0.022,
+    "ctrl_step_m": 0.04,
+    "landmarks": {   # 29 October 2026, v2 : the lower pectoral leaves the sternum level (no cusp) and reaches the side at about 30 degrees, the outer pectoral border follows the pectoral and deltoid groove
+        "notch": [0.0, 1.470], "pec_bottom": [0.0, 1.270], "navel": [0.0, 1.050],
+        "shoulder": [0.165, 1.444], "armpit": [0.150, 1.310], "waist": [0.133, 1.050],
+    },
+    "curves": {   # through points between two landmarks (front view), the landmarks themselves are the ends
+        "collarbone": ["notch", [[0.055, 1.473], [0.120, 1.452]], "shoulder"],
+        "armpit": ["shoulder", [[0.161, 1.385]], "armpit"],
+        "lower_pec": ["pec_bottom", [[0.040, 1.267], [0.085, 1.272], [0.120, 1.290]], "armpit"],
+        "flank": ["armpit", [[0.140, 1.26], [0.129, 1.20], [0.124, 1.15], [0.127, 1.10]], "waist"],
+        "waist": ["waist", [[0.068, 1.050]], "navel"],
+        "sternum_up": ["pec_bottom", [[0.0, 1.37]], "notch"],
+        "linea_alba": ["navel", [[0.0, 1.16]], "pec_bottom"],
+    },
+    "seeds": {"chest_pec": [0.080, 1.370], "chest_abs": [0.065, 1.160]},
+}
+
+
+class FrontCaster:
+    """Front ray cast : the skin point with the largest z under (x, y)."""
+    def __init__(self, obj):
+        V, F, _, _ = RM.from_obj(obj); self.T = V[F]; self.lo = self.T[:, :, :2].min(1); self.hi = self.T[:, :, :2].max(1)
+
+    def __call__(self, x, y):
+        m = (self.lo[:, 0] <= x) & (self.hi[:, 0] >= x) & (self.lo[:, 1] <= y) & (self.hi[:, 1] >= y); T = self.T[m]
+        if not len(T): raise ValueError("no skin under (%.3f, %.3f)" % (x, y))
+        a, b, c = T[:, 0], T[:, 1], T[:, 2]; v0, v1 = b[:, :2] - a[:, :2], c[:, :2] - a[:, :2]; d = v0[:, 0] * v1[:, 1] - v0[:, 1] * v1[:, 0]
+        w = np.array([x, y]) - a[:, :2]; ok = np.abs(d) > 1e-14; d = np.where(ok, d, 1.0)
+        s = (w[:, 0] * v1[:, 1] - w[:, 1] * v1[:, 0]) / d; u = (v0[:, 0] * w[:, 1] - v0[:, 1] * w[:, 0]) / d; hit = ok & (s >= -1e-9) & (u >= -1e-9) & (s + u <= 1 + 1e-9)
+        if not hit.any(): raise ValueError("no skin under (%.3f, %.3f)" % (x, y))
+        z = a[:, 2] + s * (b[:, 2] - a[:, 2]) + u * (c[:, 2] - a[:, 2]); return np.array([x, y, float(z[hit].max())])
+
+
+def catmull(P, step):
+    """2D Catmull-Rom through P, sampled every `step` metres (approximately)."""
+    P = np.asarray(P, float); E = np.vstack([2 * P[0] - P[1], P, 2 * P[-1] - P[-2]]); out = [P[0]]
+    for i in range(1, len(E) - 2):
+        p0, p1, p2, p3 = E[i - 1], E[i], E[i + 1], E[i + 2]; n = max(2, int(np.linalg.norm(p2 - p1) / step) + 1)
+        for t in np.linspace(0, 1, n)[1:]:
+            out.append(0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3))
+    return np.array(out)
+
+
+def build_doc(prm=PARAMS):
+    cast = FrontCaster(prm["obj"]); L = prm["landmarks"]; nodes, arcs, nid = [], [], {}
+    def node(name, side):
+        key = (name, side if L[name][0] != 0 else 0)
+        if key not in nid: x, y = L[name]; nid[key] = len(nodes); nodes.append({"id": len(nodes), "p": cast(side * x if x else 0.0, y).round(6).tolist()})
+        return nid[key]
+    for side in (1, -1):
+        for cname, (a, mid, b) in prm["curves"].items():
+            if L[a][0] == 0 and L[b][0] == 0 and side == -1: continue           # the sternum curves are on x = 0, made once
+            pts2 = [L[a]] + mid + [L[b]]; pts2 = [[side * p[0], p[1]] for p in pts2]
+            S = np.array([cast(x, y) for x, y in catmull(pts2, 0.01)]); m = max(4, int(round(SP.polyline_length(S) / prm["ctrl_step_m"])) + 1)
+            C = SP.fit(S, m); ia, ib = node(a, side), node(b, side); C[0] = nodes[ia]["p"]; C[-1] = nodes[ib]["p"]
+            arcs.append({"id": len(arcs), "a": ia, "b": ib, "closed": False, "pair": ["", ""], "ctrl": np.round(C, 6).tolist(), "mirror": -1, "name": cname + ("_L" if side > 0 else "_R") if L[a][0] or L[b][0] else cname})
+    for i, A in enumerate(arcs):                                         # mirror pairs by their reflected middle control point
+        if not A["name"].endswith("_L"): continue
+        for j, B in enumerate(arcs):
+            if B["name"] == A["name"][:-2] + "_R": A["mirror"], B["mirror"] = j, i
+    seeds = []
+    for nm, (x, y) in prm["seeds"].items():
+        for side, suf in ((1, "_L"), (-1, "_R")): seeds.append({"name": nm + suf, "p": cast(side * x, y).round(6).tolist()})
+    corners = {str(v): True for v in nid.values()}
+    return {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"},
+            "nodes": nodes, "arcs": [{k: v for k, v in a.items() if k != "name"} for a in arcs], "components": [], "component_seeds": seeds, "corners_force": corners, "model_ref": prm["obj"]}
+
+
+def judge(res, ref, prm):
+    P = np.array(res["P"], float).reshape(-1, 3); Q = np.array(res["Q"], int).reshape(-1, 4); st = res["stats"]
+    E = np.concatenate([Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]]); E = np.unique(np.sort(E, 1), axis=0); el = np.linalg.norm(P[E[:, 0]] - P[E[:, 1]], axis=1)
+    X = P[Q]; qe = np.linalg.norm(X - np.roll(X, -1, axis=1), axis=2); aspect = qe.max(1) / np.maximum(qe.min(1), 1e-12)
+    from scipy.spatial import cKDTree
+    side = P[:, 0] > 1e-4; tree = cKDTree(P); d_mir, _ = tree.query(P[side] * np.array([-1.0, 1, 1])) if side.any() else (np.zeros(1), None)
+    edge_faces = {}
+    for q in range(len(Q)):
+        for k in range(4):
+            a, b = sorted((Q[q, k], Q[q, (k + 1) % 4])); edge_faces[(a, b)] = edge_faces.get((a, b), 0) + 1
+    bnd = np.unique(np.array([v for (a, b), n in edge_faces.items() if n == 1 for v in (a, b)], int))
+    _, _, dsurf = ref.closest(P[bnd]) if len(bnd) else (None, None, np.zeros(1))
+    jac = np.array(res.get("quad_jac") or [], float)
+    return {"quads": int(len(Q)), "faces_meshed": st["faces_meshed"], "folded": st["folded_quads"], "min_jacobian": round(float(st["min_jac"]), 3),
+            "quads_below_0.5": st["quads_below_jac_min"], "jacobian_p05": round(float(np.percentile(jac, 5)), 3) if len(jac) else None,
+            "symmetry_max_mm": round(float(d_mir.max()) * 1000, 3), "border_on_skin_max_mm": round(float(dsurf.max()) * 1000, 3),
+            "edge_mean_m": round(float(el.mean()), 4), "edge_cv": round(float(el.std() / el.mean()), 3), "quad_aspect_max": round(float(aspect.max()), 2),
+            "quad_aspect_p95": round(float(np.percentile(aspect, 95)), 2), "welded": st["welded"], "manifold": st["manifold"],
+            "faces": [(f.get("component"), f.get("side_counts"), f.get("folded"), round(float(f.get("min_jac", 0)), 3)) for f in res["faces"] if f.get("quads")]}
+
+
+def run(prm=PARAMS):
+    doc = build_doc(prm); res = NM.build(doc, {"ref": prm["obj"], "edge_m": prm["edge_m"], "write_obj": False, "corners_force": doc["corners_force"], "symmetry_x": True})
+    J = judge(res, NM.load_ref(prm["obj"]), prm)
+    os.makedirs(os.path.dirname(prm["out_obj"]), exist_ok=True); json.dump(doc, open(prm["out_doc"], "w"))
+    return doc, res, J
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--edge", type=float, default=PARAMS["edge_m"]); a = ap.parse_args()
+    prm = dict(PARAMS, edge_m=a.edge); doc, res, J = run(prm); print(json.dumps(J, indent=1))
+
+
+if __name__ == "__main__":
+    main()

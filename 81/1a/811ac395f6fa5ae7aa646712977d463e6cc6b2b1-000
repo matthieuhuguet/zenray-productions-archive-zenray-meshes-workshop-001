@@ -41,6 +41,8 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "cross_min_deg": 20.0,            # ... only when their directions differ by more than this (below, they overlap : reported, not split)
     "cross_split": False,             # 29 October 2026 : False = crossings are reported (issue "crossing"), not split : splitting merged the roof and the windshield away
     "annulus_check": True,
+    "symmetry_x": False,              # 29 October 2026 : True : every vertex averaged with its reflected twin (x -> -x), axis vertices on x = 0 ; exact symmetry
+    "symmetry_tol_m": 0.01,           # ... a twin is the vertex nearest the reflected position, within this distance
     "untangle_iters": 400,            # 29 October 2026 : folded patches get a Winslow pass in their own plane (0 = off) ; kept only when the face folds less
     "overlap_check": True,            # 29 October 2026 : two meshable faces covering the same place (doubled curves) : the named one, else the smaller, is kept
     "overlap_plane_m": 0.05,          # ... a face's centroid inside the other's loop, this close to its plane            # 29 October 2026 : a face whose loop contains another piece of the network (an island) is skipped as annulus
@@ -846,6 +848,17 @@ class Net:
                 q, ti, _ = self.ref.closest(P[free], guide=G[free]); P[free] = q; N = self.ref.outward(ti, q)
         self.timing["conform"] = time.time() - t
 
+    # ---- symmetry : a mirrored network gives a mirrored mesh up to the independent projections ; this makes it exact
+    def symmetrize(self):
+        """29 October 2026 : each vertex and its twin (nearest to its reflection across x = 0, within symmetry_tol_m) take the mean of their mirrored positions ;
+        a vertex that is its own twin (on the axis) gets x = 0. Fixed border vertices are moved too, so the shared borders stay welded."""
+        t = time.time(); self.sym = None
+        if not self.prm.get("symmetry_x") or not len(self.V): self.timing["symmetry"] = time.time() - t; return
+        P = self.V; R = P * np.array([-1.0, 1.0, 1.0]); d, j = cKDTree(P).query(R); ok = (d <= self.prm["symmetry_tol_m"]) & (j[j] == np.arange(len(P))); before = float(d[ok].max()) if ok.any() else 0.0   # mutual twins only
+        Pn = P.copy(); Pn[ok] = 0.5 * (P[ok] + R[j[ok]]); axis = ok & (j == np.arange(len(P))); Pn[axis, 0] = 0.0
+        self.V = Pn; self.sym = {"twins": int(ok.sum()), "unmatched": int((~ok).sum()), "max_gap_before_mm": round(before * 1000, 3)}
+        self.timing["symmetry"] = time.time() - t
+
     # ---- untangle : Winslow in the patch's own plane (Radó-Kneser-Choquet : the inverse harmonic map of a planar domain does not fold)
     def _jac_grid(self, G, n):
         X = self.V[G]; a, b, c, d = X[:-1, :-1], X[1:, :-1], X[1:, 1:], X[:-1, 1:]; J = np.full(a.shape[:2], np.inf)
@@ -886,7 +899,7 @@ class Net:
         t = time.time(); prm = self.prm; P, Q = self.V, self.Q; nq = len(Q); drop = []
         self.quad_stats = {}
         if nq:
-            X = P[Q]; cen = X.mean(1); nm_f = {f["id"]: f["nm"] for f in self.faces}; Gq = np.array([nm_f[i] for i in self.face_of_quad]); n_ref = self.ref.normals_at(cen, guide=Gq)
+            X = P[Q]; cen = X.mean(1); nm_f = {f["id"]: f["nm"] for f in self.faces}; Gq = np.array([nm_f[i] for i in self.face_of_quad]); n_ref = self.ref.normals_at(cen, guide=Gq); n_ref = np.where(((n_ref * Gq).sum(1) > 0)[:, None], n_ref, Gq)   # 29 October 2026 : a normal taken on a back face (crevice, inner layer) is replaced by the face's own orientation
             E = np.linalg.norm(X - np.roll(X, -1, axis=1), axis=2); ratio = E.max(1) / np.maximum(E.min(1), 1e-12)
             J = np.zeros((nq, 4)); ang = np.zeros((nq, 4))
             for j in range(4):
@@ -930,6 +943,18 @@ class Net:
         """{sub arc id: document arc id} for the arcs created by splits (T junctions, virtual corners) : ids of sides that are not in the document."""
         return {aid: A["parent"] for aid, A in self.arcs.items() if A["parent"] != aid}
 
+    def _diag(self, f):
+        """29 October 2026 : the measured reasons a patch folds : side lengths (m), the worst ratio of opposite sides (4 sided), the sharpest corner (interior
+        angle in degrees) and how unequal the quad spacing is from one side to another (length per edge, max over min)."""
+        L = [sum(self.arcs[h[0]]["len"] for h in s if h[0] in self.arcs) for s in f["sides"]]; d = {"side_lengths": [round(x, 3) for x in L]}
+        if len(L) == 4 and min(L) > 0: d["opposite_ratio"] = round(max(L[0] / L[2], L[2] / L[0], L[1] / L[3], L[3] / L[1]), 2)
+        turns = {self.tail(f["he"][k]): t for k, t, _ in f.get("turns", [])}
+        ang = [180.0 - turns[v] for v in (self.tail(h) for h in f["he"]) if v in f["corner_nodes"] and v in turns]
+        if ang: d["min_corner_deg"] = round(min(ang), 1)
+        e = f.get("side_counts") or []
+        if len(e) == len(L) and all(x > 0 for x in e): sp = [l / c for l, c in zip(L, e)]; d["spacing_ratio"] = round(max(sp) / max(min(sp), 1e-9), 2)
+        return d
+
     def face_report(self):
         out = []
         for f in self.faces:
@@ -939,7 +964,9 @@ class Net:
                  "corner_virtual": [v not in self.real_nodes for v in cn], "native_corners": int(f.get("native_corners", len(cn)))}
             if f.get("extra_seeds"): r["extra_seeds"] = f["extra_seeds"]
             if f.get("reflex"): r["reflex_corners"] = f["reflex"]
-            if "sides" in f: r["sides"] = [[h[0] for h in s] for s in f["sides"]]; r["n_sides"] = len(f["sides"])
+            if "sides" in f:
+                r["sides"] = [[h[0] for h in s] for s in f["sides"]]; r["n_sides"] = len(f["sides"])
+                r["diag"] = self._diag(f)                            # 29 October 2026 : why a face may fold, in numbers (read by the editor's problem navigator)
             for k in ("side_counts", "quads", "min_jac", "edge_ratio", "folded", "jac_margin", "judge_ok", "bad_quads", "bad_fraction"):
                 if k in f: r[k] = f[k]
             out.append(r)
@@ -979,7 +1006,7 @@ def write_obj(net, path, name="ZenRayLines"):
 
 def _run(doc, params):
     net = Net(doc, (params or {}).get("ref"), params)
-    net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.untangle(); net.judge(); return net
+    net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.untangle(); net.symmetrize(); net.judge(); return net
 
 
 def build(doc, params=None):
@@ -1005,7 +1032,7 @@ def build(doc, params=None):
                   "quads_below_jac_min": int((net.quad_stats["jmin"] < net.prm["jac_min"]).sum()) if getattr(net, "quad_stats", None) else 0})
     stats.update({"faces_total": len(net.faces), "faces_meshed": st.get("meshed", 0), "faces_skipped": st.get("skipped", 0), "faces_infeasible": st.get("infeasible", 0),
                   "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
-                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "crossings": len(getattr(net, "crossings", [])), "untangled": getattr(net, "untangled", []), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
+                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "crossings": len(getattr(net, "crossings", [])), "untangled": getattr(net, "untangled", []), "symmetry": getattr(net, "sym", None), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
                   "issues_by_kind": dict(collections.Counter(i["kind"] for i in net.issues)), "timing": net.timing})
     if hasattr(net, "count_stats"): stats["count_deviation"] = net.count_stats
     obj_path = latest = None
