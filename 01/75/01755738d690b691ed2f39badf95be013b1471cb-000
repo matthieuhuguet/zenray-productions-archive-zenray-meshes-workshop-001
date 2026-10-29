@@ -1,0 +1,115 @@
+# MILP timing test for the quad-layout edge-count assignment problem (29 October 2026).
+# English: random guillotine T-mesh of rectangles, arcs between nodes, consistency constraints
+# (opposite sides of every patch carry the same number of edges), L1 objective toward real targets.
+# FR : test de temps pour l'affectation des nombres d'aretes (cotes opposes egaux, objectif L1).
+import sys
+import time
+
+import numpy as np
+from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import lil_matrix
+
+
+def split_layout(rng, n_rects):
+    """Random guillotine partition of the unit rectangle into n_rects rectangles."""
+    rects = [(0.0, 0.0, 1.0, 1.0)]
+    while len(rects) < n_rects:
+        i = int(rng.integers(len(rects)))
+        x0, y0, x1, y1 = rects.pop(i)
+        if (x1 - x0) >= (y1 - y0):
+            c = x0 + (x1 - x0) * float(rng.uniform(0.25, 0.75))
+            rects += [(x0, y0, c, y1), (c, y0, x1, y1)]
+        else:
+            c = y0 + (y1 - y0) * float(rng.uniform(0.25, 0.75))
+            rects += [(x0, y0, x1, c), (x0, c, x1, y1)]
+    return rects
+
+
+def build_problem(rects, edge_len):
+    """Return arcs (dict key -> index), lengths, and constraint rows (list of dict idx->coef)."""
+    pts = set()
+    for x0, y0, x1, y1 in rects:
+        for p in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            pts.add((round(p[0], 12), round(p[1], 12)))
+    pts = sorted(pts)
+    arcs = {}
+    lengths = []
+
+    def arc_chain(a, b):
+        # nodes lying on the segment a-b (axis aligned), sorted
+        horizontal = abs(a[1] - b[1]) < 1e-12
+        lo, hi = (min(a[0], b[0]), max(a[0], b[0])) if horizontal else (min(a[1], b[1]), max(a[1], b[1]))
+        on = []
+        for p in pts:
+            if horizontal and abs(p[1] - a[1]) < 1e-12 and lo - 1e-12 <= p[0] <= hi + 1e-12:
+                on.append(p[0])
+            if (not horizontal) and abs(p[0] - a[0]) < 1e-12 and lo - 1e-12 <= p[1] <= hi + 1e-12:
+                on.append(p[1])
+        on = sorted(set(round(v, 12) for v in on))
+        ids = []
+        for u, v in zip(on[:-1], on[1:]):
+            key = ("h", round(a[1], 12), u, v) if horizontal else ("v", round(a[0], 12), u, v)
+            if key not in arcs:
+                arcs[key] = len(arcs)
+                lengths.append(v - u)
+            ids.append(arcs[key])
+        return ids
+
+    rows = []
+    for x0, y0, x1, y1 in rects:
+        bottom = arc_chain((x0, y0), (x1, y0))
+        top = arc_chain((x0, y1), (x1, y1))
+        left = arc_chain((x0, y0), (x0, y1))
+        right = arc_chain((x1, y0), (x1, y1))
+        rows.append({**{i: 1.0 for i in bottom}, **{i: -1.0 for i in top}})
+        rows.append({**{i: 1.0 for i in left}, **{i: -1.0 for i in right}})
+    return arcs, np.array(lengths) / edge_len, rows
+
+
+def solve(n_rects, seed, integer=True, min_count=1, edge_len=0.05):
+    rng = np.random.default_rng(seed)
+    rects = split_layout(rng, n_rects)
+    arcs, targets, rows = build_problem(rects, edge_len)
+    na = len(arcs)
+    # variables: q_0..q_{na-1} (integer), d_0..d_{na-1} (continuous, |q-t|)
+    nv = 2 * na
+    c = np.concatenate([np.zeros(na), np.ones(na)])
+    a_eq = lil_matrix((len(rows), nv))
+    for r, row in enumerate(rows):
+        for i, coef in row.items():
+            a_eq[r, i] = coef
+    # d >= q - t  ->  q - d <= t ; d >= t - q  ->  -q - d <= -t
+    a_ub = lil_matrix((2 * na, nv))
+    ub = np.zeros(2 * na)
+    for i in range(na):
+        a_ub[i, i] = 1.0
+        a_ub[i, na + i] = -1.0
+        ub[i] = targets[i]
+        a_ub[na + i, i] = -1.0
+        a_ub[na + i, na + i] = -1.0
+        ub[na + i] = -targets[i]
+    cons = [
+        LinearConstraint(a_eq.tocsc(), np.zeros(len(rows)), np.zeros(len(rows))),
+        LinearConstraint(a_ub.tocsc(), -np.inf * np.ones(2 * na), ub),
+    ]
+    integrality = np.concatenate([np.ones(na) if integer else np.zeros(na), np.zeros(na)])
+    lb = np.concatenate([np.full(na, float(min_count)), np.zeros(na)])
+    hb = np.concatenate([np.full(na, 200.0), np.full(na, np.inf)])
+    t0 = time.perf_counter()
+    res = milp(c, integrality=integrality, bounds=Bounds(lb, hb), constraints=cons,
+               options={"time_limit": 60.0})
+    dt = time.perf_counter() - t0
+    q = res.x[:na] if res.x is not None else None
+    frac = None if q is None else float(np.max(np.abs(q - np.round(q))))
+    return dict(rects=len(rects), arcs=na, rows=len(rows), ints=na if integer else 0,
+                status=res.status, obj=None if res.fun is None else round(float(res.fun), 3),
+                seconds=round(dt, 4), max_frac=None if frac is None else round(frac, 9),
+                nodes=res.get("mip_node_count"))
+
+
+if __name__ == "__main__":
+    for n_rects in (39, 120, 400, 1000):
+        for integer in (True, False):
+            out = [solve(n_rects, seed, integer=integer) for seed in (1, 2, 3)]
+            print("integer" if integer else "LP-relax", n_rects, out)
+            sys.stdout.flush()

@@ -1,0 +1,191 @@
+"""29 October 2026 : ZenRay Lines TRI PATCH, a component with THREE corners (a pointed window, a sail) made of three quad grids
+around one centre pole of valence 3 (the midpoint pattern of Takayama, Panozzo, Sorkine-Hornung 2014) : no quad is crushed at the
+point, every quad stays square, the three grids share their spokes (welded).
+EN: counts : sides n0, n1, n2 split as p, q, s with n0 = p + s, n1 = q + p, n2 = s + q (n0 + n1 + n2 even) ; spokes r0 = q, r1 = s,
+r2 = p. Each grid : Tutte then harmonic interior in the view plane, lifted on the fair field of the component (ZrrPatch.Field).
+The judge (ZrrCheck) runs on every grid closed as a panel ; at an outline corner sharper than 30 degrees the corner quad is held to
+0.9 sin(angle) (no quad can be squarer than the corner it sits in), every other quad to 0.5.
+python ZrlTri.py <component>        FR : un component à trois coins, trois grilles de quads autour d'un pôle de valence 3."""
+import json, os, sys
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import spsolve
+from PIL import Image, ImageDraw, ImageFont
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrRun as RN, ZrrSheet as S
+import RigLib as RL
+
+PARAMS = {"partition": f"{ROOT}/work/lines/shell_mbo.npz", "corners": 3, "edge_m": 0.02, "harmonic": True,
+          "data_border_m": 0.008, "fair_cut_m": 0.30, "acute_deg": 30.0}   # 29 October 2026
+
+
+def counts(L, e):
+    n = [max(2, int(round(l / e))) for l in L]
+    if sum(n) % 2: k = int(np.argmax(L)); n[k] += 1
+    p, q, s = (n[0] + n[1] - n[2]) // 2, (n[1] + n[2] - n[0]) // 2, (n[0] + n[2] - n[1]) // 2
+    if min(p, q, s) < 1: raise ValueError(f"side counts {n} break the triangle rule")
+    return n, (p, q, s)
+
+
+def plane(v, X): q = X - v["c3"]; return np.stack([q @ v["rx"], q @ v["uy"]], -1)
+
+
+def lift(v, field, P2): return Z.to3d(v, P2[:, 0], P2[:, 1], field(P2[:, 0], P2[:, 1]))
+
+
+def grid4(v, field, B, Rr, T, Ll, params):
+    """Four border samples (3D, on the field) : B c0->c1, Rr c1->c2, T c3->c2, Ll c0->c3 ; interior by Tutte then harmonic, lifted."""
+    nu, nv = len(B) - 1, len(Rr) - 1; X = np.zeros((nu + 1, nv + 1, 3)); X[:, 0] = B; X[:, -1] = T; X[0, :] = Ll; X[-1, :] = Rr
+    P2 = plane(v, X); idx = -np.ones((nu + 1, nv + 1), int); m = (nu - 1) * (nv - 1)
+    if m > 0:
+        idx[1:-1, 1:-1] = np.arange(m).reshape(nu - 1, nv - 1); rows, cols, vals = [], [], []; rhs = np.zeros((m, 2))
+        for i in range(1, nu):
+            for j in range(1, nv):
+                r = idx[i, j]; rows.append(r); cols.append(r); vals.append(4.0)
+                for a, b in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+                    if idx[a, b] >= 0: rows.append(r); cols.append(idx[a, b]); vals.append(-1.0)
+                    else: rhs[r] += P2[a, b]
+        A = coo_matrix((vals, (rows, cols)), shape=(m, m)).tocsc(); P2[1:-1, 1:-1] = np.column_stack([spsolve(A, rhs[:, k]) for k in range(2)]).reshape(nu - 1, nv - 1, 2)
+        if params.get("harmonic"):
+            import ZrrCar as ZC
+            loop = np.vstack([P2[:, 0], P2[-1, 1:], P2[-2::-1, -1], P2[0, -2:0:-1]])
+            dense = np.vstack([loop[k] + np.outer(np.linspace(0, 1, 6)[:-1], loop[(k + 1) % len(loop)] - loop[k]) for k in range(len(loop))])
+            G2 = ZC.harmonic_grid(dense, [0, nu * 5, (nu + nv) * 5, (2 * nu + nv) * 5], None, nu, nv, params.get("harmonic_cell_m", 0.003))
+            ok = np.isfinite(G2).all(-1)[1:-1, 1:-1]; Pi = P2[1:-1, 1:-1]; Pi[ok] = G2[1:-1, 1:-1][ok]
+        X[1:-1, 1:-1] = lift(v, field, P2[1:-1, 1:-1].reshape(-1, 2)).reshape(nu - 1, nv - 1, 3)
+    return X
+
+
+def build(name, params=PARAMS, car=None, vis=None):
+    prm = dict(Z.PARAMS); prm.update(params); car = car or D.load(); vis = vis or json.load(open(f"{ROOT}/work/retopo/visibility.json"))
+    v = Z.component_view(car, name, vis, prm); M = Z.region(v, prm, car); F = Z.Field(v, M, prm)
+    sides, Q2, C2, turns = Z.outline(v, M, F, prm); curves = Z.fair_sides(sides, prm, v, F)
+    L = [c["L"] for c in curves]; n, (p, q, s) = counts(L, prm["edge_m"]); a = [p, q, s]; b = [s, p, q]; r = [q, s, p]
+    Sd = [Z.poly_sample(c["CV"], n[k]) for k, c in enumerate(curves)]                      # side k : c_k -> c_k+1
+    m3 = [Sd[k][a[k]] for k in range(3)]; M2 = plane(v, np.array(m3))
+    # 29 October 2026 : the pole sits where each spoke is as long as its count of edges (r_k edges of edge_m), least squares
+    from scipy.optimize import minimize
+    w = 1.0 / np.array(r, float); O0 = (M2 * w[:, None]).sum(0) / w.sum(); tgt = np.array(r, float) * prm["edge_m"]
+    O2 = minimize(lambda o: float((((np.linalg.norm(M2 - o, axis=1) - tgt) / tgt) ** 2).sum()), O0, method="Nelder-Mead").x
+    if not Z.region is None and not M[tuple(np.clip(np.round(Z.plane_to_px(v, O2[0], O2[1])).astype(int), 0, v["res"] - 1))]: O2 = O0
+    spokes = [None, None, None]
+    kl = int(np.argmax(r))
+    if r[kl] >= 2 * sorted(r)[1]:
+        # 29 October 2026 : a slender triangle : the long spoke runs between the two long sides, at the share of rows of each strip
+        # (transfinite midline), so both strips keep straight even rows ; the pole lands between the two short spokes
+        kn = (kl + 1) % 3; kp = (kl - 1) % 3                                   # long spoke k : sides k (from c_k) and k-1 (to c_k)
+        lo = Sd[kn][::-1][: r[kl] + 1] if False else None
+        A_ = Sd[(kl + 2) % 3]                                                  # placeholder, replaced below
+    else:
+        kl = -1
+    if kl >= 0:
+        # the long spoke starts at m_kl on side kl ; the two long sides are side kl-1 (b part, toward c_kl) and side kl+1 (a part)
+        km, kq = (kl - 1) % 3, (kl + 1) % 3
+        Bs = Sd[km][::-1][: b[km] + 1] if False else None
+        # strip k = kl+1 (corner c_kl+1) has rows a_kl+1 along side kl+1 ... use the generic rule : side kq runs from c_kq, its b part
+        # ends at c_kq+1 = c_km ; side km runs from c_km, its a part ends at m_km ; long portions : side kq b_kq (m_kq -> c_kq+1)
+        # reversed and side km a_km (c_km -> m_km), both of r_kl segments
+        S1 = Sd[kq][a[kq]:][::-1] if len(Sd[kq][a[kq]:]) == r[kl] + 1 else None
+        S2 = Sd[km][: a[km] + 1] if a[km] == r[kl] else None
+        if S1 is None or S2 is None: kl = -1
+    if kl >= 0:
+        rows1 = a[kl]; rows2 = b[kl]; f = rows2 / float(rows1 + rows2)       # m_kl splits side kl : a_kl from c_kl, b_kl to c_kl+1
+        mid = S2 + f * (S1 - S2) if np.linalg.norm(S2[0] - Sd[kl][0]) < np.linalg.norm(S1[0] - Sd[kl][0]) else S1 + f * (S2 - S1)
+        mid = lift(v, F, plane(v, mid)); mid[0] = m3[kl]; spokes[kl] = mid
+        O = mid[-1].copy()
+    else:
+        O = lift(v, F, O2[None])[0]
+    for k in range(3):
+        if spokes[k] is None:
+            P2 = np.linspace(plane(v, m3[k][None])[0], plane(v, O[None])[0], r[k] + 1); X = lift(v, F, P2); X[0] = m3[k]; spokes[k] = X
+        spokes[k][-1] = O
+    grids = []
+    for k in range(3):
+        km = (k - 1) % 3
+        B = Sd[k][: a[k] + 1]; Rr = spokes[k]; T = spokes[km]; Ll = Sd[km][::-1][: b[km] + 1]
+        assert len(B) == len(T) and len(Rr) == len(Ll), (k, len(B), len(T), len(Rr), len(Ll))
+        grids.append(grid4(v, F, B, Rr, T, Ll, prm))
+    angles = [180.0 - float(np.degrees(t)) for t in turns]
+    return dict(view=v, M=M, field=F, curves=curves, grids=grids, n=n, pqs=(p, q, s), angles=angles, info={"component": name, "sides": n, "pqs": [p, q, s], "corner_angle_deg": [round(x, 1) for x in angles], "side_lengths_m": [round(x, 3) for x in L]})
+
+
+def merge(grids):
+    P = []; Q = []; base = 0; key = {}
+    ids_all = []
+    for X in grids:
+        nu, nv = X.shape[0] - 1, X.shape[1] - 1; ids = np.zeros((nu + 1, nv + 1), np.int64)
+        for i in range(nu + 1):
+            for j in range(nv + 1):
+                kk = tuple(np.round(X[i, j], 9))
+                if kk not in key: key[kk] = len(P); P.append(X[i, j])
+                ids[i, j] = key[kk]
+        Q += [[ids[i, j], ids[i + 1, j], ids[i + 1, j + 1], ids[i, j + 1]] for i in range(nu) for j in range(nv)]; ids_all.append(ids)
+    return np.array(P), np.array(Q, np.int64), ids_all
+
+
+def judge(res, prm):
+    v = res["view"]; out = {"grids": []}; allE = []
+    for k, X in enumerate(res["grids"]):
+        P, Q, G = Z.panel(X, v["tz"], prm); dev = RN.deviation({"view": v, "X": X, "M": res["M"]}, prm)
+        jmin = min(0.5, 0.9 * np.sin(np.radians(res["angles"][k]))) if res["angles"][k] < prm["acute_deg"] else 0.5
+        kp = dict(K.PARAMS); kp["jacobian_min"] = jmin
+        j = K.check(P, Q, G, dev=dev, params=kp)
+        S_ = np.array([[G[i, jj], G[i + 1, jj], G[i + 1, jj + 1], G[i, jj + 1]] for i in range(G.shape[0] - 1) for jj in range(G.shape[1] - 1)])
+        Jq = K.scaled_jacobian(P, S_); Jq[0] = 1.0                                                   # quad (0, 0) sits in the outline corner
+        j["jacobian_off_corner"] = {"ok": bool(Jq.min() >= 0.5), "min": round(float(Jq.min()), 3)}
+        out["grids"].append(j)
+        allE.append(np.r_[np.linalg.norm(np.diff(X, axis=0), axis=-1).ravel(), np.linalg.norm(np.diff(X, axis=1), axis=-1).ravel()])
+    E = np.concatenate(allE); er = float(E.max() / E.min())
+    Pm, Qm, _ = merge(res["grids"])
+    from collections import Counter
+    und = Counter()
+    for qq in Qm.tolist():
+        for t in range(4): und[(min(qq[t], qq[(t + 1) % 4]), max(qq[t], qq[(t + 1) % 4]))] += 1
+    inc = Counter(Qm.ravel().tolist()); bnd = set(x for e, c in und.items() if c == 1 for x in e)
+    poles = {vv: c for vv, c in inc.items() if vv not in bnd and c != 4}
+    sides_ok = [bool(RL and __import__("CurveFair").check_polyline(c["CV"], 1)["ok"]) for c in res["curves"]]
+    out["whole"] = {"edge_ratio": {"ok": er <= K.PARAMS["edge_ratio_max"], "ratio": round(er, 3)}, "manifold": {"ok": max(und.values()) <= 2},
+                    "poles": {"ok": len(poles) == 1 and list(poles.values()) == [3], "interior_irregular": {int(a): int(c) for a, c in poles.items()}},
+                    "side_fair": {"ok": all(sides_ok), "sides": sides_ok}}
+    lines = {}
+    for name in ("quads_only", "closed", "oriented", "one_shell", "no_degenerate", "valence", "jacobian", "jacobian_off_corner", "fold", "kink", "iso_fair", "shape"):
+        oks = [g[name]["ok"] for g in out["grids"] if name in g]; lines[name] = {"ok": all(oks), "per_grid": [g[name] for g in out["grids"] if name in g]}
+    lines.update(out["whole"]); passed = sum(1 for x in lines.values() if x["ok"])
+    lines["score"] = {"passed": passed, "lines": len(lines), "percent": round(100.0 * passed / len(lines), 1), "ok": passed == len(lines)}
+    return lines, (Pm, Qm)
+
+
+def board(res, j, merged, out, title, car):
+    P, Q = merged; v = res["view"]; rs = S.PARAMS["tile"]; T = S.tris(Q); A = (v["rx"], v["uy"], v["tz"]); c, s = S.fit(P, A, rs)
+    sh, dep, _ = S.view(P, T, A, c, s, rs); E = sorted({(min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4])) for q in Q.tolist() for k in range(4)})
+    t1 = S.wire(sh, P, E, A, c, s, rs, dep)
+    a_, b_ = S.PARAMS["tilt"]; d = v["tz"] + a_ * v["uy"] + b_ * v["rx"]; Ao = D.frame(d / np.linalg.norm(d)); co, so = S.fit(P, Ao, rs)
+    t2, _, _ = S.view(P, T, Ao, co, so, rs, zebra=True)
+    pid = car["names"].index(res["info"]["component"]); To, _ = D.triangulate(car, car["T"] == pid); t3, _, _ = S.view(car["P"], To, Ao, co, so, rs, zebra=True)
+    f = ImageFont.truetype(S.PARAMS["font"], 24); fs = ImageFont.truetype(S.PARAMS["font"], 19); fn = ImageFont.truetype(S.PARAMS["num_font"], 19)
+    W = 3 * rs + 80; H = rs + 160 + 26 * (len(j) + 1); Im = Image.new("RGB", (W, H), (248, 248, 248)); dr = ImageDraw.Draw(Im); dr.text((20, 16), title, fill=(20, 20, 20), font=f)
+    for k, (t, cap) in enumerate(((t1, "New skin : three quad grids around one pole of valence 3"), (t2, "New skin, reflection lines (zebra)"), (t3, "Old part of v752, same view, same zebra"))):
+        x0 = 20 + k * (rs + 20); Im.paste(Image.fromarray(t.astype(np.uint8)), (x0, 86)); dr.text((x0, 60), cap, fill=(70, 70, 70), font=fs)
+    y = rs + 110
+    for k, val in j.items():
+        extra = ", ".join(f"{a} {b}" for a, b in val.items() if a not in ("ok", "per_grid") and not isinstance(b, (dict, list)))
+        if "per_grid" in val: extra = " | ".join(", ".join(f"{a} {b}" for a, b in g.items() if a != "ok" and not isinstance(b, (dict, list))) for g in val["per_grid"])[:160]
+        dr.text((20, y), ("PASS  " if val["ok"] else "FAIL  ") + k, fill=(30, 120, 60) if val["ok"] else (190, 40, 40), font=fs); dr.text((330, y), extra, fill=(60, 60, 60), font=fn); y += 26
+    Im.save(out); return out
+
+
+def run(name, params=PARAMS):
+    Z.PARAMS.update({"partition": params["partition"]}); car = D.load(); prm = dict(Z.PARAMS); prm.update(params)
+    res = build(name, params, car); j, merged = judge(res, prm)
+    d = os.path.join(f"{ROOT}/work/lines/components", name); os.makedirs(d, exist_ok=True)
+    np.savez(os.path.join(d, "skin.npz"), P=merged[0], Q=merged[1], info=json.dumps(res["info"]))
+    json.dump({"info": res["info"], "judge": j}, open(os.path.join(d, "judge.json"), "w"), indent=1, default=float)
+    out = board(res, j, merged, f"{ROOT}/versions/Lines_{name}.png", f"ZenRay Lines, {name}, tri patch {res['info']['sides']} (pole of valence 3), score {j['score']['percent']} %, 29 October 2026", car)
+    return res, j, out
+
+
+if __name__ == "__main__":
+    for nm in sys.argv[1:]:
+        res, j, out = run(nm)
+        print(nm, j["score"], res["info"], "failed", [k for k, x in j.items() if k != "score" and not x["ok"]], out, flush=True)

@@ -1,0 +1,114 @@
+# PolyFill "Quadrilateral Grid" probe, Houdini 22.0.368 headless (29 October 2026).
+# English: builds an open mesh with one hole (a ring of quads around a closed boundary loop), fills it
+# with polyfill fillmode=gridquads, reports quad count, valence histograms, boundary preservation and
+# the distance to a discrete Coons patch. Run it through the houdini_hom MCP tool (target=headless)
+# or hython. FR : sonde PolyFill grille de quads, comptes de cotes valides ou non.
+import hou
+import numpy as np
+
+SRC = '''
+import hou, math
+g = hou.pwd().geometry()
+counts = %s
+n = counts
+def F(u, v):
+    z = 0.25*u*v + 0.12*math.sin(math.pi*u/2.0)*(1.0 if v < 0.5 else 0.0) + 0.10*math.sin(math.pi*v)*(1.0 if u > 1.0 else 0.0)
+    return (u, v, z)
+P = []
+for i in range(n[0]): P.append(F(2.0*i/n[0], 0.0))
+for j in range(n[1]): P.append(F(2.0, 1.0*j/n[1]))
+for i in range(n[2]): P.append(F(2.0-2.0*i/n[2], 1.0))
+for j in range(n[3]): P.append(F(0.0, 1.0-1.0*j/n[3]))
+if len(n) == 5:   # pentagon outline
+    P = []
+    M5 = sum(n)
+    for k in range(M5):
+        a = 2*math.pi*k/M5
+        P.append((math.cos(a), math.sin(a), 0.1*math.cos(2*a)))
+M = len(P)
+cx, cy = (0.0, 0.0) if len(n) == 5 else (1.0, 0.5)
+pts = [g.createPoint() for _ in range(M)]
+for p, pos in zip(pts, P): p.setPosition(hou.Vector3(pos))
+Q = []
+for (x, y, z) in P:
+    dx, dy = x-cx, y-cy
+    d = math.hypot(dx, dy) or 1.0
+    Q.append((x+0.3*dx/d, y+0.3*dy/d, z))
+qpts = [g.createPoint() for _ in range(M)]
+for p, pos in zip(qpts, Q): p.setPosition(hou.Vector3(pos))
+for i in range(M):
+    j = (i+1) %% M
+    poly = g.createPolygon()
+    for pt in (pts[i], qpts[i], qpts[j], pts[j]): poly.addVertex(pt)
+cap = g.createPolygon()
+for pt in qpts: cap.addVertex(pt)
+'''
+
+
+def adjacency(prims):
+    adj = {}
+    for p in prims:
+        vs = [v.point().number() for v in p.vertices()]
+        for a, b in zip(vs, vs[1:] + vs[:1]):
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+    return adj
+
+
+def run(counts, fillmode='gridquads', corners=None):
+    geo = hou.node('/obj').createNode('geo')
+    py = geo.createNode('python')
+    py.parm('python').set(SRC % (repr(counts),))
+    pf = geo.createNode('polyfill')
+    pf.setInput(0, py)
+    pf.parm('fillmode').set(fillmode)
+    if corners is not None:
+        pf.parm('customcornerstoggle').set(1)
+        pf.parm('customcorners').set(corners)
+    out = {'counts': counts, 'fillmode': fillmode, 'corners': corners}
+    try:
+        pf.cook(force=True)
+    except Exception as e:
+        out['exception'] = repr(e)
+        out['errors'] = list(pf.errors())
+        geo.destroy()
+        return out
+    out['warnings'] = list(pf.warnings())
+    g = pf.geometry()
+    inp = py.geometry()
+    M = sum(counts)
+    new_prims = g.prims()[len(inp.prims()):]
+    out['new_quads'] = len(new_prims)
+    adj = adjacency(new_prims)
+    interior = [k for k in adj if k >= len(inp.points())]
+    hist = {}
+    for k in interior:
+        hist[len(adj[k])] = hist.get(len(adj[k]), 0) + 1
+    out['interior_valence_hist'] = hist
+    out['boundary_preserved'] = all((g.point(i).position() - inp.point(i).position()).length() < 1e-9 for i in range(M))
+    n = counts
+    if len(n) == 4 and n[0] == n[2] and n[1] == n[3] and interior:
+        Pp = np.array([list(inp.point(i).position()) for i in range(M)])
+        n0, n1, n2, n3 = n
+        c0 = np.array([Pp[i] for i in range(n0)] + [Pp[n0]])
+        d1 = np.array([Pp[n0 + j] for j in range(n1)] + [Pp[n0 + n1]])
+        c1 = np.array([Pp[n0 + n1 + (n2 - i)] for i in range(n2 + 1)])
+        d0 = np.array([Pp[(n0 + n1 + n2 + (n3 - j)) % M] for j in range(n3 + 1)])
+        A, B, D, C = c0[0], c0[n0], c1[0], c1[n2]
+        tfi = []
+        for i in range(1, n0):
+            for j in range(1, n1):
+                s, t = i / n0, j / n1
+                tfi.append((1 - t) * c0[i] + t * c1[i] + (1 - s) * d0[j] + s * d1[j]
+                           - ((1 - s) * (1 - t) * A + s * (1 - t) * B + (1 - s) * t * D + s * t * C))
+        tfi = np.array(tfi)
+        ip = np.array([list(g.point(k).position()) for k in interior])
+        dists = [float(np.min(np.linalg.norm(tfi - q, axis=1))) for q in ip]
+        out['coons_nn_max'] = max(dists)
+        out['coons_nn_mean'] = sum(dists) / len(dists)
+    geo.destroy()
+    return out
+
+
+result = [run([6, 4, 6, 4]), run([6, 4, 8, 4]), run([6, 4, 8, 4], corners='0 6 10 18'),
+          run([4, 4, 3, 3, 4]), run([4, 4, 3, 3, 4], corners='0 4 8 11 14'), run([4, 4, 3, 3, 4], fillmode='quads')]

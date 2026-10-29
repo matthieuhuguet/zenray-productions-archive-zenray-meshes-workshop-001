@@ -1,0 +1,124 @@
+"""29 October 2026 : ZenRay Lines MBO, a clean cut of the components by smoothing their colours ON the surface.
+EN: each component is a mask (one hot channel per component on every shell vertex). One MBO step (Merriman, Bence, Osher 1992) =
+diffuse every mask (heat flow, random walk averaging) then give each vertex the component of its strongest smoothed mask. Repeated,
+it moves every border by its curvature : jagged borders become fair curves, small islands and slivers vanish, triple junctions
+settle. A fidelity weight keeps the borders where the validated colours put them ; the left side is copied mirrored onto the right
+(exact symmetry). The borders are then laid exactly on the smooth level lines : every border vertex is moved onto the zero
+crossings of the smoothed masks (marching triangles), so the cut is a smooth curve, not a staircase of triangles.
+Output : work/lines/mbo.npz (V, F, region per face, names, smoothed vertex labels) and the audit boards before and after.
+python ZrlMbo.py        FR : découpe propre des components par lissage de leurs couleurs sur la surface (diffusion puis seuil)."""
+import os, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix, diags
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts/lines")
+
+PARAMS = {   # 29 October 2026 : the interface of the MBO cut, one place
+    "shell": f"{ROOT}/work/retopo/shell.npz", "out": f"{ROOT}/work/lines/mbo.npz",
+    "sigma_m": 0.03,          # smoothing scale of a border : wiggles shorter than this disappear
+    "iters": 4,               # MBO steps
+    "fidelity": 0.15,         # weight of the validated colours added before each threshold
+    "centre_m": 0.004,        # vertices closer to x = 0 keep their own label
+    "openings": ["CAR_arch_"],
+    "t_clip": 0.12,           # a level line never crosses an edge closer than this to a vertex (no slivers)
+    "opening_gap_m": 0.02,    # the tyre disc plus this gap is always open ; the arch outline beyond it comes from the arch colours
+    "opening_inner_m": 0.30,  # the opening is cleared only on the outer 30 cm of each side
+}
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def mirror_name(n):
+    return n[:-2] + "_R" if n.endswith("_L") else n[:-2] + "_L" if n.endswith("_R") else n
+
+
+def walk_operator(V, F):
+    E = np.unique(np.sort(np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=1), axis=0)
+    W = coo_matrix((np.ones(2 * len(E), np.float32), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(len(V), len(V))).tocsr()
+    deg = np.asarray(W.sum(1)).ravel(); return (diags(1.0 / np.maximum(deg, 1)).astype(np.float32) @ W).tocsr(), E
+
+
+def diffuse(P, U, steps):
+    for _ in range(steps): U = 0.5 * U + 0.5 * (P @ U)
+    return U
+
+
+def wheel_openings(V, lab, names, prm):
+    """29 October 2026 : every vertex inside a wheel opening takes the label of its arch : the opening becomes one clean disc.
+    The opening radius is measured on the arch labels of the validated partition (95th percentile), around the tyre centre."""
+    sys.path.insert(0, f"{ROOT}/Scripts/retopo"); import ZrrData as D
+    car = D.load(); out = lab.copy()
+    for q in ("FL", "FR", "RL", "RR"):
+        t = car["names"].index(f"CAR_wheel_tyre_{q}"); polys = np.flatnonzero(car["T"] == t)
+        pts = car["P"][np.unique(np.concatenate([car["I"][car["off"][k]:car["off"][k + 1]] for k in polys]))]; c = 0.5 * (pts.min(0) + pts.max(0))
+        side = "L" if c[0] > 0 else "R"; arch = names.index(f"CAR_arch_{'front' if q[0] == 'F' else 'rear'}_{side}")
+        r = np.hypot(V[:, 1] - c[1], V[:, 2] - c[2]); outer = np.abs(V[:, 0]) > np.abs(c[0]) - prm["opening_inner_m"]
+        rt = float(np.hypot(pts[:, 1] - c[1], pts[:, 2] - c[2]).max()); ra = rt + prm["opening_gap_m"]
+        inside = outer & (r < ra) & (np.sign(V[:, 0]) == np.sign(c[0]))
+        out[inside] = arch; log("opening", q, "tyre radius", round(rt, 3), "m ; cleared radius", round(ra, 3), "; vertices cleared", int(inside.sum()))
+    return out
+
+
+def marching_cut(V, F, lab, G, prm):
+    """29 October 2026 : cut every triangle exactly along the smooth level lines of the label field G (multi label marching
+    triangles) : the border of every component becomes a smooth polyline through edge crossings, never a staircase of triangles.
+    Crossing points are shared by the two triangles of an edge (welded) ; a triangle of three components gets a centre point."""
+    n = len(V); T = np.r_[F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]; key = np.sort(T, axis=1)
+    Eu, inv = np.unique(key, axis=0, return_inverse=True); inv = inv.reshape(3, len(F)).T
+    a, b = Eu[:, 0], Eu[:, 1]; la, lb = lab[a], lab[b]; cut = la != lb; cid = -np.ones(len(Eu), np.int64); cid[cut] = n + np.arange(cut.sum())
+    ga = G[a[cut], la[cut]] - G[a[cut], lb[cut]]; gb = G[b[cut], la[cut]] - G[b[cut], lb[cut]]
+    t = np.clip(ga / np.where(np.abs(ga - gb) < 1e-12, 1e-12, ga - gb), prm["t_clip"], 1 - prm["t_clip"])[:, None]
+    X = V[a[cut]] * (1 - t) + V[b[cut]] * t
+    L3 = lab[F]; eq01 = L3[:, 0] == L3[:, 1]; eq12 = L3[:, 1] == L3[:, 2]; eq20 = L3[:, 2] == L3[:, 0]
+    same = eq01 & eq12; three = ~eq01 & ~eq12 & ~eq20; two = ~same & ~three
+    Fo = [F[same]]; Ro = [L3[same, 0]]
+    # two labels : rotate so the lone vertex is last : (a, b, c), c alone
+    k2 = np.flatnonzero(two); lone = np.where(eq01[k2], 2, np.where(eq12[k2], 0, 1))
+    rot = np.stack([(lone + 1) % 3, (lone + 2) % 3, lone], 1); A_ = F[k2[:, None], rot]; E_ = inv[k2]
+    # edge index of (v_i, v_i+1) is inv[:, i] : edge b->c is index rot[:,1], edge c->a is index rot[:,2]
+    xbc = cid[E_[np.arange(len(k2)), rot[:, 1]]]; xca = cid[E_[np.arange(len(k2)), rot[:, 2]]]
+    la_ = lab[A_[:, 0]]; lc_ = lab[A_[:, 2]]
+    Fo += [np.stack([xbc, A_[:, 2], xca], 1), np.stack([A_[:, 0], A_[:, 1], xbc], 1), np.stack([A_[:, 0], xbc, xca], 1)]; Ro += [lc_, la_, la_]
+    # three labels : centre point
+    k3 = np.flatnonzero(three); E3 = inv[k3]; x01 = cid[E3[:, 0]]; x12 = cid[E3[:, 1]]; x20 = cid[E3[:, 2]]
+    C = (X[x01 - n] + X[x12 - n] + X[x20 - n]) / 3.0; cc = n + len(X) + np.arange(len(k3)); v0, v1, v2 = F[k3, 0], F[k3, 1], F[k3, 2]
+    for poly, l in (((x20, v0, x01), v0), ((x20, x01, cc), v0), ((x01, v1, x12), v1), ((x01, x12, cc), v1), ((x12, v2, x20), v2), ((x12, x20, cc), v2)):
+        Fo.append(np.stack(poly, 1)); Ro.append(lab[l])
+    log("marching cut : triangles kept", int(same.sum()), "two labels", len(k2), "three labels", len(k3), "crossings", len(X))
+    return np.vstack([V, X, C]), np.vstack(Fo), np.concatenate(Ro)
+
+
+def build(prm=PARAMS):
+    S = np.load(prm["shell"], allow_pickle=True); V = S["verts"]; F = S["faces"]; lab0 = np.where(S["lab"] < 0, 0, S["lab"]); names = [str(n) for n in S["names"]]
+    K = len(names); n = len(V); P, E = walk_operator(V, F); h = float(np.median(np.linalg.norm(V[E[:, 0]] - V[E[:, 1]], axis=1)))
+    steps = int(np.ceil(2.0 * (prm["sigma_m"] / h) ** 2)); log("verts", n, "edge", round(h * 1000, 2), "mm ; steps per MBO", steps)
+    lab0 = wheel_openings(V, lab0, names, prm)
+    left = np.flatnonzero(V[:, 0] > prm["centre_m"]); right = np.flatnonzero(V[:, 0] < -prm["centre_m"])
+    _, k = cKDTree(V[left]).query(V[right] * np.array([-1.0, 1.0, 1.0])); partner = left[k]
+    mir = np.array([names.index(mirror_name(nm)) if mirror_name(nm) in names else i for i, nm in enumerate(names)])
+    lab = lab0.copy(); lab[right] = mir[lab[partner]]
+    U0 = np.zeros((n, K), np.float32); U0[np.arange(n), lab] = 1.0
+    for it in range(prm["iters"]):
+        U = np.zeros((n, K), np.float32); U[np.arange(n), lab] = 1.0
+        U = diffuse(P, U, steps) + prm["fidelity"] * U0
+        new = U.argmax(1); new[right] = mir[new[partner]]
+        log("MBO", it, "changed", int((new != lab).sum()), "vertices"); lab = new
+    G = diffuse(P, np.eye(K, dtype=np.float32)[lab], max(2, steps // 4))      # gentle field whose level lines are the cut
+    V2, F2, R2 = marching_cut(V, F, lab, G, prm)
+    keepf = np.array([not any(names[l].startswith(o) for o in prm["openings"]) for l in range(K)])[R2]
+    F2 = F2[keepf]; R2 = R2[keepf]; used = np.unique(F2); remap = -np.ones(len(V2), np.int64); remap[used] = np.arange(len(used))
+    F2 = remap[F2]; V2 = V2[used]
+    T = np.r_[F2[:, [0, 1]], F2[:, [1, 2]], F2[:, [2, 0]]]; key = np.sort(T, axis=1); fr = np.r_[R2, R2, R2]
+    o = np.lexsort((key[:, 1], key[:, 0])); ks = key[o]; same = (ks[1:] == ks[:-1]).all(1); diff = same & (fr[o][1:] != fr[o][:-1])
+    line_edges = ks[1:][diff]
+    out = dict(V=V2, F=F2, region=R2, region_names=np.array(names), line_edges=line_edges)
+    os.makedirs(os.path.dirname(prm["out"]), exist_ok=True); np.savez(prm["out"], **out)
+    cnt0 = np.bincount(lab0, minlength=K); cnt1 = np.bincount(lab, minlength=K)
+    log("saved", prm["out"], len(V2), "verts", len(F2), "faces ; border edges", len(line_edges), "; components kept", int((cnt1 > 0).sum()), "of", K, "; vanished", [names[i] for i in range(K) if cnt0[i] > 0 and cnt1[i] == 0])
+    return out
+
+
+if __name__ == "__main__":
+    build()

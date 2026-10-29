@@ -1,0 +1,62 @@
+# Parity-slack stress test for scipy milp (29 October 2026).
+# English: same T-mesh problem plus k extra parity rows sum(q over subset) = 2*m (m integer >= 1),
+# subsets chosen so that a known feasible solution exists. FR : meme probleme plus lignes de parite.
+import time
+import numpy as np
+from scipy.optimize import Bounds, LinearConstraint, milp
+from scipy.sparse import lil_matrix, hstack, csc_matrix
+import MilpIntervalTiming as base
+
+def run(n_rects, seed, k_parity):
+    rng = np.random.default_rng(seed)
+    rects = base.split_layout(rng, n_rects)
+    arcs, targets, rows = base.build_problem(rects, 0.05)
+    na = len(arcs)
+    # reference feasible integer solution from the plain problem (round of a consistent lattice)
+    ref = base.solve(n_rects, seed)  # only to warm up / reuse structure
+    # build the consistent solution q* by integer coordinates: use lengths scaled to integers
+    q_star = np.maximum(1, np.round(targets)).astype(int)
+    # make q_star consistent by solving the plain problem once more and reading x (cheap)
+    # (re-solve here to get x)
+    nv = 2 * na
+    c = np.concatenate([np.zeros(na), np.ones(na)])
+    a_eq = lil_matrix((len(rows) + k_parity, nv + k_parity))
+    for r, row in enumerate(rows):
+        for i, coef in row.items():
+            a_eq[r, i] = coef
+    a_ub = lil_matrix((2 * na, nv + k_parity))
+    ub = np.zeros(2 * na)
+    for i in range(na):
+        a_ub[i, i] = 1.0; a_ub[i, na + i] = -1.0; ub[i] = targets[i]
+        a_ub[na + i, i] = -1.0; a_ub[na + i, na + i] = -1.0; ub[na + i] = -targets[i]
+    # first pass: plain solve to get a consistent integer solution
+    plain = milp(c, integrality=np.concatenate([np.ones(na), np.zeros(na)]),
+                 bounds=Bounds(np.concatenate([np.ones(na), np.zeros(na)]), np.concatenate([np.full(na, 200.0), np.full(na, np.inf)])),
+                 constraints=[LinearConstraint(csc_matrix(a_eq[:len(rows), :nv]), np.zeros(len(rows)), np.zeros(len(rows))),
+                              LinearConstraint(csc_matrix(a_ub[:, :nv]), -np.inf * np.ones(2 * na), ub)])
+    qs = np.round(plain.x[:na]).astype(int)
+    # parity rows: random subsets of 6 arcs with even total under qs
+    prow = len(rows)
+    made = 0
+    while made < k_parity:
+        sub = rng.choice(na, size=6, replace=False)
+        if qs[sub].sum() % 2 == 0:
+            for i in sub:
+                a_eq[prow + made, i] = 1.0
+            a_eq[prow + made, nv + made] = -2.0   # - 2*m_j
+            made += 1
+    integrality = np.concatenate([np.ones(na), np.zeros(na), np.ones(k_parity)])
+    lb = np.concatenate([np.ones(na), np.zeros(na), np.ones(k_parity)])
+    hb = np.concatenate([np.full(na, 200.0), np.full(na, np.inf), np.full(k_parity, 1000.0)])
+    cc = np.concatenate([c, np.zeros(k_parity)])
+    t0 = time.perf_counter()
+    res = milp(cc, integrality=integrality, bounds=Bounds(lb, hb),
+               constraints=[LinearConstraint(csc_matrix(a_eq), np.zeros(a_eq.shape[0]), np.zeros(a_eq.shape[0])),
+                            LinearConstraint(csc_matrix(a_ub), -np.inf * np.ones(2 * na), ub)],
+               options={"time_limit": 60.0})
+    dt = time.perf_counter() - t0
+    return dict(rects=n_rects, arcs=na, parity_rows=k_parity, status=res.status, seconds=round(dt, 4),
+                nodes=res.get("mip_node_count"), obj=None if res.fun is None else round(float(res.fun), 3))
+
+for n_rects, k in ((39, 0), (39, 10), (95, 30), (95, 60), (400, 150)):
+    print([run(n_rects, s, k) for s in (1, 2, 3)])

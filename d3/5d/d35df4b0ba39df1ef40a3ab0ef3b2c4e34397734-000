@@ -1,0 +1,90 @@
+# Curve network to game-ready quads (29 October 2026)
+
+Scope: 285 arcs, 147 nodes, about 39 components, numpy/scipy plus Houdini 22.0.368. Bracketed numbers are sources (end of file). "Measured" means I ran it on this Mac on 29 October 2026 (scripts in /Users/zenray/.claude/tmp/tmp-zenray-meshes/research/Scripts/). "Forum-level" means practitioner opinion.
+
+## 1. CAD tools and game car practice
+
+**Common pattern.** Every CAD tool surfaces a 4-sided (sometimes 3-sided) loop with per-edge continuity, and a shared edge is one curve, so neighbours weld by construction. Rhino NetworkSrf needs two curve families where every U curve crosses every V curve, always smooths its output, and has edge, interior and angle tolerances plus G0/G1/G2 matching [1]; edges can miss tolerance when inputs lack curvature continuity [2]. Alias Square blends four boundary curves with per-edge G0/G1/G2, a Linear (boundary only) or Cubic (tangent/curvature) blend and explicit degree and spans [3]. Maya Boundary takes 3 or 4 curves, has no tangent option, misses curves unless endpoints touch; Autodesk points to Birail [4]. Fusion Patch has per-edge Connected/Tangent/Curvature, closes the loop from one picked edge and accepts interior rails or points [5]. Plasticity 1.2 patches 3D curve loops with per-edge G0/G1/G2; its export list (OBJ, STEP, Parasolid) shows no quad tool [6]. Fusion T-splines tolerate T-points and star points, yet star points block curvature continuity and some bodies fail B-rep conversion [7][8]. Class-A practice plans patches around 2 to 3 reflection "spines", G2 where it counts; I found no authoritative span or patch-count rule [9].
+
+**Curves to quads.** No source documents the pros' quad step. The documented method is isoparametric sampling of each 4-sided patch with equal divisions per shared edge: Bessmeltsev et al. mesh every cycle with a discrete Coons patch after a global interval assignment [10]. Retopology tools snap hand-placed quads to a reference surface (Maya Quad Draw with Make Live, Houdini TopoBuild) [11][12]; that is your "project onto the existing skin" step.
+
+**Game budgets.** Forza uses manufacturer CAD, laser scans and photo tracking [13]; one Forza Horizon car was split into about 150 pieces [14]. Gran Turismo 7 cars have about 500,000 polygons plus adaptive tessellation [15]; Forza Motorsport 4 holds a Guinness record of 800,000 [16]. Forum figures: GTA V LOD0 60k to 120k triangles, Driver San Francisco 18k [17]. My estimate for you: body cage 10k to 25k quads, LOD0 60k to 150k triangles.
+
+**Rules (forum-level).** Loops follow the arch and close fully around wheel arches and round openings [18]. Even loop spacing; panel lines are natural density breaks; mismatched counts across a panel gap are a visible flaw [19]. Support loops sit close to a crisp edge, wider for softer [20]. Valence 3 and 5 poles cannot be avoided; keep them on flat or hidden areas, near support loops [20][21]. Inward flanges: no source found; convention to verify: return the panel edge inward one to two gap widths with one support loop, equal counts on both lips.
+
+## 2. Algorithms
+
+- **Bilinear Coons**: four curves meeting at corners, C = Lc + Ld - B; reproduces the boundary exactly, may crease against neighbours (bicubic blend fixes it) [22]. Gordon adds interior curves but needs a grid-like net [23][1]. Effort: 15 numpy lines, 10 minutes. Weakness: blind to interior crown, so project onto the skin afterwards.
+- **Gregory patches** repair Coons twist incompatibility for G1 N-sided filling [24][25]. Smooth surface, not a layout. Effort: days; skip.
+- **Tarini 2022 closed form**: an N-sided patch with side counts e_i becomes one pole of valence N, i.e. one Catmull-Clark step into N regular grids; feasible iff e_i = s_(i-1) + s_(i+1) has positive integer s, every e_i at least 2, total even [26]. N=3: s_i = (e_(i-1) - e_i + e_(i+1))/2. N=4: opposite sides equal. N=5: s_i = (e_(i-1) + e_i + e_(i+1) - e_(i-2) - e_(i+2))/2; (6,4,3,5,4) gives s = (3,2,1,1,4), my check. The sub-quad at the corner between sides i-1 and i is an s_(i-1) by s_i grid. N=6 has two parity conditions [26]. This is your midpoint-subdivision idea; it works only when these hold. Effort: 45 minutes.
+- **Takayama, Panozzo, Sorkine-Hornung 2014**: only integer counts per side (N from 2 to 6, total even); guaranteed to succeed, minimal irregular vertices, topology only, lp_solve, about 30 ms [27]. The pattern library is days of work; use Tarini.
+- **Bessmeltsev et al. 2012**: closed 3D curve cycles, no surface; stable-matching segmentation into opposite pairs, discrete Coons, interval assignment as a quadratic MIP (CPLEX), about 2 s per cycle, 0.1 s interval assignment for an average network [10]. Matching is days; reuse the last two stages.
+- **Pan et al. 2015**: curve network to a triangle surface aligned with flow lines [28]. Not quads, and you have the skin: skip.
+- **Interval assignment** is your integer problem: Mitchell lists the constraints (opposite sides equal, two sides exceed the third, sum even = 2k), soft and hard targets, relative-deviation objective [29]. Lyon, Campen, Kobbelt 2021 quantise a T-mesh by ILP but start from a seamless parametrisation [30]; Couplet et al. solve thousands of ILP variables with lp_solve in a few percent of runtime, with opposite-side sum rows per patch [31]. Effort: 40 minutes.
+
+## 3. Houdini 21 and 22
+
+- No node builds quads from a curve network or a Coons patch: the H21 and H22 modelling notes list none [32][33], and Labs has Quadrangulate (triangles to quad-dominant) but no patch, loft or N-sided tool [34].
+- **PolyFill, Quadrilateral Grid** is the 4-boundary-to-grid node; boundary points are fused; custom corners need at least two adjacent ones [35]. Measured: hole (6,4,6,4) gives 24 quads, interior all valence 4, boundary unchanged, interior within 0.04 mean and 0.06 max of a discrete Coons patch (cells 0.25 to 0.33): close, not Coons. Hole (6,4,8,4) with automatic corners silently moved the corners and returned a 7x4 grid; with your real corners it warns "conflicting corners" and outputs nothing. A pentagon only fills as a 5x4 grid with moved corners. Always set Custom Corners; the warning is a free test.
+- **Skin** (U and V cross-section groups, bilinear with two inputs) [36], **Rails** [37] and **PolyPatch** (smooth spline patch, Output Divisions) [38] are spline tools without per-side edge counts.
+- **Poly Bridge**: quads between two edge loops, fuses the source loop, adds triangles when counts differ [39]; good for flanges and rocker returns.
+- **Quad Remesh** is field based; Guide is a vector hint [40]; H22 added Rectangular mode [33]. Measured: two adjacent patches remeshed separately keep their outline but resample it (64 input boundary edges became 28 and 34; the shared edge got 8 and 9 segments at different positions), and an edge group of interior arcs given as Feature Edges changed nothing. It cannot weld panels. **TopoBuild** is interactive, no curve or loop patches [12].
+- Shared points: resample each arc once, store arc id and index as point attributes, build every patch from those exact points, weld on that key, not by distance.
+
+## 4. scipy.optimize.milp
+
+HiGHS wrapper; integrality per variable, default bounds 0 to infinity, options disp, presolve, time_limit, node_limit, mip_rel_gap (1e-4); status 0 optimal, 1 limit, 2 infeasible, x may be None [41]. Measured (scipy 1.18.1, random T-mesh of rectangles, integer counts at least 1, L1 objective via auxiliary variables): 118 arcs 8 to 63 ms (first call includes warm-up); 286 arcs plus 60 parity rows 43 to 88 ms; 3001 arcs 68 to 135 ms; 1201 arcs plus 150 parity rows 0.15 to 0.40 s; one branch node every time. Reason (my analysis): with 4-sided patches each arc sits in two rows with opposite signs, a network matrix, so the relaxation is nearly integral.
+Pitfalls: set lower bounds (default 0 allows zero-length arcs) and upper bounds; weight deviations by 1/target [29][31]; test status before touching x, round x, re-assert the equalities; infeasible sets exist [10][29], so prefer penalised slack to hard equalities; tie mirrored arcs.
+
+## Five ranked recommendations for our pipeline
+
+1. **Solve interval assignment first.** Integer q_a in [1, 60] per arc, targets t_a = length / local edge size (finer at arches and creases), relative L1 via auxiliary variables, two equalities per 4-sided component on arc sums along opposite sides, left/right arcs tied. milp takes under 0.1 s. Everything downstream then welds by construction.
+2. **Make every component 4-sided before meshing.** Rebuild each loop from the partition by walking arcs with the component on the left, choose four corners at the sharpest turns (Mitchell's corner choice [42]), give annular components (arch rings, window frames) one bridging cut, split 5 or 6 corner components with one extra curve on a character line. Likely causes of your failed arc loops (my inference): inner loops, pinch nodes, wrong corner count.
+3. **Mesh patches by discrete Coons from the shared sampled arcs, then conform.** Sample each arc once with global keys (arc, k); Coons interior; then 5 to 10 rounds of closest-point projection onto the frozen skin plus tangential Laplacian or Winslow relaxation, boundary pinned. Report min angle, aspect and flips per patch, then run FinishAudit.
+4. **Keep N-gons for the 3 and 5 sided exceptions.** Add Tarini rows (e_i = s_(i-1) + s_(i+1), s_i at least 1) to the same milp; centre the pole on a flat area, away from arch lips and creases. If infeasible, move one count by one rather than adding patterns.
+5. **Use Houdini to check and finish, not to generate.** PolyFill with Custom Corners as an independent patch check, Poly Bridge for flanges and gap returns, valence histogram, one subdivision level with zebra stripes; do not define panels with Quad Remesh or TopoBuild.
+
+## Sources (accessed 29 October 2026)
+
+[1] https://docs.mcneel.com/rhino/8/help/en-us/commands/networksrf.htm
+[2] https://discourse.mcneel.com/t/networksrf-is-not-meeting-specified-tolerance/200535
+[3] https://help.autodesk.com/cloudhelp/2014/ENU/Alias/files/SurfacesBoundarySurfacesSquare.htm
+[4] https://help.autodesk.com/cloudhelp/2016/ENU/Maya-Tech-Docs/Commands/boundary.html
+[5] https://help.autodesk.com/cloudhelp/ENU/Fusion-360-API/files/PatchFeatureInput.htm and https://www.autodesk.com/products/fusion-360/blog/?p=8454
+[6] https://www.cgchannel.com/2023/07/nick-kallen-ships-plasticity-1-2
+[7] https://help.autodesk.com/cloudhelp/ENU/Fusion-Sculpt/files/FRM-UTILITIES.htm
+[8] https://forums.autodesk.com/t5/fusion-design-validate-document/t-spline-model-failed-to-convert/m-p/12941798
+[9] https://novedge.com/blogs/design-news/alias-patch-layout-mastery-5-class-a-strategies-for-clean-highlights-stable-edits-and-engineering-ready-surfaces
+[10] https://www.cs.ubc.ca/labs/imager/tr/2012/Quadrangulation/Design-Driven%20Quadrangulation.pdf
+[11] https://help.autodesk.com/cloudhelp/2017/ENU/Maya/files/GUID-EBF1E652-4DDD-423F-B42E-3BF85AE46A5D.htm
+[12] https://www.sidefx.com/docs/houdini/nodes/sop/topobuild.html
+[13] https://forums.forza.net/t/r390-gt1-interior-what-you-playing-at/576459?page=2
+[14] https://lexusenthusiast.com/?p=28457
+[15] https://gtplanet.net/gran-turismo-7s-car-models-use-500000-polygons-each
+[16] https://www.guinnessworldrecords.com/world-records/99099-most-polygons-per-car-in-a-racing-videogame
+[17] https://polycount.com/discussion/comment/2518054 and https://polycount.com/discussion/comment/1412608/
+[18] https://polycount.com/discussion/comment/2709268
+[19] https://polycount.com/bestof/src?Page=p406 and https://blenderartists.org/t/panel-gap-in-cars/533995
+[20] https://novedge.com/blogs/design-news/cinema-4d-tip-clean-topology-for-subdivision-surface-modeling
+[21] https://archive.blender.org/wiki/2015/index.php/User:Mindrones/Wiki/Subdivision_modelling/The_pole/E_and_N_poles and https://polycount.com/discussion/comment/2808171/
+[22] https://en.wikipedia.org/wiki/Coons_patch
+[23] https://www.mdpi.com/2227-7390/13/3/335/xml
+[24] https://www.globalspec.com/reference/72210/203279/chapter-14-gregory-patches
+[25] https://www.springerprofessional.de/filling-n-sided-holes/14470492
+[26] https://arxiv.org/pdf/2101.11569
+[27] https://cims.nyu.edu/gcl/papers/pattern-based-quadrangulation.pdf
+[28] https://history.siggraph.org/?p=112768
+[29] https://www.sandia.gov/files/samitch/files/interval_journal.pdf
+[30] https://diglib.eg.org/handle/10.1111/cgf142634
+[31] https://arxiv.org/pdf/2108.02635
+[32] https://www.sidefx.com/docs/houdini/news/21/model.html
+[33] https://www.sidefx.com/docs/houdini/news/22/model.html
+[34] https://www.sidefx.com/docs/houdini/labs/index.html
+[35] https://www.sidefx.com/docs/houdini/nodes/sop/polyfill.html
+[36] https://www.sidefx.com/docs/houdini/nodes/sop/skin.html
+[37] https://www.sidefx.com/docs/houdini/nodes/sop/rails.html
+[38] https://www.sidefx.com/docs/houdini/nodes/sop/polypatch.html
+[39] https://www.sidefx.com/docs/houdini/nodes/sop/polybridge.html
+[40] https://www.sidefx.com/docs/houdini/nodes/sop/quadremesh.html
+[41] https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.milp.html
+[42] https://www.sandia.gov/-samitch/scott-a-mitchell/publications/meshing-papers/choosing-corners/

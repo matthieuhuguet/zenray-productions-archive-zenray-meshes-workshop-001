@@ -1,0 +1,70 @@
+# Quad Remesh boundary probe, Houdini 22.0.368 headless (29 October 2026).
+# English: two adjacent curved patches (shared edge x=0, identical input points) are remeshed
+# separately with the same target quad count; compare boundary edge counts and the points on the
+# shared edge. Result on 29 October 2026: outlines followed exactly but resampled (64 input boundary
+# edges became 28 and 34; the shared edge got 8 and 9 segments at different positions).
+# Run through the houdini_hom MCP tool (target=headless) or hython.
+# FR : deux patchs voisins remailles separement ne se soudent pas.
+import hou
+import numpy as np
+
+SRC = '''
+import hou, math
+g = hou.pwd().geometry()
+side = %d   # 0 = patch A (x in [-1,0]), 1 = patch B (x in [0,1])
+N = 16
+def Z(x, y): return 0.3*math.sin(math.pi*(x+1.0)/2.0)*math.sin(math.pi*y) + 0.2*x
+x0 = -1.0 if side == 0 else 0.0
+pts = {}
+for i in range(N+1):
+    for j in range(N+1):
+        x = x0 + i/float(N); y = j/float(N)
+        p = g.createPoint(); p.setPosition(hou.Vector3(x, y, Z(x, y))); pts[(i, j)] = p
+for i in range(N):
+    for j in range(N):
+        a, b, c, d = pts[(i, j)], pts[(i+1, j)], pts[(i+1, j+1)], pts[(i, j+1)]
+        for tri in ((a, b, c), (a, c, d)):
+            pr = g.createPolygon()
+            for q in tri: pr.addVertex(q)
+'''
+
+
+def boundary_points(g):
+    cnt = {}
+    for pr in g.prims():
+        vs = [v.point().number() for v in pr.vertices()]
+        for a, b in zip(vs, vs[1:] + vs[:1]):
+            k = (min(a, b), max(a, b))
+            cnt[k] = cnt.get(k, 0) + 1
+    bedges = [k for k, c in cnt.items() if c == 1]
+    bpts = sorted(set([a for a, b in bedges] + [b for a, b in bedges]))
+    return bedges, bpts
+
+
+def run(side, target):
+    geo = hou.node('/obj').createNode('geo')
+    py = geo.createNode('python')
+    py.parm('python').set(SRC % side)
+    qr = geo.createNode('quadremesh')
+    qr.setInput(0, py)
+    qr.parm('resolution').set('quad_count')
+    qr.parm('targetquadcount').set(target)
+    qr.parm('minquadcount').set(1)
+    qr.parm('decimation').set(0)
+    qr.parm('featureboundaries').set(1)
+    qr.cook(force=True)
+    g = qr.geometry()
+    gin = py.geometry()
+    be, bp = boundary_points(g)
+    bein, _ = boundary_points(gin)
+    P = np.array([list(g.point(i).position()) for i in range(len(g.points()))])
+    shared = sorted(round(float(P[i][1]), 5) for i in bp if abs(P[i][0]) < 1e-6)
+    res = {'side': side, 'out_prims': len(g.prims()), 'out_boundary_edges': len(be),
+           'in_boundary_edges': len(bein), 'shared_edge_points': shared}
+    geo.destroy()
+    return res
+
+
+A = run(0, 64)
+B = run(1, 64)
+result = {'A': A, 'B': B, 'shared_equal': A['shared_edge_points'] == B['shared_edge_points']}

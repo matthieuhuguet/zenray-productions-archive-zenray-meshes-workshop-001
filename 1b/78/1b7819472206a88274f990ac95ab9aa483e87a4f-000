@@ -10,7 +10,7 @@ import hou
 
 ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
 PARAMS = {   # 29 October 2026 : the interface of the Houdini pass, one place
-    "embed": f"{ROOT}/work/lines/embed.npz", "half_margin_m": 0.02, "quad_m": 0.025, "net": "/obj/ZRL_Car",
+    "embed": f"{ROOT}/work/lines/mbo.npz", "obj": f"{ROOT}/work/lines/mbo_left.obj", "half_margin_m": 0.02, "quad_m": 0.025, "net": "/obj/ZRL_Car",
     "curvature_weight": 1.0, "adaptivity": 0.0, "decimation_level": 2,
 }
 
@@ -53,6 +53,21 @@ np.savez(hou.pwd().parm("out_path").eval(), P=P, Q=Q, nverts=n, region=reg, regi
 '''
 
 
+REGION_VEX = r'''
+// 29 October 2026 : the OBJ group r_<id> of every face becomes its component id
+string gs[] = detailintrinsic(0, "primitivegroups"); i@region = -1;
+foreach (string g; gs) { if (startswith(g, "r_") && inprimgroup(0, g, @primnum)) { i@region = atoi(g[2:]); break; } }
+'''
+
+MISSING = []
+
+
+def setp(node, name, value):
+    p = node.parm(name)
+    if p is None: MISSING.append(f"{node.name()}.{name}"); return
+    p.set(value)
+
+
 def _python_sop(parent, name, code, parms):
     n = parent.createNode("python", name)
     tg = n.parmTemplateGroup()
@@ -62,32 +77,30 @@ def _python_sop(parent, name, code, parms):
     return n
 
 
-def build(tag="v001", quad_m=None, prm=PARAMS):
-    t0 = time.time(); quad_m = quad_m or prm["quad_m"]; out = f"{ROOT}/work/lines/car_{tag}.npz"
+def build(tag="v001", quad_m=None, prm=PARAMS, cook=True):
+    """29 October 2026 : creates /obj/ZRL_Car ; cook=False only builds the network (the cook can outlast the bridge timeout)."""
+    quad_m = quad_m or prm["quad_m"]; out = f"{ROOT}/work/lines/car_{tag}.npz"; MISSING.clear()
     old = hou.node(prm["net"])
     if old: old.destroy()
     g = hou.node("/obj").createNode("geo", prm["net"].split("/")[-1])
-    load = _python_sop(g, "load_embed", LOAD_CODE, {"embed_path": prm["embed"], "half_margin": prm["half_margin_m"]})
-    clip = g.createNode("clip", "clip_left_half"); clip.setInput(0, load)
-    clip.parmTuple("dir").set((1, 0, 0)); clip.parm("dist").set(0.0); clip.parm("clipop").set("above")
+    fl = g.createNode("file", "load_left_half"); setp(fl, "file", prm["obj"])
+    rg = g.createNode("attribwrangle", "region_from_groups"); rg.setInput(0, fl); setp(rg, "class", "primitive"); setp(rg, "snippet", REGION_VEX)
+    clip = g.createNode("clip", "clip_left_half"); clip.setInput(0, rg)
+    clip.parmTuple("dir").set((1, 0, 0)) if clip.parmTuple("dir") else MISSING.append("clip.dir"); setp(clip, "dist", 0.0); setp(clip, "clipop", "above")
     mir = g.createNode("mirror", "mirror_right"); mir.setInput(0, clip)
-    mir.parmTuple("dir").set((1, 0, 0)); mir.parm("consolidatepts").set(1)
-    clean = g.createNode("fuse::2.0", "fuse_seam"); clean.setInput(0, mir); clean.parm("tol3d").set(1e-5)
-    grp = g.createNode("attribwrangle", "constrained_lines"); grp.setInput(0, clean); grp.parm("class").set("primitive"); grp.parm("snippet").set(GROUP_VEX)
+    mir.parmTuple("dir").set((1, 0, 0)) if mir.parmTuple("dir") else MISSING.append("mirror.dir"); setp(mir, "consolidatepts", 1)
+    grp = g.createNode("attribwrangle", "constrained_lines"); grp.setInput(0, mir); setp(grp, "class", "primitive"); setp(grp, "snippet", GROUP_VEX)
     qr = g.createNode("quadremesh", "quad_remesh"); qr.setInput(0, grp)
-    qr.parm("resolution").set(1)                       # target quad area
-    qr.parm("targetquadarea").set(quad_m * quad_m)
-    qr.parm("constrainededgesgroup").set("constrained")
-    qr.parm("featureboundaries").set(1)
-    qr.parm("symmetry").set(1) if qr.parm("symmetry") else None
-    for pn, v in (("xaxis", 1), ("mirroroutput", 1), ("enableadaptivity", 0), ("decimationlevel", prm["decimation_level"])):
-        if qr.parm(pn): qr.parm(pn).set(v)
+    setp(qr, "resolution", 1); setp(qr, "targetquadarea", quad_m * quad_m); setp(qr, "constrainededgesgroup", "constrained")
+    setp(qr, "featureboundaries", 1); setp(qr, "xaxis", 1); setp(qr, "mirroroutput", 1); setp(qr, "enableadaptivity", 0)
     tr = g.createNode("attribtransfer", "region_to_quads"); tr.setInput(0, qr); tr.setInput(1, grp)
-    tr.parm("primitiveattribs").set(1); tr.parm("primattriblist").set("region"); tr.parm("pointattribs").set(0)
+    setp(tr, "primitiveattribs", 1); setp(tr, "primattriblist", "region"); setp(tr, "pointattribs", 0)
     ex = _python_sop(g, "export_numpy", EXPORT_CODE, {"embed_path": prm["embed"], "out_path": out}); ex.setInput(0, tr)
-    ex.setDisplayFlag(True); ex.setRenderFlag(True)
-    info = {}
-    for n in (load, clip, mir, clean, grp, qr, tr, ex):
-        t = time.time(); geo = n.geometry(); info[n.name()] = {"s": round(time.time() - t, 2), "points": len(geo.points()), "prims": len(geo.prims()), "errors": list(n.errors())[:2], "warnings": list(n.warnings())[:2]}
-    info["total_s"] = round(time.time() - t0, 1); info["out"] = out
+    ex.setDisplayFlag(True); ex.setRenderFlag(True); g.layoutChildren()
+    info = {"missing_parms": list(MISSING), "out": out}
+    if cook:
+        t0 = time.time()
+        for n in (fl, rg, clip, mir, grp, qr, tr, ex):
+            t = time.time(); geo = n.geometry(); info[n.name()] = {"s": round(time.time() - t, 2), "points": len(geo.points()), "prims": len(geo.prims()), "errors": list(n.errors())[:2], "warnings": list(n.warnings())[:2]}
+        info["total_s"] = round(time.time() - t0, 1)
     return info

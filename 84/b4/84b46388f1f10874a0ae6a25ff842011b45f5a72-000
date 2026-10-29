@@ -1,0 +1,138 @@
+# 29 October 2026 : ZenRay Lines SERVER, serves lines/ on 127.0.0.1 and takes the edited network from the editor.
+# EN: static files from lines/ plus one endpoint, POST /save : the body (the editor's lines JSON) is validated and written to
+#     lines/data/lines_edit.json (atomic write). A previous lines_edit.json is first copied to lines/data/backups/ with a timestamp.
+#     lines.json, the exporter's file, is never touched. Loopback only, no external dependency.
+#     python ZrlServe.py [--port 8765] [--auto-port] [--port-file lines/server.port]
+#     Background :  nohup python ZrlServe.py > lines/server.log 2>&1 & echo $! > lines/server.pid
+# FR : serveur local du dossier lines/, avec POST /save qui écrit lines_edit.json (sauvegarde horodatée de la version précédente).
+import argparse, datetime, json, os, shutil, sys
+sys.dont_write_bytecode = True
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : the interface of the server, every tunable value lives here
+    "root": f"{ROOT}/lines",
+    "host": "127.0.0.1",
+    "port": 8765,
+    "auto_port_tries": 20,               # with --auto-port : how many consecutive ports are tried when the first one is busy
+    "save_path": "/save",
+    "edit_file": "data/lines_edit.json",
+    "backup_dir": "data/backups",
+    "protected": ["data/lines.json"],    # files that /save can never write
+    "max_body_mb": 24,
+}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+
+def stamp(now=None):
+    now = now or datetime.datetime.now()
+    return "%d-%s-%d_%s" % (now.day, MONTHS[now.month - 1], now.year, now.strftime("%H%M%S"))     # 29-October-2026_104217
+
+
+def check_document(doc):
+    if not isinstance(doc, dict) or not isinstance(doc.get("nodes"), list) or not isinstance(doc.get("arcs"), list):
+        raise ValueError("not a lines document (nodes and arcs expected)")
+    for a in doc["arcs"]:
+        c = a.get("ctrl") if isinstance(a, dict) else None
+        if not isinstance(c, list) or len(c) < 2 or not all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) for x in p) for p in c):
+            raise ValueError("arc %s has bad control points" % (a.get("id") if isinstance(a, dict) else "?"))
+
+
+def save_edit(body, root, prm=PARAMS):
+    """Validate the posted document and write it atomically to the edit file. Returns the answer of the endpoint."""
+    doc = json.loads(body.decode("utf-8"))
+    check_document(doc)
+    target = os.path.realpath(os.path.join(root, prm["edit_file"]))
+    if os.path.relpath(target, os.path.realpath(root)) in [os.path.normpath(p) for p in prm["protected"]]:
+        raise ValueError("refusing to write a protected file")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    backup = None
+    if os.path.exists(target):
+        bdir = os.path.join(root, prm["backup_dir"])
+        os.makedirs(bdir, exist_ok=True)
+        backup = os.path.join(bdir, "lines_edit_%s.json" % stamp())
+        n = 1
+        while os.path.exists(backup):                       # two saves inside the same second
+            n += 1
+            backup = os.path.join(bdir, "lines_edit_%s_%d.json" % (stamp(), n))
+        shutil.copy2(target, backup)
+    tmp = target + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(body)
+    os.replace(tmp, target)
+    return {"ok": True, "path": target, "bytes": len(body), "arcs": len(doc["arcs"]), "nodes": len(doc["nodes"]), "backup": backup}
+
+
+def make_handler(root, prm):
+    class Handler(SimpleHTTPRequestHandler):
+        server_version = "ZenRayLines/1"
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=root, **kw)
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")     # the editor and its data are edited while the server runs
+            super().end_headers()
+
+        def reply(self, code, obj):
+            data = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            if self.path.split("?")[0] != prm["save_path"]:
+                return self.reply(404, {"ok": False, "error": "unknown endpoint"})
+            try:
+                n = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                return self.reply(411, {"ok": False, "error": "Content-Length required"})
+            if n <= 0 or n > prm["max_body_mb"] * 1024 * 1024:
+                return self.reply(413, {"ok": False, "error": "body size out of range"})
+            try:
+                self.reply(200, save_edit(self.rfile.read(n), root, prm))
+            except (ValueError, UnicodeDecodeError) as e:       # json.JSONDecodeError is a ValueError
+                self.reply(400, {"ok": False, "error": str(e)})
+            except OSError as e:
+                self.reply(500, {"ok": False, "error": "cannot write: %s" % e})
+
+    return Handler
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ZenRay Lines server (static files and POST /save)")
+    ap.add_argument("--root", default=PARAMS["root"], help="folder to serve (default lines/)")
+    ap.add_argument("--host", default=PARAMS["host"], help="bind address (default 127.0.0.1, loopback only)")
+    ap.add_argument("--port", type=int, default=PARAMS["port"])
+    ap.add_argument("--auto-port", action="store_true", help="when the port is busy, try the next ones instead of failing")
+    ap.add_argument("--port-file", default=None, help="write the port actually used to this file")
+    a = ap.parse_args()
+    root = os.path.realpath(a.root)
+    handler = make_handler(root, PARAMS)
+    httpd = None
+    for port in range(a.port, a.port + (PARAMS["auto_port_tries"] if a.auto_port else 1)):
+        try:
+            httpd = ThreadingHTTPServer((a.host, port), handler)
+            break
+        except OSError as e:
+            print("port %d busy (%s)" % (port, e.strerror), flush=True)
+    if httpd is None:
+        print("no free port, nothing started", flush=True)
+        sys.exit(2)
+    port = httpd.server_address[1]
+    if a.port_file:
+        with open(a.port_file, "w") as f:
+            f.write(str(port) + "\n")
+    print("ZenRay Lines serving %s at http://%s:%d/  (POST %s writes %s)" % (root, a.host, port, PARAMS["save_path"], PARAMS["edit_file"]), flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    main()

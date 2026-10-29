@@ -1,0 +1,31 @@
+"""29 October 2026 : ZenRay Lines FINISH, the conductor : from a broken model to a finished one in ONE command, every step a tool that
+already exists, nothing replayed by hand.
+  1 part audit      ZrlPartAudit.py : each part judged as it is (closed quads, manifold, no folded quad) ; clean parts are kept
+  2 repair          ZrlRepair.py    : small broken parts mended in place (box rebuilt, folds untangled, bounded move)
+  3 retopology      ZrlTune.py      : broken parts that are components of the partition rebuilt by the mini HDA builder, every
+                                      combination of its sliders tried, the best written into the table (skipped with --no-tune)
+  4 car audit       ZrlAudit.py     : the assembled car, part by part : kept, replaced at 100 %, repaired, partial, to fix
+  5 Houdini         ZrlHda.py       : the master /obj/ZRM_Car_Components (run inside Houdini : exec then master())
+python ZrlFinish.py <tag> [--no-tune]        FR : le chef d'orchestre : d'un modèle cassé à un modèle fini, une commande."""
+import json, subprocess, sys, time
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {"python": "/Users/zenray/.venvs/zenray-meshes/bin/python", "small_part_max_polys": 400}   # 29 October 2026
+
+
+def run(script, *args):
+    t = time.time(); r = subprocess.run([PARAMS["python"], "-I", f"{ROOT}/Scripts/lines/{script}", *args], capture_output=True, text=True)
+    print(time.strftime("%H:%M:%S"), script, " ".join(args)[:80], "exit", r.returncode, f"{time.time() - t:.0f} s", flush=True)
+    return r.stdout
+
+
+if __name__ == "__main__":
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v004"; tune = "--no-tune" not in sys.argv
+    run("ZrlPartAudit.py"); pa = json.load(open(f"{ROOT}/work/lines/part_audit.json"))
+    table = json.load(open(f"{ROOT}/work/lines/components_table.json"))
+    broken = [n for n, r in pa.items() if not r["clean"]]
+    twin = lambda n: n[:-2] + "_L" if n.endswith("_R") else n
+    small = [n for n in broken if pa[n]["polys"] <= PARAMS["small_part_max_polys"] and twin(n) not in table]
+    if small: print(run("ZrlRepair.py", *small))
+    comps = sorted({twin(n) for n in broken if twin(n) in table})
+    if tune and comps: print(run("ZrlTune.py", *comps))
+    print(run("ZrlAudit.py", tag))

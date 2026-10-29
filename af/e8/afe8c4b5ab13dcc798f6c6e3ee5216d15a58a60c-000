@@ -1,0 +1,1326 @@
+// 29 October 2026 : ZenRay Lines, browser editor for the car curve network (B-spline arcs in orthographic views).
+// EN: loads data/lines.json (nodes, arcs as clamped uniform cubic B-splines) and data/views.json (five orthographic cameras, each with a
+//     shaded background and a 16 bit depth map). Every arc is drawn as an SVG overlay. Control points and nodes are edited in the view
+//     plane (depth kept, or read from the depth map with "Snap to surface"), mirrored across x = 0 when "Mirror" is on.
+//     Exports : JSON (same schema as lines.json), SVG (one cubic Bezier path per span), PNG (background plus lines).
+//     Every tunable value lives in the CONFIG object below. No external dependency, no build step.
+// FR : éditeur vectoriel des courbes de la voiture dans des vues orthographiques ; tous les réglages sont dans CONFIG.
+'use strict';
+
+// ------------------------------------------------------------------------------------------------------------------ CONFIG
+const CONFIG = {
+  files: { lines: 'data/lines.json', views: 'data/views.json', saved: 'data/lines_edit.json', save: '/save', downloadJson: 'lines_edit.json' },
+  views: { order: ['left', 'right', 'top', 'front', 'back'], initial: 'left', keys: { '1': 'left', '2': 'right', '3': 'top', '4': 'front', '5': 'back' } },
+  defaults: { mirror: true, snap: false, showHidden: true, showNodes: true, showGaps: true, svgBackground: false, bgOpacity: 1, smoothAmount: 0.5 },
+  spline: { perSpan: 40 },                                   // samples per knot span when drawing an arc
+  colors: {
+    arc: '#1d3fd6', arcHidden: '#8d98d6', arcHover: '#0f9d58', arcSelected: '#ff6a00', component: '#0b8f6a',
+    polygon: '#ff6a00', handleFill: '#ffffff', handleStroke: '#ff6a00',
+    node: '#e5252a', nodeHidden: '#f1a3a5', nodeHover: '#ff8a00', nodeSelected: '#ff6a00', nodePending: '#7048e8',
+    gap: '#e5252a', preview: '#7048e8',
+  },
+  sizes: {                                                    // screen pixels (the overlay keeps them constant at any zoom)
+    arc: 1.4, arcHidden: 1.0, arcSelected: 2.8, arcHover: 2.4, component: 3.2, polygon: 1.0, gap: 1.0,
+    handleRadius: 5, handleStroke: 1.6, nodeRadius: 3.8, nodeHoverRadius: 5.6, nodeSelectedRing: 8,
+    dashHidden: [5, 4], dashPolygon: [4, 4], dashGap: [3, 3],
+  },
+  pick: { handlePx: 9, nodePx: 9, arcPx: 7, dragStartPx: 3 },
+  zoom: { speed: 0.0015, pinchBoost: 8, maxScale: 24, minFactor: 0.4, fitMargin: 0.07, lineStepPx: 33, pageStepPx: 400, leftDragPansBackground: true },
+  snap: { searchPx: 8, maxJumpM: 0.02, maxDepthM: 0.15 },     // depth map lookup : search radius, largest depth jump still interpolated, largest move of a point along the view axis
+  visibility: { tolM: 0.012, neighbourhoodPx: 1 },           // a point is hidden when the surface is closer to the viewer by more than tolM
+  mirror: { planeTolM: 0.002, nodeTolM: 0.03 },
+  attach: { tolM: 0.02 },                                     // an arc end within this distance of its node follows the node
+  gaps: { showM: 0.01 },                                      // draw a connector when an arc end is farther than this from its node
+  history: { limit: 100 },
+  edit: { addArcCtrl: 4 },
+  export: { svgDecimals: 2, svgBackgroundOpacity: 0.35, svgStroke: 1.6, svgHiddenStroke: 1.1, svgNodeRadius: 3.2, jsonDecimals: 6,
+            pngArcPx: 2.2, pngHiddenPx: 1.3, pngNodePx: 4.5, pngPerSpan: 40 },
+  listing: { stripPrefix: 'CAR_' },
+};
+
+// ------------------------------------------------------------------------------------------------------------------ helpers
+const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const mir = (p) => [-p[0], p[1], p[2]];
+const clone3 = (p) => [p[0], p[1], p[2]];
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const roundTo = (v, d) => { const f = Math.pow(10, d); const r = Math.round(v * f) / f; return r === 0 ? 0 : r; };
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const shortName = (n) => (CONFIG.listing.stripPrefix && n.startsWith(CONFIG.listing.stripPrefix) ? n.slice(CONFIG.listing.stripPrefix.length) : n);
+const swapSide = (n) => (n.endsWith('_L') ? n.slice(0, -2) + '_R' : n.endsWith('_R') ? n.slice(0, -2) + '_L' : n);
+
+// ------------------------------------------------------------------------------------------------------------------ spline
+// Clamped uniform cubic B-spline. n control points -> n-3 spans, knots [0,0,0,0,1,2,...,n-3,n-3,n-3,n-3], parameter u in [0, n-3].
+// Same convention as ZrlSpline.py (the exporter), so the editor and the exporter evaluate the very same curve.
+const Spline = (() => {
+  const P = 3;
+  const cache = new Map();
+  const left = new Float64Array(P + 1), right = new Float64Array(P + 1), Nb = new Float64Array(P + 1);
+
+  function knots(n) {
+    let k = cache.get(n);
+    if (!k) {
+      const spans = n - P;
+      k = new Array(n + P + 1);
+      for (let i = 0; i < k.length; i++) k[i] = i <= P ? 0 : (i >= n ? spans : i - P);
+      cache.set(n, k);
+    }
+    return k;
+  }
+
+  // the P+1 non zero basis functions at u inside knot span `span` (The NURBS Book, algorithm A2.2)
+  function basis(U, span, u) {
+    Nb[0] = 1;
+    for (let j = 1; j <= P; j++) {
+      left[j] = u - U[span + 1 - j];
+      right[j] = U[span + j] - u;
+      let saved = 0;
+      for (let r = 0; r < j; r++) {
+        const t = Nb[r] / (right[r + 1] + left[j - r]);
+        Nb[r] = saved + right[r + 1] * t;
+        saved = left[j - r] * t;
+      }
+      Nb[j] = saved;
+    }
+  }
+
+  function point(ctrl, U, span, u, out) {
+    basis(U, span, u);
+    let x = 0, y = 0, z = 0;
+    for (let i = 0; i <= P; i++) { const c = ctrl[span - P + i], w = Nb[i]; x += w * c[0]; y += w * c[1]; z += w * c[2]; }
+    out[0] = x; out[1] = y; out[2] = z;
+    return out;
+  }
+
+  const spanCount = (n) => Math.max(1, n - P);
+
+  // polyline of the curve : perSpan samples per span plus the final point, as a flat Float64Array [x,y,z,x,y,z,...]
+  function sample(ctrl, perSpan) {
+    const n = ctrl.length;
+    if (n < P + 1) {                                    // degenerate arc : draw its control polygon
+      const o = new Float64Array(n * 3);
+      for (let i = 0; i < n; i++) { o[3 * i] = ctrl[i][0]; o[3 * i + 1] = ctrl[i][1]; o[3 * i + 2] = ctrl[i][2]; }
+      return o;
+    }
+    const U = knots(n), spans = n - P, out = new Float64Array((spans * perSpan + 1) * 3), tmp = [0, 0, 0];
+    let w = 0;
+    for (let s = 0; s < spans; s++) {
+      for (let i = 0; i < perSpan; i++) {
+        point(ctrl, U, s + P, s + i / perSpan, tmp);
+        out[w++] = tmp[0]; out[w++] = tmp[1]; out[w++] = tmp[2];
+      }
+    }
+    point(ctrl, U, n - 1, spans, tmp);
+    out[w++] = tmp[0]; out[w++] = tmp[1]; out[w++] = tmp[2];
+    return out;
+  }
+
+  // exact cubic Bezier form of every span : [B0, B1, B2, B3] (3D points), from 4 samples of the span at t = 0, 1/3, 2/3, 1
+  function bezierSpans(ctrl) {
+    const n = ctrl.length, res = [];
+    if (n < P + 1) return res;
+    const U = knots(n), spans = n - P, S = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (let s = 0; s < spans; s++) {
+      for (let k = 0; k < 4; k++) point(ctrl, U, s + P, s + k / 3, S[k]);
+      const B1 = [0, 0, 0], B2 = [0, 0, 0];
+      for (let c = 0; c < 3; c++) {
+        B1[c] = (-5 * S[0][c] + 18 * S[1][c] - 9 * S[2][c] + 2 * S[3][c]) / 6;
+        B2[c] = (2 * S[0][c] - 9 * S[1][c] + 18 * S[2][c] - 5 * S[3][c]) / 6;
+      }
+      res.push([clone3(S[0]), B1, B2, clone3(S[3])]);
+    }
+    return res;
+  }
+
+  return { degree: P, knots, point, sample, spanCount, bezierSpans };
+})();
+
+// ------------------------------------------------------------------------------------------------------------------ views
+// Pixel convention (same as Raster.py) : x_img = res/2 + (p - c).rx * s ; y_img = res/2 - (p - c).uy * s ; depth = (p - c).tz
+// (x_img, y_img) are continuous image coordinates, the pixel (col, row) covers [col, col+1) x [row, row+1).
+function project(view, p, out) {
+  const q0 = p[0] - view.center[0], q1 = p[1] - view.center[1], q2 = p[2] - view.center[2], h = view.res / 2, s = view.px_per_m;
+  out[0] = h + (q0 * view.rx[0] + q1 * view.rx[1] + q2 * view.rx[2]) * s;
+  out[1] = h - (q0 * view.uy[0] + q1 * view.uy[1] + q2 * view.uy[2]) * s;
+  out[2] = q0 * view.tz[0] + q1 * view.tz[1] + q2 * view.tz[2];
+  return out;
+}
+
+function unproject(view, x, y, depth, out) {
+  const h = view.res / 2, s = view.px_per_m, u = (x - h) / s, v = (h - y) / s;
+  out = out || [0, 0, 0];
+  for (let i = 0; i < 3; i++) out[i] = view.center[i] + view.rx[i] * u + view.uy[i] * v + view.tz[i] * depth;
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------------------------------ 16 bit PNG
+async function inflateBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// Decodes a non interlaced 16 bit greyscale PNG (what ZrlExport.py writes for the depth maps) into {w, h, data: Uint16Array}.
+async function decodePng16(buffer) {
+  const b = new Uint8Array(buffer), dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+  for (let i = 0; i < 8; i++) if (b[i] !== sig[i]) throw new Error('not a PNG file');
+  let pos = 8, w = 0, h = 0, bitDepth = 0, colorType = -1, interlace = 0, total = 0;
+  const idat = [];
+  while (pos + 8 <= b.length) {
+    const len = dv.getUint32(pos), type = String.fromCharCode(b[pos + 4], b[pos + 5], b[pos + 6], b[pos + 7]), start = pos + 8;
+    if (type === 'IHDR') { w = dv.getUint32(start); h = dv.getUint32(start + 4); bitDepth = b[start + 8]; colorType = b[start + 9]; interlace = b[start + 12]; }
+    else if (type === 'IDAT') { idat.push(b.subarray(start, start + len)); total += len; }
+    else if (type === 'IEND') break;
+    pos = start + len + 4;
+  }
+  if (bitDepth !== 16 || colorType !== 0 || interlace !== 0) throw new Error('unsupported PNG (16 bit grey, not interlaced, expected)');
+  const joined = new Uint8Array(total);
+  let o = 0;
+  for (const c of idat) { joined.set(c, o); o += c.length; }
+  const raw = await inflateBytes(joined), stride = w * 2;
+  if (raw.length < h * (stride + 1)) throw new Error('PNG data is truncated');
+  const out = new Uint16Array(w * h);
+  let prev = new Uint8Array(stride), cur = new Uint8Array(stride);
+  for (let y = 0; y < h; y++) {
+    const off = y * (stride + 1), f = raw[off];
+    if (f === 0) { for (let i = 0; i < stride; i++) cur[i] = raw[off + 1 + i]; }
+    else if (f === 1) { for (let i = 0; i < stride; i++) cur[i] = (raw[off + 1 + i] + (i >= 2 ? cur[i - 2] : 0)) & 255; }
+    else if (f === 2) { for (let i = 0; i < stride; i++) cur[i] = (raw[off + 1 + i] + prev[i]) & 255; }
+    else if (f === 3) { for (let i = 0; i < stride; i++) cur[i] = (raw[off + 1 + i] + (((i >= 2 ? cur[i - 2] : 0) + prev[i]) >> 1)) & 255; }
+    else if (f === 4) {
+      for (let i = 0; i < stride; i++) {
+        const a = i >= 2 ? cur[i - 2] : 0, bb = prev[i], c = i >= 2 ? prev[i - 2] : 0, p = a + bb - c;
+        const pa = Math.abs(p - a), pb = Math.abs(p - bb), pc = Math.abs(p - c);
+        cur[i] = (raw[off + 1 + i] + (pa <= pb && pa <= pc ? a : (pb <= pc ? bb : c))) & 255;
+      }
+    } else throw new Error('bad PNG filter ' + f);
+    const base = y * w;
+    for (let i = 0; i < w; i++) out[base + i] = (cur[2 * i] << 8) | cur[2 * i + 1];
+    const t = prev; prev = cur; cur = t;
+  }
+  return { w, h, data: out };
+}
+
+// Depth map of one view : depth = depth_offset + value / 65535 * depth_scale, value 0 = empty (no surface).
+function createDepthMap(png, view) {
+  const w = png.w, h = png.h, data = png.data, off = view.depth_offset, step = view.depth_scale / 65535;
+  const raw = (c, r) => (c < 0 || r < 0 || c >= w || r >= h ? 0 : data[r * w + c]);
+  const at = (c, r) => { const v = raw(c, r); return v === 0 ? NaN : off + v * step; };
+
+  // smallest surface depth (farthest from the viewer) among the pixels around (c, r) ; Infinity when none is covered
+  function minNear(c, r, rad) {
+    let m = Infinity;
+    for (let dr = -rad; dr <= rad; dr++) for (let dc = -rad; dc <= rad; dc++) { const v = raw(c + dc, r + dr); if (v !== 0) { const d = off + v * step; if (d < m) m = d; } }
+    return m;
+  }
+
+  // surface depth under the continuous image point (x, y) : bilinear when the 4 neighbours are covered and close, else the nearest covered pixel
+  function surface(x, y, searchPx, maxJump) {
+    const fx = x - 0.5, fy = y - 0.5, c0 = Math.floor(fx), r0 = Math.floor(fy), tx = fx - c0, ty = fy - r0;
+    const d00 = at(c0, r0), d10 = at(c0 + 1, r0), d01 = at(c0, r0 + 1), d11 = at(c0 + 1, r0 + 1);
+    if (d00 === d00 && d10 === d10 && d01 === d01 && d11 === d11) {
+      const hi = Math.max(d00, d10, d01, d11), lo = Math.min(d00, d10, d01, d11);
+      if (hi - lo <= maxJump) return (1 - ty) * ((1 - tx) * d00 + tx * d10) + ty * ((1 - tx) * d01 + tx * d11);
+    }
+    const cc = Math.floor(x), rr = Math.floor(y), lim = searchPx * searchPx;
+    let best = NaN, bd = Infinity;
+    for (let dr = -searchPx; dr <= searchPx; dr++) {
+      for (let dc = -searchPx; dc <= searchPx; dc++) {
+        const d = at(cc + dc, rr + dr);
+        if (d === d) { const px = cc + dc + 0.5 - x, py = rr + dr + 0.5 - y, d2 = px * px + py * py; if (d2 <= lim && d2 < bd) { bd = d2; best = d; } }
+      }
+    }
+    return best;
+  }
+
+  return { w, h, at, minNear, surface };
+}
+
+// hidden when a surface closer to the viewer covers the point (3x3 neighbourhood, tolerance tolM) ; no depth map : always visible
+function isVisible(depthMap, x, y, d) {
+  if (!depthMap) return true;
+  const m = depthMap.minNear(Math.floor(x), Math.floor(y), CONFIG.visibility.neighbourhoodPx);
+  return m === Infinity || d >= m - CONFIG.visibility.tolM;
+}
+
+// ------------------------------------------------------------------------------------------------------------------ document
+function validateDoc(doc) {
+  if (!doc || !Array.isArray(doc.nodes) || !Array.isArray(doc.arcs)) throw new Error('not a lines document (nodes and arcs expected)');
+  for (const a of doc.arcs) {
+    if (!Array.isArray(a.ctrl) || a.ctrl.length < 2) throw new Error('arc ' + a.id + ' has no control points');
+    for (const p of a.ctrl) if (!Array.isArray(p) || p.length !== 3 || !p.every(Number.isFinite)) throw new Error('arc ' + a.id + ' has a bad control point');
+  }
+  for (const n of doc.nodes) if (!Array.isArray(n.p) || n.p.length !== 3 || !n.p.every(Number.isFinite)) throw new Error('node ' + n.id + ' has a bad position');
+  return doc;
+}
+
+// lines.json layout : one line per node and per arc (same layout as ZrlExport.py)
+function serializeDoc(doc, decimals) {
+  const R = (v) => roundTo(v, decimals);
+  const pt = (p) => '[' + R(p[0]) + ',' + R(p[1]) + ',' + R(p[2]) + ']';
+  const out = ['{'];
+  out.push('"version": ' + JSON.stringify(doc.version) + ', "date": ' + JSON.stringify(doc.date) + ', "units": ' + JSON.stringify(doc.units) + ',');
+  if (doc.spline) out.push('"spline": ' + JSON.stringify(doc.spline) + ',');
+  out.push('"nodes": [\n' + doc.nodes.map((n) => '{"id":' + n.id + ',"p":' + pt(n.p) + '}').join(',\n') + '\n],');
+  out.push('"arcs": [\n' + doc.arcs.map((a) => '{"id":' + a.id + ',"a":' + a.a + ',"b":' + a.b + ',"closed":' + (a.closed ? 'true' : 'false') +
+    ',"pair":' + JSON.stringify(a.pair) + ',"ctrl":[' + a.ctrl.map(pt).join(',') + '],"mirror":' + a.mirror + '}').join(',\n') + '\n],');
+  out.push('"components": ' + JSON.stringify(doc.components));
+  out.push('}');
+  return out.join('\n') + '\n';
+}
+
+// ------------------------------------------------------------------------------------------------------------------ model
+// The document plus everything that edits it : history, mirror correspondences, drags, smoothing, add and delete.
+function createModel(docIn) {
+  const M = { doc: null, arcMap: new Map(), nodeMap: new Map(), ver: new Map(), cache: new Map(), undoStack: [], redoStack: [], dirty: false, nodeMirror: new Map() };
+  let tick = 0;
+
+  M.load = (doc) => {
+    M.doc = validateDoc(doc);
+    M.arcMap = new Map(doc.arcs.map((a) => [a.id, a]));
+    M.nodeMap = new Map(doc.nodes.map((n) => [n.id, n]));
+    M.cache = new Map(); M.ver = new Map();
+    for (const a of doc.arcs) M.ver.set(a.id, ++tick);      // fresh, never reused version numbers : caches keyed on them cannot go stale
+  };
+  M.touch = (id) => { M.ver.set(id, ++tick); M.dirty = true; };
+  M.verOf = (id) => M.ver.get(id) || 0;
+  M.arc = (id) => M.arcMap.get(id);
+  M.node = (id) => M.nodeMap.get(id);
+
+  M.samples = (id) => {
+    const v = M.ver.get(id), c = M.cache.get(id);
+    if (c && c.ver === v) return c.pts;
+    const pts = Spline.sample(M.arcMap.get(id).ctrl, CONFIG.spline.perSpan);
+    M.cache.set(id, { ver: v, pts });
+    return pts;
+  };
+  M.length = (id) => { const p = M.samples(id); let L = 0; for (let i = 3; i < p.length; i += 3) L += Math.hypot(p[i] - p[i - 3], p[i + 1] - p[i - 2], p[i + 2] - p[i - 1]); return L; };
+
+  // ---- history : JSON snapshots, capped
+  M.checkpoint = () => { M.undoStack.push(JSON.stringify(M.doc)); if (M.undoStack.length > CONFIG.history.limit) M.undoStack.shift(); M.redoStack.length = 0; M.dirty = true; };
+  M.undo = () => { if (!M.undoStack.length) return false; M.redoStack.push(JSON.stringify(M.doc)); M.load(JSON.parse(M.undoStack.pop())); M.dirty = true; return true; };
+  M.redo = () => { if (!M.redoStack.length) return false; M.undoStack.push(JSON.stringify(M.doc)); M.load(JSON.parse(M.redoStack.pop())); M.dirty = true; return true; };
+
+  // ---- mirror correspondences (x -> -x)
+  const pairRev = (a, m) => {            // true when the mirror arc runs the other way ; null when the control point counts differ
+    const n = a.ctrl.length;
+    if (m.ctrl.length !== n) return null;
+    let s = 0, r = 0;
+    for (let i = 0; i < n; i++) { const q = mir(a.ctrl[i]); s += dist3(q, m.ctrl[i]); r += dist3(q, m.ctrl[n - 1 - i]); }
+    return r < s;
+  };
+  const selfMap = (a) => {               // control point index of an arc that is its own mirror : nearest mirrored point, else reversed
+    const n = a.ctrl.length, map = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const q = mir(a.ctrl[i]);
+      let best = 0, bd = Infinity;
+      for (let j = 0; j < n; j++) { const d = dist3(q, a.ctrl[j]); if (d < bd) { bd = d; best = j; } }
+      map[i] = best;
+    }
+    for (let i = 0; i < n; i++) if (map[map[i]] !== i) return a.ctrl.map((_, k) => n - 1 - k);
+    return map;
+  };
+  const inPlane = (a) => a.ctrl.every((p) => Math.abs(p[0]) <= CONFIG.mirror.planeTolM);
+  M.mirrorTarget = (a, i) => {
+    const mid = a.mirror;
+    if (mid == null || mid < 0) return null;
+    const m = M.arcMap.get(mid);
+    if (!m) return null;
+    if (m === a) {
+      if (inPlane(a)) return { arc: a, index: i, plane: true };
+      const j = selfMap(a)[i];
+      return { arc: a, index: j, plane: j === i };
+    }
+    const rev = pairRev(a, m);
+    if (rev === null) return { mismatch: true };
+    return { arc: m, index: rev ? a.ctrl.length - 1 - i : i, plane: false };
+  };
+  const endsCoincide = (a) => a.closed && a.ctrl.length > 1 && dist3(a.ctrl[0], a.ctrl[a.ctrl.length - 1]) < 1e-9;
+  const tieOf = (a, i) => (endsCoincide(a) && (i === 0 || i === a.ctrl.length - 1) ? [i === 0 ? a.ctrl.length - 1 : 0] : []);
+
+  // node correspondence : votes from the mirror arc pairs (topology), then the nearest mirrored node as a fallback
+  M.buildNodeMirror = () => {
+    const doc = M.doc, votes = new Map(), nodes = doc.nodes;
+    const add = (i, j, w) => { if (!votes.has(i)) votes.set(i, new Map()); votes.get(i).set(j, (votes.get(i).get(j) || 0) + w); };
+    const vote = (i, j) => { if (i < 0 || j < 0 || !M.nodeMap.has(i) || !M.nodeMap.has(j)) return; add(i, j, 1); if (i !== j) add(j, i, 1); };
+    for (const a of doc.arcs) {
+      const m = a.mirror != null && a.mirror >= 0 ? M.arcMap.get(a.mirror) : null;
+      if (!m) continue;
+      if (m === a) { if (a.a >= 0 && a.b >= 0 && a.a !== a.b && !inPlane(a)) vote(a.a, a.b); continue; }
+      if (a.id > m.id) continue;
+      const rev = pairRev(a, m);
+      if (rev === null) continue;
+      if (!rev) { vote(a.a, m.a); vote(a.b, m.b); } else { vote(a.a, m.b); vote(a.b, m.a); }
+    }
+    const edges = [];
+    for (const [i, mp] of votes) for (const [j, c] of mp) if (i <= j) edges.push([c, dist3(mir(M.nodeMap.get(i).p), M.nodeMap.get(j).p), i, j]);
+    edges.sort((e1, e2) => e2[0] - e1[0] || e1[1] - e2[1]);
+    const map = new Map();
+    for (const [, , i, j] of edges) if (!map.has(i) && !map.has(j)) { map.set(i, j); map.set(j, i); }
+    for (const n of nodes) {                 // geometric fallback
+      if (map.has(n.id)) continue;
+      let best = null, bd = CONFIG.mirror.nodeTolM;
+      const q = mir(n.p);
+      for (const o of nodes) { if (o.id !== n.id && map.has(o.id)) continue; const d = dist3(q, o.p); if (d <= bd) { bd = d; best = o.id; } }
+      if (best !== null) { map.set(n.id, best); map.set(best, n.id); }
+    }
+    M.nodeMirror = map;
+    return map;
+  };
+
+  M.attachedEnds = (nodeId, tol) => {      // arc ends whose end control point sits on the node (within tol)
+    const node = M.nodeMap.get(nodeId), res = [];
+    if (!node) return res;
+    for (const a of M.doc.arcs) {
+      const n = a.ctrl.length;
+      if (a.a === nodeId && dist3(a.ctrl[0], node.p) <= tol) res.push({ arc: a, index: 0 });
+      if (a.b === nodeId && dist3(a.ctrl[n - 1], node.p) <= tol) res.push({ arc: a, index: n - 1 });
+    }
+    return res;
+  };
+  M.nodeArcs = (nodeId) => M.doc.arcs.filter((a) => a.a === nodeId || a.b === nodeId);
+
+  // ---- drags : begin* captures the correspondences once, apply(p) is then cheap and is called on every pointer move
+  M.beginCtrlDrag = (arcId, i, mirrorOn) => {
+    const a = M.arcMap.get(arcId), ties = tieOf(a, i), t = mirrorOn ? M.mirrorTarget(a, i) : null;
+    const touched = new Set([arcId]);
+    let mTies = [];
+    if (t && t.arc) { touched.add(t.arc.id); if (t.arc !== a) mTies = tieOf(t.arc, t.index); }
+    return {
+      arcs: [...touched], nodes: null, mismatch: !!(t && t.mismatch), start: clone3(a.ctrl[i]),
+      apply(p) {
+        const q = clone3(p);
+        if (t && t.plane) q[0] = 0;
+        a.ctrl[i] = q;
+        for (const k of ties) a.ctrl[k] = clone3(q);
+        if (t && t.arc && !(t.arc === a && t.index === i)) {
+          const mq = mir(q);
+          t.arc.ctrl[t.index] = mq;
+          for (const k of mTies) t.arc.ctrl[k] = clone3(mq);
+        }
+        for (const id of touched) M.touch(id);
+      },
+    };
+  };
+
+  M.beginNodeDrag = (nodeId, mirrorOn) => {
+    const targets = [{ id: nodeId, mirrored: false }];
+    let plane = false;
+    if (mirrorOn) {
+      const mid = M.nodeMirror.get(nodeId);
+      if (mid === nodeId) plane = true; else if (mid != null) targets.push({ id: mid, mirrored: true });
+    }
+    const ends = [];
+    let detached = 0;
+    for (const t of targets) {
+      for (const e of M.attachedEnds(t.id, CONFIG.attach.tolM)) ends.push({ arc: e.arc, index: e.index, node: t });
+      detached += M.nodeArcs(t.id).length - ends.filter((e) => e.node === t).length;
+    }
+    const touched = [...new Set(ends.map((e) => e.arc.id))];
+    return {
+      arcs: touched, nodes: targets.map((t) => t.id), detached, mismatch: false,
+      apply(p) {
+        const q = clone3(p);
+        if (plane) q[0] = 0;
+        for (const t of targets) M.nodeMap.get(t.id).p = t.mirrored ? mir(q) : clone3(q);
+        for (const e of ends) e.arc.ctrl[e.index] = clone3(M.nodeMap.get(e.node.id).p);
+        for (const id of touched) M.touch(id);
+        M.dirty = true;
+      },
+    };
+  };
+
+  // ---- discrete edits (the caller takes a checkpoint first). Each returns the ids of the arcs it changed.
+  M.mirrorIds = (arcId, mirrorOn) => {
+    const ids = [arcId], a = M.arcMap.get(arcId);
+    if (mirrorOn && a && a.mirror != null && a.mirror >= 0 && a.mirror !== arcId && M.arcMap.has(a.mirror)) ids.push(a.mirror);
+    return ids;
+  };
+
+  M.smooth = (arcId, lambda, mirrorOn) => {
+    const ids = M.mirrorIds(arcId, mirrorOn);
+    for (const id of ids) {
+      const a = M.arcMap.get(id), c = a.ctrl, n = c.length;
+      if (n < 3) continue;
+      const nc = c.map(clone3);
+      for (let i = 1; i < n - 1; i++) for (let k = 0; k < 3; k++) nc[i][k] = c[i][k] + lambda * (0.5 * (c[i - 1][k] + c[i + 1][k]) - c[i][k]);
+      a.ctrl = nc;
+      M.touch(id);
+    }
+    return ids;
+  };
+
+  M.weld = (arcId, mirrorOn) => {           // put the end control points back on their nodes
+    const ids = M.mirrorIds(arcId, mirrorOn);
+    for (const id of ids) {
+      const a = M.arcMap.get(id), n = a.ctrl.length;
+      if (a.a >= 0 && M.nodeMap.has(a.a)) a.ctrl[0] = clone3(M.nodeMap.get(a.a).p);
+      if (a.b >= 0 && M.nodeMap.has(a.b)) a.ctrl[n - 1] = clone3(M.nodeMap.get(a.b).p);
+      M.touch(id);
+    }
+    return ids;
+  };
+
+  M.removeArcs = (arcId, mirrorOn) => {
+    const ids = M.mirrorIds(arcId, mirrorOn), gone = new Set(ids);
+    M.doc.arcs = M.doc.arcs.filter((a) => !gone.has(a.id));
+    for (const id of ids) { M.arcMap.delete(id); M.cache.delete(id); M.ver.delete(id); }
+    for (const a of M.doc.arcs) if (gone.has(a.mirror)) { a.mirror = -1; M.touch(a.id); }
+    M.dirty = true;
+    return ids;
+  };
+
+  const nodeComponents = (nodeId) => { const s = new Set(); for (const a of M.nodeArcs(nodeId)) for (const n of a.pair) if (n) s.add(n); return s; };
+  M.addArc = (na, nb, mirrorOn) => {
+    const A = M.nodeMap.get(na), B = M.nodeMap.get(nb);
+    if (!A || !B || na === nb) return null;
+    const k = CONFIG.edit.addArcCtrl, ctrl = [];
+    for (let i = 0; i < k; i++) { const t = i / (k - 1); ctrl.push([A.p[0] + (B.p[0] - A.p[0]) * t, A.p[1] + (B.p[1] - A.p[1]) * t, A.p[2] + (B.p[2] - A.p[2]) * t]); }
+    ctrl[0] = clone3(A.p); ctrl[k - 1] = clone3(B.p);
+    const shared = [...nodeComponents(na)].filter((n) => nodeComponents(nb).has(n));
+    const pair = shared.length >= 2 ? [shared[0], shared[1]] : shared.length === 1 ? [shared[0], shared[0]] : ['', ''];
+    let nextId = 1 + Math.max(-1, ...M.doc.arcs.map((a) => a.id));
+    const arc = { id: nextId++, a: na, b: nb, closed: false, pair, ctrl, mirror: -1 };
+    M.doc.arcs.push(arc); M.arcMap.set(arc.id, arc); M.touch(arc.id);
+    const created = [arc.id];
+    const ma = M.nodeMirror.get(na), mb = M.nodeMirror.get(nb);
+    if (mirrorOn && ma != null && mb != null) {
+      if ((ma === na && mb === nb) || (ma === nb && mb === na)) arc.mirror = arc.id;             // a centre arc : its own mirror
+      else {
+        const m = { id: nextId++, a: ma, b: mb, closed: false, pair: pair.map(swapSide), ctrl: ctrl.map(mir), mirror: arc.id };
+        m.ctrl[0] = clone3(M.nodeMap.get(ma).p); m.ctrl[k - 1] = clone3(M.nodeMap.get(mb).p);
+        arc.mirror = m.id;
+        M.doc.arcs.push(m); M.arcMap.set(m.id, m); M.touch(m.id);
+        created.push(m.id);
+      }
+    }
+    return created;
+  };
+
+  M.serialize = () => serializeDoc(M.doc, CONFIG.export.jsonDecimals);
+
+  M.load(docIn);
+  return M;
+}
+
+// ------------------------------------------------------------------------------------------------------------------ projection of an arc
+// Samples of an arc projected into a view, with a visibility flag per sample (depth map test).
+function projectArc(model, arc, view, depthMap) {
+  const pts = model.samples(arc.id), m = pts.length / 3;
+  const x = new Float32Array(m), y = new Float32Array(m), vis = new Uint8Array(m), p = [0, 0, 0], q = [0, 0, 0];
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, anyVis = false;
+  for (let i = 0; i < m; i++) {
+    p[0] = pts[3 * i]; p[1] = pts[3 * i + 1]; p[2] = pts[3 * i + 2];
+    project(view, p, q);
+    x[i] = q[0]; y[i] = q[1];
+    const v = isVisible(depthMap, q[0], q[1], q[2]);
+    vis[i] = v ? 1 : 0; if (v) anyVis = true;
+    if (q[0] < x0) x0 = q[0]; if (q[0] > x1) x1 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[1] > y1) y1 = q[1];
+  }
+  return { x, y, vis, bbox: [x0, y0, x1, y1], anyVis };
+}
+
+// runs of consecutive points whose segments are all visible (or all hidden) : [[i0, i1], ...] with the points i0..i1
+function runsOf(e, wantVisible) {
+  const runs = [], m = e.x.length;
+  let start = -1;
+  for (let i = 0; i < m - 1; i++) {
+    const segVisible = e.vis[i] === 1 && e.vis[i + 1] === 1;
+    if (segVisible === wantVisible) { if (start < 0) start = i; } else if (start >= 0) { runs.push([start, i]); start = -1; }
+  }
+  if (start >= 0) runs.push([start, m - 1]);
+  return runs;
+}
+
+function pathFromRuns(e, runs, decimals) {
+  const f = Math.pow(10, decimals), parts = [];
+  for (const [i0, i1] of runs) {
+    parts.push('M' + Math.round(e.x[i0] * f) / f + ' ' + Math.round(e.y[i0] * f) / f);
+    for (let i = i0 + 1; i <= i1; i++) parts.push('L' + Math.round(e.x[i] * f) / f + ' ' + Math.round(e.y[i] * f) / f);
+  }
+  return parts.join('');
+}
+
+// ------------------------------------------------------------------------------------------------------------------ SVG export
+// One <path> per arc (id arc-<id>), one cubic Bezier per span (exact), image pixel coordinates of the view.
+function buildSvg(doc, view, depthMap, opts) {
+  const res = view.res, D = opts.decimals, f = Math.pow(10, D), n2 = (v) => String(Math.round(v * f) / f), q = [0, 0, 0], model = opts.model;
+  const pr = (p) => { project(view, p, q); return n2(q[0]) + ' ' + n2(q[1]); };
+  const out = ['<?xml version="1.0" encoding="UTF-8"?>',
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + res + ' ' + res + '" width="' + res + '" height="' + res + '">',
+    '<title>ZenRay Lines, view ' + escapeHtml(opts.viewName) + ', ' + escapeHtml(doc.date || '') + '</title>'];
+  if (opts.backgroundHref) out.push('<image x="0" y="0" width="' + res + '" height="' + res + '" opacity="' + opts.bgOpacity + '" href="' + opts.backgroundHref + '"/>');
+  out.push('<g id="arcs" fill="none" stroke-linecap="round" stroke-linejoin="round">');
+  let written = 0;
+  for (const a of doc.arcs) {
+    const e = projectArc(model, a, view, depthMap);
+    if (!e.anyVis && !opts.showHidden) continue;
+    const spans = Spline.bezierSpans(a.ctrl);
+    if (!spans.length) continue;
+    let d = 'M' + pr(spans[0][0]);
+    for (const s of spans) d += 'C' + pr(s[1]) + ' ' + pr(s[2]) + ' ' + pr(s[3]);
+    const style = e.anyVis ? 'stroke="' + opts.colors.arc + '" stroke-width="' + opts.stroke + '"'
+      : 'stroke="' + opts.colors.arcHidden + '" stroke-width="' + opts.hiddenStroke + '" stroke-dasharray="6 5"';
+    out.push('<path id="arc-' + a.id + '" class="' + (e.anyVis ? 'visible' : 'hidden') + '" data-pair="' + escapeHtml(a.pair.join(' / ')) + '" data-mirror="' + a.mirror + '" ' + style + ' d="' + d + '"/>');
+    written++;
+  }
+  out.push('</g>', '<g id="nodes" stroke="none">');
+  for (const nd of doc.nodes) {
+    project(view, nd.p, q);
+    if (!opts.showHidden && !isVisible(depthMap, q[0], q[1], q[2])) continue;
+    out.push('<circle id="node-' + nd.id + '" cx="' + n2(q[0]) + '" cy="' + n2(q[1]) + '" r="' + opts.nodeRadius + '" fill="' + opts.colors.node + '"/>');
+  }
+  out.push('</g>', '</svg>');
+  return { text: out.join('\n') + '\n', arcs: written };
+}
+
+// ------------------------------------------------------------------------------------------------------------------ application (DOM)
+function startApp() {
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const $ = (id) => document.getElementById(id);
+  const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); if (attrs) for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
+  const C = CONFIG.colors, Z = CONFIG.sizes;
+
+  const el = {};
+  for (const id of ['svg', 'stage', 'status', 'viewButtons', 'bAdd', 'modeHint', 'zoomVal', 'bFit', 'coords', 'hoverInfo', 'compList', 'filter', 'arcList', 'arcCount', 'selInfo',
+    'pMirror', 'pSnap', 'pHidden', 'pNodes', 'pGaps', 'pSvgBg', 'pBgOpacity', 'pSmooth', 'pLineWidth', 'bUndo', 'bRedo', 'bSmooth', 'bWeld', 'bDelete',
+    'bExportJson', 'bExportSvg', 'bExportPng', 'bSave', 'bLoadSaved', 'gComp', 'gHid', 'gVis', 'gGaps', 'gHover', 'gSel', 'gNodes', 'gTop']) el[id] = $(id);
+
+  const S = {
+    views: {}, viewName: null, viewDef: null, depth: null, depthCache: {}, viewStates: {},
+    sel: { arc: null, node: null }, hover: null, mode: 'select', addFirst: null, space: false, drag: null,
+    params: Object.assign({}, CONFIG.defaults, { lineWidth: Z.arc }), filter: { text: '', comp: null },
+    proj: new Map(), arcEls: new Map(), nodeEls: new Map(), nodeView: new Map(),
+    W: 0, H: 0, fitK: 1, lastK: 0, fitted: false, v2: { k: 1, x0: 0, y0: 0 }, rowEls: new Map(), preview: null,
+  };
+  let model = null;
+
+  // ---------------------------------------------------------------- small UI helpers
+  function setStatus(msg, kind) { el.status.textContent = msg; el.status.className = kind || ''; }
+  const safe = (fn) => (...a) => { try { return fn(...a); } catch (e) { console.error(e); setStatus('Error: ' + (e && e.message ? e.message : e), 'error'); } };
+  function refreshTitle() { document.title = (model && model.dirty ? '* ' : '') + 'ZenRay Lines'; }
+  function stageRect() { return el.svg.getBoundingClientRect(); }
+  function measure() { const r = stageRect(); S.W = r.width; S.H = r.height; }
+
+  // ---------------------------------------------------------------- projection cache
+  function entryFor(arc) {
+    const key = model.verOf(arc.id) + '|' + S.viewName + '|' + (S.depth ? 'd' : '-');
+    let e = S.proj.get(arc.id);
+    if (e && e.key === key) return e;
+    e = projectArc(model, arc, S.viewDef, S.depth);
+    e.key = key;
+    S.proj.set(arc.id, e);
+    return e;
+  }
+
+  // ---------------------------------------------------------------- camera (viewBox) : zoom and pan
+  function saveViewState() { S.viewStates[S.viewName] = { k: S.v2.k, x0: S.v2.x0, y0: S.v2.y0, fitK: S.fitK }; }
+  function applyViewBox() {
+    if (!(S.W > 0 && S.H > 0)) return;
+    const v = S.v2;
+    el.svg.setAttribute('viewBox', v.x0 + ' ' + v.y0 + ' ' + (S.W / v.k) + ' ' + (S.H / v.k));
+    if (v.k !== S.lastK) { S.lastK = v.k; applyZoomStyles(); }          // widths and radii only depend on the zoom, not on the pan
+    el.zoomVal.textContent = Math.round(v.k / S.fitK * 100) + '%';
+  }
+  function contentBox() {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const a of model.doc.arcs) { const b = entryFor(a).bbox; if (b[0] < x0) x0 = b[0]; if (b[1] < y0) y0 = b[1]; if (b[2] > x1) x1 = b[2]; if (b[3] > y1) y1 = b[3]; }
+    for (const n of model.doc.nodes) { const q = project(S.viewDef, n.p, [0, 0, 0]); if (q[0] < x0) x0 = q[0]; if (q[1] < y0) y0 = q[1]; if (q[0] > x1) x1 = q[0]; if (q[1] > y1) y1 = q[1]; }
+    if (!(x1 > x0)) { const r = S.viewDef.res; return [0, 0, r, r]; }
+    return [x0, y0, x1, y1];
+  }
+  function fitView() {
+    measure();
+    if (!(S.W > 0 && S.H > 0)) return;
+    const b = contentBox(), w = Math.max(b[2] - b[0], 1), h = Math.max(b[3] - b[1], 1), m = 1 + 2 * CONFIG.zoom.fitMargin;
+    const k = Math.min(S.W / (w * m), S.H / (h * m));
+    S.fitK = k; S.fitted = true;
+    S.v2 = { k, x0: (b[0] + b[2]) / 2 - S.W / (2 * k), y0: (b[1] + b[3]) / 2 - S.H / (2 * k) };
+    applyViewBox(); saveViewState();
+  }
+  function zoomAt(cx, cy, factor) {
+    const r = stageRect(), v = S.v2, mx = cx - r.left, my = cy - r.top, ix = v.x0 + mx / v.k, iy = v.y0 + my / v.k;
+    const k2 = clamp(v.k * factor, S.fitK * CONFIG.zoom.minFactor, CONFIG.zoom.maxScale);
+    v.k = k2; v.x0 = ix - mx / k2; v.y0 = iy - my / k2;
+    applyViewBox(); saveViewState();
+  }
+  function imgPoint(ev) { const r = stageRect(), v = S.v2; return [v.x0 + (ev.clientX - r.left) / v.k, v.y0 + (ev.clientY - r.top) / v.k]; }
+  function toClient(ix, iy) { const r = stageRect(), v = S.v2; return { x: r.left + (ix - v.x0) * v.k, y: r.top + (iy - v.y0) * v.k }; }
+
+  // widths, dashes and radii are given in screen pixels : divide by the zoom to keep them constant
+  function applyZoomStyles() {
+    const k = S.v2.k, lw = S.params.lineWidth;
+    el.gVis.setAttribute('stroke-width', lw / k);
+    el.gHid.setAttribute('stroke-width', Z.arcHidden / k); el.gHid.setAttribute('stroke-dasharray', Z.dashHidden.map((d) => d / k).join(' '));
+    el.gComp.setAttribute('stroke-width', Z.component / k);
+    el.gGaps.setAttribute('stroke-width', Z.gap / k); el.gGaps.setAttribute('stroke-dasharray', Z.dashGap.map((d) => d / k).join(' '));
+    el.gHover.setAttribute('stroke-width', Z.arcHover / k);
+    for (const [id, c] of S.nodeEls) c.setAttribute('r', nodeRadius(id) / k);
+    renderSelection();
+  }
+
+  // ---------------------------------------------------------------- arcs
+  function ensureArcEls(arc) {
+    let e = S.arcEls.get(arc.id);
+    if (!e) {
+      e = { v: svgEl('path', { 'data-id': arc.id, stroke: C.arc }), h: svgEl('path', { 'data-id': arc.id, stroke: C.arcHidden }) };
+      el.gVis.appendChild(e.v); el.gHid.appendChild(e.h);
+      S.arcEls.set(arc.id, e);
+    }
+    return e;
+  }
+  function updateArc(arc) {
+    const e = entryFor(arc), els = ensureArcEls(arc);
+    els.v.setAttribute('d', pathFromRuns(e, runsOf(e, true), 2));
+    els.h.setAttribute('d', pathFromRuns(e, runsOf(e, false), 2));
+  }
+  function syncArcEls() {
+    const live = new Set(model.doc.arcs.map((a) => a.id));
+    for (const [id, e] of S.arcEls) if (!live.has(id)) { e.v.remove(); e.h.remove(); S.arcEls.delete(id); S.proj.delete(id); }
+    for (const a of model.doc.arcs) updateArc(a);
+  }
+
+  // ---------------------------------------------------------------- nodes and gaps
+  function nodeRadius(id) {
+    if (S.hover && S.hover.type === 'node' && S.hover.id === id) return Z.nodeHoverRadius;
+    return Z.nodeRadius;
+  }
+  function nodeColor(id, vis) {
+    if (S.addFirst === id) return C.nodePending;
+    if (S.sel.node === id) return C.nodeSelected;
+    if (S.hover && S.hover.type === 'node' && S.hover.id === id) return C.nodeHover;
+    return vis ? C.node : C.nodeHidden;
+  }
+  function renderNodes() {
+    const k = S.v2.k, q = [0, 0, 0];
+    const live = new Set();
+    for (const n of model.doc.nodes) {
+      live.add(n.id);
+      project(S.viewDef, n.p, q);
+      const vis = isVisible(S.depth, q[0], q[1], q[2]);
+      const show = S.params.showNodes && (vis || S.params.showHidden);
+      S.nodeView.set(n.id, { x: q[0], y: q[1], vis, show });
+      let c = S.nodeEls.get(n.id);
+      if (!c) { c = svgEl('circle', { 'data-id': n.id }); el.gNodes.appendChild(c); S.nodeEls.set(n.id, c); }
+      c.setAttribute('cx', q[0]); c.setAttribute('cy', q[1]); c.setAttribute('r', nodeRadius(n.id) / k);
+      c.setAttribute('fill', nodeColor(n.id, vis));
+      c.style.display = show ? '' : 'none';
+    }
+    for (const [id, c] of S.nodeEls) if (!live.has(id)) { c.remove(); S.nodeEls.delete(id); S.nodeView.delete(id); }
+    renderGaps();
+  }
+  function renderGaps() {
+    const parts = [], q = [0, 0, 0], on = S.params.showGaps && S.params.showNodes;
+    if (on) {
+      for (const a of model.doc.arcs) {
+        const n = a.ctrl.length;
+        for (const [end, nid] of [[0, a.a], [n - 1, a.b]]) {
+          if (nid < 0) continue;
+          const node = model.node(nid);
+          if (!node || dist3(a.ctrl[end], node.p) < CONFIG.gaps.showM) continue;
+          const v = S.nodeView.get(nid);
+          if (!v || !v.show) continue;
+          project(S.viewDef, a.ctrl[end], q);
+          parts.push('M' + v.x + ' ' + v.y + 'L' + q[0] + ' ' + q[1]);
+        }
+      }
+    }
+    el.gGaps.innerHTML = '';
+    if (parts.length) { const p = svgEl('path', { d: parts.join(''), stroke: C.gap }); el.gGaps.appendChild(p); }
+  }
+
+  // ---------------------------------------------------------------- selection overlay : the selected arc, its control polygon and handles
+  function isEndAttached(a, i) {
+    const n = a.ctrl.length;
+    if (i === 0 && a.a >= 0) { const nd = model.node(a.a); return !!nd && dist3(a.ctrl[0], nd.p) <= CONFIG.attach.tolM; }
+    if (i === n - 1 && a.b >= 0) { const nd = model.node(a.b); return !!nd && dist3(a.ctrl[n - 1], nd.p) <= CONFIG.attach.tolM; }
+    return false;
+  }
+  function handleList(a) {
+    const n = a.ctrl.length, res = [], q = [0, 0, 0];
+    const coincide = a.closed && n > 1 && dist3(a.ctrl[0], a.ctrl[n - 1]) < 1e-9;
+    for (let i = 0; i < n; i++) {
+      if (isEndAttached(a, i)) continue;
+      if (coincide && i === n - 1) continue;
+      project(S.viewDef, a.ctrl[i], q);
+      res.push({ i, x: q[0], y: q[1] });
+    }
+    return res;
+  }
+  function renderSelection() {
+    const g = el.gSel, k = S.v2.k;
+    g.innerHTML = '';
+    if (S.sel.arc != null) {
+      const a = model.arc(S.sel.arc);
+      if (a) {
+        const e = entryFor(a);
+        g.appendChild(svgEl('path', { d: pathFromRuns(e, [[0, e.x.length - 1]], 2), fill: 'none', stroke: C.arcSelected, 'stroke-width': Z.arcSelected / k, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+        const q = [0, 0, 0], poly = [];
+        a.ctrl.forEach((c, i) => { project(S.viewDef, c, q); poly.push((i ? 'L' : 'M') + q[0] + ' ' + q[1]); });
+        g.appendChild(svgEl('path', { d: poly.join(''), fill: 'none', stroke: C.polygon, 'stroke-width': Z.polygon / k, 'stroke-dasharray': Z.dashPolygon.map((d) => d / k).join(' '), opacity: 0.8 }));
+        const ma = S.params.mirror && a.mirror >= 0 && a.mirror !== a.id ? model.arc(a.mirror) : null;
+        if (ma) { const me = entryFor(ma); g.appendChild(svgEl('path', { d: pathFromRuns(me, [[0, me.x.length - 1]], 2), fill: 'none', stroke: C.arcSelected, 'stroke-width': 1.4 / k, 'stroke-dasharray': Z.dashHidden.map((d) => d / k).join(' '), opacity: 0.7 })); }
+        for (const h of handleList(a)) {
+          g.appendChild(svgEl('circle', { cx: h.x, cy: h.y, r: Z.handleRadius / k, fill: C.handleFill, stroke: C.handleStroke, 'stroke-width': Z.handleStroke / k, 'data-i': h.i }));
+        }
+      }
+    }
+    if (S.sel.node != null) {
+      const v = S.nodeView.get(S.sel.node);
+      if (v) g.appendChild(svgEl('circle', { cx: v.x, cy: v.y, r: Z.nodeSelectedRing / k, fill: 'none', stroke: C.nodeSelected, 'stroke-width': 1.8 / k }));
+    }
+  }
+  function renderHover() {
+    const g = el.gHover;
+    g.innerHTML = '';
+    const h = S.hover;
+    if (h && h.type === 'arc' && h.id !== S.sel.arc) {
+      const a = model.arc(h.id);
+      if (a) { const e = entryFor(a); g.appendChild(svgEl('path', { d: pathFromRuns(e, [[0, e.x.length - 1]], 2), fill: 'none', stroke: C.arcHover, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })); }
+    }
+  }
+  function renderComponent() {
+    const g = el.gComp;
+    g.innerHTML = '';
+    const comp = S.filter.comp;
+    if (!comp) return;
+    const parts = [];
+    for (const a of model.doc.arcs) if (a.pair.includes(comp)) { const e = entryFor(a); parts.push(pathFromRuns(e, [[0, e.x.length - 1]], 2)); }
+    if (parts.length) g.appendChild(svgEl('path', { d: parts.join(''), stroke: C.component, opacity: 0.55 }));
+  }
+
+  function renderAll() {
+    syncArcEls();
+    el.gHid.style.display = S.params.showHidden ? '' : 'none';
+    renderNodes(); renderSelection(); renderHover(); renderComponent();
+    applyZoomStyles();
+  }
+
+  // ---------------------------------------------------------------- picking
+  function pickAt(pt) {
+    const k = S.v2.k;
+    if (S.sel.arc != null) {                                   // 1. handles of the selected arc
+      const a = model.arc(S.sel.arc);
+      if (a) {
+        let best = null, bd = Math.pow(CONFIG.pick.handlePx / k, 2);
+        for (const h of handleList(a)) { const d = Math.pow(h.x - pt[0], 2) + Math.pow(h.y - pt[1], 2); if (d <= bd) { bd = d; best = h; } }
+        if (best) return { type: 'ctrl', arc: a.id, index: best.i, x: best.x, y: best.y };
+      }
+    }
+    const nid = nearestNode(pt);                                  // 2. nodes
+    if (nid !== null) return { type: 'node', id: nid };
+    const tol = CONFIG.pick.arcPx / k, tol2 = tol * tol;       // 3. arcs : visible parts first, hidden parts only when they are shown
+    let bestV = null, bvd = tol2, bestH = null, bhd = tol2;
+    for (const a of model.doc.arcs) {
+      const e = entryFor(a), b = e.bbox;
+      if (pt[0] < b[0] - tol || pt[0] > b[2] + tol || pt[1] < b[1] - tol || pt[1] > b[3] + tol) continue;
+      for (let i = 0; i < e.x.length - 1; i++) {
+        const d = segDist2(pt[0], pt[1], e.x[i], e.y[i], e.x[i + 1], e.y[i + 1]);
+        if (e.vis[i] === 1 && e.vis[i + 1] === 1) { if (d < bvd) { bvd = d; bestV = a.id; } } else if (d < bhd) { bhd = d; bestH = a.id; }
+      }
+    }
+    if (bestV !== null) return { type: 'arc', id: bestV };
+    if (bestH !== null && S.params.showHidden) return { type: 'arc', id: bestH };
+    return { type: 'none' };
+  }
+  // nearest node within the pick radius, a visible node winning over a hidden one
+  function nearestNode(pt) {
+    const r2 = Math.pow(CONFIG.pick.nodePx / S.v2.k, 2);
+    let bv = null, bvd = r2, bh = null, bhd = r2;
+    for (const [id, v] of S.nodeView) {
+      if (!v.show) continue;
+      const d = Math.pow(v.x - pt[0], 2) + Math.pow(v.y - pt[1], 2);
+      if (v.vis) { if (d < bvd) { bvd = d; bv = id; } } else if (d < bhd) { bhd = d; bh = id; }
+    }
+    return bv !== null ? bv : bh;
+  }
+  function segDist2(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    let t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const cx = ax + t * dx - px, cy = ay + t * dy - py;
+    return cx * cx + cy * cy;
+  }
+
+  // ---------------------------------------------------------------- selection and lists
+  function selectArc(id, opts) {
+    S.sel.arc = id; S.sel.node = null;
+    renderSelection(); renderHover(); renderNodes(); updateInfo(); updateRowSelection();
+    if (opts && opts.reveal) revealArc(id);
+  }
+  function selectNode(id) {
+    S.sel.node = id; S.sel.arc = null;
+    renderSelection(); renderNodes(); updateInfo(); updateRowSelection();
+  }
+  function clearSelection() {
+    S.sel.arc = null; S.sel.node = null;
+    renderSelection(); renderNodes(); updateInfo(); updateRowSelection();
+  }
+  function revealArc(id) {                                      // bring a selected arc into the viewport (keeps the zoom when it fits)
+    const a = model.arc(id);
+    if (!a) return;
+    measure();
+    if (!(S.W > 0)) return;
+    const b = entryFor(a).bbox, v = S.v2, vw = S.W / v.k, vh = S.H / v.k;
+    const inside = b[0] >= v.x0 && b[2] <= v.x0 + vw && b[1] >= v.y0 && b[3] <= v.y0 + vh;
+    if (inside) return;
+    const w = Math.max(b[2] - b[0], 1), h = Math.max(b[3] - b[1], 1);
+    if (w * 1.2 > vw || h * 1.2 > vh) { v.k = clamp(Math.min(S.W / (w * 1.4), S.H / (h * 1.4)), S.fitK * CONFIG.zoom.minFactor, CONFIG.zoom.maxScale); }
+    v.x0 = (b[0] + b[2]) / 2 - S.W / (2 * v.k); v.y0 = (b[1] + b[3]) / 2 - S.H / (2 * v.k);
+    applyViewBox(); saveViewState();
+  }
+  function arcLabel(a) { return a.pair.map(shortName).filter(Boolean).join(' / ') || 'no pair'; }
+
+  function renderComponentList() {
+    const counts = new Map();
+    for (const n of model.doc.components || []) counts.set(n, 0);
+    for (const a of model.doc.arcs) for (const n of new Set(a.pair)) if (n) counts.set(n, (counts.get(n) || 0) + 1);
+    el.compList.innerHTML = '';
+    for (const [name, c] of counts) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'chip' + (S.filter.comp === name ? ' on' : ''); b.setAttribute('data-comp', name);
+      b.textContent = shortName(name) + ' ' + c;
+      el.compList.appendChild(b);
+    }
+  }
+  function arcMatches(a) {
+    const f = S.filter;
+    if (f.comp && !a.pair.includes(f.comp)) return false;
+    if (f.text) {
+      const t = f.text.toLowerCase(), hay = ('#' + a.id + ' ' + a.id + ' ' + a.pair.join(' ')).toLowerCase();
+      if (!t.split(/\s+/).every((w) => hay.includes(w))) return false;
+    }
+    return true;
+  }
+  function renderArcList() {
+    const frag = document.createDocumentFragment();
+    S.rowEls = new Map();
+    let shown = 0;
+    for (const a of model.doc.arcs) {
+      if (!arcMatches(a)) continue;
+      shown++;
+      const row = document.createElement('div');
+      row.className = 'row' + (S.sel.arc === a.id ? ' sel' : ''); row.setAttribute('data-id', a.id);
+      row.innerHTML = '<span class="num">#' + a.id + '</span><span class="names">' + escapeHtml(arcLabel(a)) + '</span><span class="len">' + model.length(a.id).toFixed(2) + '</span>';
+      frag.appendChild(row);
+      S.rowEls.set(a.id, row);
+    }
+    el.arcList.innerHTML = '';
+    el.arcList.appendChild(frag);
+    el.arcCount.textContent = shown + ' of ' + model.doc.arcs.length;
+  }
+  function updateRowSelection() {
+    for (const [id, row] of S.rowEls) row.classList.toggle('sel', id === S.sel.arc);
+    const r = S.sel.arc != null ? S.rowEls.get(S.sel.arc) : null;
+    if (r && r.scrollIntoView) r.scrollIntoView({ block: 'nearest' });
+  }
+  function updateRowLengths(ids) {
+    for (const id of ids) { const row = S.rowEls.get(id), a = model.arc(id); if (row && a) row.querySelector('.len').textContent = model.length(id).toFixed(2); }
+  }
+
+  function updateInfo() {
+    const box = el.selInfo;
+    const row = (k, v) => '<div class="kv"><span>' + k + '</span><b>' + v + '</b></div>';
+    if (S.sel.arc != null && model.arc(S.sel.arc)) {
+      const a = model.arc(S.sel.arc), n = a.ctrl.length;
+      const gap = (end, nid) => { if (nid < 0) return 'free'; const nd = model.node(nid); return '#' + nid + (nd ? ' (' + (dist3(a.ctrl[end], nd.p) * 1000).toFixed(1) + ' mm)' : ''); };
+      box.innerHTML = row('Arc', '#' + a.id + (a.closed ? ' closed' : '')) + row('Pair', escapeHtml(arcLabel(a))) +
+        row('Length', model.length(a.id).toFixed(3) + ' m') + row('Control points', n + ', ' + Spline.spanCount(n) + ' spans') +
+        row('Node a', gap(0, a.a)) + row('Node b', gap(n - 1, a.b)) +
+        row('Mirror', a.mirror >= 0 ? (a.mirror === a.id ? 'itself (centre)' : '#' + a.mirror) : 'none');
+    } else if (S.sel.node != null && model.node(S.sel.node)) {
+      const nd = model.node(S.sel.node), arcs = model.nodeArcs(nd.id).map((a) => '#' + a.id).join(' ');
+      const mn = model.nodeMirror.get(nd.id);
+      box.innerHTML = row('Node', '#' + nd.id) + row('Position', nd.p.map((v) => v.toFixed(3)).join(', ')) + row('Arcs', arcs || 'none') +
+        row('Mirror', mn == null ? 'none' : mn === nd.id ? 'itself (centre)' : '#' + mn);
+    } else {
+      box.innerHTML = '<p class="hint">Nothing selected. Click an arc, or pick one in the list.</p>';
+    }
+    updateButtons();
+  }
+  function updateButtons() {
+    el.bUndo.disabled = !model.undoStack.length; el.bRedo.disabled = !model.redoStack.length;
+    const has = S.sel.arc != null && !!model.arc(S.sel.arc);
+    el.bSmooth.disabled = !has; el.bWeld.disabled = !has; el.bDelete.disabled = !has;
+    el.bAdd.classList.toggle('on', S.mode === 'add');
+    refreshTitle();
+  }
+
+  // ---------------------------------------------------------------- edits
+  function afterEdit(plan, finished) {
+    for (const id of plan.arcs) { const a = model.arc(id); if (a) updateArc(a); }
+    if (plan.nodes) renderNodes(); else renderGaps();
+    renderSelection(); renderHover();
+    if (S.filter.comp) renderComponent();
+    if (finished) { updateRowLengths(plan.arcs); updateInfo(); }
+    refreshTitle();
+  }
+  function structureChanged() {
+    syncArcEls(); renderNodes(); renderSelection(); renderHover(); renderComponent();
+    renderComponentList(); renderArcList(); updateInfo();
+  }
+  function discreteEdit(label, fn) {
+    if (S.sel.arc == null) return;
+    model.checkpoint();
+    const ids = fn();
+    afterEdit({ arcs: ids }, true);
+    updateButtons();
+    setStatus(label + ' (' + ids.map((i) => '#' + i).join(', ') + ')');
+  }
+  function doSmooth() { discreteEdit('Smoothed', () => model.smooth(S.sel.arc, S.params.smoothAmount, S.params.mirror)); }
+  function doWeld() { discreteEdit('Welded ends to nodes', () => model.weld(S.sel.arc, S.params.mirror)); }
+  function doDelete() {
+    if (S.sel.arc == null) return;
+    model.checkpoint();
+    const ids = model.removeArcs(S.sel.arc, S.params.mirror);
+    S.sel.arc = null;
+    structureChanged();
+    setStatus('Deleted ' + ids.map((i) => '#' + i).join(', '));
+  }
+  function doUndo() { if (model.undo()) { fixSelection(); S.proj.clear(); structureChanged(); setStatus('Undo'); } }
+  function doRedo() { if (model.redo()) { fixSelection(); S.proj.clear(); structureChanged(); setStatus('Redo'); } }
+  function fixSelection() { if (S.sel.arc != null && !model.arc(S.sel.arc)) S.sel.arc = null; if (S.sel.node != null && !model.node(S.sel.node)) S.sel.node = null; }
+
+  function setMode(mode) {
+    S.mode = mode; S.addFirst = null;
+    el.stage.classList.toggle('mode-add', mode === 'add');
+    el.modeHint.textContent = mode === 'add' ? 'Click a start node, then an end node. Esc cancels.' : 'Select, drag handles and nodes.';
+    removePreview(); renderNodes(); updateButtons();
+  }
+  function removePreview() { if (S.preview) { S.preview.remove(); S.preview = null; } }
+  function addModeClick(pt) {
+    const best = nearestNode(pt);
+    if (best === null) { setStatus('No node under the cursor. Click on a red dot.'); return; }
+    if (S.addFirst === null) { S.addFirst = best; renderNodes(); setStatus('Start node #' + best + '. Now click the end node.'); return; }
+    if (best === S.addFirst) return;
+    model.checkpoint();
+    const created = model.addArc(S.addFirst, best, S.params.mirror);
+    setMode('select');
+    if (created) { structureChanged(); selectArc(created[0], { reveal: true }); setStatus('Added arc ' + created.map((i) => '#' + i).join(', ') + ' (4 control points)'); }
+  }
+
+  // ---------------------------------------------------------------- pointer interaction
+  function onDown(ev) {
+    if (ev.button === 1 || (ev.button === 0 && S.space)) { S.drag = { type: 'pan', sx: ev.clientX, sy: ev.clientY, x0: S.v2.x0, y0: S.v2.y0 }; el.stage.classList.add('panning'); ev.preventDefault(); return; }
+    if (ev.button !== 0) return;
+    const pt = imgPoint(ev);
+    if (S.mode === 'add') { addModeClick(pt); return; }
+    const hit = pickAt(pt);
+    if (hit.type === 'ctrl' || hit.type === 'node') {
+      const hx = hit.type === 'ctrl' ? hit.x : S.nodeView.get(hit.id).x, hy = hit.type === 'ctrl' ? hit.y : S.nodeView.get(hit.id).y;
+      const p3 = hit.type === 'ctrl' ? model.arc(hit.arc).ctrl[hit.index] : model.node(hit.id).p, q = project(S.viewDef, p3, [0, 0, 0]);
+      S.drag = { type: hit.type, hit, sx: ev.clientX, sy: ev.clientY, started: false, plan: null, depth0: q[2], offset: [hx - pt[0], hy - pt[1]] };
+    } else if (hit.type === 'arc') {
+      selectArc(hit.id);
+    } else {
+      S.drag = { type: 'bg', sx: ev.clientX, sy: ev.clientY, x0: S.v2.x0, y0: S.v2.y0, moved: false };
+    }
+  }
+  function pointFromCursor(d, ev) {
+    const pt = imgPoint(ev), x = pt[0] + d.offset[0], y = pt[1] + d.offset[1];
+    let depth = d.depth0, snapped = false;
+    if (S.params.snap && S.depth) {
+      const s = S.depth.surface(x, y, CONFIG.snap.searchPx, CONFIG.snap.maxJumpM);
+      if (s === s && Math.abs(s - d.depth0) <= CONFIG.snap.maxDepthM) { depth = s; snapped = true; }    // a point on the far side of the car is not pulled through it
+    }
+    return { p: unproject(S.viewDef, x, y, depth), snapped };
+  }
+  function onMove(ev) {
+    const d = S.drag;
+    if (!d) { if (ev.target === el.svg || el.stage.contains(ev.target)) scheduleHover(ev); return; }
+    if (ev.buttons === 0) { onUp(ev); return; }                  // the button was released outside the window : end the drag
+    const dx = ev.clientX - d.sx, dy = ev.clientY - d.sy;
+    if (d.type === 'pan') { S.v2.x0 = d.x0 - dx / S.v2.k; S.v2.y0 = d.y0 - dy / S.v2.k; applyViewBox(); return; }
+    if (d.type === 'bg') {
+      if (!d.moved && Math.hypot(dx, dy) > CONFIG.pick.dragStartPx) { d.moved = true; el.stage.classList.add('panning'); }
+      if (d.moved && CONFIG.zoom.leftDragPansBackground) { S.v2.x0 = d.x0 - dx / S.v2.k; S.v2.y0 = d.y0 - dy / S.v2.k; applyViewBox(); }
+      return;
+    }
+    if (!d.started) {
+      if (Math.hypot(dx, dy) < CONFIG.pick.dragStartPx) return;
+      d.started = true;
+      model.checkpoint();
+      d.plan = d.type === 'ctrl' ? model.beginCtrlDrag(d.hit.arc, d.hit.index, S.params.mirror) : model.beginNodeDrag(d.hit.id, S.params.mirror);
+      if (d.type === 'ctrl') { S.sel.arc = d.hit.arc; S.sel.node = null; updateRowSelection(); }
+      if (d.plan.mismatch) setStatus('Mirror arc has another control point count: only this side moves.', 'warn');
+      else if (d.plan.detached) setStatus(d.plan.detached + ' arc end(s) are farther than ' + (CONFIG.attach.tolM * 1000) + ' mm from this node and stay where they are (use Weld ends).', 'warn');
+    }
+    const r = pointFromCursor(d, ev);
+    d.plan.apply(r.p);
+    afterEdit(d.plan, false);
+    el.coords.textContent = r.p.map((v) => v.toFixed(3)).join('  ') + (r.snapped ? '  (surface)' : '');
+  }
+  function onUp(ev) {
+    const d = S.drag;
+    if (!d) return;
+    S.drag = null;
+    el.stage.classList.remove('panning');
+    if (d.type === 'ctrl' || d.type === 'node') {
+      if (!d.started) { if (d.type === 'node') selectNode(d.hit.id); return; }
+      afterEdit(d.plan, true);
+      if (d.type === 'node') selectNode(d.hit.id);
+      updateButtons();
+      if (!d.plan.mismatch && !d.plan.detached) setStatus('Moved (' + (S.params.mirror ? 'mirror on' : 'mirror off') + ')');
+    } else if (d.type === 'bg' && !d.moved) {
+      clearSelection();
+    }
+  }
+  let hoverEv = null, hoverRaf = 0;
+  function scheduleHover(ev) {
+    hoverEv = ev;
+    if (hoverRaf) return;
+    const run = () => { hoverRaf = 0; if (hoverEv && !S.drag) updateHover(hoverEv); };
+    hoverRaf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame(run) : (run(), 0);
+  }
+  function updateHover(ev) {
+    const pt = imgPoint(ev);
+    const hit = S.mode === 'add' ? { type: 'none' } : pickAt(pt);
+    const prev = S.hover;
+    const same = prev && prev.type === hit.type && prev.id === hit.id && prev.index === hit.index && prev.arc === hit.arc;
+    if (!same) {
+      S.hover = hit.type === 'none' ? null : hit;
+      renderHover();
+      if ((prev && prev.type === 'node') || hit.type === 'node') renderNodes();
+      el.stage.classList.toggle('hot', hit.type === 'ctrl' || hit.type === 'node');
+      el.stage.classList.toggle('over-arc', hit.type === 'arc');
+      const ha = hit.type === 'arc' ? model.arc(hit.id) : null;
+      el.hoverInfo.textContent = ha ? 'Arc #' + ha.id + '  ' + arcLabel(ha) : hit.type === 'node' ? 'Node #' + hit.id : hit.type === 'ctrl' ? 'Control point ' + hit.index : '';
+    }
+    if (S.mode === 'add' && S.addFirst !== null) {
+      const v = S.nodeView.get(S.addFirst);
+      if (v) {
+        if (!S.preview) { S.preview = svgEl('line', { stroke: C.preview, 'stroke-dasharray': Z.dashGap.map((x) => x / S.v2.k).join(' ') }); el.gTop.appendChild(S.preview); }
+        S.preview.setAttribute('stroke-width', 1.6 / S.v2.k);
+        S.preview.setAttribute('x1', v.x); S.preview.setAttribute('y1', v.y); S.preview.setAttribute('x2', pt[0]); S.preview.setAttribute('y2', pt[1]);
+      }
+    }
+    // world coordinates of the surface under the cursor
+    if (S.depth) {
+      const s = S.depth.surface(pt[0], pt[1], 0, CONFIG.snap.maxJumpM);
+      if (s === s) { el.coords.textContent = unproject(S.viewDef, pt[0], pt[1], s).map((v) => v.toFixed(3)).join('  '); return; }
+    }
+    el.coords.textContent = '-';
+  }
+  function onWheel(ev) {
+    ev.preventDefault();
+    let dy = ev.deltaY;
+    if (ev.deltaMode === 1) dy *= CONFIG.zoom.lineStepPx; else if (ev.deltaMode === 2) dy *= CONFIG.zoom.pageStepPx;
+    const speed = CONFIG.zoom.speed * (ev.ctrlKey ? CONFIG.zoom.pinchBoost : 1);
+    zoomAt(ev.clientX, ev.clientY, Math.exp(-dy * speed));
+  }
+
+  // ---------------------------------------------------------------- keyboard
+  const typing = (ev) => { const t = ev.target; return !!t && (t.tagName === 'INPUT' && t.type !== 'checkbox' && t.type !== 'range' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT'); };
+  function onKeyDown(ev) {
+    if (typing(ev)) return;
+    const mod = ev.metaKey || ev.ctrlKey, key = ev.key;
+    if (key === ' ') { S.space = true; el.stage.classList.add('space'); ev.preventDefault(); return; }
+    if (mod && (key === 'z' || key === 'Z')) { ev.preventDefault(); if (ev.shiftKey) doRedo(); else doUndo(); return; }
+    if (mod && (key === 'y' || key === 'Y')) { ev.preventDefault(); doRedo(); return; }
+    if (mod) return;
+    if (key === 'Delete' || key === 'Backspace') { ev.preventDefault(); doDelete(); return; }
+    if (key === 'Escape') { if (S.mode === 'add') setMode('select'); else clearSelection(); return; }
+    if (key === 'f' || key === 'F') { fitView(); return; }
+    if (CONFIG.views.keys[key]) setView(CONFIG.views.keys[key]);
+  }
+  function onKeyUp(ev) {
+    if (ev.key === ' ') { S.space = false; el.stage.classList.remove('space'); if (!typing(ev)) ev.preventDefault(); }
+  }
+
+  // ---------------------------------------------------------------- views
+  async function setView(name) {
+    if (!S.views[name] || name === S.viewName && S.viewDef) return;
+    if (S.viewName) saveViewState();
+    S.viewName = name; S.viewDef = S.views[name];
+    S.depth = S.depthCache[name] || null;
+    S.proj.clear(); S.hover = null;
+    for (const b of el.viewButtons.querySelectorAll('button')) { const on = b.getAttribute('data-view') === name; b.classList.toggle('on', on); b.setAttribute('aria-checked', on ? 'true' : 'false'); }
+    let bg = el.svg.querySelector('image');
+    if (!bg) { bg = svgEl('image', { x: 0, y: 0, preserveAspectRatio: 'none' }); el.svg.insertBefore(bg, el.svg.firstChild); }
+    bg.setAttribute('width', S.viewDef.res); bg.setAttribute('height', S.viewDef.res);
+    bg.setAttribute('href', S.viewDef.image);
+    bg.setAttribute('opacity', S.params.bgOpacity);
+    measure();
+    const st = S.viewStates[name];
+    if (st && S.W > 0) { S.v2 = { k: st.k, x0: st.x0, y0: st.y0 }; S.fitK = st.fitK; applyViewBox(); } else fitView();
+    renderAll();
+    setStatus('View: ' + (S.viewDef.label || name) + (S.depth ? '' : ' (loading depth map)'));
+    if (!S.depth) await loadDepth(name);
+  }
+  async function loadDepth(name) {
+    try {
+      const r = await fetch(S.views[name].depth);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const png = await decodePng16(await r.arrayBuffer());
+      S.depthCache[name] = createDepthMap(png, S.views[name]);
+    } catch (e) {
+      console.error(e);
+      S.depthCache[name] = null;
+      setStatus('Depth map not available (' + e.message + '): every arc is drawn as visible and Snap to surface is off.', 'warn');
+      return;
+    }
+    if (S.viewName === name) { S.depth = S.depthCache[name]; S.proj.clear(); renderAll(); setStatus('View: ' + (S.viewDef.label || name)); }
+  }
+  function buildViewButtons() {
+    el.viewButtons.innerHTML = '';
+    CONFIG.views.order.forEach((name, i) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'btn view'; b.setAttribute('data-view', name); b.setAttribute('role', 'radio');
+      b.innerHTML = '<span>' + escapeHtml((S.views[name] && S.views[name].label) || name) + '</span><kbd>' + (i + 1) + '</kbd>';
+      el.viewButtons.appendChild(b);
+    });
+  }
+
+  // ---------------------------------------------------------------- exports
+  function download(blob, filename) {
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+  function exportJson() { const text = model.serialize(); download(new Blob([text], { type: 'application/json' }), CONFIG.files.downloadJson); setStatus('Exported ' + CONFIG.files.downloadJson + ' (' + model.doc.arcs.length + ' arcs)'); return text; }
+  function blobToDataUrl(blob) { return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(fr.error); fr.readAsDataURL(blob); }); }
+  async function svgText() {
+    const E = CONFIG.export;
+    let href = null;
+    if (S.params.svgBackground) { const r = await fetch(S.viewDef.image); href = await blobToDataUrl(await r.blob()); }
+    return buildSvg(model.doc, S.viewDef, S.depth, { model, viewName: S.viewName, decimals: E.svgDecimals, showHidden: S.params.showHidden, backgroundHref: href,
+      bgOpacity: E.svgBackgroundOpacity, colors: C, stroke: E.svgStroke, hiddenStroke: E.svgHiddenStroke, nodeRadius: E.svgNodeRadius });
+  }
+  async function exportSvg() {
+    const r = await svgText();
+    download(new Blob([r.text], { type: 'image/svg+xml' }), 'lines_' + S.viewName + '.svg');
+    setStatus('Exported lines_' + S.viewName + '.svg (' + r.arcs + ' arcs, Bezier spans)');
+    return r.text;
+  }
+  function loadImage(url) { return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('cannot load ' + url)); im.src = url; }); }
+  async function exportPng() {
+    const v = S.viewDef, E = CONFIG.export, im = await loadImage(v.image);
+    const cv = document.createElement('canvas');
+    cv.width = v.res; cv.height = v.res;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, v.res, v.res); ctx.drawImage(im, 0, 0, v.res, v.res);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const draw = (e, wantVisible) => {
+      for (const [i0, i1] of runsOf(e, wantVisible)) { ctx.beginPath(); ctx.moveTo(e.x[i0], e.y[i0]); for (let i = i0 + 1; i <= i1; i++) ctx.lineTo(e.x[i], e.y[i]); ctx.stroke(); }
+    };
+    if (S.params.showHidden) {
+      ctx.strokeStyle = C.arcHidden; ctx.lineWidth = E.pngHiddenPx; ctx.setLineDash([8, 6]);
+      for (const a of model.doc.arcs) draw(entryFor(a), false);
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = C.arc; ctx.lineWidth = E.pngArcPx;
+    for (const a of model.doc.arcs) draw(entryFor(a), true);
+    if (S.params.showNodes) {
+      for (const [, nv] of S.nodeView) { if (!nv.show) continue; ctx.fillStyle = nv.vis ? C.node : C.nodeHidden; ctx.beginPath(); ctx.arc(nv.x, nv.y, E.pngNodePx, 0, Math.PI * 2); ctx.fill(); }
+    }
+    await new Promise((res) => cv.toBlob((blob) => { download(blob, 'lines_' + S.viewName + '.png'); res(); }, 'image/png'));
+    setStatus('Exported lines_' + S.viewName + '.png');
+  }
+  async function saveToAtelier() {
+    setStatus('Saving...');
+    const r = await fetch(CONFIG.files.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: model.serialize() });
+    let j = {};
+    try { j = await r.json(); } catch (e) { /* the server answered without JSON */ }
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    model.dirty = false; refreshTitle();
+    setStatus('Saved to atelier: ' + j.path + ' (' + j.arcs + ' arcs' + (j.backup ? ', backup kept' : '') + ')', 'ok');
+    return j;
+  }
+  async function loadSaved() {
+    const r = await fetch(CONFIG.files.saved, { cache: 'no-store' });
+    if (!r.ok) { setStatus('No saved edit yet (' + CONFIG.files.saved + ' answers HTTP ' + r.status + ').', 'warn'); return; }
+    const doc = await r.json();
+    validateDoc(doc);
+    model.checkpoint();
+    model.load(doc);
+    fixSelection(); S.proj.clear(); structureChanged();
+    setStatus('Loaded ' + CONFIG.files.saved + ' (' + doc.arcs.length + ' arcs). Undo returns to the previous state.');
+  }
+
+  // ---------------------------------------------------------------- panel wiring
+  function bindParams() {
+    const P = S.params;
+    el.pMirror.checked = P.mirror; el.pSnap.checked = P.snap; el.pHidden.checked = P.showHidden; el.pNodes.checked = P.showNodes;
+    el.pGaps.checked = P.showGaps; el.pSvgBg.checked = P.svgBackground; el.pBgOpacity.value = P.bgOpacity; el.pSmooth.value = P.smoothAmount; el.pLineWidth.value = P.lineWidth;
+    el.pMirror.addEventListener('change', () => { P.mirror = el.pMirror.checked; renderSelection(); setStatus('Mirror ' + (P.mirror ? 'on: edits also move the mirror arc (x to -x)' : 'off')); });
+    el.pSnap.addEventListener('change', () => {
+      P.snap = el.pSnap.checked;
+      if (P.snap && !S.depth) setStatus('Snap to surface needs the depth map of this view (not loaded).', 'warn'); else setStatus('Snap to surface ' + (P.snap ? 'on' : 'off'));
+    });
+    el.pHidden.addEventListener('change', () => { P.showHidden = el.pHidden.checked; el.gHid.style.display = P.showHidden ? '' : 'none'; renderNodes(); });
+    el.pNodes.addEventListener('change', () => { P.showNodes = el.pNodes.checked; renderNodes(); });
+    el.pGaps.addEventListener('change', () => { P.showGaps = el.pGaps.checked; renderGaps(); });
+    el.pSvgBg.addEventListener('change', () => { P.svgBackground = el.pSvgBg.checked; });
+    el.pBgOpacity.addEventListener('input', () => { P.bgOpacity = parseFloat(el.pBgOpacity.value); const bg = el.svg.querySelector('image'); if (bg) bg.setAttribute('opacity', P.bgOpacity); });
+    el.pSmooth.addEventListener('input', () => { P.smoothAmount = parseFloat(el.pSmooth.value); });
+    el.pLineWidth.addEventListener('input', () => { P.lineWidth = parseFloat(el.pLineWidth.value); applyZoomStyles(); });
+  }
+  function bindUi() {
+    bindParams();
+    el.viewButtons.addEventListener('click', (ev) => { const b = ev.target.closest && ev.target.closest('button[data-view]'); if (b) setView(b.getAttribute('data-view')); });
+    el.compList.addEventListener('click', (ev) => {
+      const b = ev.target.closest && ev.target.closest('button[data-comp]');
+      if (!b) return;
+      const c = b.getAttribute('data-comp');
+      S.filter.comp = S.filter.comp === c ? null : c;
+      renderComponentList(); renderArcList(); renderComponent(); updateRowSelection();
+    });
+    el.filter.addEventListener('input', () => { S.filter.text = el.filter.value.trim(); renderArcList(); });
+    el.arcList.addEventListener('click', (ev) => { const r = ev.target.closest && ev.target.closest('.row'); if (r) selectArc(parseInt(r.getAttribute('data-id'), 10), { reveal: true }); });
+    el.bAdd.addEventListener('click', () => setMode(S.mode === 'add' ? 'select' : 'add'));
+    el.bFit.addEventListener('click', fitView);
+    el.bUndo.addEventListener('click', doUndo); el.bRedo.addEventListener('click', doRedo);
+    el.bSmooth.addEventListener('click', doSmooth); el.bWeld.addEventListener('click', doWeld); el.bDelete.addEventListener('click', doDelete);
+    el.bExportJson.addEventListener('click', safe(exportJson));
+    el.bExportSvg.addEventListener('click', safe(exportSvg));
+    el.bExportPng.addEventListener('click', safe(exportPng));
+    el.bSave.addEventListener('click', safe(saveToAtelier));
+    el.bLoadSaved.addEventListener('click', safe(loadSaved));
+    el.svg.addEventListener('mousedown', safe(onDown));
+    el.svg.addEventListener('wheel', safe(onWheel), { passive: false });
+    el.svg.addEventListener('mouseleave', () => { if (!S.drag && S.hover) { S.hover = null; renderHover(); renderNodes(); } });
+    window.addEventListener('mousemove', safe(onMove));
+    window.addEventListener('mouseup', safe(onUp));
+    window.addEventListener('keydown', safe(onKeyDown));
+    window.addEventListener('keyup', safe(onKeyUp));
+    window.addEventListener('beforeunload', (ev) => { if (model && model.dirty) { ev.preventDefault(); ev.returnValue = ''; } });
+    const onResize = () => { measure(); if (!S.fitted && S.viewDef) fitView(); else applyViewBox(); };
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(onResize).observe(el.stage); else window.addEventListener('resize', onResize);
+  }
+
+  async function fetchJson(url) {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(url + ' answers HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function init() {
+    try {
+      const [doc, views] = await Promise.all([fetchJson(CONFIG.files.lines), fetchJson(CONFIG.files.views)]);
+      S.views = views;
+      model = createModel(doc);
+      model.buildNodeMirror();
+    } catch (e) {
+      console.error(e);
+      setStatus('Cannot load the data (' + e.message + '). Run Scripts/lines/ZrlExport.py, then reload.', 'error');
+      return;
+    }
+    buildViewButtons(); bindUi();
+    renderComponentList(); renderArcList(); updateInfo();
+    await setView(CONFIG.views.initial);
+  }
+
+  const ready = init();
+  return {
+    ready, state: S, config: CONFIG, model: () => model,
+    api: { setView, selectArc, selectNode, clearSelection, fitView, toClient, imgPoint, pickAt, doUndo, doRedo, doSmooth, doWeld, doDelete, setMode, exportJson, exportSvg, saveToAtelier, loadSaved, renderAll, entryFor, handleList, svgText },
+  };
+}
+
+// ------------------------------------------------------------------------------------------------------------------ bootstrap
+const ZRL = { CONFIG, Spline, project, unproject, decodePng16, createDepthMap, isVisible, createModel, serializeDoc, validateDoc, buildSvg, projectArc, runsOf, pathFromRuns, startApp, app: null };
+if (typeof window !== 'undefined') window.ZRL = ZRL;
+if (typeof module !== 'undefined' && module.exports) module.exports = ZRL;
+if (typeof document !== 'undefined') {
+  const boot = () => { ZRL.app = startApp(); };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
+}

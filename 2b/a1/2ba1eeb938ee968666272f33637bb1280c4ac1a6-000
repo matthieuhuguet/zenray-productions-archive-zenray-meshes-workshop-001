@@ -1,0 +1,82 @@
+"""29 October 2026 : ZenRay Lines ASSEMBLE, the audit board of the whole car : every component built by the mini HDA (cache of
+ZrlBuildOne, parameters of work/lines/components_table.json), left ones mirrored onto the right, coloured by its judge score (green 100,
+yellow 80 or more, orange 60 or more, red below), every other part of the validated car (wheels, lights, mirrors) in grey.
+Writes work/lines/car_<tag>.npz and .obj (P, polygons, component per polygon) and versions/Lines_Car_<tag>.png.
+python ZrlAssemble.py <tag>        FR : la planche d'audit de la voiture entière, un component par couleur de score."""
+import json, os, sys
+import numpy as np
+from PIL import Image, ImageDraw
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/lines")
+import ZrrData as D, ZrrColorMap as CM, ZrlBuildOne as B1
+from Raster import Renderer
+
+PARAMS = {"table": f"{ROOT}/work/lines/components_table.json", "res": 1500, "px_per_m": 280.0,   # 29 October 2026
+          "bands": [(100.0, (90, 190, 110)), (80.0, (235, 200, 70)), (60.0, (240, 140, 60)), (0.0, (215, 70, 70))],
+          "views": [("Left", (1, 0, 0)), ("Front", (0, 0, 1)), ("Back", (0, 0, -1)), ("Top", (0, 1, 0)), ("Three quarter", (0.62, 0.45, 0.64)), ("Three quarter, reflection lines", (0.62, 0.45, 0.64))]}
+
+
+def mirror_name(n):
+    return n[:-2] + "_R" if n.endswith("_L") else n
+
+
+def colour(score):
+    for lim, c in PARAMS["bands"]:
+        if score >= lim: return np.array(c, float)
+
+
+def assemble(tag):
+    table = json.load(open(PARAMS["table"])); car = D.load(); parts = []; scores = {}
+    for name, prm in table.items():
+        p = dict(B1.DEFAULTS); p.update(prm); f = f"{ROOT}/work/lines/hda/{name}_{B1.key(name, p)}.npz"
+        if not os.path.exists(f): print("missing", name); continue
+        d = np.load(f, allow_pickle=True); sc = json.loads(str(d["judge"]))["score"]["percent"]; scores[name] = sc
+        parts.append((name, d["P"], d["Q"], sc))
+        if name.endswith("_L"): parts.append((mirror_name(name), d["P"] * np.array([-1.0, 1.0, 1.0]), d["Q"][:, ::-1], sc))
+    replaced = {n for n, *_ in parts}
+    keep = ~np.isin(car["T"], [i for i, n in enumerate(car["names"]) if n in replaced or n.startswith("CAR_arch_")])
+    P = [car["P"]]; polys = []; comp = []; base = len(car["P"]); names = list(car["names"])
+    for k in np.flatnonzero(keep): polys.append(car["I"][car["off"][k]:car["off"][k + 1]]); comp.append(car["T"][k])
+    nk = len(polys)
+    with open(f"{ROOT}/work/lines/kept_parts.obj", "w") as f:              # 29 October 2026 : the parts of v752 kept as they are, for Houdini
+        f.write("# 29 October 2026 ZenRay Meshes, parts of v752 kept (wheels, lights, mirrors)\n"); np.savetxt(f, car["P"], fmt="v %.6f %.6f %.6f"); cur = None
+        for pp, c in zip(polys, comp):
+            if c != cur: f.write("g %s\n" % car["names"][c]); cur = c
+            f.write("f " + " ".join(str(int(i) + 1) for i in pp) + "\n")
+    for n, Pn, Qn, sc in parts:
+        if n not in names: names.append(n)
+        P.append(Pn); polys += list(Qn + base); comp += [names.index(n)] * len(Qn); base += len(Pn)
+    P = np.vstack(P); comp = np.array(comp); new = np.zeros(len(comp), bool); new[nk:] = True
+    np.savez(f"{ROOT}/work/lines/car_{tag}.npz", P=P, polys=np.array([np.asarray(p) for p in polys], dtype=object), comp=comp, names=np.array(names), new=new, scores=json.dumps(scores))
+    with open(f"{ROOT}/work/lines/car_{tag}.obj", "w") as f:
+        f.write("# 29 October 2026 ZenRay Meshes car %s\n" % tag); np.savetxt(f, P, fmt="v %.6f %.6f %.6f"); cur = None
+        for p, c in zip(polys, comp):
+            if c != cur: f.write("g %s\n" % names[c]); cur = c
+            f.write("f " + " ".join(str(int(i) + 1) for i in p) + "\n")
+    return P, polys, comp, names, new, scores
+
+
+def board(tag, P, polys, comp, names, new, scores):
+    tri = []; own = []
+    for k, p in enumerate(polys):
+        p = list(p)
+        for j in range(1, len(p) - 1): tri.append((p[0], p[j], p[j + 1])); own.append(k)
+    tri = np.array(tri); own = np.array(own); R = Renderer(P, tri, smooth_deg=45.0); lo, hi = P.min(0), P.max(0); ctr = (lo + hi) / 2
+    col = np.array([colour(scores.get(names[c], scores.get(names[c].replace("_R", "_L"), 0))) if nw else np.array([200, 200, 200.0]) for c, nw in zip(comp, new)])
+    tiles = []; s = PARAMS["px_per_m"]; res = PARAMS["res"]
+    for t, d in PARAMS["views"]:
+        rx, uy, tz = D.frame(np.array(d, float)); mask, depth, N, fid = R.render(ctr, s, (rx, uy, tz), res); ok = fid >= 0; img = np.full(mask.shape + (3,), 250.0)
+        if "reflection" in t:
+            r = 2 * N[..., 2:3] * N - np.array([0, 0, 1.0]); ph = np.arctan2(r[..., 1], np.sqrt(r[..., 0] ** 2 + r[..., 2] ** 2)); st = (np.floor((ph / np.pi + 0.5) * 28) % 2)
+            img[ok] = (st[ok] * 225 + 30)[:, None] * np.ones(3)
+        else:
+            lam = (0.5 + 0.5 * np.clip(N[ok] @ np.array([0.3, 0.5, 0.81]), 0, 1))[:, None]; img[ok] = col[own[fid[ok]]] * lam
+        a = np.asarray(Image.fromarray(img.astype(np.uint8))); ys, xs = np.nonzero(mask); tiles.append((t, Image.fromarray(a[max(ys.min() - 8, 0):ys.max() + 9, max(xs.min() - 8, 0):xs.max() + 9])))
+    R.release()
+    done = sum(1 for v in scores.values() if v >= 100.0)
+    legend = [(f"{n.replace('CAR_', '')}  {v:.1f} %", colour(v)) for n, v in sorted(scores.items(), key=lambda kv: -kv[1])] + [("other parts of v752, kept", np.array([200, 200, 200]))]
+    return CM.sheet(tiles, legend, f"{ROOT}/versions/Lines_Car_{tag}.png", f"ZenRay Meshes car {tag} : {done} of {len(scores)} components at 100 % (green), mirrored left to right, other parts grey, 29 October 2026")
+
+
+if __name__ == "__main__":
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v002"; A = assemble(tag); print(board(tag, *A)); print(json.dumps(A[5]))

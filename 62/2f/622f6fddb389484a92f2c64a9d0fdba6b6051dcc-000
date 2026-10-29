@@ -1,0 +1,83 @@
+"""29 October 2026 : ZenRay Lines COUNTS, the interval assignment of a component layout (Mitchell 2000 ; Bessmeltsev et al. 2012 ;
+Lyon, Campen, Kobbelt 2021) : ONE integer edge count per shared arc, so two neighbours sample the same arc the same way (welded) and
+every patch closes : a four sided patch has equal counts on opposite sides ; a three sided patch (one pole of valence 3, Tarini 2022)
+needs e_i = s_(i-1) + s_(i+1) with s positive integers ; mirrored arcs carry the same count. Objective : the smallest relative
+deviation from the target counts (length / edge_m), solved by scipy.optimize.milp (HiGHS).
+EN: layout json : {"arcs": {"a1": length_m, ...}, "mirror": [["a1", "a2"], ...], "patches": [{"name": .., "sides": [["a1", "a3"], ...]}]}
+python ZrlCounts.py <layout.json> [edge_m]   |   python ZrlCounts.py selftest
+FR : un nombre d'arêtes entier par arc partagé, pour que deux voisins soient soudés et que chaque patch ferme."""
+import json, sys
+import numpy as np
+from scipy.optimize import milp, LinearConstraint, Bounds
+
+PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000}   # 29 October 2026
+
+
+def solve(layout, edge_m=None):
+    e = edge_m or PARAMS["edge_m"]; arcs = list(layout["arcs"]); ix = {a: i for i, a in enumerate(arcs)}; n = len(arcs)
+    tgt = np.array([max(PARAMS["min_count"], layout["arcs"][a] / e) for a in arcs])
+    extra = []                                                    # Tarini s variables of three sided patches
+    rows = []; lo = []; hi = []
+    def side_vec(side):
+        v = np.zeros(n); [v.__setitem__(ix[a], v[ix[a]] + 1) for a in side]; return v
+    for p in layout["patches"]:
+        S = [side_vec(s) for s in p["sides"]]
+        if len(S) == 4:
+            for a, b in ((0, 2), (1, 3)): rows.append(np.r_[S[a] - S[b], np.zeros(0)]); lo.append(0); hi.append(0)
+        elif len(S) == 3:
+            k0 = len(extra); extra += [p["name"]] * 3              # s_0, s_1, s_2 ; side i = s_(i-1) + s_(i+1)
+            for i in range(3):
+                r = list(S[i]); rows.append((np.array(r), {k0 + (i - 1) % 3: -1.0, k0 + (i + 1) % 3: -1.0})); lo.append(0); hi.append(0)
+        else:
+            raise ValueError(f"patch {p['name']} has {len(S)} sides : only 3 or 4 are handled")
+    m = len(extra); N = n + m + n                                  # counts, tarini s, absolute deviation t
+    A = []
+    for r in rows:
+        v = np.zeros(N)
+        if isinstance(r, tuple): v[:n] = r[0]; [v.__setitem__(n + k, c) for k, c in r[1].items()]
+        else: v[:n] = r[:n]
+        A.append(v)
+    for a, b in layout.get("mirror", []):
+        v = np.zeros(N); v[ix[a]] = 1; v[ix[b]] = -1; A.append(v); lo.append(0); hi.append(0)
+    for i in range(n):                                             # t_i >= |x_i - tgt_i| / tgt_i
+        v = np.zeros(N); v[i] = 1.0 / tgt[i]; v[n + m + i] = -1; A.append(v); lo.append(-np.inf); hi.append(1.0)
+        v = np.zeros(N); v[i] = -1.0 / tgt[i]; v[n + m + i] = -1; A.append(v); lo.append(-np.inf); hi.append(-1.0)
+    c = np.r_[np.zeros(n + m), np.ones(n)]
+    integ = np.r_[np.ones(n + m), np.zeros(n)]
+    b_lo = np.r_[np.full(n, PARAMS["min_count"]), np.ones(m), np.zeros(n)]; b_hi = np.r_[np.full(n, PARAMS["max_count"]), np.full(m, PARAMS["max_count"]), np.full(n, np.inf)]
+    r = milp(c, constraints=LinearConstraint(np.array(A), lo, hi), integrality=integ, bounds=Bounds(b_lo, b_hi))
+    if not r.success: return {"ok": False, "status": r.message}
+    x = np.round(r.x[:n]).astype(int)
+    return {"ok": True, "counts": {a: int(x[ix[a]]) for a in arcs}, "mean_rel_dev": float(np.mean(np.abs(x - tgt) / tgt)), "max_rel_dev": float(np.max(np.abs(x - tgt) / tgt))}
+
+
+def check(layout, counts):
+    """29 October 2026 : independent check of a count assignment (the verifier, not the solver)."""
+    bad = []
+    for p in layout["patches"]:
+        s = [sum(counts[a] for a in side) for side in p["sides"]]
+        if len(s) == 4 and (s[0] != s[2] or s[1] != s[3]): bad.append(p["name"])
+        if len(s) == 3:
+            t = sum(s)
+            if t % 2 or any(2 * s[i] >= t for i in range(3)): bad.append(p["name"])
+    for a, b in layout.get("mirror", []):
+        if counts[a] != counts[b]: bad.append(f"mirror {a} {b}")
+    return bad
+
+
+def selftest():
+    # two quads sharing arc "m" plus a three sided patch : the shared arc must get ONE count that closes all three
+    L = {"arcs": {"b1": 0.40, "r1": 0.20, "t1": 0.40, "m": 0.21, "b2": 0.30, "r2": 0.22, "t2": 0.30, "x": 0.25, "y": 0.27},
+         "mirror": [["r2", "x"]],
+         "patches": [{"name": "A", "sides": [["b1"], ["r1"], ["t1"], ["m"]]}, {"name": "B", "sides": [["b2"], ["r2"], ["t2"], ["m"]]},
+                     {"name": "T", "sides": [["r2"], ["x"], ["y"]]}]}
+    s = solve(L, 0.02); good = s["ok"] and not check(L, s["counts"])
+    broken = dict(s["counts"]); broken["t1"] += 1; red = bool(check(L, broken))
+    print("solve", s, "\ngreen on the solved counts :", good, "; red on a broken count :", red); return good and red
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["selftest"]: sys.exit(0 if selftest() else 1)
+    lay = json.load(open(sys.argv[1])); out = solve(lay, float(sys.argv[2]) if len(sys.argv) > 2 else None)
+    if out["ok"]: out["check_failures"] = check(lay, out["counts"])
+    print(json.dumps(out))
