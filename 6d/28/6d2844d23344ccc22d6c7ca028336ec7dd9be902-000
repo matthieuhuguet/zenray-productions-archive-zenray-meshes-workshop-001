@@ -1,0 +1,146 @@
+"""29 October 2026 : ZenRay Lines CHAIN, the drawing as data that the algorithm copies : export it, build it in Houdini, pull the curves back.
+EN: the chain file is the whole value chain of a retopology in one JSON : the curve network (every node, every arc as its matrix of control points,
+a clamped uniform cubic B-spline), the components (name, the points that name its faces, its options and corners), and the converted quad mesh
+(points, quads, the component of each quad). Houdini rebuilds it with no interpretation : one NURBS curve of order 4 per arc (Houdini's default
+knots for order 4 are exactly ZenRay Lines' knots, checked on 29 October 2026 : 0,0,0,0,1,...,n-3 x4, same points to 1e-6), the mesh with a
+"name" per quad and one COMP_<name> output per component, inside /obj/ZRL_Chain : chain_curves (Python SOP reading the file) -> EDIT_curves (an
+Edit SOP where control points can be moved by hand) -> CURVES_OUT ; chain_mesh -> MESH_OUT -> COMP_*. Pull reads CURVES_OUT back : every arc
+with its control points, matched by arc id, with the fingerprint of the network that was sent (to refuse a stale apply).
+    POST /chain {"op": "export" | "build" | "pull", "lines": document, "mesh": {"P", "Q", "fq", "face_names"}}
+    python -I ZrlChain.py export|build|pull [--lines lines_edit.json]
+FR : la chaîne d'une retopologie en un fichier que l'algorithme recopie : courbes en matrices de points, components, maillage ; construite dans
+Houdini telle quelle, et les courbes modifiées dans Houdini reviennent dans ZenRay Lines.
+"""
+import argparse, hashlib, json, os, socket, sys, time
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : every tunable value of the chain
+    "dir": f"{ROOT}/work/lines/chain", "latest": "chain_latest.json", "net": "/obj/ZRL_Chain",
+    "host": "127.0.0.1", "port": 18812, "timeout_s": 180.0, "max_components": 400,
+}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+CURVES_SOP = r'''# 29 October 2026 : ZenRay Lines chain : one NURBS curve of order 4 per arc, its control points copied from the chain file
+import json, hou
+node = hou.pwd(); geo = node.geometry(); d = json.load(open(node.parm("chain_path").eval()))
+for nm, dv in (("arc_id", -1), ("node_a", -1), ("node_b", -1)): geo.addAttrib(hou.attribType.Prim, nm, dv)
+geo.addAttrib(hou.attribType.Prim, "sides", ""); geo.addAttrib(hou.attribType.Global, "chain_fingerprint", ""); geo.setGlobalAttribValue("chain_fingerprint", d["fingerprint"])
+for A in d["arcs"]:
+    ctrl = A["ctrl"]; c = geo.createNURBSCurve(len(ctrl), False, min(4, len(ctrl)))
+    for v, p in zip(c.vertices(), ctrl): v.point().setPosition(p)
+    c.setAttribValue("arc_id", int(A["id"])); c.setAttribValue("node_a", int(A["a"])); c.setAttribValue("node_b", int(A["b"])); c.setAttribValue("sides", "|".join(A.get("sides") or []))
+'''
+MESH_SOP = r'''# 29 October 2026 : ZenRay Lines chain : the converted quads, a "name" per quad (its component)
+import json, hou
+node = hou.pwd(); geo = node.geometry(); d = json.load(open(node.parm("chain_path").eval())).get("mesh") or {}
+geo.addAttrib(hou.attribType.Prim, "name", "")
+pts = geo.createPoints([hou.Vector3(p) for p in d.get("P", [])])
+for q, nm in zip(d.get("Q", []), d.get("component_of_quad", [])):
+    poly = geo.createPolygon()
+    for i in q: poly.addVertex(pts[i])
+    poly.setAttribValue("name", nm)
+'''
+HOM_BUILD = r'''
+import hou
+path, netpath, maxc = %(path)r, %(net)r, %(maxc)d
+net = hou.node(netpath)
+if net is None: net = hou.node("/obj").createNode("geo", netpath.rsplit("/", 1)[-1])
+for ch in list(net.children()): ch.destroy()                       # rebuilt each time : the chain file is the source
+def py(name, code):
+    n = net.createNode("python", name); g = n.parmTemplateGroup(); g.append(hou.StringParmTemplate("chain_path", "Chain file", 1, default_value=(path,))); n.setParmTemplateGroup(g)
+    n.parm("python").set(code); return n
+cs = py("chain_curves", %(curves)r); ed = net.createNode("edit", "EDIT_curves"); ed.setInput(0, cs); co = net.createNode("null", "CURVES_OUT"); co.setInput(0, ed)
+ms = py("chain_mesh", %(mesh)r); mo = net.createNode("null", "MESH_OUT"); mo.setInput(0, ms)
+names = sorted(set(mo.geometry().primStringAttribValues("name"))) if mo.geometry().findPrimAttrib("name") else []
+outs = {}
+for nm in names[:maxc]:
+    if not nm: continue
+    safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in nm)
+    b = net.createNode("blast", "keep_" + safe); b.setInput(0, mo); b.parm("group").set('@name="%%s"' %% nm); b.parm("grouptype").set("prims"); b.parm("negate").set(1)
+    n = net.createNode("null", "COMP_" + safe); n.setInput(0, b); outs[n.name()] = len(n.geometry().prims())
+mg = net.createNode("merge", "VIEW"); mg.setInput(0, co); mg.setInput(1, mo); mg.setDisplayFlag(True); mg.setRenderFlag(True); net.layoutChildren()
+cg = co.geometry(); mgeo = mo.geometry()
+result = {"node": net.path(), "curves": len(cg.prims()), "quads": sum(1 for p in mgeo.prims() if len(p.vertices()) == 4), "components": len(names), "outputs": outs,
+          "fingerprint": cg.attribValue("chain_fingerprint")}
+'''
+HOM_PULL = r'''
+import hou
+n = hou.node(%(net)r + "/CURVES_OUT")
+if n is None: raise RuntimeError("no %(net)s/CURVES_OUT : build the chain in Houdini first")
+g = n.geometry(); arcs = []
+for pr in g.prims():
+    arcs.append({"id": int(pr.attribValue("arc_id")), "ctrl": [list(v.point().position()) for v in pr.vertices()]})
+result = {"fingerprint": g.attribValue("chain_fingerprint"), "arcs": arcs, "node": n.path()}
+'''
+
+
+def stamp():
+    t = time.localtime(); return "%d-%s-%d_%s" % (t.tm_mday, MONTHS[t.tm_mon - 1], t.tm_year, time.strftime("%H%M%S", t))
+
+
+def fingerprint(doc):
+    """the network that was sent : nodes and arcs, rounded to the micrometre ; the same drawing gives the same fingerprint."""
+    key = [[n["id"], [round(float(x), 6) for x in n["p"]]] for n in doc.get("nodes", [])] + [[a["id"], a["a"], a["b"], [[round(float(x), 6) for x in c] for c in a["ctrl"]]] for a in doc.get("arcs", [])]
+    return hashlib.sha1(json.dumps(key, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def chain(doc, mesh=None):
+    comps = {}; opts = doc.get("component_options") or {}
+    for q in doc.get("component_seeds") or []: comps.setdefault(q["name"], {"name": q["name"], "seeds": [], "options": opts.get(q["name"], {})})["seeds"].append(q["p"])
+    t = time.localtime()
+    out = {"format": "ZenRayLinesChain/1", "date": "%d %s %d %s" % (t.tm_mday, MONTHS[t.tm_mon - 1], t.tm_year, time.strftime("%H:%M:%S", t)), "units": "m", "up": "+y",
+           "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans", "houdini": "NURBS order 4, default knots : the same curve"},
+           "model_ref": doc.get("model_ref"), "fingerprint": fingerprint(doc),
+           "nodes": [{"id": n["id"], "p": n["p"]} for n in doc.get("nodes", [])],
+           "arcs": [{"id": a["id"], "a": a["a"], "b": a["b"], "ctrl": a["ctrl"], "sides": a.get("pair") or ["", ""], "mirror": a.get("mirror", -1)} for a in doc.get("arcs", [])],
+           "components": list(comps.values())}
+    if mesh and mesh.get("P"):
+        P, Q = mesh["P"], mesh["Q"]; fq = mesh.get("fq") or [0] * (len(Q) // 4); names = {str(k): v for k, v in (mesh.get("face_names") or {}).items()}
+        out["mesh"] = {"P": [P[i:i + 3] for i in range(0, len(P), 3)], "Q": [Q[i:i + 4] for i in range(0, len(Q), 4)],
+                       "component_of_quad": [names.get(str(f)) or "face_%s" % f for f in fq]}
+    return out
+
+
+def export(req, prm=PARAMS):
+    c = chain(req["lines"], req.get("mesh")); os.makedirs(prm["dir"], exist_ok=True); path = os.path.join(prm["dir"], "chain_%s.json" % stamp())
+    with open(path, "w") as f: json.dump(c, f)
+    with open(os.path.join(prm["dir"], prm["latest"]), "w") as f: json.dump(c, f)
+    return {"ok": True, "path": path, "fingerprint": c["fingerprint"], "arcs": len(c["arcs"]), "nodes": len(c["nodes"]), "components": len(c["components"]), "quads": len((c.get("mesh") or {}).get("Q", []))}
+
+
+def bridge(code, prm=PARAMS):
+    try:
+        with socket.create_connection((prm["host"], prm["port"]), timeout=prm["timeout_s"]) as sock:
+            sock.sendall((json.dumps({"op": "hom", "code": code}) + "\n").encode("utf-8")); raw = b""
+            while not raw.endswith(b"\n"):
+                chunk = sock.recv(1 << 20)
+                if not chunk: break
+                raw += chunk
+    except OSError as ex:
+        raise RuntimeError("Houdini is not reachable on %s:%d (open Houdini with the zrbridge running) : %s" % (prm["host"], prm["port"], ex))
+    ans = json.loads(raw.decode("utf-8") or "{}")
+    if not ans.get("ok"): raise RuntimeError(ans.get("error") or "Houdini bridge answered without ok")
+    return ans.get("result") or {}
+
+
+def handle(req, prm=PARAMS):
+    op = req.get("op", "export")
+    if op == "export": return export(req, prm)
+    if op == "build":
+        ex = export(req, prm) if req.get("lines") else {"path": os.path.join(prm["dir"], prm["latest"])}
+        res = bridge(HOM_BUILD % {"path": ex["path"], "net": prm["net"], "maxc": prm["max_components"], "curves": CURVES_SOP, "mesh": MESH_SOP}, prm)
+        return dict(res, ok=True, path=ex["path"], sent_fingerprint=ex.get("fingerprint"))
+    if op == "pull": return dict(bridge(HOM_PULL % {"net": prm["net"]}, prm), ok=True)
+    raise ValueError("op must be export, build or pull")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("op", choices=["export", "build", "pull"])
+    ap.add_argument("--lines", default=os.path.join(ROOT, "lines/data/lines_edit.json")); a = ap.parse_args()
+    req = {"op": a.op}
+    if a.op != "pull": req["lines"] = json.load(open(a.lines))
+    out = handle(req); print(json.dumps({k: (v if k != "arcs" else len(v)) for k, v in out.items()}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

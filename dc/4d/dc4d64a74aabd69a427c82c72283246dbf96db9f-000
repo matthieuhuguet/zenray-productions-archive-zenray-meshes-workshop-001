@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align', chain: '/chain' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -805,7 +805,8 @@
   function onKey(ev) {
     if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
     const k = ev.key.toLowerCase(), mod = ev.metaKey || ev.ctrlKey;
-    if (mod && k === 'z') { ev.preventDefault(); (ev.shiftKey ? model.redo() : model.undo()) && (model.buildNodeMirror(), S.handle = null, redraw()); return; }
+    if (k === 'f2' && S.comp) { ev.preventDefault(); const el = document.querySelector('#compList .row-c.sel .nm'); if (el) el.dispatchEvent(new MouseEvent('dblclick')); return; }   // 29 October 2026 : F2 renames
+    if (mod && k === 'z') { ev.preventDefault(); (ev.shiftKey ? model.redo() : model.undo()) && (model.buildNodeMirror(), S.handle = null, renderCompList(), redraw()); return; }   // 29 October 2026 : the components list follows the undo
     if (mod && k === 's') { ev.preventDefault(); safe(save)(); return; }
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
@@ -818,7 +819,7 @@
     else if (k === 'delete' || (k === 'backspace' && S.tool !== 'draw')) { ev.preventDefault(); deleteSelection(); }
     else if (k === 'backspace' && S.tool === 'draw' && S.draw) { S.draw.pts.pop(); redraw(); }
     else if (k === 'enter' && S.tool === 'draw') finishDraw();
-    else if (k === 'escape') { if (S.patch) S.patch = null; else if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
+    else if (k === 'escape') { if (S.addTo) { S.addTo = null; setTool('select'); status('Face not added.'); } if (S.patch) S.patch = null; else if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
   }
   function frameSel() {
     const pts = []; for (const id of S.sel) { const s = arcPts(id); for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); }
@@ -830,21 +831,38 @@
   const seeds = () => (model.doc.component_seeds || (model.doc.component_seeds = []));
   const compOpts = () => (model.doc.component_options || (model.doc.component_options = {}));
   function hashColour(name) { let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0; const hue = (h % 360) / 360, s = 0.55, l = 0.5; const f = (n) => { const k = (n + hue * 12) % 12, a = s * Math.min(l, 1 - l); return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); }; return [f(0), f(8), f(4), 1]; }
-  function addSeed(p) {
-    const name = ($('compName').value || '').trim() || ('component_' + (seeds().length + 1));
-    if (seeds().some((q) => q.name === name)) return status('A component named ' + name + ' already exists : rename it or pick another name.', 'error');
-    edit('Component ' + name + ' added', () => { seeds().push({ name, p: clone3(p) }); S.comp = name; });
+  function addSeed(p) {   // 29 October 2026 : a new component, or (S.addTo) one more face for an existing component
+    if (S.addTo) { const n = S.addTo; S.addTo = null; edit('Face added to ' + n, () => { seeds().push({ name: n, p: clone3(p) }); S.comp = n; }); renderCompList(); setTool('select'); return; }
+    const name = ($('compName').value || '').trim() || nextCompName();
+    if (seeds().some((q) => q.name === name)) return status('A component named ' + name + ' already exists : use + face on its row to give it another face, or pick another name.', 'error');
+    edit('Component ' + name + ' added', () => { seeds().push({ name, p: clone3(p) }); S.comp = name; }); $('compName').value = '';
     renderCompList();
   }
-  function renameComp() {
-    const to = ($('compName').value || '').trim(); if (!S.comp || !to) return status('Select a component and type its new name.');
-    if (seeds().some((q) => q.name === to)) return status('The name ' + to + ' is taken.', 'error');
-    const from = S.comp;
+  function nextCompName() { let k = seeds().length + 1, name; do { name = 'component_' + String(k++).padStart(2, '0'); } while (seeds().some((q) => q.name === name)); return name; }
+  function renameCompTo(from, to) {   // 29 October 2026 : one place renames everything that carries the name : seeds, curve sides, options
+    to = (to || '').trim().replace(/\s+/g, '_'); if (!from || !to || to === from) return false;
+    if (seeds().some((q) => q.name === to)) { status('The name ' + to + ' is taken.', 'error'); return false; }
     edit('Component ' + from + ' renamed ' + to, () => { for (const q of seeds()) if (q.name === from) q.name = to; for (const a of model.doc.arcs) a.pair = (a.pair || []).map((n) => (n === from ? to : n));
       if (compOpts()[from]) { compOpts()[to] = compOpts()[from]; delete compOpts()[from]; } S.comp = to; });
+    renderCompList(); return true;
+  }
+  function deleteCompNamed(n, withCurves) {   // 29 October 2026 : the name only, or the name and the curves that border only this component
+    if (!n) return status('Select a component first.');
+    let ids = [];
+    if (withCurves) {
+      const fs = (S.faces || []).filter((f) => f.component === n), others = (S.faces || []).filter((f) => f.component && f.component !== n), par = S.arcParents || {};
+      const up = (aid) => { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; return model.arc(id) ? id : null; };
+      const shared = new Set(); for (const f of others) for (const [aid] of f.arcs || []) { const id = up(aid); if (id != null) shared.add(id); }
+      const own = new Set(); for (const f of fs) for (const [aid] of f.arcs || []) { const id = up(aid); if (id != null && !shared.has(id)) own.add(id); }
+      if (!fs.length) return status('Preview the faces (P) first : the curves of ' + n + ' are found from its faces.', 'error');
+      ids = [...own];
+    }
+    edit('Component ' + n + ' deleted' + (withCurves ? ' with ' + ids.length + ' curve(s) of its own' : '') + ' (Cmd Z brings it back)', () => {
+      model.doc.component_seeds = seeds().filter((q) => q.name !== n); delete compOpts()[n]; if (ids.length) removeArcIds(ids); if (S.comp === n) S.comp = null; S.sel.clear(); });
     renderCompList();
   }
-  function deleteComp() { if (!S.comp) return status('Select a component first.'); const n = S.comp; edit('Component ' + n + ' removed from the registry', () => { model.doc.component_seeds = seeds().filter((q) => q.name !== n); delete compOpts()[n]; S.comp = null; }); renderCompList(); }
+  function renameComp() { const to = ($('compName').value || '').trim(); if (!S.comp || !to) return status('Select a component and type its new name (or double click its name in the list).'); renameCompTo(S.comp, to); }
+  function deleteComp() { deleteCompNamed(S.comp, false); }
   async function importSeeds() {
     const r = await fetch(CFG.files.seeds, { cache: 'no-store' }); if (!r.ok) return status('No seeds file (run Scripts/lines/ZrlSeeds.py)', 'error');
     const list = await r.json(); edit(list.length + ' components imported', () => { const have = new Set(seeds().map((q) => q.name)); for (const q of list) if (!have.has(q.name)) seeds().push({ name: q.name, p: q.p }); });
@@ -858,13 +876,30 @@
   function faceOptions() { const out = {}; if (!S.faces) return out; for (const f of S.faces) { const o = f.component && compOpts()[f.component]; if (o) out[f.id] = o; } return out; }
   function renderCompList() {
     const list = $('compList'); if (!list) return; const faces = S.faces || [], byComp = {}; for (const f of faces) if (f.component) (byComp[f.component] = byComp[f.component] || []).push(f);
-    const rows = seeds().map((q) => { const fs = byComp[q.name] || [], o = compOpts()[q.name] || {}, c = hashColour(q.name).slice(0, 3).map((v) => Math.round(v * 255));
-      const st = fs.length ? fs.map((f) => f.status + (f.side_counts ? ' ' + f.side_counts.join('x') : '')).join(', ') : (faces.length ? 'no face' : '');
-      return `<div class="row-c${S.comp === q.name ? ' sel' : ''}" data-name="${q.name}"><i style="background:rgb(${c.join(',')})"></i><span>${q.name.replace(/^CAR_/, '')}</span><small>${st}${o.skip ? ' skip' : ''}${o.rotate ? ' rot ' + o.rotate : ''}${o.edge_scale && o.edge_scale !== 1 ? ' density x' + (1 / o.edge_scale).toFixed(2) : ''}</small></div>`; });
+    const filt = (($('compFilter') && $('compFilter').value) || '').trim().toLowerCase(), names = [...new Set(seeds().map((q) => q.name))];   // 29 October 2026 : one row per component, all its faces
+    const quads = {}; if (S.mesh && S.mesh.fq && S.mesh.faces) { const nameOf = {}; for (const f of S.mesh.faces) nameOf[f.id] = f.component; for (const id of S.mesh.fq) { const n = nameOf[id]; if (n) quads[n] = (quads[n] || 0) + 1; } }
+    const esc = (t) => String(t).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+    const rows = names.filter((n) => !filt || n.toLowerCase().includes(filt)).map((n) => { const fs = byComp[n] || [], o = compOpts()[n] || {}, c = hashColour(n).slice(0, 3).map((v) => Math.round(v * 255)), nseed = seeds().filter((q) => q.name === n).length;
+      const st = fs.length ? fs.length + ' face' + (fs.length > 1 ? 's' : '') + ' : ' + fs.map((f) => f.status + (f.side_counts ? ' ' + f.side_counts.join('x') : '')).join(', ') : (faces.length ? 'no face under its point' + (nseed > 1 ? 's' : '') : nseed + ' point' + (nseed > 1 ? 's' : ''));
+      return `<div class="row-c${S.comp === n ? ' sel' : ''}" data-name="${esc(n)}"><i style="background:rgb(${c.join(',')})"></i><span class="nm" title="Double click to rename">${esc(n.replace(/^CAR_/, ''))}</span>`
+        + `<span class="acts"><b data-act="face" title="Add one more face to this component (then click it)">+ face</b><b data-act="iso" title="Isolate">iso</b><b data-act="del" title="Delete the name (Shift : also its own curves). Cmd Z undoes">&times;</b></span>`
+        + `<small>${st}${quads[n] ? ', ' + quads[n] + ' quads' : ''}${o.skip ? ', skipped' : ''}${o.rotate ? ', pattern ' + o.rotate : ''}${o.edge_scale && o.edge_scale !== 1 ? ', density x' + (1 / o.edge_scale).toFixed(2) : ''}</small></div>`; });
     const unnamed = faces.filter((f) => !f.component).length;
-    list.innerHTML = rows.join('') + (faces.length ? `<div class="hint">${faces.length} faces, ${unnamed} without a component</div>` : '');
-    $('compCount').textContent = seeds().length;
-    list.querySelectorAll('.row-c').forEach((el) => el.addEventListener('click', () => { S.comp = el.dataset.name; $('compName').value = S.comp; const q = seeds().find((z) => z.name === S.comp); if (q && q.p) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]); renderCompList(); redraw(); }));
+    list.innerHTML = (rows.join('') || '<div class="hint">No component yet : type a name, press Place (C) and click a face.</div>') + (faces.length ? `<div class="hint">${faces.length} faces, ${unnamed} without a component</div>` : '');
+    $('compCount').textContent = names.length;
+    const select = (n, frame) => { S.comp = n; $('compName').value = n; const q = seeds().find((z) => z.name === n); if (frame && q && q.p) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]); renderCompList(); redraw(); };
+    list.querySelectorAll('.row-c').forEach((el) => {
+      const n = el.dataset.name;
+      el.addEventListener('click', (ev) => { const act = ev.target.dataset && ev.target.dataset.act; ev.stopPropagation();
+        if (act === 'face') { S.comp = n; S.addTo = n; setTool('seed'); status('Click the face to add to ' + n + ' (Esc cancels).'); return; }
+        if (act === 'iso') { select(n, false); isolateComp(); return; }
+        if (act === 'del') { deleteCompNamed(n, ev.shiftKey); return; }
+        if (!ev.target.closest('input')) select(n, true); });
+      const nm = el.querySelector('.nm'); nm.addEventListener('dblclick', (ev) => { ev.stopPropagation(); const inp = document.createElement('input'); inp.type = 'text'; inp.value = n; inp.className = 'rename';
+        nm.replaceWith(inp); inp.focus(); inp.select(); let done = false;
+        const commit = (ok) => { if (done) return; done = true; if (ok && inp.value.trim() && inp.value.trim() !== n) { if (!renameCompTo(n, inp.value)) renderCompList(); } else renderCompList(); };
+        inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') commit(true); else if (e.key === 'Escape') commit(false); }); inp.addEventListener('blur', () => commit(true)); });
+    });
   }
   // 29 October 2026 : FACES of the network under a surface point : the loop's plane (Newell normal), point inside the projected loop, smallest face wins
   const facePlanes = new WeakMap();
@@ -1013,6 +1048,41 @@
     status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
     renderCompList(); redraw();
   }
+  // 29 October 2026 : THE CHAIN : the drawing as data (curves as control point matrices, components, quads), rebuilt as it is in Houdini, curves pulled back
+  function chainBody(op) {
+    const body = { op, lines: JSON.parse(model.serialize()) };
+    if (S.mesh) { const names = {}; for (const f of S.mesh.faces || []) if (f.component) names[f.id] = f.component; body.mesh = { P: Array.from(S.mesh.P), Q: Array.from(S.mesh.Q), fq: S.mesh.fq, face_names: names }; }
+    return body;
+  }
+  async function chainCall(body) {
+    const r = await fetch(CFG.files.chain, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) { status('Chain : ' + (res.error || r.status), 'error'); return null; } return res;
+  }
+  async function exportChain() {
+    const res = await chainCall(chainBody('export')); if (!res) return; S.chainFp = res.fingerprint;
+    status('Chain written : ' + res.arcs + ' curves, ' + res.components + ' components' + (res.quads ? ', ' + res.quads + ' quads' : ' (convert to mesh to add the quads)') + ' : ' + res.path);
+  }
+  async function buildChain() {
+    status('Building the chain in Houdini ...'); const res = await chainCall(chainBody('build')); if (!res) return; S.chainFp = res.sent_fingerprint;
+    status('Houdini ' + res.node + ' : ' + res.curves + ' NURBS curves (move their points in EDIT_curves), ' + res.quads + ' quads, ' + res.components + ' components (COMP_ outputs) ; file ' + res.path);
+  }
+  async function pullChain() {
+    const res = await chainCall({ op: 'pull' }); if (!res) return;
+    const here = model.doc.arcs.length, stale = S.chainFp && res.fingerprint && res.fingerprint !== S.chainFp; let changed = 0, maxMove = 0, missing = 0;
+    const tol = 1e-6;                                                 // 29 October 2026 : Houdini keeps 32 bit floats : below a micrometre it is noise, not an edit
+    const sub = (p, q) => [p[0] - q[0], p[1] - q[1], p[2] - q[2]], add = (p, q) => [p[0] + q[0], p[1] + q[1], p[2] + q[2]], len = (v) => Math.hypot(v[0], v[1], v[2]);
+    edit('Curves pulled from Houdini', () => {
+      for (const h of res.arcs) { const a = model.arc(h.id); if (!a) { missing++; continue; }
+        const last = a.ctrl.length - 1, old0 = clone3(a.ctrl[0]), oldN = clone3(a.ctrl[last]); let mv = 0;
+        if (h.ctrl.length !== a.ctrl.length) { a.ctrl = h.ctrl.map(clone3); mv = Infinity; }
+        else for (let i = 0; i <= last; i++) { const d = d3(a.ctrl[i], h.ctrl[i]); if (d >= tol) { a.ctrl[i] = clone3(h.ctrl[i]); mv = Math.max(mv, d); } }   // only the points that really moved
+        if (mv < tol) continue; model.touch(a.id); changed++; if (Number.isFinite(mv)) maxMove = Math.max(maxMove, mv);
+        for (const [end, nid, old] of [[0, a.a, old0], [a.ctrl.length - 1, a.b, oldN]]) {   // a moved end drags its node and the other ends on that node by the same vector
+          const delta = sub(a.ctrl[end], old); if (len(delta) < tol) continue; const nd = model.node(nid); if (nd) nd.p = add(nd.p, delta);
+          for (const o of model.doc.arcs) { if (o === a) continue; if (o.a === nid) { o.ctrl[0] = add(o.ctrl[0], delta); model.touch(o.id); } if (o.b === nid) { o.ctrl[o.ctrl.length - 1] = add(o.ctrl[o.ctrl.length - 1], delta); model.touch(o.id); } } } }
+    });
+    status('Pulled from Houdini : ' + changed + ' curve(s) changed, largest move ' + (1000 * maxMove).toFixed(1) + ' mm' + (missing ? ', ' + missing + ' unknown here' : '') + (stale ? ' (the network changed here since the build : only matching curves were applied)' : '') + ' ; ' + here + ' curves in the network.');
+  }
   async function sendToHoudini() {
     if (!S.mesh) await convertToMesh(); if (!S.mesh) return;
     const names = {}; for (const f of S.mesh.faces || []) if (f.component) names[f.id] = f.component;      // 29 October 2026 : the mesh as shown, tweaks included
@@ -1054,10 +1124,12 @@
     on('bSelText', () => { const t = $('selText').value.trim().toLowerCase(); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).some((n) => n && n.toLowerCase().includes(t)) || String(a.id) === t).map((a) => a.id)); status(S.sel.size + ' curve(s) selected'); redraw(); });
     on('bSelAll', () => { S.sel = new Set(model.doc.arcs.map((a) => a.id)); redraw(); }); on('bSelNone', () => { S.sel.clear(); S.node = null; S.handle = null; redraw(); });
     on('bSelInvert', () => { S.sel = new Set(model.doc.arcs.filter((a) => !S.sel.has(a.id)).map((a) => a.id)); redraw(); });
-    on('bCompImport', importSeeds); on('bCompRename', renameComp); on('bCompDelete', deleteComp); on('bCompAdd', () => setTool('seed'));
+    on('bCompImport', importSeeds); on('bCompRename', renameComp); on('bCompDelete', deleteComp); on('bCompAdd', () => { S.addTo = null; setTool('seed'); });
+    on('bCompDeleteAll', () => deleteCompNamed(S.comp, true)); if ($('compFilter')) $('compFilter').addEventListener('input', renderCompList);   // 29 October 2026
+    $('compName').addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') { if (S.comp && $('compName').value.trim() && $('compName').value.trim() !== S.comp) renameComp(); else { S.addTo = null; setTool('seed'); } } });
     on('bCompSkip', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('skip', !(o && o.skip)); schedulePreview(); });
     on('bCompRotate', () => cyclePattern(+1));
-    on('bPreview', previewFaces); on('bHoudini', sendToHoudini); if ($('bCreaseAlign')) on('bCreaseAlign', creaseAlignment);   // 29 October 2026
+    on('bPreview', previewFaces); on('bHoudini', sendToHoudini); if ($('bChainExport')) { on('bChainExport', exportChain); on('bChainBuild', buildChain); on('bChainPull', pullChain); }   // 29 October 2026 : the chain if ($('bCreaseAlign')) on('bCreaseAlign', creaseAlignment);   // 29 October 2026
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
     on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bAutoFix', () => safe(autoFix)()); on('bCompName', nameFacesFromModel);
@@ -1076,7 +1148,7 @@
     cv().addEventListener('wheel', () => creasesLater(), { passive: true });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
