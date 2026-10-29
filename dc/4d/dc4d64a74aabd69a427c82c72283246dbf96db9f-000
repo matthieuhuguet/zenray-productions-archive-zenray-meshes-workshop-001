@@ -341,21 +341,39 @@
     const fs = (S.faces || []).find((f) => f.component === S.comp); if (fs && fs.boundary) framePoints(fs.boundary); else if (q) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]);
     redraw(); status(S.comp + ' isolated : ' + keep.map((p) => (view.st.mesh.head.parts[p] || p)).join(', ').replace(/CAR_/g, '') + ' ; Shift H shows everything, P previews, Convert works on its curves only');
   }
-  async function bestPattern() {   // 29 October 2026 : B : every pattern of the picked face or selected component tried on its own curves, the cleanest kept and listed
-    const f = S.face ? faceOf(S.face.id) : (S.faces || []).find((z) => z.component && z.component === S.comp);
-    if (!f) return status('Pick a face (G) or select a component that has a face.');
-    const n = f.native_corners || (f.corners || []).length; if (n < 4) return status('A face with ' + n + ' corners has a single pattern : add a corner with K first.');
-    let comp = f.component || S.comp; if (!comp) edit('Face named for its pattern', () => { comp = ensureComp(); }); S.comp = comp;
+  async function patternTrials(f, comp, n) {   // 29 October 2026 : every pattern of one face meshed on its own curves, best first (folded, then below 0.5, then min Jacobian)
     const par = S.arcParents || {}, ids = new Set(); for (const [aid] of f.arcs || []) { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; if (model.arc(id)) ids.add(id); }
     const doc = JSON.parse(model.serialize()), arcs = doc.arcs.filter((a) => ids.has(a.id)), used = new Set(); for (const a of arcs) { used.add(a.a); used.add(a.b); }
-    const sub = { ...doc, arcs, nodes: doc.nodes.filter((nd) => used.has(nd.id)) }, rows = []; status('Trying the ' + (n + 1) + ' patterns of ' + comp + '...');
+    const sub = { ...doc, arcs, nodes: doc.nodes.filter((nd) => used.has(nd.id)) }, rows = [];
     for (const r of [null].concat([...Array(n).keys()])) {
       const co = JSON.parse(JSON.stringify(compOpts())), o = (co[comp] = Object.assign({}, co[comp] || {})); if (r === null) delete o.rotate; else o.rotate = r;
       const res = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: sub, params: Object.assign(meshParams(), { component_options: co, auto_fallback: false, write_obj: false }) }) }).then((x) => x.json()).catch(() => null);
       const fc = res && res.ok !== false ? (res.faces || []).find((z) => z.component === comp && z.quads) : null;
       rows.push({ r, ok: !!fc, folded: fc ? fc.folded : 1e9, bad: fc ? fc.bad_quads : 1e9, minJ: fc ? +fc.min_jac : -9, sides: fc ? fc.side_counts : null });
     }
-    rows.sort((a, b) => a.folded - b.folded || a.bad - b.bad || b.minJ - a.minJ); const best = rows[0];
+    return rows.sort((a, b) => a.folded - b.folded || a.bad - b.bad || b.minJ - a.minJ);
+  }
+  async function bestPatternsAll() {   // 29 October 2026 : every meshed face that fails the judge, with 4 corners or more, gets its best pattern (unnamed faces are named part_NN)
+    if (!S.mesh) return status('Convert to a mesh first : the faces that fail the judge are the ones improved.');
+    const failing = (S.mesh.faces || []).filter((f) => f.quads && f.judge_ok === false && (f.native_corners || (f.corners || []).length) >= 4); let done = 0, gain = 0; const lines = [];
+    for (const mf of failing) {
+      const f = (S.faces || []).find((z) => z.id === mf.id) || mf, n = f.native_corners || (f.corners || []).length; let comp = f.component;
+      if (!comp) { S.face = { id: f.id, p: mf.centroid }; edit('Face named for its pattern', () => { comp = ensureComp(); }); S.face = null; }
+      status('Best patterns : face ' + (++done) + ' of ' + failing.length + ' (' + comp + ')...');
+      const rows = await patternTrials(f, comp, n), best = rows[0], cur = compOpts()[comp] && compOpts()[comp].rotate, now = rows.find((x) => (x.r === null ? undefined : x.r) === cur) || rows[rows.length - 1];
+      if (best.ok && best.r !== (cur === undefined ? null : cur)) { const o = compOpts()[comp] || (compOpts()[comp] = {}); if (best.r === null) delete o.rotate; else o.rotate = best.r; gain += Math.max(0, now.folded - best.folded); }
+      lines.push(comp.replace(/^CAR_/, '') + ' : ' + (best.r === null ? 'native' : 'variant ' + (best.r + 1)) + ', ' + best.folded + ' folded');
+    }
+    S.dirty = true; $('meshInfo').textContent = 'Best patterns, ' + failing.length + ' faces :\n' + lines.join('\n'); await convertToMesh();
+    status('Best patterns applied to ' + failing.length + ' faces (about ' + gain + ' folded quads less on their own curves) ; ' + (S.mesh ? S.mesh.stats.folded + ' folded quads in the whole mesh' : ''));
+    return { faces: failing.length, gain };
+  }
+  async function bestPattern() {   // 29 October 2026 : B : every pattern of the picked face or selected component tried on its own curves, the cleanest kept and listed
+    const f = S.face ? faceOf(S.face.id) : (S.faces || []).find((z) => z.component && z.component === S.comp);
+    if (!f) return status('Pick a face (G) or select a component that has a face.');
+    const n = f.native_corners || (f.corners || []).length; if (n < 4) return status('A face with ' + n + ' corners has a single pattern : add a corner with K first.');
+    let comp = f.component || S.comp; if (!comp) edit('Face named for its pattern', () => { comp = ensureComp(); }); S.comp = comp;
+    status('Trying the ' + (n + 1) + ' patterns of ' + comp + '...'); const rows = await patternTrials(f, comp, n); const best = rows[0];
     if (!best.ok) return status('No pattern of ' + comp + ' meshes on its own curves.', 'error');
     setCompOption('rotate', best.r === null ? undefined : best.r);
     $('meshInfo').textContent = 'Patterns of ' + comp + ', best first :\n' + rows.map((x) => (x.r === null ? 'native' : 'variant ' + (x.r + 1)) + ' : ' + (x.ok ? x.folded + ' folded, ' + x.bad + ' below 0.5, min ' + x.minJ.toFixed(2) + ', ' + (x.sides || []).join(' x ') : 'does not mesh')).join('\n');
@@ -488,7 +506,7 @@
     const nq = M.Q.length / 4, seen = new Set(), polys = [], tri = new Uint32Array(nq * 6), col = new Float32Array(M.P.length / 3 * 4), pos = Float32Array.from(M.P);
     let bad = 0, warn = 0, Jmin = 1; const byComp = $('pCompColour') && $('pCompColour').checked, compOf = new Map((M.faces || []).map((f) => [f.id, f.component || 'face_' + f.id]));   // 29 October 2026 : fills by component, lines keep the quality colours
     for (let q = 0; q < nq; q++) {
-      const J = quadQuality(M.P, M.Q, q); Jmin = Math.min(Jmin, J); const c = J < 0 ? CFG.colors.meshBad : J < 0.5 ? CFG.colors.meshWarn : CFG.colors.meshOk; if (J < 0) bad++; else if (J < 0.5) warn++;
+      const J = M.res && M.res.quad_jac && M.res.quad_jac.length === nq && !M.edited ? M.res.quad_jac[q] : quadQuality(M.P, M.Q, q); Jmin = Math.min(Jmin, J);   // 29 October 2026 : the server's judge (surface normals) until the mesh is retouched here const c = J < 0 ? CFG.colors.meshBad : J < 0.5 ? CFG.colors.meshWarn : CFG.colors.meshOk; if (J < 0) bad++; else if (J < 0.5) warn++;
       for (let k = 0; k < 4; k++) {
         const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4], key = a < b ? a + ',' + b : b + ',' + a; if (seen.has(key)) continue; seen.add(key);
         polys.push({ pts: [M.P[3 * a], M.P[3 * a + 1], M.P[3 * a + 2], M.P[3 * b], M.P[3 * b + 1], M.P[3 * b + 2]], color: c });
@@ -523,7 +541,7 @@
     status('Network checked : ' + issues.length + ' issue(s), the curves concerned are selected'); redraw();
   }
   function relaxMesh() {
-    const M = S.mesh; if (!M) return status('Convert to a mesh first.');
+    const M = S.mesh; if (!M) return status('Convert to a mesh first.'); M.edited = true;
     const nv = M.P.length / 3, nb = Array.from({ length: nv }, () => new Set()), edgeFaces = new Map(), nq = M.Q.length / 4;
     for (let q = 0; q < nq; q++) for (let k = 0; k < 4; k++) { const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4]; nb[a].add(b); nb[b].add(a); const key = a < b ? a + ',' + b : b + ',' + a; if (!edgeFaces.has(key)) edgeFaces.set(key, []); edgeFaces.get(key).push(M.fq[q] != null ? M.fq[q] : 0); }
     const fixed = new Uint8Array(nv); for (const [key, fs] of edgeFaces) if (fs.length !== 2 || fs[0] !== fs[1]) { const [a, b] = key.split(',').map(Number); fixed[a] = 1; fixed[b] = 1; }
@@ -660,7 +678,7 @@
     if (D.kind === 'zoom') { view.zoom(-dx + dy); D.x = x; D.y = y; redraw(true); return; }
     if (D.kind === 'box') { const b = $('boxSel'); Object.assign(b.style, { display: 'block', left: Math.min(x, D.x) + 'px', top: Math.min(y, D.y) + 'px', width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px' }); return; }
     if (D.kind === 'extend') { D.preview = extendCurve(D.arc, x, y); if (D.preview) { S.draw = { pts: D.preview.map((p) => ({ p })) }; redraw(); } return; }
-    if (D.kind === 'meshVertex') { const h = view.pickSurface(x, y); if (h) { S.mesh.P[3 * D.v] = h.p[0]; S.mesh.P[3 * D.v + 1] = h.p[1]; S.mesh.P[3 * D.v + 2] = h.p[2]; buildMeshLayers(); } return; }
+    if (D.kind === 'meshVertex') { const h = view.pickSurface(x, y); if (h) { S.mesh.edited = true; S.mesh.P[3 * D.v] = h.p[0]; S.mesh.P[3 * D.v + 1] = h.p[1]; S.mesh.P[3 * D.v + 2] = h.p[2]; buildMeshLayers(); } return; }
     if ((D.kind === 'ctrl' || D.kind === 'node') && !D.started) {
       if (Math.hypot(dx, dy) < CFG.pick.dragStartPx) return;
       model.checkpoint(); D.started = true; S.dirty = true;
@@ -941,7 +959,7 @@
     on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
-    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bCompName', nameFacesFromModel);
+    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
     on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
@@ -954,7 +972,7 @@
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
