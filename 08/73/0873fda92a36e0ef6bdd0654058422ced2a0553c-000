@@ -5,9 +5,10 @@ their normals differ by less than zone_deg (a sharp edge or a part border stops 
 boundary of the zone (edges used by one zone triangle only) is chained into loops ; the longest one is the contour. It is resampled every step_m,
 four corners are chosen (the sharpest turns spread around the loop, completed by the extreme points along the zone's two main axes when the contour
 is round), and the loop is cut there into four sides, each fitted to a cubic B-spline whose ends are the corners. A zone with a second long loop
-(the side of a tyre is a ring) is reported as a ring : a revolution template fits it, a rectangle does not.
+(the side of a tyre is a ring) is cut by ring_cuts seams across the ring into four sided patches that share their seams (29 October 2026).
     POST /auto_patch {"op": "patch", "p": [x, y, z], "zone_deg": 25, "max_radius_m": 1.0}       -> corners, sides, report
     POST /auto_patch {"op": "snap", "p": [x, y, z], "radius_m": 0.02}                           -> the nearest point on a contour
+    POST /auto_patch {"op": "closest", "p": [x, y, z]}                                          -> the nearest point on the surface (29 October 2026)
 FR : un clic sur une zone donne son patch à quatre côtés, ajusté sur son vrai contour ; un point posé s'accroche au contour le plus proche.
 """
 import json, math, os, sys, time
@@ -25,6 +26,7 @@ PARAMS = {   # 29 October 2026 : every tunable value of the auto patch and of th
     "corner_deg": 35.0,        # a turn above this is a corner candidate
     "corner_gap_frac": 0.12,   # two corners are at least this fraction of the contour apart
     "ring_frac": 0.35,         # a second loop longer than this fraction of the contour makes the zone a ring
+    "ring_cuts": 4,            # 29 October 2026 : a ring zone is cut into this many four sided patches (seams across the ring), 0 refuses rings
     "ctrl_step_m": 0.04,       # control points of a side
     "spike_deg": 150.0,        # a turn above this is a spike of the contour (a slit), never a corner
     "prune_passes": 3, "fill_passes": 2,   # zone cleanup : peninsulas cut, notches filled
@@ -123,6 +125,52 @@ def corners(X, total, normal, prm=PARAMS):
     return sorted(picked[:4]), turn
 
 
+def _fit_side(S, prm):
+    """a polyline -> the control points of a cubic B-spline (one every ctrl_step_m), its ends pinned on the polyline's ends."""
+    import ZrlSpline as SP
+    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(S, axis=0), axis=1))]; mm = max(4, int(round(cum[-1] / prm["ctrl_step_m"])) + 1)
+    tt = np.linspace(0, cum[-1], max(4 * mm, 16)); R = np.stack([np.interp(tt, cum, S[:, q]) for q in range(3)], 1)
+    ctrl = SP.fit(R, mm); ctrl[0], ctrl[-1] = S[0], S[-1]; return ctrl
+
+
+def ring_patches(m, Z, Ls, prm, rep, t):
+    """29 October 2026 : a ring zone (a tyre sidewall is an annulus, its tread a band) cut into ring_cuts four sided patches.
+    EN: the two loops are resampled, smoothed and put back on the surface ; the ring axis is the direction of least spread of their points ; the cuts
+    sit at equal angles around it, half a sector away from the up direction, so the patches lie top, front, bottom and back. Each cut is a seam
+    straight across the ring, put on the surface ; patch k is loop A from cut k to cut k+1, the seam k+1, loop B back, the seam k. Its seed is the
+    middle of its sector. The patches share their corners and seams : the editor welds them into one network.
+    FR : un anneau (flanc de pneu, bande de roulement) coupé par des coutures en quatre patchs à quatre côtés qui partagent coutures et coins."""
+    import ZrlSpline as SP, ZrlNetMesh as NM
+    from scipy.spatial import cKDTree
+    tri = m["P"][m["F"][Z]]; ref = NM.Ref(tri); loops = []
+    for L in Ls[:2]:
+        X, _ = resample_closed(m["P"][L], prm["step_m"])
+        for _ in range(6): X = 0.5 * X + 0.25 * (np.roll(X, 1, 0) + np.roll(X, -1, 0))
+        loops.append(ref.closest(X)[0])
+    allp = np.vstack(loops); c = allp.mean(0); _, _, W = np.linalg.svd(allp - c, full_matrices=False); ax = W[2]
+    up = np.array([0.0, 1.0, 0.0]); e1 = up - (up @ ax) * ax
+    if np.linalg.norm(e1) < 1e-6: e1 = W[0]
+    e1 = e1 / np.linalg.norm(e1); e2 = np.cross(ax, e1); ang = lambda X: np.arctan2((X - c) @ e2, (X - c) @ e1)
+    walks = []
+    for X in loops:                                                             # each loop walked with its angle growing
+        a = np.unwrap(ang(X)); walks.append(X if a[-1] >= a[0] else X[::-1].copy())
+    K = int(prm["ring_cuts"]); th = [math.pi / K + 2 * math.pi * k / K for k in range(K)]
+    cut = lambda X, x: int(np.argmin(np.abs(np.angle(np.exp(1j * (ang(X) - x))))))
+    arc = lambda X, i, j: X[i:j + 1] if j > i else np.vstack([X[i:], X[:j + 1]])
+    A, B = walks; ia = [cut(A, x) for x in th]; ib = [cut(B, x) for x in th]
+    seams = [ref.closest(A[ia[k]] * (1 - s) + B[ib[k]] * s)[0] for k in range(K) for s in [np.linspace(0, 1, 12)[:, None]]]
+    cen = tri.mean(1); ar = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); ca = ang(cen); patches = []; dev = 0.0
+    for k in range(K):
+        k2 = (k + 1) % K; sides = [_fit_side(arc(A, ia[k], ia[k2]), prm), _fit_side(seams[k2], prm), _fit_side(arc(B, ib[k], ib[k2])[::-1], prm), _fit_side(seams[k][::-1], prm)]
+        for S, ctrl in ((arc(A, ia[k], ia[k2]), sides[0]), (arc(B, ib[k], ib[k2]), sides[2])): dev = max(dev, float(cKDTree(S).query(SP.sample(ctrl, 20))[0].max()))
+        inside = np.mod(ca - th[k], 2 * math.pi) < 2 * math.pi / K; i = np.where(inside)[0]
+        if len(i): g = (cen[i] * ar[i, None]).sum(0) / max(float(ar[i].sum()), 1e-12); mid = cen[i[int(np.argmin(np.linalg.norm(cen[i] - g, axis=1)))]]
+        else: mid = 0.5 * (A[ia[k]] + B[ib[k2]])
+        patches.append({"corners": [np.round(v, 6).tolist() for v in (A[ia[k]], A[ia[k2]], B[ib[k2]], B[ib[k]])], "sides": [np.round(q, 6).tolist() for q in sides], "seed": np.round(mid, 6).tolist()})
+    rep.update({"cuts": K, "fit_dev_mm": round(dev * 1000, 2), "axis": np.round(ax, 4).tolist(), "seconds": round(time.time() - t, 2)})
+    return {"ok": True, "ring": True, "patches": patches, "corners": patches[0]["corners"], "sides": patches[0]["sides"], "seed": patches[0]["seed"], "report": rep}
+
+
 def patch(req, prm=PARAMS):
     import ZrlSpline as SP, ZrlNetMesh as NM
     t = time.time(); prm = dict(prm, **{k: v for k, v in req.items() if k in prm}); m = mesh(req.get("ref")); p = np.asarray(req["p"], float)
@@ -131,7 +179,8 @@ def patch(req, prm=PARAMS):
     total0 = ln(Ls[0]); ring = len(Ls) > 1 and ln(Ls[1]) > prm["ring_frac"] * total0
     rep = {"triangles": int(len(Z)), "part": m["names"][int(m["G"][t0])], "loops": len(Ls), "perimeter_m": round(total0, 3), "ring": bool(ring),
            "area_m2": round(float(0.5 * np.linalg.norm(np.cross(m["P"][m["F"][Z, 1]] - m["P"][m["F"][Z, 0]], m["P"][m["F"][Z, 2]] - m["P"][m["F"][Z, 0]]), axis=1).sum()), 4)}
-    if ring: return {"ok": False, "ring": True, "report": rep, "error": "this zone is a ring (%s) : a four sided patch cannot cover it ; use the revolution template" % rep["part"]}
+    if ring and int(prm["ring_cuts"]) < 2: return {"ok": False, "ring": True, "report": rep, "error": "this zone is a ring (%s) : a four sided patch cannot cover it ; use the revolution template" % rep["part"]}
+    if ring: return ring_patches(m, Z, Ls, prm, rep, t)
     normal = m["N"][Z].mean(0); normal /= max(np.linalg.norm(normal), 1e-9)
     X, total = resample_closed(m["P"][Ls[0]], prm["step_m"])
     for _ in range(6):                                                           # the contour of triangles zigzags : light smoothing, then back on the surface
@@ -147,7 +196,11 @@ def patch(req, prm=PARAMS):
         ctrl = SP.fit(S, mm); ctrl[0], ctrl[-1] = X[i], X[j]; sides.append(np.round(ctrl, 6).tolist())
         dev = max(dev, float(cKDTree(X).query(SP.sample(ctrl, 20))[0].max()))   # the fitted side against the contour it was fitted on
     rep.update({"fit_dev_mm": round(dev * 1000, 2), "corner_turns_deg": [round(float(turn[c]), 1) for c in C], "seconds": round(time.time() - t, 2)})
-    return {"ok": True, "corners": [np.round(X[c], 6).tolist() for c in C], "sides": sides, "seed": np.round(p, 6).tolist(), "report": rep}
+    # 29 October 2026 : the seed (it names the face and carries the label) goes to the middle of the zone : the triangle centre nearest the area centroid, ON the surface
+    # FR : la graine, qui nomme la face et porte l'étiquette, va au milieu de la zone, sur la surface.
+    cen = tri.mean(1); ar = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
+    g = (cen * ar[:, None]).sum(0) / max(float(ar.sum()), 1e-12); mid = cen[int(np.argmin(np.linalg.norm(cen - g, axis=1)))]
+    return {"ok": True, "corners": [np.round(X[c], 6).tolist() for c in C], "sides": sides, "seed": np.round(mid, 6).tolist(), "click": np.round(p, 6).tolist(), "report": rep}
 
 
 def feature_tree(m, prm=PARAMS):
@@ -173,8 +226,18 @@ def snap(req, prm=PARAMS):
     return {"ok": True, "p": np.round(pts[i], 6).tolist(), "snapped": True, "moved_mm": round(float(d) * 1000, 1)}
 
 
+def closest(req, prm=PARAMS):
+    """29 October 2026 : the point of the reference nearest to p : the middle of two merged points of the curves goes back on the surface.
+    FR : le point de la référence le plus proche de p : le milieu de deux points fusionnés revient sur la surface."""
+    import ZrlNetMesh as NM
+    m = mesh(req.get("ref")); p = np.asarray(req["p"], float)
+    if "ref_all" not in m: m["ref_all"] = NM.Ref(m["P"][m["F"]])
+    q = np.asarray(m["ref_all"].closest(p[None])[0])[0]
+    return {"ok": True, "p": np.round(q, 6).tolist(), "moved_mm": round(float(np.linalg.norm(q - p)) * 1000, 2)}
+
+
 def handle(req):
-    return snap(req) if req.get("op") == "snap" else patch(req)
+    return {"snap": snap, "closest": closest}.get(req.get("op"), patch)(req)
 
 
 if __name__ == "__main__":
