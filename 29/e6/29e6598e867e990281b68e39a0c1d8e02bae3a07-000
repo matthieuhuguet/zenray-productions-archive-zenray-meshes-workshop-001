@@ -36,6 +36,44 @@ PARAMS = {   # 29 October 2026 : every landmark and setting of the layout, metre
         "linea_alba": ["navel", [[0.0, 1.16]], "pec_bottom"],
     },
     "seeds": {"chest_pec": [0.080, 1.370], "chest_abs": [0.065, 1.160]},
+    "layout": "panels",   # 29 October 2026 : "panels" = v4 on the sculpted panel lines (PANELS), "grid4" = v3, four patches through the landmarks above
+    "snap_mm": 6.0,       # a crease node moves to the strongest crease pixel within this radius
+}
+
+PANELS = {   # 29 October 2026, v4 : the senior layout ON the sculpted panel lines of Manny measured by ZrlCreases.py (right side, mirrored at x = 0)
+    "nodes": {   # metres in the front view ; the nodes listed in on_crease snap to the crease
+        "notch": [0.0, 1.470], "utop": [0.0, 1.442], "wtop": [0.0, 1.295], "c3top": [0.0, 1.212], "abot": [0.0, 1.088],
+        "collar": [0.055, 1.470], "bend": [0.046, 1.422], "shoulder": [0.165, 1.444], "j1": [0.056, 1.286], "sidetop": [0.146, 1.282],
+        "j1d": [0.062, 1.2345], "meet": [0.136, 1.240], "wbot": [0.068, 1.179], "rbot": [0.050, 1.078], "waistside": [0.130, 1.075],
+    },
+    "on_crease": ["utop", "wtop", "c3top", "abot", "bend", "j1", "sidetop", "meet", "wbot", "rbot"],   # j1d is placed on the wave by hand : snapped, it jumps to the curl and the faces merge
+    "arcs": [   # a, b, mode ("crease" follows the valley between the nodes, "free" goes through the points), through points, name
+        ["notch", "collar", "free", [[0.028, 1.472]], "collarbone_in"],
+        ["collar", "shoulder", "free", [[0.120, 1.452]], "collarbone"],
+        ["shoulder", "sidetop", "free", [[0.161, 1.385], [0.152, 1.32]], "armpit"],
+        ["sidetop", "j1", "crease", [], "pec_bottom"],
+        ["j1", "bend", "crease", [], "plate_leg"],
+        ["bend", "collar", "free", [[0.0505, 1.446]], "plate_top"],
+        ["bend", "utop", "crease", [], "plate_arch"],
+        ["j1", "j1d", "free", [], "plate_foot"],
+        ["j1d", "wtop", "crease", [], "plate_bottom"],
+        ["wtop", "utop", "free", [], "sternum"],
+        ["j1d", "wbot", "free", [], "rectus_up"],          # the rectus border carried up to the plate : the long rib crease no longer faces the short abdomen
+        ["sidetop", "meet", "free", [], "side_ribs"],
+        ["meet", "wbot", "crease", [], "costal_margin"],
+        ["wbot", "c3top", "crease", [], "abs_top"],
+        ["wbot", "rbot", "crease", [], "rectus_border"],
+        ["rbot", "abot", "crease", [], "abs_bottom"],
+        ["abot", "c3top", "free", [], "linea_alba"],
+        ["meet", "waistside", "free", [[0.131, 1.16]], "flank"],
+        ["waistside", "rbot", "free", [[0.09, 1.08]], "waist"],
+    ],
+    "seeds": {"chest_top": [0.0, 1.458], "chest_pec": [0.105, 1.37], "chest_plate": [0.025, 1.36], "chest_band": [0.10, 1.26],   # x = 0 : one patch across the sternum
+              "chest_ribs": [0.0, 1.25], "abs_rectus": [0.025, 1.14], "abs_oblique": [0.10, 1.15]},
+    "corners": {   # the four corners of every patch, by node name (name@L / name@R for a patch across the sternum) : same choice on both sides, symmetric mesh
+        "chest_top": ["collar@L", "collar@R", "bend@R", "bend@L"], "chest_pec": ["collar", "shoulder", "sidetop", "j1"], "chest_plate": ["utop", "bend", "j1d", "wtop"],
+        "chest_band": ["j1", "sidetop", "meet", "wbot"], "chest_ribs": ["j1d@L", "j1d@R", "wbot@R", "wbot@L"], "abs_rectus": ["c3top", "wbot", "rbot", "abot"],
+        "abs_oblique": ["meet", "waistside", "rbot", "wbot"]},
 }
 
 
@@ -89,6 +127,50 @@ def build_doc(prm=PARAMS):
             "nodes": nodes, "arcs": [{k: v for k, v in a.items() if k != "name"} for a in arcs], "components": [], "component_seeds": seeds, "corners_force": corners, "model_ref": prm["obj"]}
 
 
+def build_doc_panels(prm=PARAMS, pan=PANELS):
+    """29 October 2026, v4 : the network on the panel lines : crease nodes snapped to the crease map, crease arcs = cheapest path along the valley
+    (ZrlCreases.crease_path), free arcs through their points ; all lifted on the skin by the front ray cast and fitted to cubic B-splines ; no forced
+    corner, every face finds its own corners by the turn of its curves (a leg that continues straight is not a corner of the face beside it)."""
+    import ZrlCreases as ZC, ZrlRefMesh as RM
+    cast = FrontCaster(prm["obj"]); V, F, _, _ = RM.from_obj(prm["obj"]); cprm = dict(ZC.PARAMS); cm = ZC.crease_map(V, F, cprm)
+    N = {k: np.array(v, float) for k, v in pan["nodes"].items()}
+    for k in pan["on_crease"]:
+        c, r = ZC.world_to_pixel(cprm, np.array([[N[k][0], N[k][1], 0.0]]))[0]; rad = prm["snap_mm"] / 1000.0 * cprm["px_per_m"]
+        rr, cc = np.mgrid[int(r - rad):int(r + rad) + 1, int(c - rad):int(c + rad) + 1]; ok = (rr - r) ** 2 + (cc - c) ** 2 <= rad ** 2
+        if N[k][0] == 0: ok &= np.abs(cc - c) < 0.5                                       # a node on the symmetry line stays on it
+        cv = np.where(ok, np.nan_to_num(cm["curv"][np.clip(rr, 0, cprm["res"] - 1), np.clip(cc, 0, cprm["res"] - 1)]), -1)
+        i = np.unravel_index(np.argmax(cv), cv.shape)
+        if cv[i] > cprm["min_curv"]: N[k] = ZC.pixel_to_world(cprm, np.array([float(rr[i])]), np.array([float(cc[i])]))[0, :2]
+    nodes, arcs, nid = [], [], {}
+    def node(name, side):
+        x, y = N[name]; key = (name, side if x != 0 else 0)
+        if key not in nid: nid[key] = len(nodes); nodes.append({"id": len(nodes), "p": cast(side * x, y).round(6).tolist()})
+        return nid[key]
+    paths = {}
+    for a, b, mode, mid, name in pan["arcs"]:
+        paths[name] = ZC.crease_path(cm, cprm, N[a], N[b], snap_mm=0.0) if mode == "crease" else catmull([N[a].tolist()] + mid + [N[b].tolist()], 0.004)
+        paths[name][0], paths[name][-1] = N[a], N[b]
+    for side in (1, -1):
+        for a, b, mode, mid, name in pan["arcs"]:
+            if N[a][0] == 0 and N[b][0] == 0 and side == -1: continue
+            pts = paths[name] * np.array([side, 1.0]); S = np.array([cast(x, y) for x, y in pts]); S = SP.clean_polyline(S) if hasattr(SP, "clean_polyline") else S
+            m = max(4, int(round(SP.polyline_length(S) / prm["ctrl_step_m"])) + 1); C = SP.fit(S, m); ia, ib = node(a, side), node(b, side)
+            C[0] = nodes[ia]["p"]; C[-1] = nodes[ib]["p"]
+            arcs.append({"id": len(arcs), "a": ia, "b": ib, "closed": False, "pair": ["", ""], "ctrl": np.round(C, 6).tolist(), "mirror": -1,
+                         "name": name + ("" if N[a][0] == 0 and N[b][0] == 0 else ("_L" if side > 0 else "_R"))})
+    for i, A in enumerate(arcs):
+        if A["name"].endswith("_L"):
+            for j, B in enumerate(arcs):
+                if B["name"] == A["name"][:-2] + "_R": A["mirror"], B["mirror"] = j, i
+    sides = lambda nm: [(0, "")] if pan["seeds"][nm][0] == 0 else [(1, "_L"), (-1, "_R")]        # 29 October 2026 : a seed on x = 0 is one patch across the sternum
+    seeds = [{"name": nm + suf, "p": cast(side * x, y).round(6).tolist()} for nm, (x, y) in pan["seeds"].items() for side, suf in sides(nm)]
+    def corner(c, side): nm, _, sd = c.partition("@"); return node(nm, {"L": 1, "R": -1}[sd] if sd else side)
+    copts = {nm + suf: {"corners": [corner(c, side) for c in cs]} for nm, cs in pan.get("corners", {}).items() for side, suf in sides(nm)}
+    return {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"},
+            "nodes": nodes, "arcs": [{k: v for k, v in a.items() if k != "name"} for a in arcs], "arc_names": [a["name"] for a in arcs], "components": [],
+            "component_seeds": seeds, "component_options": copts, "corners_force": {}, "model_ref": prm["obj"]}
+
+
 def judge(res, ref, prm):
     P = np.array(res["P"], float).reshape(-1, 3); Q = np.array(res["Q"], int).reshape(-1, 4); st = res["stats"]
     E = np.concatenate([Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]]); E = np.unique(np.sort(E, 1), axis=0); el = np.linalg.norm(P[E[:, 0]] - P[E[:, 1]], axis=1)
@@ -110,8 +192,49 @@ def judge(res, ref, prm):
             "faces": [(f.get("component"), f.get("side_counts"), f.get("folded"), round(float(f.get("min_jac", 0)), 3)) for f in res["faces"] if f.get("quads")]}
 
 
+def tutte_refill(res, prm):
+    """29 October 2026 : every four sided patch gets its interior again from ZrlTutteFill (bijective map to the square, in the front view, lifted by
+    the front ray cast), then exact symmetry across x = 0 (mutual twins), then fresh Jacobians, folds and per face numbers in res (same judge as NM)."""
+    import ZrlTutteFill as TF
+    from scipy.spatial import cKDTree
+    cast = FrontCaster(prm["obj"]); P0 = np.array(res["P"], float).reshape(-1, 3); P, done = TF.refill(P0, res, cast)
+    def sym(P):
+        R = P * np.array([-1.0, 1, 1]); d, j = cKDTree(P).query(R); ok = (d <= 0.01) & (j[j] == np.arange(len(P)))
+        P = P.copy(); P[ok] = 0.5 * (P[ok] + R[j[ok]]); P[ok & (j == np.arange(len(P))), 0] = 0.0; return P
+    ref = NM.load_ref(prm["obj"]); Q = np.array(res["Q"], int).reshape(-1, 4); z = np.tile([0.0, 0.0, 1.0], (len(Q), 1))
+    def jacs(P):
+        n = ref.normals_at(P[Q].mean(1), guide=z); n = np.where(((n * z).sum(1) > 0)[:, None], n, z); return TF.quad_jacobians(P, Q, n)
+    P = sym(P); j0, j1 = jacs(P0), jacs(P); foq = np.array(res["face_of_quad"], int); kept = []
+    for f, G in TF.face_grids(res):                                   # 29 October 2026 : the Tutte interior is kept only on the faces it improves
+        qs = np.flatnonzero(foq == f["id"]); inner = G[1:-1, 1:-1].ravel()
+        if len(qs) and j1[qs].min() < j0[qs].min(): P[inner] = P0[inner]
+        else: kept.append(f.get("component"))
+    if prm.get("optimize_interior", True):                          # 29 October 2026 : then each interior vertex moves to raise the worst quad around it
+        inner = TF.interior_vertices(Q, foq)                         # every vertex inside one face (Tarini spokes and poles too), borders excluded
+        P2, gain = TF.optimize_interior(P, Q, inner, cast); P2 = sym(P2); j2 = jacs(P2); res.setdefault("stats", {})["interior_opt"] = gain
+        groups = {}                                                   # kept per mirrored pair (name without _L/_R), only where the true Jacobian improves on both
+        for f in res["faces"]:
+            if f.get("quads"): groups.setdefault(str(f.get("component"))[:-2] if str(f.get("component")).endswith(("_L", "_R")) else str(f.get("component")), []).append(f)
+        jp = jacs(P); inner_set = set(inner)
+        for key, fs in groups.items():
+            if all(j2[np.flatnonzero(foq == f["id"])].min() > jp[np.flatnonzero(foq == f["id"])].min() for f in fs):
+                for f in fs: vv = [v for v in np.unique(Q[foq == f["id"]]) if int(v) in inner_set]; P[vv] = P2[vv]
+        P = sym(P)
+    done = kept; jac = jacs(P)
+    st = res["stats"]; jmin = float(st.get("jac_min_threshold", 0.5)) if isinstance(st.get("jac_min_threshold"), (int, float)) else 0.5
+    res["P"] = P.tolist(); res["quad_jac"] = jac.tolist(); st["folded_quads"] = int((jac < 0).sum()); st["min_jac"] = float(jac.min()); st["quads_below_jac_min"] = int((jac < jmin).sum())
+    st["tutte_faces"] = done; foq = np.array(res["face_of_quad"], int)
+    for f in res["faces"]:
+        qs = np.flatnonzero(foq == f["id"])
+        if len(qs): f["folded"] = int((jac[qs] < 0).sum()); f["min_jac"] = float(jac[qs].min())
+    return res
+
+
 def run(prm=PARAMS):
-    doc = build_doc(prm); res = NM.build(doc, {"ref": prm["obj"], "edge_m": prm["edge_m"], "write_obj": False, "corners_force": doc["corners_force"], "symmetry_x": True})
+    doc = build_doc_panels(prm) if prm.get("layout") == "panels" else build_doc(prm)
+    res = NM.build(doc, {"ref": prm["obj"], "edge_m": prm["edge_m"], "write_obj": False, "corners_force": doc["corners_force"], "symmetry_x": True, "min_arc_count": prm.get("min_arc_count", 2),
+                         "component_options": doc.get("component_options") or {}})
+    if prm.get("tutte_fill", True) and prm.get("layout") == "panels": tutte_refill(res, prm)   # 29 October 2026 : interiors that cannot fold
     J = judge(res, NM.load_ref(prm["obj"]), prm)
     os.makedirs(os.path.dirname(prm["out_obj"]), exist_ok=True); json.dump(doc, open(prm["out_doc"], "w"))
     P = np.array(res["P"], float).reshape(-1, 3); Q = np.array(res["Q"], int).reshape(-1, 4)   # 29 October 2026 : the quads, for ZrlCreases.py and any viewer

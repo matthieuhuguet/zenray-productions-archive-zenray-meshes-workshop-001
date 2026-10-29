@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -512,12 +512,43 @@
     });
     renderCompList();
   }
-  function finishDraw() {
+  // 29 October 2026 : the camera axes (rx right, uy up, tz toward the viewer), so the creases are read as this camera sees them
+  function viewAxes() {
+    const c = view.cam, cp = Math.cos(c.pitch), tz = [cp * Math.sin(c.yaw), Math.sin(c.pitch), cp * Math.cos(c.yaw)], f = [-tz[0], -tz[1], -tz[2]];
+    const up = Math.abs(cp) < 1e-4 ? [0, 0, -Math.sign(c.pitch)] : [0, 1, 0]; let r = [f[1] * up[2] - f[2] * up[1], f[2] * up[0] - f[0] * up[2], f[0] * up[1] - f[1] * up[0]];
+    const n = Math.hypot(r[0], r[1], r[2]) || 1; r = r.map((x) => x / n); return { rx: r, uy: [r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]], tz };
+  }
+  // 29 October 2026 : the crease layer : the valleys of the model as this camera sees them, red points on the surface, refreshed after each move
+  let creaseTimer = null;
+  async function showCreases() {
+    if (!$('pShowCreases') || !$('pShowCreases').checked) { view.clearLayer('creases'); view.draw(); return; }
+    const c = view.cam, ext = 2 * c.dist * Math.tan(view.CFG.fov * Math.PI / 360) * Math.max(1, view.canvas.width / Math.max(1, view.canvas.height));
+    const r = await fetch(CFG.files.creases, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ view: viewAxes(), center: c.target, extent_m: ext, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.points) return status('The crease layer failed.');
+    view.setPoints('creases', r.points.map((p) => ({ p, color: [0.84, 0.16, 0.16, 1], size: 3 })), { onTop: false, order: 5 }); view.draw();
+    status(r.points.length + ' crease points seen from this camera (smoothing ' + r.sigma_mm + ' mm).');
+  }
+  async function creaseAlignment() {   // 29 October 2026 : the senior check : how many of the creases seen from this camera carry an edge of the mesh
+    if (!S.mesh) return status('Convert to mesh first.');
+    const c = view.cam, ext = 2 * c.dist * Math.tan(view.CFG.fov * Math.PI / 360) * Math.max(1, view.canvas.width / Math.max(1, view.canvas.height));
+    const r = await fetch(CFG.files.creaseAlign, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ view: viewAxes(), center: c.target, extent_m: ext, P: Array.from(S.mesh.P), Q: Array.from(S.mesh.Q), ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    if (!r || r.aligned == null) return status('No visible quad to measure from this camera.');
+    status('Edges on the creases, this view : ' + Math.round(100 * r.aligned) + ' % of ' + r.crease_points + ' crease points (a random grid scores about 30 %), median gap ' + r.median_gap_mm + ' mm, ' + r.visible_quads + ' visible quads.');
+    return r;
+  }
+  function creasesLater() { if ($('pShowCreases') && $('pShowCreases').checked) { clearTimeout(creaseTimer); creaseTimer = setTimeout(safe(showCreases), 400); } }
+  async function finishDraw() {
     const D = S.draw; if (!D || D.pts.length < 2) { S.draw = null; redraw(); return status('A curve needs at least two points.'); }
+    let follow = null;                                                // 29 October 2026 : with "follow the creases", the server joins the clicks along the valleys
+    if ($('pCrease') && $('pCrease').checked) {
+      status('Following the creases between the ' + D.pts.length + ' points ...');
+      const r = await fetch(CFG.files.creasePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pts: D.pts.map((q) => q.p), view: viewAxes(), ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+      if (r && r.ctrl && r.ctrl.length >= 2) follow = r; else status('The crease path failed : the clicked points are kept.');
+    }
     edit('Curve drawn', () => {
       const endNode = (q) => { if (q.node != null) return q.node; if (q.arc != null && model.arc(q.arc)) return splitArcAt(q.arc, q.p, P().mirror).node; return addNode(q.p); };
       const a = endNode(D.pts[0]), b = endNode(D.pts[D.pts.length - 1]);
-      const ctrl = D.pts.map((q) => clone3(q.p)); ctrl[0] = clone3(model.node(a).p); ctrl[ctrl.length - 1] = clone3(model.node(b).p);
+      const ctrl = (follow ? follow.ctrl : D.pts.map((q) => q.p)).map(clone3); ctrl[0] = clone3(model.node(a).p); ctrl[ctrl.length - 1] = clone3(model.node(b).p);
       const arc = addArc(a, b, ctrl, ['', '']);
       const side = ctrl.every((p) => p[0] > 0.01) || ctrl.every((p) => p[0] < -0.01);
       if (P().mirror && side) {
@@ -528,6 +559,7 @@
       }
       S.sel = new Set([arc.id]); S.draw = null;
     });
+    if (follow) status('Curve drawn along the creases : ' + Math.round(100 * follow.crease_share) + ' % of its length on a crease, ' + follow.ctrl.length + ' control points.');
   }
 
   // ------------------------------------------------------------------ mesh (server conversion, display, tweak, relax, export)
@@ -738,6 +770,7 @@
   }
   function onUp(ev) {
     const D = S.drag; S.drag = null; if (!D) return;
+    if (D.kind === 'orbit' || D.kind === 'pan' || D.kind === 'zoom') creasesLater();   // 29 October 2026
     if (D.kind === 'box') {
       $('boxSel').style.display = 'none'; const [x, y] = local(ev), x0 = Math.min(x, D.x), x1 = Math.max(x, D.x), y0 = Math.min(y, D.y), y1 = Math.max(y, D.y);
       if (x1 - x0 < 3 && y1 - y0 < 3) { if (!D.add) { S.sel.clear(); S.node = null; S.handle = null; } redraw(); return; }
@@ -1014,7 +1047,7 @@
     on('bCompImport', importSeeds); on('bCompRename', renameComp); on('bCompDelete', deleteComp); on('bCompAdd', () => setTool('seed'));
     on('bCompSkip', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('skip', !(o && o.skip)); schedulePreview(); });
     on('bCompRotate', () => cyclePattern(+1));
-    on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
+    on('bPreview', previewFaces); on('bHoudini', sendToHoudini); if ($('bCreaseAlign')) on('bCreaseAlign', creaseAlignment);   // 29 October 2026
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
     on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bAutoFix', () => safe(autoFix)()); on('bCompName', nameFacesFromModel);
@@ -1028,9 +1061,11 @@
     for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
+    if ($('pShowCreases')) $('pShowCreases').addEventListener('change', safe(showCreases));   // 29 October 2026 : crease layer
+    cv().addEventListener('wheel', () => creasesLater(), { passive: true });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

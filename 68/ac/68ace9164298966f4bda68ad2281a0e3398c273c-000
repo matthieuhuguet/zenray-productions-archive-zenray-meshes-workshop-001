@@ -82,3 +82,42 @@ def quad_jacobians(P, Q, normals):
         e1 = X[:, (j + 1) % 4] - X[:, j]; e2 = X[:, (j - 1) % 4] - X[:, j]
         J = np.minimum(J, (np.cross(e1, e2) * normals).sum(1) / np.maximum(np.linalg.norm(e1, axis=1) * np.linalg.norm(e2, axis=1), 1e-12))
     return J
+
+
+def optimize_interior(P, Q, movable, lift, sweeps=6, steps_mm=(4.0, 2.0, 1.0, 0.5)):
+    """29 October 2026 : optimisation based smoothing (Freitag) : each movable vertex tries 8 moves in the view plane per step size, lifted by
+    lift(x, y), and keeps the one that raises the smallest front plane scaled Jacobian of its quads. Border vertices never move. Returns P, gain."""
+    P = np.array(P, float).copy(); Q = np.asarray(Q, int); inc = {}
+    for qi, q in enumerate(Q):
+        for v in q: inc.setdefault(int(v), []).append(qi)
+    def jmin(qs, P):
+        X = P[Q[qs]][:, :, :2]; J = np.full(len(qs), np.inf)
+        for j in range(4):
+            e1 = X[:, (j + 1) % 4] - X[:, j]; e2 = X[:, (j - 1) % 4] - X[:, j]
+            J = np.minimum(J, (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]) / np.maximum(np.linalg.norm(e1, axis=1) * np.linalg.norm(e2, axis=1), 1e-12))
+        return float(J.min())
+    dirs = [(np.cos(a), np.sin(a)) for a in np.arange(8) * np.pi / 4]; before = min(jmin(inc[v], P) for v in movable if v in inc)
+    for _ in range(sweeps):
+        for v in movable:
+            if v not in inc: continue
+            qs = inc[v]; best = jmin(qs, P); keep = P[v].copy()
+            for s in steps_mm:
+                for dx, dy in dirs:
+                    x, y = keep[0] + dx * s / 1000.0, keep[1] + dy * s / 1000.0
+                    try: cand = lift(x, y)
+                    except ValueError: continue
+                    old = P[v].copy(); P[v] = cand; j = jmin(qs, P)
+                    if j > best + 1e-4: best = j; keep = P[v].copy()
+                    P[v] = old
+            P[v] = keep
+    after = min(jmin(inc[v], P) for v in movable if v in inc); return P, (round(before, 3), round(after, 3))
+
+
+def interior_vertices(Q, face_of_quad):
+    """29 October 2026 : vertices whose quads all belong to one face and whose edges are all shared by two quads (inside a face, off every border)."""
+    Q = np.asarray(Q, int); foq = np.asarray(face_of_quad, int); faces_of = {}; edge_n = {}
+    for qi, q in enumerate(Q):
+        for k in range(4):
+            v = int(q[k]); faces_of.setdefault(v, set()).add(int(foq[qi])); e = (min(v, int(q[(k + 1) % 4])), max(v, int(q[(k + 1) % 4]))); edge_n[e] = edge_n.get(e, 0) + 1
+    border = {v for e, n in edge_n.items() if n != 2 for v in e}
+    return sorted(v for v, fs in faces_of.items() if len(fs) == 1 and v not in border)
