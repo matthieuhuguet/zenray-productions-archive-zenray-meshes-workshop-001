@@ -75,7 +75,10 @@ def split(faces, sn, fa, cent, A_full_idx, depth, out, prm):
             a /= np.linalg.norm(a) + 1e-20; b /= np.linalg.norm(b) + 1e-20
     else:                              # cut across the longest extent, through the centroid
         c = xy - np.average(xy, axis=0, weights=fa[faces]); u, s_, vt = np.linalg.svd(c * np.sqrt(fa[faces])[:, None], full_matrices=False); g = (c @ vt[0]) > 0
-    A = face_adjacency(_S["F"], faces); parts = []
+    A = face_adjacency(_S["F"], faces); As = A + A.T
+    for _ in range(6):   # 29 October 2026 : the split line is smoothed by majority votes, no saw teeth along the voxel shell
+        vote = As @ g.astype(float); tot = np.asarray(As.sum(1)).ravel(); g = (vote + g) > (tot + 1) / 2
+    parts = []
     for side in (g, ~g):   # each side kept connected : its largest piece ; the rest joins the other side
         idx = np.flatnonzero(side)
         if len(idx) == 0: continue
@@ -101,12 +104,17 @@ def build_leaf(car, name, leaf, prm):
     s = prm["px_per_m"]; res = int(min(prm["res_max"], 2 ** np.ceil(np.log2(ext * s))))
     if res < ext * s: s = res / ext
     c3 = c0 + rx * (x.max() + x.min()) / 2 + uy * (y.max() + y.min()) / 2
-    pm = D.body_poly_mask(car); tri, owner = D.triangulate(car, pm); R = Renderer(car["P"], tri); mask, depth, N, fid = R.render(c3, s, (rx, uy, tz), res); R.release()
+    # 29 October 2026 : LOCAL render, only what lies near the leaf : a leaf inside a wheel arch was hidden by the far side of the car
+    lo = S_["V"][S_["F"][leaf["faces"]].ravel()].min(0) - 0.06; hi = S_["V"][S_["F"][leaf["faces"]].ravel()].max(0) + 0.06
+    _, _, pc = Z.D.poly_normals_areas(car) if "pc" not in _S else (None, None, _S["pc"]); _S["pc"] = pc
+    near = np.all((pc >= lo) & (pc <= hi), axis=1)
+    pm = D.body_poly_mask(car) & near; tri, owner = D.triangulate(car, pm); R = Renderer(car["P"], tri); mask, depth, N, fid = R.render(c3, s, (rx, uy, tz), res); R.release()
     lab = np.full(mask.shape, -1); ok = fid >= 0; lab[ok] = car["T"][owner[fid[ok]]]
     pid = car["names"].index(name); v = dict(pid=pid, rx=rx, uy=uy, tz=tz, c3=c3, s=s, res=res, lab=lab, depth=depth)
     key = np.zeros(len(S_["F"]), np.int64); key[leaf["faces"]] = 1
-    R = Renderer(S_["V"], S_["F"]); m2, d2, N2, f2 = R.render(c3, s, (rx, uy, tz), res); R.release()
-    M = np.zeros(mask.shape, bool); M[f2 >= 0] = key[f2[f2 >= 0]] == 1
+    sel = np.flatnonzero(np.all((S_["cent"] >= lo) & (S_["cent"] <= hi), axis=1))
+    R = Renderer(S_["V"], S_["F"][sel]); m2, d2, N2, f2 = R.render(c3, s, (rx, uy, tz), res); R.release()
+    M = np.zeros(mask.shape, bool); M[f2 >= 0] = key[sel[f2[f2 >= 0]]] == 1
     Lc, n = ndi.label(M)
     if n == 0: raise ValueError("leaf not visible in its own view")
     M = Lc == (np.argmax(np.bincount(Lc.ravel())[1:]) + 1); M = ndi.binary_fill_holes(M)
