@@ -1,0 +1,786 @@
+# 29 October 2026 : ZenRay Lines NETMESH, a network of 3D curves drawn on a surface -> ONE WELDED QUAD MESH (server side of the editor).
+# EN: doctor()  repairs the document (ends welded onto their nodes, false closed flags, duplicates, free ends) and lists the issues ;
+#     faces()   traces the faces of the curve network on the surface by a rotation system (arc ends sorted around the surface normal) ;
+#     build()   corners -> sides -> ONE integer count per (sub)arc (ZrlCounts, milp) -> arcs sampled ONCE (so neighbours share the very
+#               same points) -> 4 sided faces by a discrete Coons patch, 3 / 5 / 6 sided faces by the Tarini midpoint pattern (centre,
+#               spokes, N Coons sub-patches) -> interior projected on the reference surface and relaxed, boundary fixed -> judged.
+#     python ZrlNetMesh.py <lines.json> [--ref v752|/abs/model.obj]   (prints the stats) ; tests in ZrlNetMeshTest.py.
+# FR : réseau de courbes 3D tracé sur une surface -> maillage de quads soudé ; chaque arc est échantillonné une seule fois.
+import collections, copy, datetime, json, math, os, sys, time
+import numpy as np
+from scipy.spatial import cKDTree
+import scipy.sparse as sps
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+for _p in (f"{ROOT}/Scripts", f"{ROOT}/Scripts/retopo", f"{ROOT}/Scripts/lines"):
+    if _p not in sys.path: sys.path.insert(0, _p)
+import ZrlSpline as SP
+import ZrlCounts as CT
+
+PARAMS = {   # 29 October 2026 : the interface of this module, every tunable value lives here
+    "ref": "v752",                    # reference surface : "v752" (validated car) or an absolute .obj path
+    "step_m": 0.002,                  # doctor : polyline step of an evaluated arc
+    "weld_tol_m": 0.02,               # doctor : an arc end closer than this to its node is snapped onto it, else it is a loose end
+    "snap_report_m": 0.0001,          # doctor : snapped ends moved by less than this are not listed as issues
+    "dup_mid_tol_m": 0.02,            # doctor : candidate duplicate arcs have their mid points this close
+    "dup_mean_dist_m": 0.01,          # doctor : duplicate when the mean distance of the two polylines is below this
+    "min_arc_len_m": 0.001,           # doctor : shorter arcs are zero length arcs
+    "tangent_dist_m": 0.02,           # faces : tangent of an arc end measured this far along the polyline (1 to 3 cm)
+    "node_normal_band_m": 0.01,       # faces : triangles within this distance of the nearest one vote for the normal of a node
+    "max_face_sides": 6,              # faces with more corners are skipped
+    "max_face_area_m2": 3.0,          # faces larger than this are skipped
+    "skip_faces": [],                 # face ids skipped on request
+    "corner_deg": 35.0,               # a node of a face loop is a corner when the turn is larger than this
+    "corners_force": {},              # {node id: true|false} forces / forbids a corner
+    "snap_corner_m": 0.01,            # extra corners : a split closer than this to an existing node uses that node
+    "tjunction_tol_m": 0.03,          # a free arc end this close to another arc is a T junction : that arc is split there, both meet in a new node
+    "min_compactness": 0.08,          # faces thinner than this (area / (perimeter^2 / 4 pi)) are skipped as slivers
+    "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
+    "corner_min_gap_frac": 0.05,      # ... but never closer than this fraction of the face perimeter to another corner
+    "drop_failed": False,             # True : quads of faces failing the judge are left out of the mesh (status "rejected")
+    "edge_m": 0.02,                   # target edge length (counts = length / edge_m)
+    "min_loop_count": 3,              # a loop arc (both ends on one node) needs at least this many edges
+    "harmonic": True,                 # before the relaxation, the interior is solved as a harmonic (Tutte) map with the boundary fixed : unfolds a Coons patch
+    "auto_fallback": True,            # faces of 3, 5 or 6 sides that fail the judge are meshed again as 4 sided patches (face option rotate = 0)
+    "relax_iters": 30,                # Laplacian relaxation rounds of the interior
+    "project_k": 8,                   # nearest triangles (by centroid) tested by the exact point-triangle projection
+    "project_every": 3,               # the relaxed interior is re-projected every N rounds (and at the last one)
+    "jac_min": 0.5,                   # judge : minimum scaled Jacobian of a quad
+    "sharp_deg": 30.0,                # judge : corner quads of corners sharper than this are held to 0.9 sin(angle)
+    "sharp_factor": 0.9,
+    "out_dir": f"{ROOT}/work/lines/mesh",
+    "write_obj": True,
+    "face_options": {},               # {face id: {"skip": bool, "corners": [node ids], "rotate": int}} per face topology choices
+    "boundary_step_m": 0.01,          # /faces : spacing of the boundary polyline returned for drawing and picking
+    "seed_plane_tol_m": 0.5,          # component seeds : a face is a candidate when the seed projects inside its loop and lies within this of its plane
+}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+
+def stamp(now=None):
+    now = now or datetime.datetime.now()
+    return "%d-%s-%d_%s" % (now.day, MONTHS[now.month - 1], now.year, now.strftime("%H%M%S"))
+
+
+def native(x):
+    """JSON friendly copy (numpy scalars and arrays -> python)."""
+    if isinstance(x, dict): return {(k if isinstance(k, str) else str(k)): native(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)): return [native(v) for v in x]
+    if isinstance(x, np.ndarray): return native(x.tolist())
+    if isinstance(x, (np.integer,)): return int(x)
+    if isinstance(x, (np.floating,)): return float(x)
+    if isinstance(x, (np.bool_,)): return bool(x)
+    return x
+
+
+# ----------------------------------------------------------------------------------------------------------- reference surface
+def tri_closest(p, a, b, c):
+    """Closest point of triangles (a, b, c) to points p, all (M, 3) (Ericson, Real-Time Collision Detection 5.1.5, vectorised)."""
+    ab, ac, ap = b - a, c - a, p - a
+    d1, d2 = (ab * ap).sum(1), (ac * ap).sum(1)
+    bp = p - b; d3, d4 = (ab * bp).sum(1), (ac * bp).sum(1)
+    cp = p - c; d5, d6 = (ab * cp).sum(1), (ac * cp).sum(1)
+    vc, vb, va = d1 * d4 - d3 * d2, d5 * d2 - d1 * d6, d3 * d6 - d5 * d4
+    den = va + vb + vc; den = np.where(np.abs(den) < 1e-30, 1.0, den)
+    res = a + ab * (vb / den)[:, None] + ac * (vc / den)[:, None]                        # inside the triangle
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0); t = (d4 - d3) / ((d4 - d3) + (d5 - d6)); res[m] = (b + (c - b) * t[:, None])[m]   # edge bc
+        m = (vb <= 0) & (d2 >= 0) & (d6 <= 0); t = d2 / (d2 - d6); res[m] = (a + ac * t[:, None])[m]                                          # edge ac
+        m = (d6 >= 0) & (d5 <= d6); res[m] = c[m]                                                                                             # vertex c
+        m = (vc <= 0) & (d1 >= 0) & (d3 <= 0); t = d1 / (d1 - d3); res[m] = (a + ab * t[:, None])[m]                                          # edge ab
+    m = (d3 >= 0) & (d4 <= d3); res[m] = b[m]                                                                                                 # vertex b
+    m = (d1 <= 0) & (d2 <= 0); res[m] = a[m]                                                                                                  # vertex a
+    return res
+
+
+class Ref:
+    """Reference surface : triangles, KD tree on their centroids, outward normals (away from the bounding box centre)."""
+    def __init__(self, tri):
+        tri = np.asarray(tri, float)
+        self.A, self.B, self.C = tri[:, 0], tri[:, 1], tri[:, 2]
+        n = np.cross(self.B - self.A, self.C - self.A); L = np.linalg.norm(n, axis=1)
+        self.N = n / np.maximum(L, 1e-30)[:, None]
+        self.cent = tri.mean(1); self.kd = cKDTree(self.cent)
+        pts = tri.reshape(-1, 3); self.center = (pts.min(0) + pts.max(0)) / 2
+
+    def closest(self, pts, k=None, guide=None):
+        """Closest surface point of pts. guide (M, 3) : expected outward direction per point ; triangles facing away from it
+        (dot below 0.1) are penalised so that a point of a panel never jumps to the inner layer of a double shell."""
+        k = min(k or PARAMS["project_k"], len(self.A)); pts = np.asarray(pts, float).reshape(-1, 3); M = len(pts)
+        _, idx = self.kd.query(pts, k=k, workers=-1); idx = idx.reshape(M, k)
+        P = np.repeat(pts, k, 0); i = idx.ravel()
+        q = tri_closest(P, self.A[i], self.B[i], self.C[i])
+        d = np.linalg.norm(q - P, axis=1)
+        if guide is not None:
+            dots = (self.outward(i, q) * np.repeat(np.asarray(guide, float).reshape(-1, 3), k, 0)).sum(1)
+            d = d + (dots < 0.1) * 10.0
+        d = d.reshape(M, k); j = d.argmin(1); sel = np.arange(M) * k + j
+        return q[sel], i[sel], d[np.arange(M), j]
+
+    def outward(self, tri_idx, q):
+        n = self.N[tri_idx]; s = ((q - self.center) * n).sum(1)
+        return np.where((s < -1e-9)[:, None], -n, n)
+
+    def normals_at(self, pts, guide=None):
+        q, i, _ = self.closest(pts, guide=guide); return self.outward(i, q)
+
+    def node_normal(self, p, band=None):
+        band = PARAMS["node_normal_band_m"] if band is None else band
+        k = min(8, len(self.A)); p = np.asarray(p, float)
+        _, idx = self.kd.query(p, k=k); idx = np.atleast_1d(idx)
+        q = tri_closest(np.repeat(p[None], len(idx), 0), self.A[idx], self.B[idx], self.C[idx])
+        d = np.linalg.norm(q - p, axis=1); near = d <= d.min() + band
+        n = self.outward(idx[near], q[near]); v = n.sum(0); L = np.linalg.norm(v)
+        return n[0] if L < 1e-9 else v / L
+
+
+_REF = {}
+
+
+def read_obj(path):
+    V, F = [], []
+    for line in open(path):
+        w = line.split()
+        if not w: continue
+        if w[0] == "v": V.append([float(x) for x in w[1:4]])
+        elif w[0] == "f":
+            ix = [int(t.split("/")[0]) for t in w[1:]]; ix = [i - 1 if i > 0 else len(V) + i for i in ix]
+            for j in range(1, len(ix) - 1): F.append([ix[0], ix[j], ix[j + 1]])
+    V = np.array(V, float); return V[np.array(F)]
+
+
+def load_ref(ref=None):
+    if isinstance(ref, Ref): return ref
+    key = ref or PARAMS["ref"]
+    if key not in _REF:
+        if key == "v752":
+            import ZrrData as D
+            car = D.load(); T, _ = D.triangulate(car); tri = car["P"][T]
+        elif isinstance(key, str) and key.lower().endswith(".obj") and os.path.isabs(key): tri = read_obj(key)
+        else: raise ValueError("reference must be 'v752' or an absolute .obj path, got %r" % (key,))
+        _REF[key] = Ref(tri)
+    return _REF[key]
+
+
+# ----------------------------------------------------------------------------------------------------------------- polylines
+def resample_step(pts, step):
+    pts = SP.clean_polyline(pts); cum = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]); L = cum[-1]
+    if L < 1e-12: return np.vstack([pts[0], pts[0]])
+    m = max(1, int(round(L / step))); s = np.linspace(0.0, L, m + 1)
+    return np.stack([np.interp(s, cum, pts[:, k]) for k in range(3)], 1)
+
+
+def resample_count(pts, cum, count):
+    s = np.linspace(0.0, cum[-1], count + 1)
+    return np.stack([np.interp(s, cum, pts[:, k]) for k in range(3)], 1)
+
+
+def eval_arc(ctrl, step):
+    ctrl = np.asarray(ctrl, float); n = len(ctrl)
+    if n < 4: return resample_step(ctrl, step)
+    spans = n - 3; Lc = np.linalg.norm(np.diff(ctrl, axis=0), axis=1).sum()
+    u = np.linspace(0.0, spans, max(8, int(Lc / (step * 0.75)) + spans * 4))
+    return resample_step(SP.evaluate(ctrl, u), step)
+
+
+def cumlen(pts): return np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+
+
+# ---------------------------------------------------------------------------------------------------------------------- doctor
+def _doctor(doc, prm):
+    """Returns (fixed document, issues, {arc id: polyline}). The input document is never modified."""
+    D = copy.deepcopy(doc); tol = prm["weld_tol_m"]; issues = []
+    def issue(kind, **kw): issues.append(dict({"kind": kind}, **kw))
+    nodes = {n["id"]: np.array(n["p"], float) for n in D["nodes"]}
+    nid_list = list(nodes); NP = np.array([nodes[i] for i in nid_list]) if nodes else np.zeros((0, 3)); kdn = cKDTree(NP) if len(NP) else None
+    def nearest_node(p):
+        if kdn is None: return None, np.inf
+        d, j = kdn.query(p); return nid_list[j], float(d)
+    arcs = []
+    for a in D["arcs"]:
+        if not isinstance(a.get("ctrl"), list) or len(a["ctrl"]) < 2: issue("bad_arc", arc=a.get("id"), value=None, fix="removed"); continue
+        ctrl = np.array(a["ctrl"], float); aid = a["id"]
+        a.setdefault("a", -1); a.setdefault("b", -1); a.setdefault("mirror", -1)
+        for end in ("a", "b"):
+            if a[end] != -1 and a[end] not in nodes: issue("missing_node", arc=aid, value=a[end], fix="end detached"); a[end] = -1
+        gap = float(np.linalg.norm(ctrl[0] - ctrl[-1])); island = False
+        if a.get("closed"):
+            if gap <= tol: ctrl[-1] = ctrl[0] if (a["a"] < 0 and a["b"] < 0) else ctrl[-1]; island = a["a"] < 0 and a["b"] < 0
+            else: issue("false_closed", arc=aid, value=round(gap, 6), fix="closed flag cleared"); a["closed"] = False
+        if island: a["ctrl"] = ctrl.tolist(); arcs.append(a); continue
+        for end, k in (("a", 0), ("b", -1)):
+            nid = a[end]; e = ctrl[k]
+            if nid == -1:                                           # free end : attach it when a node lies within the tolerance
+                j, dj = nearest_node(e)
+                if j is not None and dj <= tol: a[end] = j; ctrl[k] = nodes[j]; issue("attached", arc=aid, value=round(dj, 6), fix="free end attached to node %s" % j)
+                else: issue("free_end", arc=aid, value=None, fix="kept free (dangling arcs are pruned from the faces)")
+                continue
+            d = float(np.linalg.norm(e - nodes[nid]))
+            if d <= tol:
+                ctrl[k] = nodes[nid]
+                if d > prm["snap_report_m"]: issue("snapped", arc=aid, value=round(d, 6), fix="end snapped onto node %s" % nid)
+            else:
+                j, dj = nearest_node(e)
+                if j is not None and dj <= tol: a[end] = j; ctrl[k] = nodes[j]; issue("loose_end", arc=aid, value=round(d, 6), fix="reattached to node %s (%.1f mm away)" % (j, dj * 1000))
+                else: a[end] = -1; issue("loose_end", arc=aid, value=round(d, 6), fix="detached from node %s, free end" % nid)
+        a["ctrl"] = ctrl.tolist(); arcs.append(a)
+    polys = {}; keep = []
+    for a in arcs:                                                  # polylines of the repaired arcs, zero length arcs out
+        P = eval_arc(a["ctrl"], prm["step_m"]); L = float(cumlen(P)[-1])
+        if L < prm["min_arc_len_m"]: issue("zero_length", arc=a["id"], value=round(L, 6), fix="removed"); continue
+        polys[a["id"]] = P; keep.append(a)
+    if len(keep) > 1:                                               # duplicates : same place, same length
+        mids = np.array([P[len(P) // 2] for P in (polys[a["id"]] for a in keep)]); pairs = sorted(cKDTree(mids).query_pairs(prm["dup_mid_tol_m"]))
+        gone = set()
+        def samp(P, m=24): return resample_count(P, cumlen(P), m)
+        for i, j in pairs:
+            ai, aj = keep[i], keep[j]
+            if i in gone or j in gone: continue
+            Pi, Pj = polys[ai["id"]], polys[aj["id"]]; Li, Lj = cumlen(Pi)[-1], cumlen(Pj)[-1]
+            if abs(Li - Lj) > 0.05 * max(Li, Lj) + 0.01: continue
+            Si, Sj = samp(Pi), samp(Pj)
+            m = min(np.linalg.norm(Si - Sj, axis=1).mean(), np.linalg.norm(Si - Sj[::-1], axis=1).mean())
+            if m < prm["dup_mean_dist_m"]: gone.add(j); issue("duplicate_arc", arc=aj["id"], value=round(float(m), 6), fix="removed, arc %s kept" % ai["id"])
+        keep = [a for k, a in enumerate(keep) if k not in gone]
+    ids = {a["id"] for a in keep}
+    for a in keep:
+        if a.get("mirror", -1) not in ids: a["mirror"] = -1
+    D["arcs"] = keep; polys = {a["id"]: polys[a["id"]] for a in keep}
+    deg = collections.Counter()
+    for a in keep:
+        for end in ("a", "b"):
+            if a[end] >= 0: deg[a[end]] += 1
+    for nid in nodes:
+        if deg[nid] == 1: issue("dangling_node", node=nid, value=1, fix="its arc is pruned from the faces")
+        elif deg[nid] == 0: issue("isolated_node", node=nid, value=0, fix="ignored")
+    return D, issues, polys
+
+
+def doctor(doc, params=None):
+    prm = dict(PARAMS); prm.update(params or {})
+    fixed, issues, _ = _doctor(doc, prm)
+    kinds = dict(collections.Counter(i["kind"] for i in issues))
+    return native({"ok": True, "issues": issues, "counts_by_kind": kinds, "fixed": fixed, "arcs_in": len(doc["arcs"]), "arcs_out": len(fixed["arcs"]),
+                   "nodes": len(fixed["nodes"])})
+
+
+# ------------------------------------------------------------------------------------------------------------------------ net
+class Net:
+    def __init__(self, doc, ref=None, params=None):
+        self.prm = dict(PARAMS); self.prm.update(params or {})
+        self.t0 = time.time(); self.timing = {}
+        self.ref = load_ref(ref if ref is not None else self.prm["ref"])
+        self.fixed, self.issues, polys = _doctor(doc, self.prm)
+        self.nodes = {n["id"]: np.array(n["p"], float) for n in self.fixed["nodes"]}
+        self.next_node = (max(self.nodes) + 1) if self.nodes else 0; self.real_nodes = set(self.nodes)
+        self.arcs = {}; self.mirror = {}
+        for a in self.fixed["arcs"]:
+            self.arcs[a["id"]] = self._mk(polys[a["id"]].copy(), a["a"], a["b"], a["id"], bool(a.get("closed")))
+            if a.get("mirror", -1) != -1: self.mirror[a["id"]] = a["mirror"]
+        self.next_arc = (max(self.arcs) + 1) if self.arcs else 0
+        self.force = {int(k): bool(v) for k, v in (self.prm.get("corners_force") or {}).items()}
+        self.faces = []; self.dangling = []; self.nn_cache = {}; self.tan_cache = {}; self.euler = {}; self.unplaced_seeds = []; self.tj = []
+        self._prepare_graph()
+
+    # ---- arcs
+    def _mk(self, pts, a, b, parent, closed=False):
+        if a >= 0: pts[0] = self.nodes[a]
+        if b >= 0: pts[-1] = self.nodes[b]
+        cum = cumlen(pts); return {"pts": pts, "cum": cum, "len": float(cum[-1]), "a": a, "b": b, "parent": parent, "closed": closed, "lo": pts.min(0), "hi": pts.max(0)}
+
+    def _set_end(self, aid, end, nv):
+        A = self.arcs[aid]; A[end] = nv; A["pts"][0 if end == "a" else -1] = self.nodes[nv]
+        A["cum"] = cumlen(A["pts"]); A["len"] = float(A["cum"][-1]); A["lo"], A["hi"] = A["pts"].min(0), A["pts"].max(0)
+
+    def _tjunctions(self):
+        """Free ends lying on (or at the free end of) another arc, within tjunction_tol_m : the receiving arc is split there and both meet in a node."""
+        tol, snap = self.prm["tjunction_tol_m"], self.prm["snap_corner_m"]; self.tj = []
+        for _pass in range(6):
+            n0 = len(self.tj)
+            for aid in sorted(list(self.arcs)):
+                if aid not in self.arcs: continue
+                for end in ("a", "b"):
+                    X = self.arcs[aid]
+                    if X[end] >= 0 or (X["a"] < 0 and X["b"] < 0 and X["closed"]): continue
+                    p = X["pts"][0] if end == "a" else X["pts"][-1]; best = None
+                    for bid, Y in self.arcs.items():
+                        if bid == aid or np.any(p < Y["lo"] - tol) or np.any(p > Y["hi"] + tol): continue
+                        d = np.linalg.norm(Y["pts"] - p, axis=1); i = int(d.argmin())
+                        if d[i] <= tol and (best is None or d[i] < best[0]): best = (float(d[i]), bid, i)
+                    if best is None: continue
+                    d, bid, i = best; Y = self.arcs[bid]; sY = float(Y["cum"][i])
+                    if sY <= snap and Y["a"] >= 0: nv = Y["a"]
+                    elif Y["len"] - sY <= snap and Y["b"] >= 0: nv = Y["b"]
+                    elif sY <= snap or Y["len"] - sY <= snap:
+                        nv = self.next_node; self.next_node += 1; self.nodes[nv] = Y["pts"][i].copy(); self._set_end(bid, "a" if sY <= snap else "b", nv)
+                    else: nv = self._split_arc(bid, sY)
+                    self._set_end(aid, end, nv); self.tj.append({"arc": aid, "end": end, "onto": bid, "dist": round(d, 6), "node": nv})
+            if len(self.tj) == n0: break
+
+    def _prepare_graph(self):
+        self._tjunctions()
+        for aid in list(self.arcs):                                  # islands (closed, no node) become loop arcs on a virtual node
+            A = self.arcs[aid]
+            if A["a"] < 0 and A["b"] < 0 and A["closed"]:
+                vn = self.next_node; self.next_node += 1; self.nodes[vn] = A["pts"][0].copy(); A["pts"][-1] = A["pts"][0]; A["a"] = A["b"] = vn
+        changed = True
+        while changed:                                               # dangling arcs (free end or degree one node) are pruned
+            changed = False; deg = collections.Counter()
+            for A in self.arcs.values():
+                for e in (A["a"], A["b"]):
+                    if e >= 0: deg[e] += 1
+            for aid in sorted(self.arcs):
+                A = self.arcs[aid]
+                if A["a"] < 0 or A["b"] < 0 or deg[A["a"]] == 1 or deg[A["b"]] == 1:
+                    self.dangling.append(aid); del self.arcs[aid]; changed = True
+                    for e in (A["a"], A["b"]):
+                        if e >= 0: deg[e] -= 1
+                    break
+
+    def nn(self, v):
+        if v not in self.nn_cache: self.nn_cache[v] = self.ref.node_normal(self.nodes[v])
+        return self.nn_cache[v]
+
+    def tail(self, h): return self.arcs[h[0]]["a"] if h[1] > 0 else self.arcs[h[0]]["b"]
+    def head(self, h): return self.arcs[h[0]]["b"] if h[1] > 0 else self.arcs[h[0]]["a"]
+
+    def hpts(self, h):
+        P = self.arcs[h[0]]["pts"]; return P if h[1] > 0 else P[::-1]
+
+    def tan(self, aid, d):
+        """Unit-less tangent leaving the tail of the half edge (aid, d), measured tangent_dist_m along the polyline."""
+        key = (aid, d)
+        if key not in self.tan_cache:
+            A = self.arcs[aid]; P = A["pts"] if d > 0 else A["pts"][::-1]; cum = A["cum"] if d > 0 else A["len"] - A["cum"][::-1]
+            s = min(self.prm["tangent_dist_m"], 0.5 * A["len"]); q = np.array([np.interp(s, cum, P[:, k]) for k in range(3)])
+            self.tan_cache[key] = q - P[0]
+        return self.tan_cache[key]
+
+    def flat(self, t, v):
+        n = self.nn(v); t = t - (t @ n) * n; L = np.linalg.norm(t); return t / L if L > 1e-12 else t
+
+    # ---- faces (rotation system)
+    def trace(self):
+        t = time.time(); out = collections.defaultdict(list)
+        for aid, A in self.arcs.items(): out[A["a"]].append((aid, 1)); out[A["b"]].append((aid, -1))
+        nxt = {}
+        for v, hes in out.items():
+            n = self.nn(v); ts = [self.flat(self.tan(*h), v) for h in hes]
+            e1 = ts[0] if np.linalg.norm(ts[0]) > 0.5 else np.cross(n, [1.0, 0.0, 0.0]); e2 = np.cross(n, e1)
+            order = sorted(range(len(hes)), key=lambda i: math.atan2(ts[i] @ e2, ts[i] @ e1)); rot = [hes[i] for i in order]
+            for i, h in enumerate(rot): nxt[(h[0], -h[1])] = rot[(i - 1) % len(rot)]
+        seen = set(); self.faces = []
+        for h0 in sorted(nxt):
+            if h0 in seen: continue
+            loop = []; h = h0
+            while h not in seen:
+                seen.add(h); loop.append(h); h = nxt[h]
+            self.faces.append({"id": len(self.faces), "he": loop, "status": "pending", "reason": "", "corner_nodes": set()})
+        nodes_used = {e for A in self.arcs.values() for e in (A["a"], A["b"])}
+        parent = {v: v for v in nodes_used}
+        def find(x):
+            while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        for A in self.arcs.values(): parent[find(A["a"])] = find(A["b"])
+        comps = len({find(v) for v in nodes_used})
+        self.euler = {"V": len(nodes_used), "E": len(self.arcs), "F": len(self.faces), "components": comps}
+        self.euler["chi"] = self.euler["V"] - self.euler["E"] + self.euler["F"]; self.euler["expected_closed_surface"] = 2 * comps
+        for f in self.faces: self._geometry(f)
+        self.assign_components()
+        self.timing["trace"] = time.time() - t
+
+    def _geometry(self, f):
+        P = np.concatenate([self.hpts(h)[:-1] for h in f["he"]]); c = P.mean(0); Q = P - c
+        av = 0.5 * np.cross(Q, np.roll(Q, -1, axis=0)).sum(0)
+        nm = np.sum([self.nn(self.tail(h)) for h in f["he"]], axis=0); ln = np.linalg.norm(nm); nm = nm / ln if ln > 1e-9 else nm
+        f["area_signed"] = float(av @ nm) if ln > 1e-9 else 0.0; f["normal_mean_len"] = float(ln / len(f["he"]))
+        f["area"] = abs(f["area_signed"]); f["perimeter"] = float(sum(self.arcs[h[0]]["len"] for h in f["he"])); f["centroid"] = c
+        f["poly"] = P; f["vec_area"] = av; f["nm"] = nm
+
+    # ---- components : every face takes the name of the seed it contains
+    def assign_components(self):
+        seeds = self.fixed.get("component_seeds") or []; self.unplaced_seeds = []
+        for f in self.faces: f["component"] = None; f["extra_seeds"] = []
+        cand = []
+        for f in self.faces:
+            if f["area_signed"] <= 0 or f["normal_mean_len"] < 0.3: continue
+            n = f["vec_area"] / max(np.linalg.norm(f["vec_area"]), 1e-30); e1 = np.cross(n, [1.0, 0.0, 0.0])
+            if np.linalg.norm(e1) < 0.1: e1 = np.cross(n, [0.0, 1.0, 0.0])
+            e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1); Q = f["poly"] - f["centroid"]
+            cand.append((f, n, e1, e2, np.stack([Q @ e1, Q @ e2], 1)))
+        for sd in seeds:
+            name = str(sd.get("name", "")); q = self.ref.closest(np.array(sd["p"], float)[None])[0][0]; best = None
+            for f, n, e1, e2, poly in cand:
+                d = q - f["centroid"]; x, y = d @ e1, d @ e2; dist = abs(d @ n)
+                if dist > self.prm["seed_plane_tol_m"] and dist > 0.5 * f["perimeter"]: continue
+                if x < poly[:, 0].min() - 1e-9 or x > poly[:, 0].max() + 1e-9 or y < poly[:, 1].min() - 1e-9 or y > poly[:, 1].max() + 1e-9: continue
+                xs, ys = poly[:, 0], poly[:, 1]; xn, yn = np.roll(xs, -1), np.roll(ys, -1)
+                cross = (ys > y) != (yn > y); xi = xs + (y - ys) * (xn - xs) / np.where(yn != ys, yn - ys, 1e-30)
+                if int(np.sum(cross & (x < xi))) % 2 == 1 and (best is None or dist < best[0]): best = (dist, f)
+            if best is None: self.unplaced_seeds.append(name)
+            elif best[1]["component"] is None: best[1]["component"] = name
+            else: best[1]["extra_seeds"].append(name)
+
+    # ---- corners
+    def corners(self):
+        t = time.time(); prm = self.prm; skip = set(int(i) for i in prm["skip_faces"] or [])
+        opts = {int(k): v for k, v in (prm.get("face_options") or {}).items()}
+        for f in self.faces:
+            if f["id"] in skip or opts.get(f["id"], {}).get("skip"): f["status"], f["reason"] = "skipped", "user"
+            elif f["normal_mean_len"] < 0.3 and f["area"] > 0: f["status"], f["reason"] = "skipped", "wraps_around"
+            elif f["area_signed"] <= 0: f["status"], f["reason"] = "skipped", "complement"
+            elif f["area"] > prm["max_face_area_m2"]: f["status"], f["reason"] = "skipped", "area"
+            elif f["area"] < prm["min_compactness"] * f["perimeter"] ** 2 / (4 * math.pi): f["status"], f["reason"] = "skipped", "sliver"
+        for f in self.faces:
+            if f["status"] != "pending": continue
+            he = f["he"]; f["turns"] = []; explicit = "corners" in opts.get(f["id"], {})
+            for k in range(len(he)):
+                prev, cur = he[k - 1], he[k]; v = self.tail(cur)
+                t_in = -self.flat(self.tan(prev[0], -prev[1]), v); t_out = self.flat(self.tan(cur[0], cur[1]), v)
+                turn = math.degrees(math.acos(float(np.clip(t_in @ t_out, -1.0, 1.0)))); sgn = float(np.cross(t_in, t_out) @ self.nn(v))
+                f["turns"].append((k, turn, sgn))
+                if explicit: is_c = v in set(opts[f["id"]]["corners"])
+                elif v in self.force: is_c = self.force[v]
+                else: is_c = turn > prm["corner_deg"]
+                if is_c: f["corner_nodes"].add(v)
+            if not explicit: self._fill_corners(f)
+            f["reflex"] = int(sum(1 for k, tn, sg in f["turns"] if self.tail(he[k]) in f["corner_nodes"] and sg < 0 and tn > prm["corner_deg"]))
+        for f in self.faces:                                         # rotate : which corners pair up as opposite sides
+            r = opts.get(f["id"], {}).get("rotate")
+            if f["status"] != "pending" or r is None: continue
+            r = int(r); ci = self._cidx(f); n = len(ci)
+            if n >= 5: f["corner_nodes"] = {self.tail(f["he"][ci[(r + round(k * n / 4)) % n]]) for k in range(4)}
+            elif n == 3: self._add_corners(f, pick=r % 3)
+            elif n == 4: f["rot"] = r % 4
+        for f in self.faces:
+            if f["status"] == "pending" and self._ncorners(f) > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
+        for f in self.faces:
+            if f["status"] == "pending" and self._ncorners(f) < 3: self._add_corners(f)
+        for f in self.faces:
+            if f["status"] != "pending": continue
+            n = self._ncorners(f)
+            if n < 3: f["status"], f["reason"] = "skipped", "few_corners"
+            elif n > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
+            else: self._sides(f)
+        self.timing["corners"] = time.time() - t
+
+    def _fill_corners(self, f):
+        """Faces with 1 or 2 sharp corners take the sharpest remaining nodes (turn above corner_min_deg, spaced) up to 4 corners : a node of a
+        trivalent panel network is a natural corner even when it turns gently, which beats a virtual corner at the middle of a long chain."""
+        prm = self.prm; he = f["he"]; ci = self._cidx(f)
+        if len(ci) >= 4 or len(ci) == 3: return
+        pos = np.concatenate([[0.0], np.cumsum([self.arcs[h[0]]["len"] for h in he])]); P = pos[-1]; chosen = [pos[k] for k in ci]
+        for k, turn, sgn in sorted(f["turns"], key=lambda x: -x[1]):
+            if len(chosen) >= 4: break
+            v = self.tail(he[k])
+            if turn < prm["corner_min_deg"] or v in f["corner_nodes"] or self.force.get(v) is False: continue
+            if any(min(abs(pos[k] - c), P - abs(pos[k] - c)) < prm["corner_min_gap_frac"] * P for c in chosen): continue
+            f["corner_nodes"].add(v); chosen.append(pos[k])
+
+    def _cidx(self, f): return [k for k, h in enumerate(f["he"]) if self.tail(h) in f["corner_nodes"]]
+    def _ncorners(self, f): return len(self._cidx(f))
+
+    def _sides(self, f):
+        he = f["he"]; ci = self._cidx(f); f["sides"] = []
+        for t in range(len(ci)):
+            i, j = ci[t], ci[(t + 1) % len(ci)]
+            f["sides"].append([tuple(h) for h in (he[i:j] if j > i else he[i:] + he[:j])])
+        r = f.get("rot", 0) % max(len(f["sides"]), 1); f["sides"] = f["sides"][r:] + f["sides"][:r]
+        f["status"] = "ok"
+
+    def _split_arc(self, aid, s):
+        A = self.arcs[aid]; pts, cum = A["pts"], A["cum"]
+        k = int(np.clip(np.searchsorted(cum, s), 1, len(pts) - 1)); t = (s - cum[k - 1]) / max(cum[k] - cum[k - 1], 1e-12)
+        q = pts[k - 1] + t * (pts[k] - pts[k - 1]); nv = self.next_node; self.next_node += 1; self.nodes[nv] = q
+        i1, i2 = self.next_arc, self.next_arc + 1; self.next_arc += 2
+        self.arcs[i1] = self._mk(np.vstack([pts[:k], q[None]]), A["a"], nv, A["parent"], False)
+        self.arcs[i2] = self._mk(np.vstack([q[None], pts[k:]]), nv, A["b"], A["parent"], False)
+        del self.arcs[aid]
+        for f in self.faces:
+            new = []
+            for h in f["he"]:
+                if h[0] != aid: new.append(h)
+                elif h[1] > 0: new += [(i1, 1), (i2, 1)]
+                else: new += [(i2, -1), (i1, -1)]
+            f["he"] = new
+        return nv
+
+    def _add_corners(self, f, target=4, pick=None):
+        """Faces with fewer than 3 corners : split the longest chain at its arc length middle until there are `target` corners.
+        pick = chain index to split first instead of the longest (face option rotate on a three cornered face)."""
+        for it in range(8):
+            he = f["he"]; ci = self._cidx(f)
+            if len(ci) >= target: return
+            if not ci: f["corner_nodes"].add(self.tail(he[0])); continue
+            best = None
+            for t in range(len(ci)):
+                i, j = ci[t], ci[(t + 1) % len(ci)]; seq = list(range(i, j)) if j > i else list(range(i, len(he))) + list(range(0, j))
+                if not seq: seq = list(range(i, len(he))) + list(range(0, i))
+                L = sum(self.arcs[he[k][0]]["len"] for k in seq)
+                if (pick is not None and it == 0 and t == pick) or (not (pick is not None and it == 0) and (best is None or L > best[0])): best = (L, seq)
+            L, seq = best; half = L / 2; acc = 0.0
+            for k in seq:
+                h = he[k]; ln = self.arcs[h[0]]["len"]
+                if acc + ln >= half - 1e-12: break
+                acc += ln
+            u = half - acc; snap = self.prm["snap_corner_m"]
+            if u <= snap and k != seq[0]: f["corner_nodes"].add(self.tail(h)); continue
+            if u <= snap and k == seq[0]:
+                if len(seq) < 2 and ln < 2 * snap: break
+                f["corner_nodes"].add(self.tail(h)); continue
+            if ln - u <= snap: f["corner_nodes"].add(self.head(h)); continue
+            s_a = u if h[1] > 0 else ln - u
+            f["corner_nodes"].add(self._split_arc(h[0], s_a))
+
+    # ---- counts
+    def counts(self):
+        t = time.time(); cand = [f for f in self.faces if f["status"] == "ok"]; self.counts_by_arc = {}; self.tarini = {}
+        opts = {int(k): v for k, v in (self.prm.get("face_options") or {}).items()}; arc_scales = collections.defaultdict(list)
+        for f in self.faces:                                         # edge_scale of a face multiplies the target edge length ; a shared arc takes the mean
+            for h in f["he"]: arc_scales[h[0]].append(float(opts.get(f["id"], {}).get("edge_scale", 1.0) or 1.0))
+        def layout_of(fs):
+            used = sorted({h[0] for f in fs for side in f["sides"] for h in side})
+            L = {"arcs": {a: self.arcs[a]["len"] / max(1e-6, float(np.mean(arc_scales[a]))) for a in used}, "mirror": [], "patches": [], "min": {}}
+            for a in used:
+                if self.arcs[a]["a"] == self.arcs[a]["b"]: L["min"][a] = self.prm["min_loop_count"]
+            seen = set()
+            for a in used:
+                b = self.mirror.get(a)
+                if b is not None and b in L["arcs"] and self.mirror.get(b) == a and (b, a) not in seen: L["mirror"].append([a, b]); seen.add((a, b))
+            for f in fs: L["patches"].append({"name": f["id"], "sides": [[h[0] for h in side] for side in f["sides"]]})
+            return L
+        self.infeasible = []; self.mirror_dropped = []
+        if cand:
+            L = layout_of(cand); r = CT.solve(L, self.prm["edge_m"], elastic=True)
+            if not r["ok"]:
+                for f in cand: f["status"], f["reason"] = "infeasible", "solver: %s" % r.get("status")
+                self.infeasible = [f["id"] for f in cand]; cand = []
+            elif r["violations"] or r["violated_mirror"]:
+                bad = set(r["violations"]); self.mirror_dropped = r["violated_mirror"]
+                for f in cand:
+                    if f["id"] in bad: f["status"], f["reason"] = "infeasible", "counts cannot close (slack %.0f)" % r["violations"][f["id"]]; self.infeasible.append(f["id"])
+                cand = [f for f in cand if f["status"] == "ok"]
+                if cand:
+                    L = layout_of(cand); L["mirror"] = [m for m in L["mirror"] if m not in self.mirror_dropped and m[::-1] not in self.mirror_dropped]
+                    r = CT.solve(L, self.prm["edge_m"], elastic=False)
+                    if not r["ok"]:
+                        for f in cand: f["status"], f["reason"] = "infeasible", "solver: %s" % r.get("status")
+                        self.infeasible += [f["id"] for f in cand]; cand = []
+            if cand: self.counts_by_arc = r["counts"]; self.tarini = r["tarini"]; self.count_stats = {k: r[k] for k in ("mean_rel_dev", "max_rel_dev")}
+        for f in self.faces:
+            if f["status"] == "ok": f["side_counts"] = [int(sum(self.counts_by_arc[h[0]] for h in side)) for side in f["sides"]]
+        self.timing["counts"] = time.time() - t
+
+    # ---- fill
+    def fill(self):
+        t = time.time(); self.V = []; self.fixed_v = []; keymap = {}; self.arc_vs = {}; self.guide = []; cur = [np.zeros(3)]
+        def vid(key, pos, fixed=True):
+            if key is not None and key in keymap: return keymap[key]
+            self.V.append(np.asarray(pos, float)); self.fixed_v.append(fixed); self.guide.append(np.zeros(3) if fixed else cur[0]); i = len(self.V) - 1
+            if key is not None: keymap[key] = i
+            return i
+        for aid, c in self.counts_by_arc.items():
+            A = self.arcs[aid]; S = resample_count(A["pts"], A["cum"], c); ids = []
+            for k in range(c + 1):
+                if k == 0: ids.append(vid(("n", A["a"]), self.nodes[A["a"]]))
+                elif k == c: ids.append(vid(("n", A["b"]), self.nodes[A["b"]]))
+                else: ids.append(vid(("a", aid, k), S[k]))
+            self.arc_vs[aid] = ids
+        self.Q = []; self.face_of_quad = []; self.corner_quads = collections.defaultdict(list)
+        def side_vs(side):
+            out = []
+            for aid, d in side:
+                seq = self.arc_vs[aid] if d > 0 else self.arc_vs[aid][::-1]
+                out = list(seq) if not out else out + list(seq[1:])
+            return out
+        def patch(fid, bottom, top, left, right, corner_at=()):
+            V = self.V; Pb, Pt = np.array([V[i] for i in bottom]), np.array([V[i] for i in top]); Pl, Pr = np.array([V[i] for i in left]), np.array([V[i] for i in right])
+            m, n = len(bottom) - 1, len(left) - 1
+            u = np.linspace(0, 1, m + 1)[:, None, None]; v = np.linspace(0, 1, n + 1)[None, :, None]
+            S = ((1 - v) * Pb[:, None, :] + v * Pt[:, None, :] + (1 - u) * Pl[None, :, :] + u * Pr[None, :, :]
+                 - ((1 - u) * (1 - v) * Pb[0] + u * (1 - v) * Pb[-1] + (1 - u) * v * Pt[0] + u * v * Pt[-1]))
+            G = -np.ones((m + 1, n + 1), dtype=np.int64)
+            G[:, 0], G[:, n], G[0, :], G[m, :] = bottom, top, left, right
+            for i in range(1, m):
+                for j in range(1, n): G[i, j] = vid(None, S[i, j], False)
+            q0 = len(self.Q)
+            for i in range(m):
+                for j in range(n): self.Q.append([int(G[i, j]), int(G[i + 1, j]), int(G[i + 1, j + 1]), int(G[i, j + 1])]); self.face_of_quad.append(fid)
+            return q0, m, n
+        self.meshed = []
+        for f in self.faces:
+            if f["status"] != "ok": continue
+            S = [side_vs(s) for s in f["sides"]]; e = [len(x) - 1 for x in S]; N = len(S); f["side_counts"] = e; cur[0] = f["nm"]
+            try:
+                if N == 4:
+                    if e[0] != e[2] or e[1] != e[3]: raise ValueError("opposite sides differ %s" % e)
+                    q0, m, n = patch(f["id"], S[0], S[2][::-1], S[3][::-1], S[1])
+                    f["corner_quads"] = [q0, q0 + (m - 1) * n, q0 + (m - 1) * n + n - 1, q0 + n - 1]
+                else:
+                    s = self.tarini.get(f["id"]) or CT.tarini_s(e)
+                    if s is None or any(e[i] != s[i - 1] + s[(i + 1) % N] for i in range(N)): raise ValueError("no Tarini spokes for %s" % e)
+                    P0 = np.mean([self.V[x[0]] for x in S], axis=0); c = vid(None, P0, False); spoke = []
+                    for i in range(N):
+                        Bi = S[i][s[i - 1]]; ids = [c]
+                        for k in range(1, s[i]): ids.append(vid(None, P0 + (self.V[Bi] - P0) * k / s[i], False))
+                        spoke.append(ids + [Bi])
+                    f["corner_quads"] = []
+                    for i in range(N):
+                        q0, m, n = patch(f["id"], S[i][:s[i - 1] + 1], spoke[i - 1][::-1], S[i - 1][s[(i - 2) % N]:][::-1], spoke[i][::-1])
+                        f["corner_quads"].append(q0)
+                f["status"] = "meshed"; self.meshed.append(f["id"])
+            except Exception as ex:                                  # a face that cannot be filled is reported, never fatal
+                f["status"], f["reason"] = "infeasible", "fill: %s" % ex; self.infeasible.append(f["id"])
+        self.V = np.array(self.V).reshape(-1, 3); self.fixed_v = np.array(self.fixed_v, bool); self.Q = np.array(self.Q, dtype=np.int64).reshape(-1, 4)
+        self.guide = np.array(self.guide).reshape(-1, 3)
+        self.timing["fill"] = time.time() - t
+
+    # ---- project and relax
+    def conform(self):
+        t = time.time(); free = np.flatnonzero(~self.fixed_v); prm = self.prm
+        if len(free) == 0 or len(self.Q) == 0: self.timing["conform"] = time.time() - t; return
+        P = self.V; G = self.guide
+        E = np.concatenate([self.Q[:, [0, 1]], self.Q[:, [1, 2]], self.Q[:, [2, 3]], self.Q[:, [3, 0]]]); E = np.unique(np.sort(E, axis=1), axis=0)
+        n = len(P); W = sps.coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(n, n)).tocsr()
+        deg = np.asarray(W.sum(1)).ravel()
+        if prm["harmonic"]:                                          # harmonic map : L x = 0 on the free vertices, boundary fixed
+            from scipy.sparse.linalg import spsolve
+            fixed = np.flatnonzero(self.fixed_v); Lap = (sps.diags(deg) - W).tocsr(); A = Lap[free][:, free].tocsc(); rhs = -(Lap[free][:, fixed] @ P[fixed])
+            try: P[free] = spsolve(A, rhs).reshape(len(free), 3)
+            except Exception: pass
+        P[free] = self.ref.closest(P[free], guide=G[free])[0]
+        W = sps.diags(1.0 / np.maximum(deg, 1)) @ W
+        iters = prm["relax_iters"]
+        for it in range(iters):
+            Pn = W @ P; P[free] = Pn[free]
+            if (it + 1) % prm["project_every"] == 0 or it == iters - 1: P[free] = self.ref.closest(P[free], guide=G[free])[0]
+        self.timing["conform"] = time.time() - t
+
+    # ---- judge
+    def judge(self):
+        t = time.time(); prm = self.prm; P, Q = self.V, self.Q; nq = len(Q); drop = []
+        self.quad_stats = {}
+        if nq:
+            X = P[Q]; cen = X.mean(1); nm_f = {f["id"]: f["nm"] for f in self.faces}; Gq = np.array([nm_f[i] for i in self.face_of_quad]); n_ref = self.ref.normals_at(cen, guide=Gq)
+            E = np.linalg.norm(X - np.roll(X, -1, axis=1), axis=2); ratio = E.max(1) / np.maximum(E.min(1), 1e-12)
+            J = np.zeros((nq, 4)); ang = np.zeros((nq, 4))
+            for j in range(4):
+                e1 = X[:, (j + 1) % 4] - X[:, j]; e2 = X[:, (j - 1) % 4] - X[:, j]; l1 = np.maximum(np.linalg.norm(e1, axis=1), 1e-12); l2 = np.maximum(np.linalg.norm(e2, axis=1), 1e-12)
+                J[:, j] = (np.cross(e1, e2) * n_ref).sum(1) / (l1 * l2); ang[:, j] = np.degrees(np.arccos(np.clip((e1 * e2).sum(1) / (l1 * l2), -1, 1)))
+            jmin = J.min(1); self.quad_stats = {"jmin": jmin, "ratio": ratio, "ang": ang}
+        foq = np.array(self.face_of_quad, dtype=np.int64)
+        for f in self.faces:
+            if f["status"] != "meshed": continue
+            qs = np.flatnonzero(foq == f["id"]); jm = jmin[qs]; thr = np.full(len(qs), prm["jac_min"]); pos = {q: i for i, q in enumerate(qs)}
+            for cq in f["corner_quads"]:                              # corner quads of sharp (or very obtuse) corners : 0.9 sin(angle)
+                if cq in pos:
+                    a = ang[cq, 0:4].min() if False else None
+                    j_c = int(np.argmin(np.abs(J[cq] - np.sin(np.radians(ang[cq]))) + (J[cq] < 0) * 9))
+                    th = ang[cq][int(np.argmin(np.abs(ang[cq] - 90.0)) if False else j_c)]
+                    if th < prm["sharp_deg"] or th > 180.0 - prm["sharp_deg"]: thr[pos[cq]] = min(prm["jac_min"], prm["sharp_factor"] * math.sin(math.radians(th)))
+            f["quads"] = int(len(qs)); f["min_jac"] = float(jm.min()); f["edge_ratio"] = float(ratio[qs].max()); f["folded"] = int((jm <= 0).sum())
+            f["jac_margin"] = float((jm - thr).min()); f["judge_ok"] = bool(f["folded"] == 0 and f["jac_margin"] >= 0)
+            if prm["drop_failed"] and not f["judge_ok"]: f["status"], f["reason"] = "rejected", "failed the judge (min Jacobian %.2f, %d folded)" % (f["min_jac"], f["folded"]); drop.append(f["id"])
+        if drop:                                                    # drop_failed : rebuild the quad list without the rejected faces, then judge again
+            keep = ~np.isin(foq, drop); self.Q = self.Q[keep]; self.face_of_quad = [x for x, k in zip(self.face_of_quad, keep) if k]
+            used = np.unique(self.Q); remap = -np.ones(len(P), dtype=np.int64); remap[used] = np.arange(len(used)); self.V = P[used]; self.fixed_v = self.fixed_v[used]; self.Q = remap[self.Q]
+            prm = dict(prm); prm["drop_failed"] = False; self.prm = prm; self.judge(); return
+        # global : welded, manifold
+        stats = {"quads": int(nq), "vertices": int(len(P))}
+        if nq:
+            D = np.concatenate([Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]]); key = np.sort(D, axis=1); u, cnt = np.unique(key, axis=0, return_counts=True)
+            dd = np.unique(D, axis=0, return_counts=True)[1]
+            stats.update({"edges": int(len(u)), "boundary_edges": int((cnt == 1).sum()), "non_manifold_edges": int((cnt > 2).sum()), "flipped_edges": int((dd > 1).sum()),
+                          "duplicate_vertices": int(len(P) - len(np.unique(np.round(P, 6), axis=0))), "euler_mesh": int(len(np.unique(Q)) - len(u) + nq),
+                          "min_jac": float(self.quad_stats["jmin"].min()), "folded_quads": int((self.quad_stats["jmin"] <= 0).sum()),
+                          "max_edge_ratio": float(self.quad_stats["ratio"].max())})
+            stats["manifold"] = bool(stats["non_manifold_edges"] == 0 and stats["flipped_edges"] == 0)
+            stats["welded"] = bool(stats["non_manifold_edges"] == 0 and stats["duplicate_vertices"] == 0)
+            stats["closed"] = bool(stats["boundary_edges"] == 0)
+        self.stats = stats; self.timing["judge"] = time.time() - t
+
+    # ---- report
+    def face_report(self):
+        out = []
+        for f in self.faces:
+            cn = [self.tail(h) for h in f["he"] if self.tail(h) in f["corner_nodes"]]
+            r = {"id": f["id"], "component": f.get("component"), "status": f["status"], "reason": f["reason"], "area": round(f["area"], 6), "perimeter": round(f["perimeter"], 6),
+                 "centroid": f["centroid"], "arcs": [list(h) for h in f["he"]], "corners": cn, "corner_points": [self.nodes[v] for v in cn],
+                 "corner_virtual": [v not in self.real_nodes for v in cn]}
+            if f.get("extra_seeds"): r["extra_seeds"] = f["extra_seeds"]
+            if f.get("reflex"): r["reflex_corners"] = f["reflex"]
+            if "sides" in f: r["sides"] = [[h[0] for h in s] for s in f["sides"]]; r["n_sides"] = len(f["sides"])
+            for k in ("side_counts", "quads", "min_jac", "edge_ratio", "folded", "jac_margin", "judge_ok"):
+                if k in f: r[k] = f[k]
+            out.append(r)
+        return out
+
+
+# ------------------------------------------------------------------------------------------------------------------ public API
+def faces(doc, ref=None, params=None):
+    """Faces of the curve network on the surface : ordered (arc id, direction) loops, area, perimeter, centroid, corners, Euler."""
+    net = Net(doc, ref, params); net.trace(); net.corners()
+    return native({"faces": net.face_report(), "euler": net.euler, "dangling_arcs": net.dangling, "issues": net.issues})
+
+
+def faces_report(doc, params=None):
+    """POST /faces : doctor + faces + corners + counts, no fill. Per face : id, component, status, corners, sides, side_counts, boundary polyline."""
+    net = Net(doc, None, params); net.trace(); net.corners(); net.counts(); step = net.prm["boundary_step_m"]; out = net.face_report()
+    for r, f in zip(out, net.faces):
+        P = np.concatenate([net.hpts(h)[:-1] for h in f["he"]] + [net.hpts(f["he"][0])[:1]]); keep = max(1, int(round(step / net.prm["step_m"])))
+        idx = sorted(set(range(0, len(P), keep)) | {len(P) - 1}); r["boundary"] = np.round(P[idx], 5).ravel().tolist(); r.pop("poly", None)
+        r["side_counts"] = f.get("side_counts")
+    st = collections.Counter(f["status"] for f in net.faces)
+    return native({"ok": True, "faces": out, "euler": net.euler, "dangling_arcs": net.dangling, "issues": net.issues, "unplaced_seeds": net.unplaced_seeds,
+                   "arc_counts": net.counts_by_arc, "counts": {"faces": len(net.faces), "ok": st.get("ok", 0), "skipped": st.get("skipped", 0), "infeasible": st.get("infeasible", 0)},
+                   "timing": net.timing, "time_s": round(time.time() - net.t0, 3)})
+
+
+def write_obj(net, path, name="ZenRayLines"):
+    os.makedirs(os.path.dirname(path), exist_ok=True); foq = np.array(net.face_of_quad, dtype=np.int64); comp = {f["id"]: f.get("component") for f in net.faces}
+    with open(path, "w") as fh:
+        fh.write("# ZenRay Lines mesh, 29 October 2026\no %s\n" % name)
+        for p in net.V: fh.write("v %.6f %.6f %.6f\n" % (p[0], p[1], p[2]))
+        for fid in sorted(set(foq.tolist())):
+            fh.write("g %s\n" % ("_".join(str(comp[fid]).split()) if comp.get(fid) else "face_%d" % fid))
+            for q in net.Q[foq == fid]: fh.write("f %d %d %d %d\n" % tuple(int(i) + 1 for i in q))
+    return path
+
+
+def _run(doc, params):
+    net = Net(doc, (params or {}).get("ref"), params)
+    net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.judge(); return net
+
+
+def build(doc, params=None):
+    t0 = time.time(); net = _run(doc, params); fallback = []
+    if net.prm["auto_fallback"]:                                    # N sided faces (N = 3, 5, 6) that fail the judge : try a 4 sided patch
+        bad = [f["id"] for f in net.faces if f["status"] == "meshed" and not f.get("judge_ok", True) and len(f["sides"]) != 4
+               and "rotate" not in (net.prm.get("face_options") or {}).get(f["id"], (net.prm.get("face_options") or {}).get(str(f["id"]), {}))]
+        if bad:
+            p2 = dict(params or {}); fo = {str(k): dict(v) for k, v in (p2.get("face_options") or {}).items()}
+            for i in bad: fo.setdefault(str(i), {})["rotate"] = 0
+            p2["face_options"] = fo; net2 = _run(doc, p2)
+            nfail = lambda n: sum(1 for f in n.faces if f["status"] == "meshed" and not f.get("judge_ok", True))
+            if nfail(net2) < nfail(net): net = net2; fallback = bad
+    fr = net.face_report(); st = collections.Counter(f["status"] for f in net.faces)
+    stats = dict(net.stats)
+    stats.update({"faces_total": len(net.faces), "faces_meshed": st.get("meshed", 0), "faces_skipped": st.get("skipped", 0), "faces_infeasible": st.get("infeasible", 0),
+                  "skipped_reasons": dict(collections.Counter(f["reason"] for f in net.faces if f["status"] == "skipped")),
+                  "euler_network": net.euler, "dangling_arcs": net.dangling, "t_junctions": len(net.tj), "fallback_faces": fallback, "mirror_dropped": net.mirror_dropped,
+                  "issues_by_kind": dict(collections.Counter(i["kind"] for i in net.issues)), "timing": net.timing})
+    if hasattr(net, "count_stats"): stats["counts"] = net.count_stats
+    obj_path = latest = None
+    if net.prm["write_obj"] and len(net.Q):
+        obj_path = write_obj(net, os.path.join(net.prm["out_dir"], "mesh_%s.obj" % stamp()))
+        latest = write_obj(net, os.path.join(net.prm["out_dir"], "latest.obj"))
+    stats["time_s"] = round(time.time() - t0, 3); stats["unplaced_seeds"] = net.unplaced_seeds
+    return native({"ok": True, "P": np.round(net.V, 6).ravel().tolist() if len(net.V) else [], "Q": net.Q.ravel().tolist() if len(net.Q) else [],
+                   "face_of_quad": net.face_of_quad, "faces": fr, "issues": net.issues, "stats": stats, "obj_path": obj_path, "latest_obj": latest,
+                   "arc_counts": net.counts_by_arc})
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]; ref = args[args.index("--ref") + 1] if "--ref" in args else None
+    doc = json.load(open(args[0])); res = build(doc, {"ref": ref} if ref else {})
+    print(json.dumps(res["stats"], indent=1)); print("obj", res["obj_path"])
