@@ -1,0 +1,115 @@
+"""29 October 2026 : ZenRay Lines NETWORK FROM THE COMPONENT CUT.
+EN: the borders between the MBO regions of the shell (work/lines/mbo.npz, ZrlMbo.py) become a ZenRay Lines curve network : the vertices where
+three regions or more meet are nodes (clusters closer than junction_merge_m merged), the chains of border edges between them are arcs (resampled
+to control points every ctrl_step_m), a border loop that meets no junction is a closed arc on its own node, and every region gets a named seed at
+its most interior point. Planar by construction (the borders of a partition never cross or double), one face per component. Mirror pairs are
+linked by their reflected middle points. Writes lines/data/lines_mbo.json, loaded by the 3D editor with "Load component network".
+    python -I ZrlNetworkFromMbo.py [--mbo work/lines/mbo.npz] [--out lines/data/lines_mbo.json]
+FR : le réseau de courbes tiré des frontières entre les régions du découpage en components : sans doublon ni croisement, une face par component.
+"""
+import argparse, collections, json, sys
+import numpy as np
+from scipy.spatial import cKDTree
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : every tunable value of the conversion
+    "mbo": f"{ROOT}/work/lines/mbo.npz",
+    "out": f"{ROOT}/lines/data/lines_mbo.json",
+    "ctrl_step_m": 0.05,          # one control point every this arc length (at least min_ctrl per arc)
+    "min_ctrl": 4,
+    "junction_merge_m": 0.015,    # junction vertices closer than this are one node (marching triangles split a 4 way junction in two)
+    "min_arc_m": 0.008,           # a chain shorter than this between two nodes of one cluster is dropped
+    "mirror_tol_m": 0.01,         # arcs whose reflected middle points are this close are mirror pairs
+    "open_borders": True,         # 29 October 2026 : the free edges of the shell (panel edges, glass borders) are curves too, else the pieces stay apart
+    "min_loop_m": 0.08,           # closed border loops shorter than this are label noise, dropped
+    "seed_names_from": "region_names",
+}
+
+
+def resample(P, step, nmin):
+    seg = np.linalg.norm(np.diff(P, axis=0), axis=1); cum = np.r_[0, np.cumsum(seg)]; L = cum[-1]
+    n = max(nmin, int(round(L / step)) + 1); t = np.linspace(0, L, n)
+    return np.stack([np.interp(t, cum, P[:, k]) for k in range(3)], 1), L
+
+
+def build(prm=PARAMS):
+    d = np.load(prm["mbo"], allow_pickle=True); V, F, R, E = d["V"], d["F"], d["region"], d["line_edges"]; names = [str(x) for x in d["region_names"]]
+    n_region_edges = len(E); n_open = 0
+    if prm["open_borders"]:                                           # edges used by one triangle only : the free borders of the shell
+        e = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1); key = e[:, 0] * (len(V) + 1) + e[:, 1]
+        u, c = np.unique(key, return_counts=True); ob = u[c == 1]; OB = np.stack([ob // (len(V) + 1), ob % (len(V) + 1)], 1)
+        have = set((E[:, 0] * (len(V) + 1) + E[:, 1]).tolist()) | set((E[:, 1] * (len(V) + 1) + E[:, 0]).tolist())
+        OB = np.array([x for x in OB if int(x[0] * (len(V) + 1) + x[1]) not in have], dtype=np.int64).reshape(-1, 2); n_open = len(OB); E = np.concatenate([E, OB])
+    adj = collections.defaultdict(list)
+    for a, b in E: adj[int(a)].append(int(b)); adj[int(b)].append(int(a))
+    deg = {v: len(n) for v, n in adj.items()}
+    special = sorted(v for v, k in deg.items() if k != 2)
+    parent = {v: v for v in special}
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    if special:
+        for i, j in cKDTree(V[special]).query_pairs(prm["junction_merge_m"]): parent[find(special[i])] = find(special[j])
+    clusters = collections.defaultdict(list)
+    for v in special: clusters[find(v)].append(v)
+    node_id = {}; nodes = []
+    for k, (root, members) in enumerate(sorted(clusters.items())):
+        for v in members: node_id[v] = k
+        nodes.append({"id": k, "p": [round(float(c), 6) for c in V[members].mean(0)]})
+    seen = set(); chains = []
+    for s in special:
+        for nb in adj[s]:
+            if (s, nb) in seen: continue
+            chain = [s, nb]; seen.add((s, nb)); seen.add((nb, s)); prev, cur = s, nb
+            while deg[cur] == 2:
+                nxt = adj[cur][0] if adj[cur][0] != prev else adj[cur][1]
+                seen.add((cur, nxt)); seen.add((nxt, cur)); chain.append(nxt); prev, cur = cur, nxt
+            chains.append((chain, False))
+    for a, b in E:                                                    # border loops that meet no junction
+        a, b = int(a), int(b)
+        if (a, b) in seen: continue
+        chain = [a, b]; seen.add((a, b)); seen.add((b, a)); prev, cur = a, b
+        while cur != a:
+            nxt = adj[cur][0] if adj[cur][0] != prev else adj[cur][1]
+            seen.add((cur, nxt)); seen.add((nxt, cur)); chain.append(nxt); prev, cur = cur, nxt
+        chains.append((chain, True))
+    arcs = []; dropped = 0
+    for chain, closed in chains:
+        P = V[chain]
+        if closed:
+            k = len(nodes); nodes.append({"id": k, "p": [round(float(c), 6) for c in P[0]]}); a = b = k
+        else:
+            a, b = node_id[chain[0]], node_id[chain[-1]]
+            P = P.copy(); P[0] = nodes[a]["p"]; P[-1] = nodes[b]["p"]
+        if closed and float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) < prm["min_loop_m"]: nodes.pop(); dropped += 1; continue
+        C, L = resample(P, prm["ctrl_step_m"], prm["min_ctrl"])
+        if not closed and a == b and L < prm["min_arc_m"]: dropped += 1; continue
+        arcs.append({"id": len(arcs), "a": a, "b": b, "closed": bool(closed), "pair": ["", ""], "ctrl": [[round(float(c), 6) for c in p] for p in C], "mirror": -1})
+    mids = np.array([a["ctrl"][len(a["ctrl"]) // 2] for a in arcs]); refl = mids * np.array([-1.0, 1.0, 1.0]); tree = cKDTree(mids); pairs = 0
+    for i, a in enumerate(arcs):
+        dd, j = tree.query(refl[i])
+        if dd <= prm["mirror_tol_m"] and j != i and arcs[j]["mirror"] < 0 and a["mirror"] < 0: a["mirror"] = int(j); arcs[j]["mirror"] = i; pairs += 1
+    seeds = []
+    for r, name in enumerate(names):                                  # the most interior vertex of the region : farthest from its border
+        fr = np.flatnonzero(R == r)
+        if not len(fr): continue
+        vr = np.unique(F[fr].ravel()); bv = np.unique(np.array([v for v in vr if v in adj], dtype=np.int64)) if len(adj) else np.array([], int)
+        if len(bv): dist, _ = cKDTree(V[bv]).query(V[vr]); best = vr[int(np.argmax(dist))]
+        else: best = vr[0]
+        seeds.append({"name": name, "p": [round(float(c), 6) for c in V[best]]})
+    doc = {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"},
+           "nodes": nodes, "arcs": arcs, "components": names, "component_seeds": seeds}
+    stats = {"border_edges": int(len(E)), "region_border_edges": int(n_region_edges), "open_border_edges": int(n_open), "junction_vertices": len(special), "nodes": len(nodes), "arcs": len(arcs), "closed_loops": sum(1 for _, c in chains if c),
+             "dropped_short": dropped, "mirror_pairs": pairs, "seeds": len(seeds), "regions": len(names)}
+    return doc, stats
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--mbo", default=PARAMS["mbo"]); ap.add_argument("--out", default=PARAMS["out"]); a = ap.parse_args()
+    prm = dict(PARAMS, mbo=a.mbo, out=a.out); doc, stats = build(prm)
+    with open(prm["out"], "w") as f: json.dump(doc, f)
+    print(json.dumps(dict(stats, out=prm["out"])))
+
+
+if __name__ == "__main__":
+    main()
