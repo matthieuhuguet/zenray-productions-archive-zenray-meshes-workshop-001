@@ -20,7 +20,7 @@ PARAMS = {   # 29 October 2026 : the interface of the server, every tunable valu
     "backup_dir": "data/backups",
     "protected": ["data/lines.json"],    # files that /save can never write
     "max_body_mb": 24,
-    "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini", "/project": "project", "/model": "model", "/crease_path": "crease_path", "/creases": "creases", "/crease_align": "crease_align"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
+    "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini", "/project": "project", "/model": "model", "/crease_path": "crease_path", "/creases": "creases", "/crease_align": "crease_align", "/chain": "chain", "/auto_patch": "auto_patch"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
     "lines_dir": f"{ROOT}/Scripts/lines",
     "export_path": "/export",            # 29 October 2026 : the editor's exports (PNG, SVG, OBJ, JSON) land in the atelier, never in Downloads
     "export_dir": f"{ROOT}/work/lines/exports",
@@ -91,6 +91,12 @@ def run_netmesh(kind, body, prm=PARAMS):
     if kind == "houdini":
         import ZrlHoudiniLink
         return ZrlHoudiniLink.handle(req)
+    if kind == "auto_patch":                                # 29 October 2026 : a click gives the four sided patch of the zone, or a point snapped to a contour (ZrlAutoPatch.py)
+        import ZrlAutoPatch
+        return ZrlAutoPatch.handle(req)
+    if kind == "chain":                                     # 29 October 2026 : the chain file, its build in Houdini and the pull of its curves (ZrlChain.py)
+        import ZrlChain
+        return ZrlChain.handle(req)
     if kind == "creases": req = dict(req, op="map"); kind = "crease_path"   # 29 October 2026 : the crease layer, same child process
     if kind == "crease_align": req = dict(req, op="align"); kind = "crease_path"   # 29 October 2026 : edges of the mesh on the creases, same child process
     if kind == "crease_path":                               # 29 October 2026 : a drawn curve that follows the creases seen from the camera (ZrlCreases.py), in a child process
@@ -105,6 +111,22 @@ def run_netmesh(kind, body, prm=PARAMS):
     if not isinstance(req, dict) or "lines" not in req: raise ValueError('body must be {"lines": document, "params": {...}}')
     doc = req["lines"]; check_document(doc); params = req.get("params") or {}
     return {"doctor": NM.doctor, "mesh": NM.build, "faces": NM.faces_report, "project": NM.project_doc}[kind](doc, params)
+
+
+def code_version(root, lines_dir):
+    """29 October 2026 : the version of the code on disk : the page (html, js, css of lines/) and the Python modules of Scripts/lines, from their
+    names, sizes and modification times ; cheap enough to be asked every 3 s, and it moves as soon as a file is saved."""
+    import hashlib
+    def h(folder, exts):
+        parts = []
+        for f in sorted(os.listdir(folder)):
+            if f.endswith(exts):
+                st = os.stat(os.path.join(folder, f)); parts.append("%s:%d:%d" % (f, st.st_size, int(st.st_mtime * 1000)))
+        return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+    return h(root, (".html", ".js", ".css")), h(lines_dir, (".py",))
+
+
+PY_AT_START = {}
 
 
 def make_handler(root, prm):
@@ -126,8 +148,20 @@ def make_handler(root, prm):
             self.end_headers()
             self.wfile.write(data)
 
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/api/lines/version":                   # 29 October 2026 : the page and the launcher ask which code runs (see version-guard.js, ZenRayLines.sh)
+                web, py = code_version(root, prm["lines_dir"]); PY_AT_START.setdefault("py", py)
+                return self.reply(200, {"app": "zenray-lines", "web": web, "py_loaded": PY_AT_START["py"], "py_now": py, "pid": os.getpid()})
+            return super().do_GET()
+
         def do_POST(self):
             path = self.path.split("?")[0]
+            if path == "/api/lines/restart":                   # 29 October 2026 : the Python code changed : the server relaunches itself (ZrlServeRestart.sh, detached)
+                import subprocess
+                script = os.path.join(prm["lines_dir"], "ZrlServeRestart.sh")
+                subprocess.Popen(["/bin/zsh", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                return self.reply(200, {"ok": True, "restarting": True})
             if path in prm["mesh_paths"]:                       # netmesh endpoints : any failure is a JSON 500, the server never crashes
                 try:
                     n = int(self.headers.get("Content-Length", ""))
@@ -191,6 +225,7 @@ def main():
             f.write(str(port) + "\n")
     print("ZenRay Lines serving %s at http://%s:%d/  (POST %s writes %s)" % (root, a.host, port, PARAMS["save_path"], PARAMS["edit_file"]), flush=True)
     try:
+        PY_AT_START["py"] = code_version(root, PARAMS["lines_dir"])[1]   # 29 October 2026 : the Python this process loaded
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass

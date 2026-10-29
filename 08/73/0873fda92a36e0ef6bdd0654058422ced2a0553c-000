@@ -1,0 +1,184 @@
+"""29 October 2026 : ZenRay Lines AUTO PATCH : a click on the model gives the four sided patch of the zone under it, fitted on the zone's real contour,
+and a clicked point snaps onto the nearest contour of the mesh (a sharp edge or the border of a part).
+EN: the zone grows on the reference mesh from the clicked triangle : a neighbour across an edge joins while both triangles belong to the same part,
+their normals differ by less than zone_deg (a sharp edge or a part border stops the zone) and it stays within max_radius_m of the click. The
+boundary of the zone (edges used by one zone triangle only) is chained into loops ; the longest one is the contour. It is resampled every step_m,
+four corners are chosen (the sharpest turns spread around the loop, completed by the extreme points along the zone's two main axes when the contour
+is round), and the loop is cut there into four sides, each fitted to a cubic B-spline whose ends are the corners. A zone with a second long loop
+(the side of a tyre is a ring) is reported as a ring : a revolution template fits it, a rectangle does not.
+    POST /auto_patch {"op": "patch", "p": [x, y, z], "zone_deg": 25, "max_radius_m": 1.0}       -> corners, sides, report
+    POST /auto_patch {"op": "snap", "p": [x, y, z], "radius_m": 0.02}                           -> the nearest point on a contour
+FR : un clic sur une zone donne son patch à quatre côtés, ajusté sur son vrai contour ; un point posé s'accroche au contour le plus proche.
+"""
+import json, math, os, sys, time
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+PARAMS = {   # 29 October 2026 : every tunable value of the auto patch and of the snap
+    "zone_deg": 25.0,          # a neighbour whose normal turns more than this is across a sharp edge : the zone stops
+    "max_radius_m": 1.0,       # the zone never goes farther than this from the click
+    "max_triangles": 60000,
+    "step_m": 0.004,           # contour resampling
+    "turn_window_m": 0.02,     # a corner's turn is measured between the directions this far before and after it
+    "corner_deg": 35.0,        # a turn above this is a corner candidate
+    "corner_gap_frac": 0.12,   # two corners are at least this fraction of the contour apart
+    "ring_frac": 0.35,         # a second loop longer than this fraction of the contour makes the zone a ring
+    "ctrl_step_m": 0.04,       # control points of a side
+    "spike_deg": 150.0,        # a turn above this is a spike of the contour (a slit), never a corner
+    "prune_passes": 3, "fill_passes": 2,   # zone cleanup : peninsulas cut, notches filled
+    "feature_deg": 25.0,       # snap : an edge whose two normals differ by more than this is a contour
+    "snap_radius_m": 0.02, "snap_sample_m": 0.002,
+}
+_CACHE = {}
+
+
+def mesh(src=None):
+    """the reference (indexed triangles, part of each triangle) with its triangle adjacency, cached per source."""
+    import ZrlRefMesh as RM
+    src = src or json.load(open(os.path.join(ROOT, "lines/data/ref_mesh.json"))).get("source") or "v752"
+    if src in _CACHE: return _CACHE[src]
+    P, F, G, names = RM.from_v752() if str(src).lower() in ("v752", "original") else RM.from_obj(src)
+    P = np.asarray(P, float); F = np.asarray(F, np.int64); G = np.asarray(G, np.int64); T = len(F)
+    N = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]); A = np.linalg.norm(N, axis=1); N = N / np.maximum(A, 1e-20)[:, None]
+    E = np.stack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], 1).reshape(-1, 2); key = np.minimum(E[:, 0], E[:, 1]) * (len(P) + 1) + np.maximum(E[:, 0], E[:, 1])
+    order = np.argsort(key, kind="stable"); ks = key[order]; nb = -np.ones(3 * T, np.int64)
+    same = np.flatnonzero(ks[1:] == ks[:-1])                                     # manifold pairs : the two half edges of one edge
+    a, b = order[same], order[same + 1]; nb[a] = b // 3; nb[b] = a // 3
+    from scipy.spatial import cKDTree
+    m = {"src": src, "P": P, "F": F, "G": G, "names": [str(x) for x in names], "N": N, "nb": nb.reshape(T, 3), "cent": P[F].mean(1), "tree": cKDTree(P[F].mean(1))}
+    _CACHE[src] = m; return m
+
+
+def zone(m, p, prm=PARAMS, part=None):
+    """triangles of the zone under p : same part, normals within zone_deg of their neighbour, within max_radius_m."""
+    _, cand = m["tree"].query(p, k=16); t0 = None; best = 1e9
+    for t in np.atleast_1d(cand):                                               # the triangle nearest to the click (by its plane), of the clicked part when given
+        if part is not None and m["G"][t] != part: continue
+        d = abs(float((np.asarray(p) - m["P"][m["F"][t, 0]]) @ m["N"][t])) + 0.1 * float(np.linalg.norm(m["cent"][t] - p))
+        if d < best: best, t0 = d, int(t)
+    if t0 is None: t0 = int(np.atleast_1d(cand)[0])
+    cosmax = math.cos(math.radians(prm["zone_deg"])); g0 = m["G"][t0]; seen = {t0}; stack = [t0]
+    while stack and len(seen) < prm["max_triangles"]:
+        t = stack.pop()
+        for u in m["nb"][t]:
+            if u < 0 or u in seen or m["G"][u] != g0: continue
+            if float(m["N"][t] @ m["N"][u]) < cosmax: continue
+            if np.linalg.norm(m["cent"][u] - p) > prm["max_radius_m"]: continue
+            seen.add(int(u)); stack.append(int(u))
+    Z = set(seen)                                                               # 29 October 2026 : cleanup : cut one triangle wide peninsulas, fill notches, so the contour has no spikes
+    for _ in range(prm["prune_passes"]):
+        cut = [t for t in Z if sum(1 for u in m["nb"][t] if u < 0 or u not in Z) >= 2]
+        if not cut or len(cut) >= len(Z) * 0.5: break
+        Z.difference_update(cut)
+    for _ in range(prm["fill_passes"]):
+        add = {int(u) for t in Z for u in m["nb"][t] if u >= 0 and u not in Z and m["G"][u] == g0 and sum(1 for w in m["nb"][u] if w in Z) >= 2}
+        if not add: break
+        Z |= add
+    Z.add(t0); return np.array(sorted(Z), np.int64), t0
+
+
+def loops(m, Z):
+    """boundary loops of the zone, as ordered vertex index lists (the winding of the triangles), longest first."""
+    inz = np.zeros(len(m["F"]), bool); inz[Z] = True; nxt = {}
+    for t in Z:
+        for k in range(3):
+            u = m["nb"][t, k]
+            if u < 0 or not inz[u]: a, b = int(m["F"][t, k]), int(m["F"][t, (k + 1) % 3]); nxt[a] = b
+    out, used = [], set()
+    for s in list(nxt):
+        if s in used: continue
+        L = [s]; used.add(s); v = nxt.get(s)
+        while v is not None and v not in used: L.append(v); used.add(v); v = nxt.get(v)
+        if len(L) > 2: out.append(L)
+    P = m["P"]; ln = lambda L: float(np.linalg.norm(np.diff(P[L + L[:1]], axis=0), axis=1).sum())
+    return sorted(out, key=ln, reverse=True), ln
+
+
+def resample_closed(X, step):
+    Y = np.vstack([X, X[:1]]); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Y, axis=0), axis=1))]; n = max(12, int(cum[-1] / step))
+    t = np.linspace(0, cum[-1], n, endpoint=False); return np.stack([np.interp(t, cum, Y[:, k]) for k in range(3)], 1), cum[-1]
+
+
+def corners(X, total, normal, prm=PARAMS):
+    """four indices of the closed polyline X : the sharpest turns spread around it, completed by the extremes along the zone's main axes."""
+    n = len(X); w = max(1, int(round(prm["turn_window_m"] / (total / n)))); turn = np.zeros(n)
+    for i in range(n):
+        u = X[i] - X[(i - w) % n]; v = X[(i + w) % n] - X[i]; u = u - (u @ normal) * normal; v = v - (v @ normal) * normal
+        if np.linalg.norm(u) > 1e-9 and np.linalg.norm(v) > 1e-9: turn[i] = math.degrees(math.acos(float(np.clip(u @ v / np.linalg.norm(u) / np.linalg.norm(v), -1, 1))))
+    gap = prm["corner_gap_frac"] * n; picked = []
+    for i in np.argsort(-turn):
+        if turn[i] < prm["corner_deg"] or len(picked) == 4: break
+        if turn[i] > prm["spike_deg"]: continue                                # a spike (slit) is not a corner
+        if all(min(abs(i - j), n - abs(i - j)) >= gap for j in picked): picked.append(int(i))
+    if len(picked) < 4:                                                         # 29 October 2026 : the corners of the zone's oriented box : the four ends of a strip, the four shoulders of a round zone
+        c = X.mean(0); Y = (X - c) - np.outer((X - c) @ normal, normal); _, _, W = np.linalg.svd(Y, full_matrices=False)
+        u, v = Y @ W[0], Y @ W[1]; u = u / max(np.abs(u).max(), 1e-9); v = v / max(np.abs(v).max(), 1e-9)
+        for su, sv in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
+            i = int(np.argmax(su * u + sv * v))
+            if len(picked) < 4 and all(min(abs(i - j), n - abs(i - j)) >= gap * 0.5 for j in picked): picked.append(i)
+    while len(picked) < 4:                                                      # still short : the point farthest along the loop from every corner
+        s = sorted(picked) or [0]; gaps = [((s[(k + 1) % len(s)] - s[k]) % n or n, s[k]) for k in range(len(s))]; g, at = max(gaps); picked.append(int((at + g // 2) % n))
+    return sorted(picked[:4]), turn
+
+
+def patch(req, prm=PARAMS):
+    import ZrlSpline as SP, ZrlNetMesh as NM
+    t = time.time(); prm = dict(prm, **{k: v for k, v in req.items() if k in prm}); m = mesh(req.get("ref")); p = np.asarray(req["p"], float)
+    Z, t0 = zone(m, p, prm, req.get("part")); Ls, ln = loops(m, Z)
+    if not Ls: return {"ok": False, "error": "the zone under the click has no contour (a closed smooth part) : lower the zone angle or use a template"}
+    total0 = ln(Ls[0]); ring = len(Ls) > 1 and ln(Ls[1]) > prm["ring_frac"] * total0
+    rep = {"triangles": int(len(Z)), "part": m["names"][int(m["G"][t0])], "loops": len(Ls), "perimeter_m": round(total0, 3), "ring": bool(ring),
+           "area_m2": round(float(0.5 * np.linalg.norm(np.cross(m["P"][m["F"][Z, 1]] - m["P"][m["F"][Z, 0]], m["P"][m["F"][Z, 2]] - m["P"][m["F"][Z, 0]]), axis=1).sum()), 4)}
+    if ring: return {"ok": False, "ring": True, "report": rep, "error": "this zone is a ring (%s) : a four sided patch cannot cover it ; use the revolution template" % rep["part"]}
+    normal = m["N"][Z].mean(0); normal /= max(np.linalg.norm(normal), 1e-9)
+    X, total = resample_closed(m["P"][Ls[0]], prm["step_m"])
+    for _ in range(6):                                                           # the contour of triangles zigzags : light smoothing, then back on the surface
+        X = 0.5 * X + 0.25 * (np.roll(X, 1, 0) + np.roll(X, -1, 0))
+    tri = m["P"][m["F"][Z]]; ref = NM.Ref(tri); X = ref.closest(X)[0]
+    C, turn = corners(X, total, normal, prm); sides = []; dev = 0.0; raw = m["P"][Ls[0]]
+    from scipy.spatial import cKDTree
+    rawtree = cKDTree(np.vstack([raw[i] * (1 - s) + raw[(i + 1) % len(raw)] * s for i in range(len(raw)) for s in np.linspace(0, 1, 6, endpoint=False)]))
+    for k in range(4):
+        i, j = C[k], C[(k + 1) % 4]; seg = X[i:j + 1] if j > i else np.vstack([X[i:], X[:j + 1]])
+        L = float(np.linalg.norm(np.diff(seg, axis=0), axis=1).sum()); mm = max(4, int(round(L / prm["ctrl_step_m"])) + 1)
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(seg, axis=0), axis=1))]; tt = np.linspace(0, cum[-1], max(4 * mm, 16)); S = np.stack([np.interp(tt, cum, seg[:, q]) for q in range(3)], 1)
+        ctrl = SP.fit(S, mm); ctrl[0], ctrl[-1] = X[i], X[j]; sides.append(np.round(ctrl, 6).tolist())
+        dev = max(dev, float(cKDTree(X).query(SP.sample(ctrl, 20))[0].max()))   # the fitted side against the contour it was fitted on
+    rep.update({"fit_dev_mm": round(dev * 1000, 2), "corner_turns_deg": [round(float(turn[c]), 1) for c in C], "seconds": round(time.time() - t, 2)})
+    return {"ok": True, "corners": [np.round(X[c], 6).tolist() for c in C], "sides": sides, "seed": np.round(p, 6).tolist(), "report": rep}
+
+
+def feature_tree(m, prm=PARAMS):
+    """samples of every contour of the mesh : part borders (edges with one triangle) and sharp edges (normals apart by more than feature_deg)."""
+    key = ("features", prm["feature_deg"])
+    if key in m: return m[key]
+    F, P, N, nb = m["F"], m["P"], m["N"], m["nb"]; cosmax = math.cos(math.radians(prm["feature_deg"])); segs = []
+    for k in range(3):
+        u = nb[:, k]; a, b = F[:, k], F[:, (k + 1) % 3]; t = np.arange(len(F))
+        border = u < 0; sharp = (u >= 0) & (t < u) & ((N * N[np.maximum(u, 0)]).sum(1) < cosmax)
+        sel = border | sharp; segs.append(np.stack([P[a[sel]], P[b[sel]]], 1))
+    S = np.concatenate(segs); L = np.linalg.norm(S[:, 1] - S[:, 0], axis=1); n = np.maximum(1, np.ceil(L / prm["snap_sample_m"]).astype(int))
+    pts = np.concatenate([S[i, 0] + (S[i, 1] - S[i, 0]) * (np.arange(n[i])[:, None] / n[i]) for i in range(len(S))]) if len(S) else np.zeros((0, 3))
+    from scipy.spatial import cKDTree
+    m[key] = (cKDTree(pts) if len(pts) else None, pts); return m[key]
+
+
+def snap(req, prm=PARAMS):
+    prm = dict(prm, **{k: v for k, v in req.items() if k in prm}); m = mesh(req.get("ref")); tree, pts = feature_tree(m, prm); p = np.asarray(req["p"], float)
+    if tree is None: return {"ok": True, "p": p.tolist(), "snapped": False}
+    d, i = tree.query(p)
+    if d > prm["snap_radius_m"]: return {"ok": True, "p": p.tolist(), "snapped": False, "nearest_mm": round(float(d) * 1000, 1)}
+    return {"ok": True, "p": np.round(pts[i], 6).tolist(), "snapped": True, "moved_mm": round(float(d) * 1000, 1)}
+
+
+def handle(req):
+    return snap(req) if req.get("op") == "snap" else patch(req)
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("x", type=float); ap.add_argument("y", type=float); ap.add_argument("z", type=float)
+    ap.add_argument("--snap", action="store_true"); a = ap.parse_args(); r = handle({"op": "snap" if a.snap else "patch", "p": [a.x, a.y, a.z]})
+    print(json.dumps({k: v for k, v in r.items() if k not in ("sides",)}, indent=1))

@@ -1,0 +1,35 @@
+// 29 October 2026 : ZenRay Lines version guard (the same idea as ZenRay Motion Design's). The app window stays open for days and holds the JavaScript it
+// loaded, so the page asks the server which code is on disk (GET /api/lines/version) when it loads, on focus and every 3 s :
+//   the page's code changed (html, js, css of lines/)  -> it reloads by itself when nothing is unsaved ; with unsaved changes a banner asks first ;
+//   the server's Python changed (Scripts/lines/*.py)   -> the server relaunches itself (POST /api/lines/restart) ; the drawing in the page is kept.
+// FR : garde de version : la page se recharge quand son code change, le serveur se relance quand son Python change ; rien de non enregistré ne se perd.
+(function () {
+  "use strict";
+  const PARAMS = { everyMs: 3000, reloadDelayMs: 900 };
+  let boot = null, pending = false, restarting = false, banner = null;
+  const dirty = () => (window.ZRL3D && window.ZRL3D.S && window.ZRL3D.S.dirty) || /^\* /.test(document.title);
+  const typing = () => { const a = document.activeElement; return !!a && (a.tagName === "TEXTAREA" || (a.tagName === "INPUT" && !/^(range|checkbox|radio|button)$/.test(a.type)) || a.isContentEditable); };
+  const show = (text, button) => {
+    if (!banner) { banner = document.createElement("div"); banner.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:99999;padding:8px 14px;background:#c8431f;color:#fff;font:13px/1.3 system-ui,sans-serif;text-align:center"; document.body.appendChild(banner); }
+    banner.textContent = text + " ";
+    if (button) { const b = document.createElement("button"); b.textContent = button; b.style.cssText = "margin-left:8px;padding:3px 10px;border:0;border-radius:6px;cursor:pointer"; b.onclick = () => location.reload(); banner.appendChild(b); }
+  };
+  const check = async () => {
+    const v = await fetch("/api/lines/version", { cache: "no-store" }).then((r) => r.json()).catch(() => null);
+    if (!v || v.app !== "zenray-lines") return;
+    if (v.py_loaded !== v.py_now && !restarting) {             // the server runs an older Python : it relaunches itself, the page stays
+      restarting = true; fetch("/api/lines/restart", { method: "POST", body: "{}", headers: { "Content-Type": "application/json" } }).catch(() => null);
+      setTimeout(() => { restarting = false; }, 8000); return;
+    }
+    if (boot === null) { boot = v.web; window.__zrlBootWeb = v.web; return; }
+    if (v.web === boot || pending) return;
+    pending = true;
+    if (dirty()) { show("ZenRay Lines a été mis à jour. Enregistre ton dessin (Save), puis recharge.", "Recharger quand même"); return; }
+    show("ZenRay Lines a été mis à jour : rechargement.");
+    const go = () => { if (typing()) { setTimeout(go, 1500); return; } location.reload(); };
+    setTimeout(go, PARAMS.reloadDelayMs);
+  };
+  check(); setInterval(check, PARAMS.everyMs);
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) check(); });
+})();

@@ -1,0 +1,28 @@
+#!/bin/zsh
+# 29 October 2026 : launcher of ZenRay Lines, built like ZenRay Motion Design's : "ZenRay Lines.app" is not a native shell, it starts the local
+# server when it does not answer (or relaunches it when its Python is older than the files on disk), then opens the editor page in a Chrome app
+# window of its own (no tabs, no address bar) with a PRIVATE profile (never the personal Chrome profile). The page carries version-guard.js, so the
+# window always runs the latest code. ZR_URL changes the page, ZR_DRY=1 only prints what it would do, ZR_NO_BROWSER=1 starts the server only.
+# FR : lanceur : démarre ou relance le serveur, puis ouvre la page dans une fenêtre Chrome à profil privé ; la page se tient à jour seule.
+RES="${0:A:h:h}/Resources"
+ROOT="$(cat "$RES/root-path.txt" 2>/dev/null || echo /Users/zenray/.claude/tmp/tmp-zenray-meshes)"
+PY="$(cat "$RES/python-path.txt" 2>/dev/null || echo /Users/zenray/.venvs/zenray-meshes/bin/python)"
+PORT="${ZR_PORT:-8766}"; URL="${ZR_URL:-http://127.0.0.1:$PORT/3d.html}"
+LOGS="$HOME/Library/Application Support/ZenRayLines"; PROFILE="$LOGS/Chrome"; mkdir -p "$LOGS"
+version() { curl -s -m 2 "http://127.0.0.1:$PORT/api/lines/version" 2>/dev/null; }
+answers() { version | grep -q zenray-lines; }
+stale() { version | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d['py_loaded'] != d['py_now'] else 1)" 2>/dev/null; }
+if [[ "${ZR_DRY:-}" == "1" ]]; then echo "server answers: $(answers && echo yes || echo no) | stale python: $(stale && echo yes || echo no) | python: $PY | root: $ROOT | url: $URL | profile: $PROFILE"; exit 0; fi
+port_open() { curl -s -m 2 -o /dev/null "http://127.0.0.1:$PORT/3d.html" 2>/dev/null; }
+if ! answers && port_open; then                                   # 29 October 2026 : an older server (without the version route) holds the port : relaunch it
+  /bin/zsh "$ROOT/Scripts/lines/ZrlServeRestart.sh" "$PORT" > "$LOGS/restart.log" 2>&1
+fi
+if ! answers; then
+  ( cd "$ROOT" && nohup "$PY" -I -B Scripts/lines/ZrlServe.py --port "$PORT" --port-file lines/server.port > lines/server.log 2>&1 & echo $! > lines/server.pid )
+  for i in $(seq 1 120); do answers && break; sleep 0.5; done
+elif stale; then
+  /bin/zsh "$ROOT/Scripts/lines/ZrlServeRestart.sh" "$PORT" > "$LOGS/restart.log" 2>&1
+fi
+answers || { osascript -e 'display alert "ZenRay Lines" message "Le serveur ne répond pas. Journal : /Users/zenray/.claude/tmp/tmp-zenray-meshes/lines/server.log"'; exit 1; }
+[[ "${ZR_NO_BROWSER:-}" == "1" ]] && { echo "server ready on $PORT"; exit 0; }
+open -na "Google Chrome" --args --app="$URL" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check --window-size=1600,1000

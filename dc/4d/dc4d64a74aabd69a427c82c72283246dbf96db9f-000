@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align', chain: '/chain' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align', chain: '/chain', autoPatch: '/auto_patch' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -512,6 +512,31 @@
     });
     renderCompList();
   }
+  // 29 October 2026 : SNAP and AUTO PATCH (Scripts/lines/ZrlAutoPatch.py) : a clicked point goes onto the nearest contour of the mesh (sharp edge or part border,
+  // within 2 cm) ; a click on a zone gives the four sided patch fitted on the zone's real contour, named from the Components field, mirrored when Mirror is on
+  async function snapToContour(p) {
+    if (!$('pSnapEdge') || !$('pSnapEdge').checked) return { p, snapped: false };
+    const r = await fetch(CFG.files.autoPatch, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'snap', p, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    return r && r.ok && r.snapped ? { p: r.p, snapped: true, moved_mm: r.moved_mm } : { p, snapped: false };
+  }
+  async function autoPatchAt(h) {
+    status('Finding the zone ...'); const deg = $('pZoneDeg') ? +$('pZoneDeg').value : 25;
+    const r = await fetch(CFG.files.autoPatch, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'patch', p: h.p, part: h.part, zone_deg: deg, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.ok) return status('Auto patch : ' + ((r && (r.error || (r.report && r.report.part))) || 'no answer from the server'), 'error');
+    const name = ($('compName').value || '').trim() || nextCompName(); if (seeds().some((q) => q.name === name)) return status('A component named ' + name + ' already exists : type another name.', 'error');
+    const nodeAt = (p) => { let bn = null, bd = 0.005; for (const n of model.doc.nodes) { const d = d3(n.p, p); if (d < bd) { bd = d; bn = n.id; } } return bn !== null ? bn : addNode(p); };
+    edit('Auto patch ' + name, () => {
+      const make = (corners, sides, seedP, nm) => { const ids = corners.map(nodeAt);
+        for (let k = 0; k < 4; k++) { const a = ids[k], b = ids[(k + 1) % 4]; if (a === b) continue; const c = sides[k].map(clone3); c[0] = clone3(model.node(a).p); c[c.length - 1] = clone3(model.node(b).p); addArc(a, b, c, ['', '']); }
+        seeds().push({ name: nm, p: clone3(seedP) }); };
+      make(r.corners, r.sides, r.seed, name);
+      if (P().mirror && Math.abs(r.seed[0]) > 3 * CFG.edit.centreSnapM) { const mname = /_L$/.test(name) ? name.replace(/_L$/, '_R') : /_R$/.test(name) ? name.replace(/_R$/, '_L') : name + '_mirror';
+        if (!seeds().some((q) => q.name === mname)) make(r.corners.map(mir), r.sides.map((c) => c.map(mir)), mir(r.seed), mname); }
+      S.comp = name;
+    });
+    $('compName').value = ''; renderCompList(); schedulePreview();
+    status('Patch ' + name + ' : contour of ' + r.report.part.replace(/^CAR_/, '') + ' followed within ' + r.report.fit_dev_mm + ' mm (' + r.report.triangles + ' triangles, ' + r.report.perimeter_m + ' m round)' + (P().mirror && Math.abs(r.seed[0]) > 3 * CFG.edit.centreSnapM ? ', mirrored' : '') + '.');
+  }
   // 29 October 2026 : SWAP between the reference sheet and the current 3D model : model only, sheet only (seen from any angle), or both
   const SHOW_MODES = ['model', 'reference', 'both'];
   function setShow(mode) {
@@ -708,7 +733,7 @@
     if (S.handle) parts.push('control point ' + S.handle.i + ' of curve ' + S.handle.arc);
     $('selInfo').textContent = parts.join('\n') || 'Nothing selected.';
   }
-  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', seed: 'Click on the model to place the component named in the Components field.', extend: 'Press on a curve and drag : a parallel curve follows the cursor on the surface, joined at both ends : a new strip of quads (Maya Quad Draw extend).', loop: 'Click on a line of the previewed quads : that edge loop becomes a curve of the network, from border to border, and splits its face in two (Maya Insert Edge Loop).', face: 'Click inside a face : its sides, corners and status. The component buttons then change its quads ; Rotate pattern cycles its variants ; K on a node forces or forbids a corner.' };
+  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', autopatch: 'Click a zone of the model : a four sided patch is fitted on its real contour (type the name first in Components, or rename it in the list). Zone angle : how sharp an edge must be to stop the zone.', seed: 'Click on the model to place the component named in the Components field.', extend: 'Press on a curve and drag : a parallel curve follows the cursor on the surface, joined at both ends : a new strip of quads (Maya Quad Draw extend).', loop: 'Click on a line of the previewed quads : that edge loop becomes a curve of the network, from border to border, and splits its face in two (Maya Insert Edge Loop).', face: 'Click inside a face : its sides, corners and status. The component buttons then change its quads ; Rotate pattern cycles its variants ; K on a node forces or forbids a corner.' };
   function setTool(t) { S.tool = t; S.draw = t === 'draw' ? (S.draw || { pts: [] }) : null; document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === t)); $('toolHint').textContent = HINTS[t] || ''; redraw(); }
 
   // ------------------------------------------------------------------ mouse
@@ -722,8 +747,10 @@
     if (S.tool === 'draw') {
       const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
       const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
+      if (n === null && !a && p) { snapToContour(p).then((q) => { S.draw.pts.push({ p: q.p, node: null, arc: null }); status('Point ' + S.draw.pts.length + (q.snapped ? ' on a contour of the mesh (' + q.moved_mm + ' mm)' : '')); redraw(); }); return; }
       S.draw.pts.push({ p, node: n, arc: a ? a.id : null }); status('Point ' + S.draw.pts.length + (n !== null ? ' on node ' + n : a ? ' on curve ' + a.id : '')); redraw(); return;
     }
+    if (S.tool === 'autopatch') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); autoPatchAt(h); return; }
     if (S.tool === 'insert' || S.tool === 'split') {
       const sd = surfaceDist(x, y), a = pickArc(x, y, sd, CFG.pick.arcPx * 1.5); if (!a) return status('Click on a curve.');
       if (S.tool === 'insert') insertCtrl(a.id, a.p); else edit('Curve split, new node', () => { const r = splitArcAt(a.id, a.p, P().mirror); S.sel = new Set(); S.node = r.node; });
@@ -736,8 +763,9 @@
     if (S.tool === 'patch') {                                             // 29 October 2026 : four clicks, one quad patch (Quad Draw)
       const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
       const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
-      S.patch = S.patch || []; S.patch.push({ p, node: n, arc: a ? a.id : null, sx: x, sy: y }); status('Patch corner ' + S.patch.length + ' of 4');
-      if (S.patch.length === 4) finishPatch(); else redraw(); return;
+      const push = (q, snapped) => { S.patch = S.patch || []; S.patch.push({ p: q, node: n, arc: a ? a.id : null, sx: x, sy: y }); status('Patch corner ' + S.patch.length + ' of 4' + (snapped ? ' (on a contour)' : '')); if (S.patch.length === 4) finishPatch(); else redraw(); };
+      if (n === null && !a && p) { snapToContour(p).then((q) => push(q.p, q.snapped)); return; }
+      push(p, false); return;
     }
     if (S.tool === 'tweak') {
       if (!S.mesh) return status('Convert to a mesh first.');
@@ -801,7 +829,16 @@
     if (D.started) { const [ux, uy] = local(ev), how = D.kind === 'ctrl' ? attachDroppedEnd(D.hit.arc, D.hit.i, ux, uy) : null; schedulePreview(); model.buildNodeMirror(); status(D.kind === 'ctrl' ? (how ? 'End ' + how : 'Control point moved') + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
     if (D.kind === 'meshVertex') status('Mesh vertex moved');
   }
-  function onWheel(ev) { ev.preventDefault(); view.zoom(ev.deltaY); redraw(true); }
+  // 29 October 2026 : TRACKPAD like Blender on a Mac : two finger swipe orbits, pinch zooms (ctrlKey), Shift + swipe pans ; a mouse wheel (whole line steps,
+  // no horizontal part) still zooms. Works in every tool, while a curve is being drawn too : the clicks of the curve are never touched.
+  function isTrackpad(ev) { if (ev.ctrlKey) return true; if (ev.deltaMode !== 0) return false; return Math.abs(ev.deltaX) > 0 || !Number.isInteger(ev.deltaY) || Math.abs(ev.deltaY) < 40; }
+  function onWheel(ev) {
+    ev.preventDefault(); const pad = $('pTrackpad') ? $('pTrackpad').checked : true;
+    if (ev.ctrlKey) view.zoom(ev.deltaY * 4);                                    // pinch
+    else if (pad && isTrackpad(ev)) { if (ev.shiftKey) view.pan(ev.deltaX, ev.deltaY); else view.orbit(ev.deltaX, ev.deltaY); }
+    else view.zoom(ev.deltaY);
+    redraw(true); if (typeof creasesLater === 'function') creasesLater();
+  }
   function onKey(ev) {
     if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
     const k = ev.key.toLowerCase(), mod = ev.metaKey || ev.ctrlKey;
@@ -813,7 +850,7 @@
     if (views[k]) { view.preset(views[k]); redraw(); return; }
     if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateComp(); else if (k === 'b') safe(bestPattern)(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
     else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
-    else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'v') { setShow(SHOW_MODES[(SHOW_MODES.indexOf(S.show || 'both') + 1) % 3]); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
+    else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'w') { setTool('autopatch'); } else if (k === 'v') { setShow(SHOW_MODES[(SHOW_MODES.indexOf(S.show || 'both') + 1) % 3]); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
     else if (k === 'h') { if (ev.shiftKey) { view.showAllParts(); if (S.isolated) { S.isolated = false; $('pSolo').checked = false; } status('Every part shown'); } else { const h = view.pickSurface(S.mouse ? S.mouse[0] : 0, S.mouse ? S.mouse[1] : 0); if (h) { view.setPartHidden(h.part, true); status('Part hidden : ' + (view.st.mesh.head.parts[h.part] || h.part) + ' (Shift H shows all)'); } } redraw(true); }
     else if (k === 'r') smoothSel(CFG.edit.roundPasses); else if (k === 'j') { if (S.node !== null) joinAtNode(S.node); else status('Select a node with two curves.'); }
     else if (k === 'delete' || (k === 'backspace' && S.tool !== 'draw')) { ev.preventDefault(); deleteSelection(); }
@@ -1144,11 +1181,16 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     document.querySelectorAll('#showSwitch .btn').forEach((b) => b.addEventListener('click', () => setShow(b.dataset.show)));   // 29 October 2026 : the swap
+    if ($('pZoneDeg')) $('pZoneDeg').addEventListener('input', () => { $('pZoneDegVal').textContent = $('pZoneDeg').value; });   // 29 October 2026 : auto patch zone angle
+    document.querySelectorAll('details.more[id]').forEach((d) => {   // 29 October 2026 : the drawers remember whether they were open (this browser only)
+      try { const v = localStorage.getItem('zrl.' + d.id); if (v !== null) d.open = v === '1'; } catch (e) { /* storage blocked : defaults */ }
+      d.addEventListener('toggle', () => { try { localStorage.setItem('zrl.' + d.id, d.open ? '1' : '0'); } catch (e) { /* ignore */ } });
+    });
     if ($('pShowCreases')) $('pShowCreases').addEventListener('change', safe(showCreases));   // 29 October 2026 : crease layer
     cv().addEventListener('wheel', () => creasesLater(), { passive: true });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, autoPatchAt, snapToContour, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
