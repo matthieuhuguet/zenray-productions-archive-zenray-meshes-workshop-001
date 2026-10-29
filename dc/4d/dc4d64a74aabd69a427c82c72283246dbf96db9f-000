@@ -321,6 +321,26 @@
     const fs = (S.faces || []).find((f) => f.component === S.comp); if (fs && fs.boundary) framePoints(fs.boundary); else if (q) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]);
     redraw(); status(S.comp + ' isolated : ' + keep.map((p) => (view.st.mesh.head.parts[p] || p)).join(', ').replace(/CAR_/g, '') + ' ; Shift H shows everything, P previews, Convert works on its curves only');
   }
+  async function bestPattern() {   // 29 October 2026 : B : every pattern of the picked face or selected component tried on its own curves, the cleanest kept and listed
+    const f = S.face ? faceOf(S.face.id) : (S.faces || []).find((z) => z.component && z.component === S.comp);
+    if (!f) return status('Pick a face (G) or select a component that has a face.');
+    const n = f.native_corners || (f.corners || []).length; if (n < 4) return status('A face with ' + n + ' corners has a single pattern : add a corner with K first.');
+    let comp = f.component || S.comp; if (!comp) edit('Face named for its pattern', () => { comp = ensureComp(); }); S.comp = comp;
+    const par = S.arcParents || {}, ids = new Set(); for (const [aid] of f.arcs || []) { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; if (model.arc(id)) ids.add(id); }
+    const doc = JSON.parse(model.serialize()), arcs = doc.arcs.filter((a) => ids.has(a.id)), used = new Set(); for (const a of arcs) { used.add(a.a); used.add(a.b); }
+    const sub = { ...doc, arcs, nodes: doc.nodes.filter((nd) => used.has(nd.id)) }, rows = []; status('Trying the ' + (n + 1) + ' patterns of ' + comp + '...');
+    for (const r of [null].concat([...Array(n).keys()])) {
+      const co = JSON.parse(JSON.stringify(compOpts())), o = (co[comp] = Object.assign({}, co[comp] || {})); if (r === null) delete o.rotate; else o.rotate = r;
+      const res = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: sub, params: Object.assign(meshParams(), { component_options: co, auto_fallback: false, write_obj: false }) }) }).then((x) => x.json()).catch(() => null);
+      const fc = res && res.ok !== false ? (res.faces || []).find((z) => z.component === comp && z.quads) : null;
+      rows.push({ r, ok: !!fc, folded: fc ? fc.folded : 1e9, bad: fc ? fc.bad_quads : 1e9, minJ: fc ? +fc.min_jac : -9, sides: fc ? fc.side_counts : null });
+    }
+    rows.sort((a, b) => a.folded - b.folded || a.bad - b.bad || b.minJ - a.minJ); const best = rows[0];
+    if (!best.ok) return status('No pattern of ' + comp + ' meshes on its own curves.', 'error');
+    setCompOption('rotate', best.r === null ? undefined : best.r);
+    $('meshInfo').textContent = 'Patterns of ' + comp + ', best first :\n' + rows.map((x) => (x.r === null ? 'native' : 'variant ' + (x.r + 1)) + ' : ' + (x.ok ? x.folded + ' folded, ' + x.bad + ' below 0.5, min ' + x.minJ.toFixed(2) + ', ' + (x.sides || []).join(' x ') : 'does not mesh')).join('\n');
+    status('Best pattern of ' + comp + ' : ' + (best.r === null ? 'native' : 'variant ' + (best.r + 1)) + ' (' + best.folded + ' folded, ' + best.bad + ' below 0.5)'); schedulePreview(); return rows;
+  }
   function selectFaceCurves() {   // 29 October 2026 : the curves of the selected component's faces (or of the picked face), split pieces mapped back to their curve
     const fs = (S.faces || []).filter((f) => (S.face && f.id === S.face.id) || (S.comp && f.component === S.comp)); if (!fs.length) return status('Select a component that has a face, or pick a face (G).');
     const par = S.arcParents || {}, ids = new Set(); for (const f of fs) for (const [aid] of f.arcs || []) { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; if (model.arc(id)) ids.add(id); }
@@ -660,7 +680,7 @@
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
     if (views[k]) { view.preset(views[k]); redraw(); return; }
-    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateComp(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
+    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateComp(); else if (k === 'b') safe(bestPattern)(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
     else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
     else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
     else if (k === 'h') { if (ev.shiftKey) { view.showAllParts(); if (S.isolated) { S.isolated = false; $('pSolo').checked = false; } status('Every part shown'); } else { const h = view.pickSurface(S.mouse ? S.mouse[0] : 0, S.mouse ? S.mouse[1] : 0); if (h) { view.setPartHidden(h.part, true); status('Part hidden : ' + (view.st.mesh.head.parts[h.part] || h.part) + ' (Shift H shows all)'); } } redraw(true); }
@@ -837,7 +857,7 @@
     const arcs = doc.arcs.filter((a) => S.sel.has(a.id)), used = new Set(); for (const a of arcs) { used.add(a.a); used.add(a.b); }
     return { ...doc, arcs, nodes: doc.nodes.filter((n) => used.has(n.id)) };
   }
-  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), face_options: faceOptions(), corners_force: model.doc.corners_force || {} }; }
+  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), component_options: compOpts(), corners_force: model.doc.corners_force || {} }; }   // 29 October 2026 : options by component name, stable when face ids change
   async function previewFaces() {
     const seq = ++previewSeq; const t0 = performance.now();
     const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: docForServer(), params: meshParams() }) });
@@ -887,7 +907,7 @@
     on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
-    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompName', nameFacesFromModel);
+    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
     on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
@@ -899,7 +919,7 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

@@ -62,7 +62,8 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "sharp_factor": 0.9,
     "out_dir": f"{ROOT}/work/lines/mesh",
     "write_obj": True,
-    "face_options": {},               # {face id: {"skip": bool, "corners": [node ids], "rotate": int}} per face topology choices
+    "face_options": {},
+    "component_options": {},          # 29 October 2026 : {component name: {skip, corners, rotate, edge_scale}} : stable across edits, unlike face ids ; a face option wins               # {face id: {"skip": bool, "corners": [node ids], "rotate": int}} per face topology choices
     "boundary_step_m": 0.01,          # /faces : spacing of the boundary polyline returned for drawing and picking
     "project_arcs": True,             # 29 October 2026 : nodes and arc polylines are put on the reference surface before the faces (curves drawn off the shell fold the first quad row)
     "seed_plane_tol_m": 0.5,          # component seeds : a face is a candidate when the seed projects inside its loop and lies within this of its plane
@@ -513,10 +514,19 @@ class Net:
             c = sorted(f.pop("_seed_cands", []))
             if c: f["component"] = c[0][1]; f["extra_seeds"] = [n for _, n in c[1:]]
 
+    def _face_opts(self):
+        """29 October 2026 : per face options : component_options by the face's component name, then face_options by face id on top."""
+        out = {}; co = self.prm.get("component_options") or {}
+        for f in self.faces:
+            c = f.get("component")
+            if c and c in co: out[f["id"]] = dict(co[c])
+        for k, v in (self.prm.get("face_options") or {}).items(): out.setdefault(int(k), {}).update(v)
+        return out
+
     # ---- corners
     def corners(self):
         t = time.time(); prm = self.prm; skip = set(int(i) for i in prm["skip_faces"] or [])
-        opts = {int(k): v for k, v in (prm.get("face_options") or {}).items()}
+        opts = self._face_opts()
         for f in self.faces:
             if f["id"] in skip or opts.get(f["id"], {}).get("skip"): f["status"], f["reason"] = "skipped", "user"
             elif f["normal_mean_len"] < 0.3 and f["area"] > 0: f["status"], f["reason"] = "skipped", "wraps_around"
@@ -692,7 +702,7 @@ class Net:
     # ---- counts
     def counts(self):
         t = time.time(); cand = [f for f in self.faces if f["status"] == "ok"]; self.counts_by_arc = {}; self.tarini = {}
-        opts = {int(k): v for k, v in (self.prm.get("face_options") or {}).items()}; arc_scales = collections.defaultdict(list)
+        opts = self._face_opts(); arc_scales = collections.defaultdict(list)
         for f in self.faces:                                         # edge_scale of a face multiplies the target edge length ; a shared arc takes the mean
             for h in f["he"]: arc_scales[h[0]].append(float(opts.get(f["id"], {}).get("edge_scale", 1.0) or 1.0))
         def layout_of(fs):
@@ -956,7 +966,7 @@ def build(doc, params=None):
     t0 = time.time(); net = _run(doc, params); fallback = []
     if net.prm["auto_fallback"]:                                    # N sided faces (N = 3, 5, 6) that fail the judge : try a 4 sided patch
         bad = [f["id"] for f in net.faces if f["status"] == "meshed" and not f.get("judge_ok", True) and len(f["sides"]) in (5, 6)
-               and "rotate" not in (net.prm.get("face_options") or {}).get(f["id"], (net.prm.get("face_options") or {}).get(str(f["id"]), {}))]
+               and "rotate" not in net._face_opts().get(f["id"], {})]
         if bad:
             p2 = dict(params or {}); fo = {str(k): dict(v) for k, v in (p2.get("face_options") or {}).items()}
             for i in bad: fo.setdefault(str(i), {})["rotate"] = 0
