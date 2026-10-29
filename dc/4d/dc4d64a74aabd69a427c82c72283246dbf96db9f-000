@@ -22,6 +22,8 @@
     perSpan: 24,
     diag: { opposite: 2.0, sharp: 25, flat: 150, spacing: 3.0 },   // 29 October 2026 : thresholds of the fold diagnosis (opposite side ratio, corner degrees, spacing ratio)
     sheet: { behindM: 1.6 },   // 29 October 2026 : the blueprint planes sit this far behind the view centre, past the model
+    // 29 October 2026 : NAME LABELS in the middle of each component : estimated box (charPx per letter), parts labelled only when bigger than minPartPx on screen, at most maxParts, never overlapping
+    labels: { charPx: 6.4, padX: 7, h: 18, gap: 3, minPartPx: 34, maxParts: 70, strip: /^CAR_(body_)?/ },
   };
   const $ = (id) => document.getElementById(id);
   const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null, face: null, doctor: null };
@@ -547,6 +549,14 @@
     status(mode === 'model' ? 'Showing the current 3D model.' : (sheets ? (mode === 'reference' ? 'Showing the reference sheet (' + sheets + ' views), from any angle.' : 'Showing the 3D model over the reference sheet (aligned views).') : 'No reference sheet for this model : run ZrlSheetViews.py, or Use this model with the views ticked.'));
     redraw(true); view.draw();
   }
+  // 29 October 2026 : SHADING : grey, or each component of the model in its own colour (the converted quads then take their component's colour too)
+  function setShade(mode) {
+    S.shade = mode === 'parts' ? 'parts' : 'gray'; view.setShade(S.shade);
+    document.querySelectorAll('#shadeSwitch .btn').forEach((b) => b.classList.toggle('active', b.dataset.shade === S.shade));
+    $('pCompColour').checked = S.shade === 'parts'; if (S.mesh) buildMeshLayers();
+    status(S.shade === 'parts' ? 'Colours : one colour per component (' + (view.st.mesh ? view.st.mesh.head.parts.length : 0) + ' parts) ; Shift N shows or hides the names.' : 'Grey shading.');
+    redraw(true);
+  }
   // 29 October 2026 : the camera axes (rx right, uy up, tz toward the viewer), so the creases are read as this camera sees them
   function viewAxes() {
     const c = view.cam, cp = Math.cos(c.pitch), tz = [cp * Math.sin(c.yaw), Math.sin(c.pitch), cp * Math.cos(c.yaw)], f = [-tz[0], -tz[1], -tz[2]];
@@ -848,6 +858,8 @@
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
     if (views[k]) { view.preset(views[k]); redraw(); return; }
+    if (ev.shiftKey && k === 'v') { setShade(S.shade === 'parts' ? 'gray' : 'parts'); return; }   // 29 October 2026 : Shift V : grey or colours ; Shift N : names
+    if (ev.shiftKey && k === 'n') { $('pTags').checked = !$('pTags').checked; status('Names ' + ($('pTags').checked ? 'shown' : 'hidden')); redraw(true); return; }
     if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateComp(); else if (k === 'b') safe(bestPattern)(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
     else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
     else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'w') { setTool('autopatch'); } else if (k === 'v') { setShow(SHOW_MODES[(SHOW_MODES.indexOf(S.show || 'both') + 1) % 3]); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
@@ -1052,12 +1064,33 @@
     const fs = S.face && faceOf(S.face.id); if (fs && fs.boundary) view.setRibbons('faceSel', [{ pts: fs.boundary, color: CFG.colors.sel }], { width: CFG.preview.faceWidth * 2, order: 2.6 }); else view.clearLayer('faceSel');
     renderDoctor(); renderForced(); renderTags();
   }
-  function renderTags() {   // 29 October 2026 : name tags of the seeds, an HTML layer over the canvas, hidden when the seed faces away
-    const host = $('tags'); if (!host) return; const show = $('pTags').checked, c3 = view.st.mesh ? view.st.mesh.head.bbox : null; let html = '';
-    if (show && c3) { const ctr = [(c3[0][0] + c3[1][0]) / 2, (c3[0][1] + c3[1][1]) / 2, (c3[0][2] + c3[1][2]) / 2];
-      for (const q of seeds()) { const v = view.project(q.p); if (v[3] <= 0) continue; const facing = V.dot(V.sub(q.p, ctr), V.sub(view.st.eye, q.p)) > 0; if (!facing && !$('pXray').checked) continue;
-        html += `<div class="tag${S.comp === q.name ? ' sel' : ''}" style="left:${v[0].toFixed(0)}px;top:${v[1].toFixed(0)}px">${q.name.replace(/^CAR_/, '')}</div>`; } }
-    host.innerHTML = html;
+  // 29 October 2026 : NAME LABELS, an HTML layer over the canvas. Each label sits on a 3D anchor in the middle of its component and is projected
+  // again at every frame, so it stays in the middle while the view turns. Your components (their seed, set in the middle of an auto patch) come
+  // first ; in Colours the parts of the model are named too, the biggest on screen first. A label is hidden when another part covers its anchor
+  // (one small position render, view.visible) or when it would overlap a label already placed.
+  // FR : les étiquettes de noms, au milieu de chaque composant, suivent la vue ; cachées derrière une pièce ou si elles se chevauchent.
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function renderTags() {
+    const host = $('tags'); if (!host) return; const st = view.st;
+    if (!$('pTags').checked || !st.mesh || !st.MVP) { host.innerHTML = ''; return; }
+    const L = CFG.labels, W = st.W, H = st.H, cand = [];
+    for (const q of seeds()) cand.push({ p: q.p, text: q.name.replace(L.strip, ''), dot: hashColour(q.name), cls: S.comp === q.name ? 'sel' : 'comp', mine: true });
+    if (st.shade === 'parts' && st.showMesh) {
+      const parts = [];
+      for (const a of st.anchors) { if (st.hidden && st.hidden[a.part]) continue; let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (let c = 0; c < 8; c++) { const v = view.project([c & 1 ? a.hi[0] : a.lo[0], c & 2 ? a.hi[1] : a.lo[1], c & 4 ? a.hi[2] : a.lo[2]]); if (v[3] <= 0) continue; x0 = Math.min(x0, v[0]); x1 = Math.max(x1, v[0]); y0 = Math.min(y0, v[1]); y1 = Math.max(y1, v[1]); }
+        const size = Math.max(x1 - x0, y1 - y0); if (size >= L.minPartPx) parts.push({ a, size }); }
+      parts.sort((u, w) => w.size - u.size);
+      for (const { a } of parts.slice(0, L.maxParts)) { const c = st.partColours[a.part]; cand.push({ p: a.p, text: (st.mesh.head.parts[a.part] || 'part ' + a.part).replace(L.strip, ''), dot: [c[0], c[1], c[2], 1], cls: 'part' }); }
+    }
+    const seen = st.xray ? cand.map(() => true) : view.visible(cand.map((c) => c.p)), placed = [], out = [];
+    const free = (x, y, w, h) => placed.every((r) => x >= r[0] + r[2] + L.gap || r[0] >= x + w + L.gap || y >= r[1] + r[3] + L.gap || r[1] >= y + h + L.gap);
+    cand.forEach((c, i) => { if (!seen[i]) return; const v = view.project(c.p); if (v[3] <= 0) return;
+      const w = c.text.length * L.charPx + 2 * L.padX + 11, h = L.h, x = v[0] - w / 2, y = v[1] - h / 2;
+      if (x + w < 0 || y + h < 0 || x > W || y > H) return; if (!c.mine && !free(x, y, w, h)) return; placed.push([x, y, w, h]);   // your components are always written ; the parts give way
+      const rgb = 'rgb(' + c.dot.slice(0, 3).map((t) => Math.round(t * 255)).join(',') + ')';
+      out.push(`<div class="tag ${c.cls}" style="left:${v[0].toFixed(0)}px;top:${v[1].toFixed(0)}px"><i style="background:${rgb}"></i>${esc(c.text)}</div>`); });
+    host.innerHTML = out.join('');
   }
   let facesTimer = null, meshTimer = null, previewSeq = 0;
   function schedulePreview() {
@@ -1181,6 +1214,7 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     document.querySelectorAll('#showSwitch .btn').forEach((b) => b.addEventListener('click', () => setShow(b.dataset.show)));   // 29 October 2026 : the swap
+    document.querySelectorAll('#shadeSwitch .btn').forEach((b) => b.addEventListener('click', () => setShade(b.dataset.shade)));   // 29 October 2026 : grey or colours
     if ($('pZoneDeg')) $('pZoneDeg').addEventListener('input', () => { $('pZoneDegVal').textContent = $('pZoneDeg').value; });   // 29 October 2026 : auto patch zone angle
     document.querySelectorAll('details.more[id]').forEach((d) => {   // 29 October 2026 : the drawers remember whether they were open (this browser only)
       try { const v = localStorage.getItem('zrl.' + d.id); if (v !== null) d.open = v === '1'; } catch (e) { /* storage blocked : defaults */ }
@@ -1190,7 +1224,7 @@
     cv().addEventListener('wheel', () => creasesLater(), { passive: true });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, autoPatchAt, snapToContour, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { setShade, renderTags, importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, autoPatchAt, snapToContour, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

@@ -9,6 +9,9 @@ const View3D = (() => {
   const CFG = {   // 29 October 2026 : every tunable value of the engine
     fov: 32, near: 0.02, far: 60, nearFrac: 0.01, farFrac: 60,   /* 29 October 2026 : near and far follow the distance (nearFrac x dist, at least 1 mm), nothing is clipped up close */ bg: [0.965, 0.965, 0.96, 1], meshColor: [0.80, 0.82, 0.86], xrayAlpha: 0.28, highlight: [0.95, 0.55, 0.2],
     orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.01, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14, planeAlpha: 0.9, planeAlignCos: 0.97,
+    // 29 October 2026 : COLOUR SHADING : one hue per part (golden angle), two lightness steps ; the sides of a pair (_L _R, _FL ...) share their colour
+    partHueStep: 137.508, partSat: 0.52, partLight: [0.62, 0.72], partPairs: /_(L|R|FL|FR|RL|RR)$/, planeWhite: 250,   // planeWhite : the white margin of a sheet panel (min channel over it) is cut off the plane
+    occDiv: 6, occTolM: 0.03, occTolPx: 4,   // 29 October 2026 : labels : a small position render (1 texel per occDiv device px) says which anchors are seen
   };
   const V = {
     sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
@@ -30,8 +33,8 @@ uniform mat4 uMVP; out vec3 vN; out vec3 vP; flat out float vPart;
 void main(){ vN=aN; vP=aP; vPart=aPart; gl_Position=uMVP*vec4(aP,1.0); }`,
     meshF: `#version 300 es
 precision highp float; in vec3 vN; in vec3 vP; flat in float vPart;
-uniform vec3 uEye; uniform vec3 uColor; uniform float uAlpha; uniform float uHiPart; uniform vec3 uHi; uniform highp sampler2D uHidden; out vec4 o;
-void main(){ if(texelFetch(uHidden, ivec2(int(vPart+0.5),0), 0).r>0.5) discard; vec3 n=normalize(vN); vec3 v=normalize(uEye-vP); float d=abs(dot(n,v)); vec3 c=uColor*(0.32+0.68*d)+0.10*pow(1.0-d,3.0);
+uniform vec3 uEye; uniform vec3 uColor; uniform float uAlpha; uniform float uHiPart; uniform vec3 uHi; uniform highp sampler2D uHidden; uniform highp sampler2D uPartCol; uniform int uShade; out vec4 o;
+void main(){ ivec2 pi=ivec2(int(vPart+0.5),0); if(texelFetch(uHidden, pi, 0).r>0.5) discard; vec3 n=normalize(vN); vec3 v=normalize(uEye-vP); float d=abs(dot(n,v)); vec3 base=uShade==1?texelFetch(uPartCol, pi, 0).rgb:uColor; vec3 c=base*(0.32+0.68*d)+0.10*pow(1.0-d,3.0);
  if(abs(vPart-uHiPart)<0.5) c=mix(c,uHi,0.35); o=vec4(c,uAlpha); }`,
     pickF: `#version 300 es
 precision highp float; in vec3 vN; in vec3 vP; flat in float vPart; uniform highp sampler2D uHidden;
@@ -71,7 +74,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
     };
     const P = { mesh: prog(SH.meshV, SH.meshF), pick: prog(SH.meshV, SH.pickF), rib: prog(SH.ribV, SH.colF), pt: prog(SH.ptV, SH.ptF), fill: prog(SH.fillV, SH.colF), img: prog(SH.imgV, SH.imgF) };
     const cam = { target: [0, 0.6, 0], yaw: 0.9, pitch: 0.35, dist: 7, ortho: false };
-    const st = { planes: {}, showPlanes: true, planesAlways: false, mesh: null, layers: {}, xray: false, showMesh: true, hiPart: -1, W: 1, H: 1, dpr: 1, MVP: null, eye: null, pickFbo: null, pickSize: [0, 0] };
+    const st = { planes: {}, showPlanes: true, planesAlways: false, mesh: null, layers: {}, xray: false, showMesh: true, hiPart: -1, W: 1, H: 1, dpr: 1, MVP: null, eye: null, pickFbo: null, pickSize: [0, 0], shade: 'gray', anchors: [], occ: null };
 
     function setMesh(head, buf) {
       const o = head.offsets, nv = head.vertices, nt = head.triangles;
@@ -84,6 +87,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       gl.bindVertexArray(null);
       st.mesh = { vao, count: nt * 3, head, pos, idx, part };
       st.hidden = new Uint8Array(Math.max(1, head.parts.length)); st.hiddenTex = gl.createTexture(); uploadHidden();
+      st.partCol = gl.createTexture(); uploadPartColours(head.parts); st.anchors = partAnchors(pos, idx, part, head.parts.length);
       const b = head.bbox; cam.target = [(b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2, (b[0][2] + b[1][2]) / 2];
       cam.dist = 1.6 * Math.max(b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]);
     }
@@ -135,15 +139,71 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
     const setPartHidden = (part, v) => { if (!st.hidden || part < 0 || part >= st.hidden.length) return; st.hidden[part] = v ? 255 : 0; uploadHidden(); };
     const showAllParts = () => { if (st.hidden) { st.hidden.fill(0); uploadHidden(); } };
     const isolateParts = (keep) => { if (!st.hidden) return; st.hidden.fill(255); for (const p of keep) if (p >= 0 && p < st.hidden.length) st.hidden[p] = 0; uploadHidden(); };   // 29 October 2026 : only these parts drawn and picked
+    // 29 October 2026 : COLOUR SHADING, one colour per part (texture of one texel per part, read by the mesh shader when st.shade is 'parts')
+    function partColour(k) { const h = ((k * CFG.partHueStep) % 360) / 60, s = CFG.partSat, l = CFG.partLight[k % CFG.partLight.length], c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h % 2) - 1)), m = l - c / 2;
+      const [r, g, b] = h < 1 ? [c, x, 0] : h < 2 ? [x, c, 0] : h < 3 ? [0, c, x] : h < 4 ? [0, x, c] : h < 5 ? [x, 0, c] : [c, 0, x]; return [r + m, g + m, b + m]; }
+    function uploadPartColours(names) {
+      const base = names.map((n) => n.replace(CFG.partPairs, '')), at = new Map([...new Set(base)].map((b, i) => [b, i])), px = new Uint8Array(Math.max(1, names.length) * 4);
+      st.partColours = names.map((n, i) => partColour(at.get(base[i]))); st.partColours.forEach((c, i) => px.set([c[0] * 255, c[1] * 255, c[2] * 255, 255], 4 * i));
+      gl.bindTexture(gl.TEXTURE_2D, st.partCol); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, Math.max(1, names.length), 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
+    // 29 October 2026 : per part, the label anchor : the triangle centre nearest the part's area centroid (ON the surface, in the middle of the part), and the part's box
+    function partAnchors(pos, idx, part, np) {
+      const nt = part.length, A = new Float64Array(np), C = new Float64Array(np * 3), lo = new Float64Array(np * 3).fill(Infinity), hi = new Float64Array(np * 3).fill(-Infinity), cen = new Float32Array(nt * 3);
+      for (let t = 0; t < nt; t++) { const a = idx[3 * t] * 3, b = idx[3 * t + 1] * 3, c = idx[3 * t + 2] * 3, g = part[t];
+        const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2], vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2], ar = 0.5 * Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+        for (let k = 0; k < 3; k++) { const q0 = pos[a + k], q1 = pos[b + k], q2 = pos[c + k], m = (q0 + q1 + q2) / 3; cen[3 * t + k] = m; C[3 * g + k] += ar * m; lo[3 * g + k] = Math.min(lo[3 * g + k], q0, q1, q2); hi[3 * g + k] = Math.max(hi[3 * g + k], q0, q1, q2); }
+        A[g] += ar; }
+      for (let g = 0; g < np; g++) if (A[g] > 0) for (let k = 0; k < 3; k++) C[3 * g + k] /= A[g];
+      const best = new Float64Array(np).fill(Infinity), at = new Int32Array(np).fill(-1);
+      for (let t = 0; t < nt; t++) { const g = part[t]; if (!(A[g] > 0)) continue; const d = (cen[3 * t] - C[3 * g]) ** 2 + (cen[3 * t + 1] - C[3 * g + 1]) ** 2 + (cen[3 * t + 2] - C[3 * g + 2]) ** 2; if (d < best[g]) { best[g] = d; at[g] = t; } }
+      const out = []; for (let g = 0; g < np; g++) if (at[g] >= 0) { const t = at[g]; out.push({ part: g, p: [cen[3 * t], cen[3 * t + 1], cen[3 * t + 2]], lo: [lo[3 * g], lo[3 * g + 1], lo[3 * g + 2]], hi: [hi[3 * g], hi[3 * g + 1], hi[3 * g + 2]], area: A[g] }); }
+      return out;
+    }
+    const setShade = (mode) => { st.shade = mode === 'parts' ? 'parts' : 'gray'; };
+    // 29 October 2026 : which of these points are seen from the camera : one position render at 1 / occDiv resolution, a point is seen when a texel of its 3 x 3 neighbourhood shows a surface within tol of it
+    function visible(points) { ready();
+      if (!st.mesh || !floatOk || !points.length) return points.map(() => true);
+      const k = CFG.occDiv, w = Math.max(8, Math.round(canvas.width / k)), h = Math.max(8, Math.round(canvas.height / k));
+      if (!st.occ || st.occ.w !== w || st.occ.h !== h) {
+        if (st.occ) { gl.deleteFramebuffer(st.occ.fb); gl.deleteTexture(st.occ.t); gl.deleteRenderbuffer(st.occ.rb); }
+        const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb); const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32F, w, h);
+        const rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); st.occ = { fb, t, rb, w, h, data: new Float32Array(w * h * 4) };
+      }
+      matrices(); gl.bindFramebuffer(gl.FRAMEBUFFER, st.occ.fb); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.NONE]); gl.viewport(0, 0, w, h); gl.disable(gl.SCISSOR_TEST);
+      gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clear(gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.useProgram(P.pick.p); gl.uniformMatrix4fv(P.pick.u.uMVP, false, st.MVP); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.pick.u.uHidden, 0); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0); gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, st.occ.data);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height); gl.enable(gl.BLEND); gl.bindVertexArray(null);
+      const D = st.occ.data, sx = w / st.W, sy = h / st.H, texM = 2 * cam.dist * Math.tan(CFG.fov * Math.PI / 360) / h;   // world size of one texel at the target distance
+      return points.map((p) => { const v = project(p); if (v[3] <= 0 || v[0] < 0 || v[1] < 0 || v[0] > st.W || v[1] > st.H) return false;
+        const cx = Math.floor(v[0] * sx), cy = Math.floor(h - 1 - v[1] * sy), tol = Math.max(CFG.occTolM, CFG.occTolPx * texM * (cam.ortho ? 1 : v[3] / cam.dist));
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const x = cx + dx, y = cy + dy; if (x < 0 || y < 0 || x >= w || y >= h) continue; const i = 4 * (y * w + x);
+          if (D[i + 3] > 0.5 && Math.hypot(D[i] - p[0], D[i + 1] - p[1], D[i + 2] - p[2]) <= tol) return true; }
+        return false; });
+    }
     // 29 October 2026 : IMAGE PLANES (blueprints) : a textured quad per reference view, drawn behind the model when the camera looks along its axis
     function setImagePlane(name, url, corners, back) {
       const pl = st.planes[name] = { ready: false, back: back.slice(), alpha: CFG.planeAlpha }; const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
       const pos = new Float32Array(corners.flat()), uv = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
-      const bind = (data, loc, n) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); };
-      bind(pos, 0, 3); bind(uv, 1, 2); const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW); gl.bindVertexArray(null); pl.vao = vao;
-      const im = new Image(); im.onload = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, im);
+      const bind = (data, loc, n) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); return b; };
+      const pb = bind(pos, 0, 3), ub = bind(uv, 1, 2); const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW); gl.bindVertexArray(null); pl.vao = vao;
+      const im = new Image(); im.onload = () => {
+        // 29 October 2026 : the white margin of the panel (a 1600 px square around a long side view) is cut off : the plane keeps the box of the drawing only, no white band in the view
+        const box = contentBox(im); if (box) { const [u0, v0, u1, v1] = box, at = (u, v) => [0, 1, 2].map((k) => corners[0][k] + (corners[1][k] - corners[0][k]) * u + (corners[3][k] - corners[0][k]) * v);
+          gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([...at(u0, v0), ...at(u1, v0), ...at(u1, v1), ...at(u0, v1)]), gl.STATIC_DRAW);
+          gl.bindBuffer(gl.ARRAY_BUFFER, ub); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([u0, v0, u1, v0, u1, v1, u0, v1]), gl.STATIC_DRAW); pl.box = box; }
+        const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, im);
         gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         pl.tex = t; pl.ready = true; if (st.onPlaneReady) st.onPlaneReady(name); }; im.src = url;
+    }
+    function contentBox(im) {   // 29 October 2026 : [u0, v0, u1, v1] of the pixels darker than planeWhite (sampled on 256 x 256), or null
+      const n = 256, c = document.createElement('canvas'); c.width = n; c.height = n; const x = c.getContext('2d', { willReadFrequently: true }); x.drawImage(im, 0, 0, n, n); const d = x.getImageData(0, 0, n, n).data;
+      let r0 = n, r1 = -1, c0 = n, c1 = -1;
+      for (let y = 0; y < n; y++) for (let q = 0; q < n; q++) { const i = 4 * (y * n + q); if (d[i + 3] > 8 && Math.min(d[i], d[i + 1], d[i + 2]) < CFG.planeWhite) { if (y < r0) r0 = y; if (y > r1) r1 = y; if (q < c0) c0 = q; if (q > c1) c1 = q; } }
+      return r1 < 0 ? null : [c0 / n, r0 / n, (c1 + 1) / n, (r1 + 1) / n];
     }
     function drawPlanes() {   // the plane faces the camera when the camera looks along its back direction
       if (!st.showPlanes) return; const f = V.norm(V.sub(cam.target, st.eye)); let any = false;
@@ -178,6 +238,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
         gl.useProgram(P.mesh.p); gl.uniformMatrix4fv(P.mesh.u.uMVP, false, st.MVP); gl.uniform3fv(P.mesh.u.uEye, st.eye); gl.uniform3fv(P.mesh.u.uColor, CFG.meshColor);
         gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : 1.0);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.mesh.u.uHidden, 0);
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, st.partCol); gl.uniform1i(P.mesh.u.uPartCol, 1); gl.uniform1i(P.mesh.u.uShade, st.shade === 'parts' ? 1 : 0); gl.activeTexture(gl.TEXTURE0);
         gl.depthMask(!st.xray); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0); gl.depthMask(true);
       }
       const layers = Object.values(st.layers).filter((L) => L.visible && L.count > 0).sort((a, b) => a.order - b.order);
@@ -269,7 +330,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, CFG.pitchLimit], bottom: [0, -CFG.pitchLimit], persp: [0.9, 0.35] }[name];
       if (t) { cam.yaw = t[0]; cam.pitch = t[1]; }
     }
-    return { gl, CFG, cam, st, setImagePlane, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
+    return { gl, CFG, cam, st, setImagePlane, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas, setShade, visible };
   }
   return { create, CFG, V };
 })();
