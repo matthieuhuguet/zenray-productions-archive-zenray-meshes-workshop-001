@@ -9,9 +9,9 @@
 
 // ------------------------------------------------------------------------------------------------------------------ CONFIG
 const CONFIG = {
-  files: { lines: 'data/lines.json', views: 'data/views.json', saved: 'data/lines_edit.json', save: '/save', downloadJson: 'lines_edit.json' },
+  files: { lines: 'data/lines.json', views: 'data/views.json', sheets: 'data/sheet_views.json', saved: 'data/lines_edit.json', save: '/save', downloadJson: 'lines_edit.json' },
   views: { order: ['left', 'right', 'top', 'front', 'back'], initial: 'left', keys: { '1': 'left', '2': 'right', '3': 'top', '4': 'front', '5': 'back' } },
-  defaults: { mirror: true, snap: false, showHidden: true, showNodes: true, showGaps: true, svgBackground: false, bgOpacity: 1, smoothAmount: 0.5 },
+  defaults: { mirror: true, snap: false, showHidden: true, showNodes: true, showGaps: true, svgBackground: false, bgOpacity: 1, smoothAmount: 0.5, bgSource: 'model' },   // 29 October 2026 : bgSource model or sheet (the six view reference)
   spline: { perSpan: 40 },                                   // samples per knot span when drawing an arc
   colors: {
     arc: '#1d3fd6', arcHidden: '#8d98d6', arcHover: '#0f9d58', arcSelected: '#ff6a00', component: '#0b8f6a',
@@ -265,7 +265,7 @@ function serializeDoc(doc, decimals) {
     ',"pair":' + JSON.stringify(a.pair) + ',"ctrl":[' + a.ctrl.map(pt).join(',') + '],"mirror":' + a.mirror + '}').join(',\n') + '\n],');
   out.push('"components": ' + JSON.stringify(doc.components));
   // 29 October 2026 : the component registry and per component options of the 3D editor travel with the document (absent keys write nothing)
-  for (const k of ['component_seeds', 'component_options', 'corners_force']) if (doc[k] !== undefined) out[out.length - 1] += ',\n"' + k + '": ' + JSON.stringify(doc[k]);
+  for (const k of ['component_seeds', 'component_options', 'corners_force', 'model_ref']) if (doc[k] !== undefined) out[out.length - 1] += ',\n"' + k + '": ' + JSON.stringify(doc[k]);
   out.push('}');
   return out.join('\n') + '\n';
 }
@@ -584,7 +584,7 @@ function startApp() {
 
   const el = {};
   for (const id of ['svg', 'stage', 'status', 'viewButtons', 'bAdd', 'modeHint', 'zoomVal', 'bFit', 'coords', 'hoverInfo', 'compList', 'filter', 'arcList', 'arcCount', 'selInfo',
-    'pMirror', 'pSnap', 'pHidden', 'pNodes', 'pGaps', 'pSvgBg', 'pBgOpacity', 'pSmooth', 'pLineWidth', 'bUndo', 'bRedo', 'bSmooth', 'bWeld', 'bDelete',
+    'pMirror', 'pSnap', 'pHidden', 'pNodes', 'pGaps', 'pSvgBg', 'pBgOpacity', 'pBgSource', 'pSmooth', 'pLineWidth', 'bUndo', 'bRedo', 'bSmooth', 'bWeld', 'bDelete',
     'bExportJson', 'bExportSvg', 'bExportPng', 'bSave', 'bLoadSaved', 'gComp', 'gHid', 'gVis', 'gGaps', 'gHover', 'gSel', 'gNodes', 'gTop']) el[id] = $(id);
 
   const S = {
@@ -1139,7 +1139,7 @@ function startApp() {
     let bg = el.svg.querySelector('image');
     if (!bg) { bg = svgEl('image', { x: 0, y: 0, preserveAspectRatio: 'none' }); el.svg.insertBefore(bg, el.svg.firstChild); }
     bg.setAttribute('width', S.viewDef.res); bg.setAttribute('height', S.viewDef.res);
-    bg.setAttribute('href', S.viewDef.image);
+    bg.setAttribute('href', bgHref(name));
     bg.setAttribute('opacity', S.params.bgOpacity);
     measure();
     const st = S.viewStates[name];
@@ -1183,7 +1183,7 @@ function startApp() {
   async function svgText() {
     const E = CONFIG.export;
     let href = null;
-    if (S.params.svgBackground) { const r = await fetch(S.viewDef.image); href = await blobToDataUrl(await r.blob()); }
+    if (S.params.svgBackground) { const r = await fetch(bgHref(S.viewName)); href = await blobToDataUrl(await r.blob()); }
     return buildSvg(model.doc, S.viewDef, S.depth, { model, viewName: S.viewName, decimals: E.svgDecimals, showHidden: S.params.showHidden, backgroundHref: href,
       bgOpacity: E.svgBackgroundOpacity, colors: C, stroke: E.svgStroke, hiddenStroke: E.svgHiddenStroke, nodeRadius: E.svgNodeRadius });
   }
@@ -1195,7 +1195,7 @@ function startApp() {
   }
   function loadImage(url) { return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new Error('cannot load ' + url)); im.src = url; }); }
   async function exportPng() {
-    const v = S.viewDef, E = CONFIG.export, im = await loadImage(v.image);
+    const v = S.viewDef, E = CONFIG.export, im = await loadImage(bgHref(S.viewName));
     const cv = document.createElement('canvas');
     cv.width = v.res; cv.height = v.res;
     const ctx = cv.getContext('2d');
@@ -1252,6 +1252,8 @@ function startApp() {
     el.pNodes.addEventListener('change', () => { P.showNodes = el.pNodes.checked; renderNodes(); });
     el.pGaps.addEventListener('change', () => { P.showGaps = el.pGaps.checked; renderGaps(); });
     el.pSvgBg.addEventListener('change', () => { P.svgBackground = el.pSvgBg.checked; });
+    el.pBgSource.value = P.bgSource; el.pBgSource.addEventListener('change', () => { P.bgSource = el.pBgSource.value; const bg = el.svg.querySelector('image'); if (bg && S.viewName) bg.setAttribute('href', bgHref(S.viewName));
+      setStatus(P.bgSource === 'sheet' ? (S.sheets && S.sheets[S.viewName] ? 'Background : the reference sheet, on the same camera as the model' : 'No sheet for this view (run Scripts/lines/ZrlSheetViews.py)') : 'Background : the model render'); });
     el.pBgOpacity.addEventListener('input', () => { P.bgOpacity = parseFloat(el.pBgOpacity.value); const bg = el.svg.querySelector('image'); if (bg) bg.setAttribute('opacity', P.bgOpacity); });
     el.pSmooth.addEventListener('input', () => { P.smoothAmount = parseFloat(el.pSmooth.value); });
     el.pLineWidth.addEventListener('input', () => { P.lineWidth = parseFloat(el.pLineWidth.value); applyZoomStyles(); });
@@ -1295,10 +1297,12 @@ function startApp() {
     return r.json();
   }
 
+  // 29 October 2026 : the background of a view : the model render, or the reference sheet panel warped on the same camera (ZrlSheetViews.py)
+  function bgHref(name) { return S.params.bgSource === 'sheet' && S.sheets && S.sheets[name] ? S.sheets[name] : S.views[name].image; }
   async function init() {
     try {
       const [doc, views] = await Promise.all([fetchJson(CONFIG.files.lines), fetchJson(CONFIG.files.views)]);
-      S.views = views;
+      S.views = views; S.sheets = await fetchJson(CONFIG.files.sheets).catch(() => ({}));   // optional : the sheet stage needs Scripts/lines/ZrlSheetViews.py
       model = createModel(doc);
       model.buildNodeMirror();
     } catch (e) {

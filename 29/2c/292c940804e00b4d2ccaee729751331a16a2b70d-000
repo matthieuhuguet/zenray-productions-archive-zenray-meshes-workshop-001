@@ -8,7 +8,7 @@
 const View3D = (() => {
   const CFG = {   // 29 October 2026 : every tunable value of the engine
     fov: 32, near: 0.02, far: 60, bg: [0.965, 0.965, 0.96, 1], meshColor: [0.80, 0.82, 0.86], xrayAlpha: 0.28, highlight: [0.95, 0.55, 0.2],
-    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.05, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14,
+    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.05, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14, planeAlpha: 0.9, planeAlignCos: 0.97,
   };
   const V = {
     sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
@@ -49,6 +49,10 @@ uniform mat4 uMVP; uniform float uBias; out vec4 vC; void main(){ vec4 c=uMVP*ve
     ptF: `#version 300 es
 precision highp float; in vec4 vC; uniform float uAlpha; out vec4 o;
 void main(){ vec2 q=gl_PointCoord*2.0-1.0; float r=dot(q,q); if(r>1.0) discard; float e=smoothstep(0.55,0.75,r); o=vec4(mix(vC.rgb,vec3(1.0),e*0.0)*(1.0-0.35*e), vC.a*uAlpha); }`,
+    imgV: `#version 300 es
+layout(location=0) in vec3 aP; layout(location=1) in vec2 aT; uniform mat4 uMVP; out vec2 vT; void main(){ vT=aT; gl_Position=uMVP*vec4(aP,1.0); }`,
+    imgF: `#version 300 es
+precision highp float; in vec2 vT; uniform sampler2D uTex; uniform float uAlpha; out vec4 o; void main(){ vec4 c=texture(uTex, vT); o=vec4(c.rgb, c.a*uAlpha); }`,
     fillV: `#version 300 es
 layout(location=0) in vec3 aP; layout(location=1) in vec4 aC; uniform mat4 uMVP; uniform float uBias; out vec4 vC;
 void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
@@ -65,9 +69,9 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS); for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name; u[nm] = gl.getUniformLocation(p, nm); }
       return { p, u };
     };
-    const P = { mesh: prog(SH.meshV, SH.meshF), pick: prog(SH.meshV, SH.pickF), rib: prog(SH.ribV, SH.colF), pt: prog(SH.ptV, SH.ptF), fill: prog(SH.fillV, SH.colF) };
+    const P = { mesh: prog(SH.meshV, SH.meshF), pick: prog(SH.meshV, SH.pickF), rib: prog(SH.ribV, SH.colF), pt: prog(SH.ptV, SH.ptF), fill: prog(SH.fillV, SH.colF), img: prog(SH.imgV, SH.imgF) };
     const cam = { target: [0, 0.6, 0], yaw: 0.9, pitch: 0.35, dist: 7, ortho: false };
-    const st = { mesh: null, layers: {}, xray: false, showMesh: true, hiPart: -1, W: 1, H: 1, dpr: 1, MVP: null, eye: null, pickFbo: null, pickSize: [0, 0] };
+    const st = { planes: {}, showPlanes: true, mesh: null, layers: {}, xray: false, showMesh: true, hiPart: -1, W: 1, H: 1, dpr: 1, MVP: null, eye: null, pickFbo: null, pickSize: [0, 0] };
 
     function setMesh(head, buf) {
       const o = head.offsets, nv = head.vertices, nt = head.triangles;
@@ -131,6 +135,24 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
     const setPartHidden = (part, v) => { if (!st.hidden || part < 0 || part >= st.hidden.length) return; st.hidden[part] = v ? 255 : 0; uploadHidden(); };
     const showAllParts = () => { if (st.hidden) { st.hidden.fill(0); uploadHidden(); } };
     const isolateParts = (keep) => { if (!st.hidden) return; st.hidden.fill(255); for (const p of keep) if (p >= 0 && p < st.hidden.length) st.hidden[p] = 0; uploadHidden(); };   // 29 October 2026 : only these parts drawn and picked
+    // 29 October 2026 : IMAGE PLANES (blueprints) : a textured quad per reference view, drawn behind the model when the camera looks along its axis
+    function setImagePlane(name, url, corners, back) {
+      const pl = st.planes[name] = { ready: false, back: back.slice(), alpha: CFG.planeAlpha }; const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+      const pos = new Float32Array(corners.flat()), uv = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
+      const bind = (data, loc, n) => { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 0, 0); };
+      bind(pos, 0, 3); bind(uv, 1, 2); const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW); gl.bindVertexArray(null); pl.vao = vao;
+      const im = new Image(); im.onload = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, im);
+        gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        pl.tex = t; pl.ready = true; if (st.onPlaneReady) st.onPlaneReady(name); }; im.src = url;
+    }
+    function drawPlanes() {   // the plane faces the camera when the camera looks along its back direction
+      if (!st.showPlanes) return; const f = V.norm(V.sub(cam.target, st.eye)); let any = false;
+      for (const pl of Object.values(st.planes)) { if (!pl.ready || V.dot(f, pl.back) < CFG.planeAlignCos) continue;
+        if (!any) { gl.useProgram(P.img.p); gl.uniformMatrix4fv(P.img.u.uMVP, false, st.MVP); gl.depthMask(false); any = true; }
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, pl.tex); gl.uniform1i(P.img.u.uTex, 0); gl.uniform1f(P.img.u.uAlpha, pl.alpha);
+        gl.bindVertexArray(pl.vao); gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0); }
+      if (any) { gl.depthMask(true); gl.bindVertexArray(null); }
+    }
     const setVisible = (name, v) => { if (st.layers[name]) st.layers[name].visible = v; };
     const clearLayer = (name) => { if (st.layers[name]) st.layers[name].visible = false; };
 
@@ -149,6 +171,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       resize(); matrices(); gl.viewport(0, 0, canvas.width, canvas.height);
       gl.clearColor(...CFG.bg); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      drawPlanes();
       if (st.mesh && st.showMesh) {
         gl.useProgram(P.mesh.p); gl.uniformMatrix4fv(P.mesh.u.uMVP, false, st.MVP); gl.uniform3fv(P.mesh.u.uEye, st.eye); gl.uniform3fv(P.mesh.u.uColor, CFG.meshColor);
         gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : 1.0);
@@ -244,7 +267,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, CFG.pitchLimit], bottom: [0, -CFG.pitchLimit], persp: [0.9, 0.35] }[name];
       if (t) { cam.yaw = t[0]; cam.pitch = t[1]; }
     }
-    return { gl, CFG, cam, st, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
+    return { gl, CFG, cam, st, setImagePlane, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
   }
   return { create, CFG, V };
 })();

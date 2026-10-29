@@ -1,0 +1,62 @@
+"""29 October 2026 : ZenRay Lines SHEET VIEWS, the six view reference sheet laid on the cameras of ZenRay Lines.
+EN: every panel of the reference sheet (work/car/views/NN_<view>_rgb.png, cut by SheetSplit.py) is warped onto the camera of the matching
+ZenRay Lines view (lines/data/views.json : center, px_per_m, res, rx, uy) through the sheet calibration of SheetFit.py (work/car/frame/frame.json :
+per panel axes, px_per_m and object box, world box lo + dims). The map is affine (scale, offset, quarter turns when the panel axes differ, as for
+the top view), so a world point lands on the same pixel in the model render and in the sheet image : the lines can be drawn on the sheet first,
+on the model later, and the gap between both shows where the model leaves the reference. Writes lines/data/sheet_<view>.png and
+lines/data/sheet_views.json ({view: image}), read by the 2D editor (background : model or sheet) and the 3D editor (blueprint planes).
+    python -I ZrlSheetViews.py [--frame work/car/frame/frame.json] [--panels work/car/views]
+FR : la planche six vues recalée sur les caméras de ZenRay Lines, pour dessiner les lignes dès la référence, avant ou à côté du modèle 3D.
+"""
+import argparse, json, os
+import numpy as np
+from PIL import Image
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PARAMS = {   # 29 October 2026 : every tunable value of the warp
+    "views": f"{ROOT}/lines/data/views.json",
+    "frame": f"{ROOT}/work/car/frame/frame.json",
+    "panels": f"{ROOT}/work/car/views",
+    "out_dir": f"{ROOT}/lines/data",
+    "index": "sheet_views.json",
+    "fill": (255, 255, 255),
+}
+
+
+def axis_range(a, lo, dims):
+    """min and max of p . a over the world box lo + [0, dims], a a signed unit axis."""
+    a = np.asarray(a, float); lo = np.asarray(lo, float); hi = lo + np.asarray(dims, float)
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]) @ a
+    return float(corners.min()), float(corners.max())
+
+
+def build(prm=PARAMS):
+    views = json.load(open(prm["views"])); fr = json.load(open(prm["frame"])); frames = {v["name"]: v for v in fr["views"]}
+    sheet = json.load(open(os.path.join(prm["panels"], "sheet.json"))); idx = {p["name"]: p["index"] for p in sheet["panels"]}
+    out, report = {}, {}
+    for name, V in views.items():
+        F = frames.get(name)
+        if F is None or name not in idx: report[name] = "no panel"; continue
+        c, s_v, res = np.asarray(V["center"], float), float(V["px_per_m"]), int(V["res"]); rxv, uyv = np.asarray(V["rx"], float), np.asarray(V["uy"], float)
+        rxf, uyf, s_f = np.asarray(F["rx"], float), np.asarray(F["uy"], float), float(F["px_per_m"]); x0, y0, x1, y1 = F["bbox"]
+        xmin, xmax = axis_range(rxf, fr["lo"], fr["dims_m"]); ymin, ymax = axis_range(uyf, fr["lo"], fr["dims_m"])
+        def sheet_px(col, row):                                       # output pixel of the view -> pixel of the sheet panel
+            u = (col + 0.5 - res / 2) / s_v; v = (res / 2 - 0.5 - row) / s_v; p = c + u * rxv + v * uyv
+            X, Y = p @ rxf, p @ uyf
+            return (x0 + x1) / 2 + (X - (xmin + xmax) / 2) * s_f, (y0 + y1) / 2 - (Y - (ymin + ymax) / 2) * s_f
+        o = np.array(sheet_px(0, 0)); ex = np.array(sheet_px(1, 0)) - o; ey = np.array(sheet_px(0, 1)) - o
+        img = Image.open(os.path.join(prm["panels"], "%02d_%s_rgb.png" % (idx[name], name))).convert("RGB")
+        warped = img.transform((res, res), Image.AFFINE, data=(ex[0], ey[0], o[0], ex[1], ey[1], o[1]), resample=Image.BICUBIC, fillcolor=prm["fill"])
+        path = os.path.join(prm["out_dir"], "sheet_%s.png" % name); warped.save(path, optimize=True)
+        out[name] = "data/sheet_%s.png" % name; report[name] = {"scale_ratio": round(s_v / s_f, 3), "affine": [round(float(x), 5) for x in (ex[0], ey[0], o[0], ex[1], ey[1], o[1])]}
+    with open(os.path.join(prm["out_dir"], prm["index"]), "w") as f: json.dump(out, f, indent=1)
+    return out, report
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--frame", default=PARAMS["frame"]); ap.add_argument("--panels", default=PARAMS["panels"]); a = ap.parse_args()
+    out, report = build(dict(PARAMS, frame=a.frame, panels=a.panels)); print(json.dumps({"written": out, "report": report}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

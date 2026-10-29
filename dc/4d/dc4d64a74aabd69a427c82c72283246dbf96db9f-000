@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', seeds: 'data/seeds_v752.json' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -20,6 +20,7 @@
     edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01, weldMinM: 0.0005, weldMaxM: 0.12 },
     repair: { snapM: 0.03, endGuardM: 0.03, dupM: 0.01 },   // 29 October 2026 : Repair network : a far end attaches to what lies within snapM ; duplicates closer than dupM
     perSpan: 24,
+    sheet: { behindM: 1.6 },   // 29 October 2026 : the blueprint planes sit this far behind the view centre, past the model
   };
   const $ = (id) => document.getElementById(id);
   const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null, face: null, doctor: null };
@@ -169,9 +170,24 @@
   // (T junction), else becomes free (red) ; near ends are welded with a fade ; a curve that retraces another between the same two nodes is removed.
   function nearestOnArcs(p, skip, maxD) { let hit = null, bd = maxD; for (const b of model.doc.arcs) { if (skip.has(b.id)) continue; const sm = arcPts(b.id); for (let k = 0; k < sm.length; k += 3) { const d = Math.hypot(sm[k] - p[0], sm[k + 1] - p[1], sm[k + 2] - p[2]); if (d < bd) { bd = d; hit = { id: b.id, p: [sm[k], sm[k + 1], sm[k + 2]], k: k / 3, n: sm.length / 3 }; } } } return hit; }
   function meanDist(sa, sb) { let t = 0, n = 0; for (let i = 0; i < sa.length; i += 3) { let m = Infinity; for (let j = 0; j < sb.length; j += 3) m = Math.min(m, Math.hypot(sa[i] - sb[j], sa[i + 1] - sb[j + 1], sa[i + 2] - sb[j + 2])); t += m; n++; } return n ? t / n : Infinity; }
+  // 29 October 2026 : SOURCE OF TRUTH : a new version of the model (OBJ) replaces the reference of both editors (POST /model), then every node and
+  // control point is put back on its surface (POST /project with ref = the OBJ) : the lines follow the true shape as the model improves.
+  const modelRef = () => model.doc.model_ref || null;
+  async function useModel() {
+    const obj = ($('modelPath').value || '').trim(); if (!obj) return status('Type the path of the model (.obj) first.');
+    status('Loading ' + obj + ' : reference, views and sheet...');
+    const r = await fetch(CFG.files.model, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ obj, views: $('pModelViews').checked }) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Model failed : ' + (res.error || r.status), 'error');
+    const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json', { cache: 'no-store' }).then((x) => x.json()), fetch(CFG.files.ref + '.bin', { cache: 'no-store' }).then((x) => x.arrayBuffer())]);
+    view.setMesh(head, buf); refGrid = null; loadSheetPlanes(); model.doc.model_ref = res.obj;
+    const mv = await snapToSurface(); S.mesh = null; buildMeshLayers();
+    status('Source of truth : ' + res.obj.split('/').pop() + ' (' + res.triangles + ' triangles' + (res.views ? ', views ' + res.views : '') + ') ; curves moved onto it : median ' + ((mv && mv.median_m || 0) * 1000).toFixed(1) + ' mm, largest ' + ((mv && mv.max_m || 0) * 100).toFixed(1) + ' cm');
+    $('modelInfo').textContent = 'Model : ' + res.obj + '\n' + res.vertices + ' vertices, ' + res.triangles + ' triangles, ' + res.parts + ' parts, ' + res.seconds + ' s';
+    return { res, mv };
+  }
   async function snapToSurface() {   // 29 October 2026 : every node and control point onto the reference surface (server closest point), one undo step
     status('Snapping the curves onto the surface...');
-    const r = await fetch(CFG.files.project, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: {} }) });
+    const r = await fetch(CFG.files.project, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: modelRef() ? { ref: modelRef() } : {} }) });
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Snap failed : ' + (res.error || r.status), 'error');
     const D = res.doc, nodes = new Map(D.nodes.map((n) => [n.id, n.p])), arcs = new Map(D.arcs.map((a) => [a.id, a.ctrl])), mv = res.moved || {};
     edit('Curves snapped on the surface : median move ' + ((mv.median_m || 0) * 1000).toFixed(1) + ' mm, largest ' + ((mv.max_m || 0) * 100).toFixed(1) + ' cm', () => {
@@ -860,7 +876,7 @@
     const arcs = doc.arcs.filter((a) => S.sel.has(a.id)), used = new Set(); for (const a of arcs) { used.add(a.a); used.add(a.b); }
     return { ...doc, arcs, nodes: doc.nodes.filter((n) => used.has(n.id)) };
   }
-  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), component_options: compOpts(), corners_force: model.doc.corners_force || {} }; }   // 29 October 2026 : options by component name, stable when face ids change
+  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), component_options: compOpts(), corners_force: model.doc.corners_force || {}, ...(modelRef() ? { ref: modelRef() } : {}) }; }   // 29 October 2026 : options by component name, stable when face ids change
   async function previewFaces() {
     const seq = ++previewSeq; const t0 = performance.now();
     const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: docForServer(), params: meshParams() }) });
@@ -883,12 +899,21 @@
   }
 
   // ------------------------------------------------------------------ boot
+  // 29 October 2026 : the six view reference sheet as blueprint planes : each panel (ZrlSheetViews.py) on its camera of views.json, set behind the model
+  async function loadSheetPlanes() {
+    const [views, sheets] = await Promise.all([fetch(CFG.files.views).then((r) => r.json()), fetch(CFG.files.sheets).then((r) => (r.ok ? r.json() : {})).catch(() => ({}))]).catch(() => [null, {}]);
+    if (!views) return; let n = 0;
+    for (const [name, url] of Object.entries(sheets || {})) { const v = views[name]; if (!v) continue; const H = v.res / (2 * v.px_per_m), back = v.tz.map((x) => -x), c = V.add(v.center, V.mul(back, CFG.sheet.behindM));
+      const at = (a, b) => V.add(V.add(c, V.mul(v.rx, a * H)), V.mul(v.uy, b * H)); view.setImagePlane(name, url, [at(-1, 1), at(1, 1), at(1, -1), at(-1, -1)], back); n++; }
+    view.st.onPlaneReady = () => redraw(true); if (n) S.sheetPlanes = n;
+  }
   async function boot() {
     view = View3D.create($('cv'));
     const css = (c) => 'rgb(' + c.slice(0, 3).map((v) => Math.round(v * 255)).join(',') + ')';   // 29 October 2026 : the legend reads the judge colours from CFG, one source
     $('legend').innerHTML = 'Quads : <i style="background:' + css(CFG.colors.meshOk) + '"></i>good <i style="background:' + css(CFG.colors.meshWarn) + '"></i>squashed (Jacobian under 0.5) <i style="background:' + css(CFG.colors.meshBad) + '"></i>folded';
     if (!view.floatOk) status('Float render targets are missing : snapping to the surface is off in this browser', 'error');
     const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json').then((r) => r.json()), fetch(CFG.files.ref + '.bin').then((r) => r.arrayBuffer())]);
+    loadSheetPlanes();
     view.setMesh(head, buf);
     const src = new URLSearchParams(location.search).get('src');
     let doc = null; for (const u of src ? [src] : [CFG.files.edit, CFG.files.lines]) { const r = await fetch(u, { cache: 'no-store' }); if (r.ok) { doc = await r.json(); break; } }
@@ -915,16 +940,17 @@
     on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
-    on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
+    on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
     on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network')); on('bLoadMbo', () => loadDoc(CFG.files.mboNet, 'Component network (borders of the component cut, Scripts/lines/ZrlNetworkFromMbo.py)'));
     for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
+    $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

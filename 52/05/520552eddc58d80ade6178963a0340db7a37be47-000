@@ -1,0 +1,60 @@
+"""29 October 2026 : ZenRay Lines USE MODEL, a new version of the 3D model becomes the source of truth of both editors.
+EN: ZenRay Lines works at every stage of ZenRay Meshes : on the six view sheet first, then on the 3D model, and the curves follow the true shape
+each time the model improves. This script takes the new model (an OBJ, one group per part) and refreshes, in lines/data :
+  ref_mesh.bin/json   the reference of the 3D editor (ZrlRefMesh.py), the previous one copied to data/backups first ;
+  view_<n>, depth_<n>, views.json   the renders and depth maps of the 2D editor (ZrlExport.py views stage, on a shell made from the OBJ) ;
+  sheet_<n>, sheet_views.json       the reference sheet warped again on those cameras (ZrlSheetViews.py).
+The curves themselves are put back on the new surface by the editor ("Use this model" calls POST /model, then POST /project with ref = the OBJ).
+    python -I ZrlUseModel.py --obj model.obj [--no-views]        or POST /model {"obj": path}
+FR : une nouvelle version du modèle devient la source de vérité ; les vues, la référence et la planche suivent, les courbes se recalent dessus.
+"""
+import argparse, datetime, json, os, shutil, subprocess, sys, time
+import numpy as np
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+PARAMS = {   # 29 October 2026 : every tunable value of the update
+    "data": f"{ROOT}/lines/data",
+    "work": f"{ROOT}/work/lines/models",
+    "python": "/Users/zenray/.venvs/zenray-meshes/bin/python",
+    "views": True,
+}
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+
+def stamp():
+    n = datetime.datetime.now(); return "%d-%s-%d_%s" % (n.day, MONTHS[n.month - 1], n.year, n.strftime("%H%M%S"))
+
+
+def shell_from_obj(V, F, G, names, path):
+    """verts, triangles, a label per VERTEX (the part of one of its triangles) and the part names, as ZrlExport's views stage reads them."""
+    lab = np.zeros(len(V), np.int64); lab[F[:, 0]] = G; lab[F[:, 1]] = G; lab[F[:, 2]] = G
+    np.savez(path, verts=V, faces=F, lab=lab, names=np.array(names)); return path
+
+
+def run(obj, prm=PARAMS, views=None):
+    import ZrlRefMesh as RM, ZrlSheetViews as SV
+    t0 = time.time(); obj = os.path.realpath(obj)
+    if not os.path.isfile(obj): raise FileNotFoundError(obj)
+    V, F, G, names = RM.from_obj(obj); out = {"obj": obj, "vertices": int(len(V)), "triangles": int(len(F)), "parts": len(names)}
+    ref = os.path.join(prm["data"], "ref_mesh"); bdir = os.path.join(prm["data"], "backups"); os.makedirs(bdir, exist_ok=True)
+    for ext in (".bin", ".json"):
+        if os.path.exists(ref + ext): shutil.copy2(ref + ext, os.path.join(bdir, "ref_mesh_%s%s" % (stamp(), ext)))
+    RM.write(V, F, G, names, ref); out["ref_mesh"] = ref + ".bin"
+    if prm["views"] if views is None else views:
+        os.makedirs(prm["work"], exist_ok=True); sh = shell_from_obj(V, F, G, names, os.path.join(prm["work"], "shell_%s.npz" % stamp()))
+        r = subprocess.run([prm["python"], "-I", "-B", os.path.join(HERE, "ZrlExport.py"), "--skip-lines", "--shell", sh, "--out", prm["data"]], capture_output=True, text=True, timeout=600)
+        out["views"] = "ok" if r.returncode == 0 else ("failed : " + (r.stderr or r.stdout)[-400:])
+        if r.returncode == 0: written, _ = SV.build(dict(SV.PARAMS, views=os.path.join(prm["data"], "views.json"), out_dir=prm["data"])); out["sheet_views"] = sorted(written)
+    out["seconds"] = round(time.time() - t0, 1); out["ok"] = True
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--no-views", action="store_true"); a = ap.parse_args()
+    print(json.dumps(run(a.obj, views=not a.no_views), indent=1))
+
+
+if __name__ == "__main__":
+    main()
