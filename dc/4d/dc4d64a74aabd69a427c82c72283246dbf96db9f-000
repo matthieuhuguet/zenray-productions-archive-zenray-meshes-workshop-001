@@ -280,6 +280,43 @@
       if (m) { const mp = pts.map(mir), rev = d3(mir(a.ctrl[0]), m.ctrl[m.ctrl.length - 1]) < d3(mir(a.ctrl[0]), m.ctrl[0]); const mm = build(m, rev ? mp.reverse() : mp); for (let k = 0; k < 3; k++) { made[k].mirror = mm[k].id; mm[k].mirror = made[k].id; } }   // the mirror curve may run the other way
     });
   }
+  // 29 October 2026 : NAME FACES FROM THE MODEL : each unnamed face of the last conversion takes the reference part found under most of its quads
+  // (nearest vertex of the reference, hash grid of 3 cm cells) ; a second face of the same part is numbered _2, _3. Seeds sit on a quad centre.
+  let refGrid = null;
+  function refIndex() {
+    if (refGrid) return refGrid; const m = view.st.mesh, pos = m.pos, idx = m.idx, part = m.part, nv = pos.length / 3, vpart = new Int32Array(nv).fill(-1);
+    for (let t = 0; t < part.length; t++) for (let k = 0; k < 3; k++) vpart[idx[3 * t + k]] = part[t];
+    const cell = 0.03, map = new Map(), key = (i, j, k) => i + ',' + j + ',' + k;
+    for (let v = 0; v < nv; v++) { const kk = key(Math.floor(pos[3 * v] / cell), Math.floor(pos[3 * v + 1] / cell), Math.floor(pos[3 * v + 2] / cell)); (map.get(kk) || map.set(kk, []).get(kk)).push(v); }
+    refGrid = { cell, map, key, pos, vpart }; return refGrid;
+  }
+  function partAt(p) {
+    const G = refIndex(), i0 = Math.floor(p[0] / G.cell), j0 = Math.floor(p[1] / G.cell), k0 = Math.floor(p[2] / G.cell); let best = -1, bd = Infinity;
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) for (let dk = -1; dk <= 1; dk++) { const L = G.map.get(G.key(i0 + di, j0 + dj, k0 + dk)); if (!L) continue;
+      for (const v of L) { const d = (G.pos[3 * v] - p[0]) ** 2 + (G.pos[3 * v + 1] - p[1]) ** 2 + (G.pos[3 * v + 2] - p[2]) ** 2; if (d < bd) { bd = d; best = v; } } }
+    return best >= 0 ? G.vpart[best] : -1;
+  }
+  function nameFacesFromModel() {
+    const M = S.mesh; if (!M) return status('Convert to a mesh first : the faces are named from the parts under their quads.');
+    const parts = view.st.mesh.head.parts, named = new Set(seeds().map((q) => q.name)), byFace = new Map(), add = [];
+    for (let q = 0; q < M.Q.length / 4; q++) { const c = [0, 0, 0]; for (let k = 0; k < 4; k++) { const i = M.Q[4 * q + k]; c[0] += M.P[3 * i] / 4; c[1] += M.P[3 * i + 1] / 4; c[2] += M.P[3 * i + 2] / 4; } (byFace.get(M.fq[q]) || byFace.set(M.fq[q], []).get(M.fq[q])).push(c); }
+    for (const f of M.faces || []) {
+      if (f.component || !byFace.has(f.id)) continue; const cs = byFace.get(f.id), votes = new Map();
+      for (let i = 0; i < cs.length; i += Math.max(1, Math.floor(cs.length / 60))) { const pt = partAt(cs[i]); if (pt >= 0) votes.set(pt, (votes.get(pt) || 0) + 1); }
+      if (!votes.size) continue; const top = Array.from(votes.entries()).sort((a, b) => b[1] - a[1])[0][0], base = parts[top] || 'part_' + top; let name = base, k = 2; while (named.has(name)) name = base + '_' + k++;
+      const mean = cs.reduce((t, p) => V.add(t, p), [0, 0, 0]).map((x) => x / cs.length); let sp = cs[0], bd = Infinity; for (const p of cs) { const d = d3(p, mean); if (d < bd) { bd = d; sp = p; } }
+      named.add(name); add.push({ name, p: clone3(sp) });
+    }
+    if (!add.length) return status('Every meshed face already has a component.');
+    edit(add.length + ' face(s) named from the model', () => { for (const q of add) seeds().push(q); }); renderCompList();
+    status(add.length + ' face(s) named from the parts of the model : ' + add.slice(0, 6).map((q) => q.name.replace(/^CAR_/, '')).join(', ') + (add.length > 6 ? '...' : ''));
+    return add;
+  }
+  function selectFaceCurves() {   // 29 October 2026 : the curves of the selected component's faces (or of the picked face), split pieces mapped back to their curve
+    const fs = (S.faces || []).filter((f) => (S.face && f.id === S.face.id) || (S.comp && f.component === S.comp)); if (!fs.length) return status('Select a component that has a face, or pick a face (G).');
+    const par = S.arcParents || {}, ids = new Set(); for (const f of fs) for (const [aid] of f.arcs || []) { let id = aid, g = 0; while (!model.arc(id) && par[id] != null && g++ < 20) id = par[id]; if (model.arc(id)) ids.add(id); }
+    S.sel = ids; S.handle = null; status(ids.size + ' curve(s) border ' + (S.comp || 'face ' + S.face.id)); redraw();
+  }
   function attachDroppedEnd(arcId, i, x, y) {   // 29 October 2026 : an END control point dropped on a node attaches there, on a curve it splits it (T junction), in the void it is free ; the mirror curve follows
     const a = model.arc(arcId); if (!a || (i !== 0 && i !== a.ctrl.length - 1)) return null;
     const end = i === 0 ? 'a' : 'b', sd = surfaceDist(x, y), m = P().mirror ? mirrorArcOf(arcId) : null, own = new Set([arcId]); if (m) own.add(m.id);
@@ -348,6 +385,19 @@
       const c = [0, 1, 2, 3].map((k) => model.node(ids[k]).p).reduce((s, p) => V.add(s, V.mul(p, 0.25)), [0, 0, 0]); const q = view.project(c), h = view.pickSurface(q[0], q[1]);
       const name = ($('compName').value || '').trim() || ('patch_' + (seeds().length + 1));
       if (!seeds().some((z) => z.name === name)) seeds().push({ name, p: h ? h.p : c });
+      if (P().mirror && Math.abs(c[0]) > 3 * CFG.edit.centreSnapM) {   // 29 October 2026 : the mirrored patch : reflected curves, nodes reused or cut on existing curves, component _L <-> _R
+        const mids = ids.map((nid) => { const mp = mir(model.node(nid).p); if (Math.abs(mp[0]) < CFG.edit.centreSnapM) return nid;
+          let bn = null, bd = CFG.repair.endGuardM; for (const n of model.doc.nodes) { const d = d3(n.p, mp); if (d < bd) { bd = d; bn = n.id; } } if (bn !== null) return bn;
+          const hit = nearestOnArcs(mp, new Set(), CFG.repair.snapM); return hit ? splitArcAt(hit.id, hit.p, false).node : addNode(mp); });
+        for (let k = 0; k < 4; k++) {
+          const a = mids[k], b = mids[(k + 1) % 4], oa = ids[k], ob = ids[(k + 1) % 4]; if (a === b || model.doc.arcs.some((z) => (z.a === a && z.b === b) || (z.a === b && z.b === a))) continue;
+          const src = model.doc.arcs.find((z) => (z.a === oa && z.b === ob) || (z.a === ob && z.b === oa)); let pts = src ? src.ctrl.map(mir) : [mir(model.node(oa).p), mir(model.node(ob).p)];
+          if (src && src.a !== oa) pts = pts.reverse(); pts[0] = clone3(model.node(a).p); pts[pts.length - 1] = clone3(model.node(b).p);
+          const ma = addArc(a, b, pts, ['', '']); if (src && !(src.mirror >= 0)) { src.mirror = ma.id; ma.mirror = src.id; }
+        }
+        const mname = /_L$/.test(name) ? name.replace(/_L$/, '_R') : /_R$/.test(name) ? name.replace(/_R$/, '_L') : name + '_mirror';
+        if (!seeds().some((z) => z.name === mname)) seeds().push({ name: mname, p: mir(h ? h.p : c) });
+      }
       S.sel = new Set(created); S.comp = name;
     });
     renderCompList();
@@ -410,7 +460,7 @@
     const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
     if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
-    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], euler: (res.stats && res.stats.euler_network) || (S.doctor && S.doctor.euler) || null, k: S.doctor ? S.doctor.k : null };
+    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.arc_parents) S.arcParents = res.arc_parents; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], euler: (res.stats && res.stats.euler_network) || (S.doctor && S.doctor.euler) || null, k: S.doctor ? S.doctor.k : null };
     $('doctorInfo').textContent = problemSummary();
     status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
   }
@@ -456,10 +506,25 @@
     const a = document.createElement('a'); a.href = typeof data === 'string' && data.startsWith('data:') ? data : URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click();
     status('Downloaded ' + name + ' (the server could not save it in the atelier)'); return null;
   }
-  function exportSvg() {
+  function exportSvg() {   // 29 October 2026 : current camera ; seen curves solid, hidden parts dashed and light (one pick of the whole view decides)
     view.matrices(); const W = view.st.W, H = view.st.H, out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><!-- 29 October 2026 ZenRay Lines 3D, current camera -->`];
-    for (const a of model.doc.arcs) { const s = arcPts(a.id); let d = ''; for (let i = 0; i < s.length; i += 3) { const q = view.project([s[i], s[i + 1], s[i + 2]]); d += (i ? 'L' : 'M') + q[0].toFixed(1) + ' ' + q[1].toFixed(1); } out.push(`<path id="arc_${a.id}" d="${d}" fill="none" stroke="#222" stroke-width="1.6"/>`); }
-    for (const n of model.doc.nodes) { const q = view.project(n.p); out.push(`<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="3" fill="#c03"/>`); }
+    const buf = $('pXray').checked ? null : view.pickRect(0, 0, W, H), eye = view.st.eye;
+    const seen = (p, q) => { if (!buf || q[0] < 0 || q[1] < 0 || q[0] >= W || q[1] >= H) return true; const sp = buf.at(q[0], q[1]); return !sp || d3(p, eye) <= d3(sp, eye) + CFG.pick.hiddenTolM; };
+    for (const a of model.doc.arcs) { const sm = arcPts(a.id); let dv = '', dh = '', pxy = null, pv = false, last = null;
+      for (let i = 0; i < sm.length; i += 3) { const p = [sm[i], sm[i + 1], sm[i + 2]], q = view.project(p), v = seen(p, q), xy = q[0].toFixed(1) + ' ' + q[1].toFixed(1);
+        if (pxy !== null) { if (v && pv) { dv += (last === 'v' ? 'L' : 'M' + pxy + 'L') + xy; last = 'v'; } else { dh += (last === 'h' ? 'L' : 'M' + pxy + 'L') + xy; last = 'h'; } }
+        pxy = xy; pv = v; }
+      if (dh) out.push(`<path id="arc_${a.id}_hidden" d="${dh}" fill="none" stroke="#b9b9b9" stroke-width="0.9" stroke-dasharray="3 3"/>`);
+      if (dv) out.push(`<path id="arc_${a.id}" d="${dv}" fill="none" stroke="#222" stroke-width="1.6"/>`); }
+    for (const n of model.doc.nodes) { const q = view.project(n.p); if (seen(n.p, q)) out.push(`<circle cx="${q[0].toFixed(1)}" cy="${q[1].toFixed(1)}" r="3" fill="#c03"/>`); }
+    const M = S.mesh; if (M && $('pMesh').checked) {   // 29 October 2026 : the previewed quads too, only their visible edges (one pick of the whole view)
+      const done = new Set(), segs = [];
+      for (let q = 0; q < M.Q.length / 4; q++) for (let k = 0; k < 4; k++) { const a = M.Q[4 * q + k], b = M.Q[4 * q + (k + 1) % 4], key = a < b ? a + ',' + b : b + ',' + a; if (done.has(key)) continue; done.add(key);
+        const pa = [M.P[3 * a], M.P[3 * a + 1], M.P[3 * a + 2]], pb = [M.P[3 * b], M.P[3 * b + 1], M.P[3 * b + 2]], m = V.mul(V.add(pa, pb), 0.5), qm = view.project(m);
+        if (qm[3] <= 0 || qm[0] < 0 || qm[1] < 0 || qm[0] >= W || qm[1] >= H) continue; const sp = buf && buf.at(qm[0], qm[1]); if (sp && d3(m, eye) > d3(sp, eye) + CFG.pick.hiddenTolM) continue;
+        const qa = view.project(pa), qb = view.project(pb); segs.push('M' + qa[0].toFixed(1) + ' ' + qa[1].toFixed(1) + 'L' + qb[0].toFixed(1) + ' ' + qb[1].toFixed(1)); }
+      out.push(`<path id="quads" d="${segs.join('')}" fill="none" stroke="#2e8b57" stroke-width="0.6"/>`);
+    }
     out.push('</svg>'); return download('zenray_lines_view.svg', out.join('\n'), 'image/svg+xml');
   }
   function exportPng(name) { refresh(); return download((typeof name === 'string' && name) || 'zenray_lines_view.png', view.canvas.toDataURL('image/png')); }
@@ -771,7 +836,7 @@
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (seq !== previewSeq) return;
     if (!r.ok || res.ok === false) return status('Preview failed : ' + (res.error || r.status), 'error');
     S.faces = res.faces || []; const by = {}; for (const f of S.faces) by[f.status] = (by[f.status] || 0) + 1;
-    S.doctor = { dangling: res.dangling_arcs || [], issues: res.issues || [], euler: res.euler || null, k: S.doctor ? S.doctor.k : null };
+    S.doctor = { dangling: res.dangling_arcs || [], issues: res.issues || [], euler: res.euler || null, k: S.doctor ? S.doctor.k : null }; S.arcParents = res.arc_parents || {};
     if (S.face) { const f = faceAt(S.face.p); S.face = f ? { id: f.id, p: S.face.p } : null; }
     $('doctorInfo').textContent = problemSummary();
     status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
@@ -813,7 +878,7 @@
     on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
-    on('bCompCurves', () => { if (!S.comp) return status('Select a component first.'); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).includes(S.comp)).map((a) => a.id)); status(S.sel.size + ' curve(s) border ' + S.comp); redraw(); });
+    on('bCompCurves', selectFaceCurves); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
     on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
@@ -825,7 +890,7 @@
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();
