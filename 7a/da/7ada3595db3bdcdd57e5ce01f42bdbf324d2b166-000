@@ -1,0 +1,57 @@
+"""29 October 2026 : ZenRay Lines HOUDINI LINK, the finishing step : the quad mesh converted by ZenRay Lines is loaded into the open
+Houdini session through the zrbridge (TCP 127.0.0.1:18812, one JSON line {"op": "hom", "code": ...}), as /obj/ZRL_Retopo : a File SOP
+reading the OBJ (one group per component), the component name copied to a "name" primitive attribute, an OUT node. Called by the
+server endpoint POST /houdini ; usable alone : python ZrlHoudiniLink.py <obj path>.
+FR : la finition dans Houdini : le maillage de ZenRay Lines chargé dans la session ouverte, un groupe et un nom par component."""
+import json, socket, sys
+PARAMS = {"host": "127.0.0.1", "port": 18812, "timeout_s": 60.0, "net": "/obj/ZRL_Retopo"}   # 29 October 2026
+
+HOM = r'''
+import hou
+path = %(path)r
+net = hou.node(%(net)r)
+if net is None: net = hou.node("/obj").createNode("geo", %(name)r)
+f = net.node("load") or net.createNode("file", "load"); f.parm("file").set(path)
+w = net.node("name_from_groups") or net.createNode("attribwrangle", "name_from_groups"); w.setInput(0, f); w.parm("class").set("primitive")
+w.parm("snippet").set('string gs[] = detailintrinsic(0, "primitivegroups"); s@name = ""; foreach (string g; gs) { if (inprimgroup(0, g, @primnum)) { s@name = g; break; } }')
+o = net.node("OUT") or net.createNode("output", "OUT"); o.setInput(0, w); o.setDisplayFlag(True); o.setRenderFlag(True); net.layoutChildren()
+f.parm("reload").pressButton(); geo = o.geometry()
+names = sorted(set(geo.primStringAttribValues("name"))) if geo.findPrimAttrib("name") else []
+result = {"node": net.path(), "prims": len(geo.prims()), "points": len(geo.points()), "components": len(names), "quads": sum(1 for p in geo.prims() if len(p.vertices()) == 4)}
+'''
+
+
+def send(obj_path, prm=PARAMS):
+    code = HOM % {"path": obj_path, "net": prm["net"], "name": prm["net"].rsplit("/", 1)[-1]}
+    with socket.create_connection((prm["host"], prm["port"]), timeout=prm["timeout_s"]) as sock:
+        sock.sendall((json.dumps({"op": "hom", "code": code}) + "\n").encode("utf-8")); raw = b""
+        while not raw.endswith(b"\n"):
+            chunk = sock.recv(1 << 20)
+            if not chunk: break
+            raw += chunk
+    ans = json.loads(raw.decode("utf-8") or "{}")
+    if not ans.get("ok"): raise RuntimeError(ans.get("error") or "Houdini bridge answered without ok")
+    out = ans.get("result") or {}; out["ok"] = True; return out
+
+
+def handle(body, out_dir="/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/lines/mesh"):
+    """29 October 2026 : POST /houdini : the editor sends the mesh exactly as shown (P flat, Q flat by 4, face_of_quad, face_names
+    {face id: component}) ; it is written as OBJ (one group per component) then loaded in Houdini : what is previewed is what is sent."""
+    import os, time
+    if body.get("P") is None: return send(body["obj"])
+    P, Q = body["P"], body["Q"]; fq = body.get("face_of_quad") or [0] * (len(Q) // 4); names = {str(k): v for k, v in (body.get("face_names") or {}).items()}
+    os.makedirs(out_dir, exist_ok=True); path = os.path.join(out_dir, "houdini_%s.obj" % time.strftime("%H%M%S"))
+    order = sorted(range(len(Q) // 4), key=lambda q: str(names.get(str(fq[q])) or "face_%s" % fq[q]))
+    with open(path, "w") as f:
+        f.write("# 29 October 2026 ZenRay Lines mesh sent to Houdini\n")
+        for i in range(0, len(P), 3): f.write("v %.6f %.6f %.6f\n" % (P[i], P[i + 1], P[i + 2]))
+        cur = None
+        for q in order:
+            g = names.get(str(fq[q])) or "face_%s" % fq[q]
+            if g != cur: f.write("g %s\n" % g); cur = g
+            f.write("f %d %d %d %d\n" % tuple(Q[4 * q + k] + 1 for k in range(4)))
+    out = send(path); out["obj"] = path; return out
+
+
+if __name__ == "__main__":
+    print(json.dumps(send(sys.argv[1])))

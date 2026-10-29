@@ -20,6 +20,8 @@ PARAMS = {   # 29 October 2026 : the interface of the server, every tunable valu
     "backup_dir": "data/backups",
     "protected": ["data/lines.json"],    # files that /save can never write
     "max_body_mb": 24,
+    "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
+    "lines_dir": f"{ROOT}/Scripts/lines",
 }
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 
@@ -63,6 +65,20 @@ def save_edit(body, root, prm=PARAMS):
     return {"ok": True, "path": target, "bytes": len(body), "arcs": len(doc["arcs"]), "nodes": len(doc["nodes"]), "backup": backup}
 
 
+def run_netmesh(kind, body, prm=PARAMS):
+    """29 October 2026 : POST /doctor, /mesh, /faces (body {"lines": doc, "params": {...}}) and /houdini (body of ZrlHoudiniLink.handle).
+    The python -I server has no script folder on sys.path : the Scripts/lines folder is added here. Raises on any error (the caller answers 500)."""
+    if prm["lines_dir"] not in sys.path: sys.path.insert(0, prm["lines_dir"])
+    req = json.loads(body.decode("utf-8"))
+    if kind == "houdini":
+        import ZrlHoudiniLink
+        return ZrlHoudiniLink.handle(req)
+    import ZrlNetMesh as NM
+    if not isinstance(req, dict) or "lines" not in req: raise ValueError('body must be {"lines": document, "params": {...}}')
+    doc = req["lines"]; check_document(doc); params = req.get("params") or {}
+    return {"doctor": NM.doctor, "mesh": NM.build, "faces": NM.faces_report}[kind](doc, params)
+
+
 def make_handler(root, prm):
     class Handler(SimpleHTTPRequestHandler):
         server_version = "ZenRayLines/1"
@@ -83,7 +99,18 @@ def make_handler(root, prm):
             self.wfile.write(data)
 
         def do_POST(self):
-            if self.path.split("?")[0] != prm["save_path"]:
+            path = self.path.split("?")[0]
+            if path in prm["mesh_paths"]:                       # netmesh endpoints : any failure is a JSON 500, the server never crashes
+                try:
+                    n = int(self.headers.get("Content-Length", ""))
+                    if n <= 0 or n > prm["max_body_mb"] * 1024 * 1024: raise ValueError("body size out of range")
+                    self.reply(200, run_netmesh(prm["mesh_paths"][path], self.rfile.read(n), prm))
+                except BaseException as e:
+                    import traceback; traceback.print_exc(); sys.stderr.flush()
+                    try: self.reply(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+                    except Exception: pass
+                return
+            if path != prm["save_path"]:
                 return self.reply(404, {"ok": False, "error": "unknown endpoint"})
             try:
                 n = int(self.headers.get("Content-Length", ""))

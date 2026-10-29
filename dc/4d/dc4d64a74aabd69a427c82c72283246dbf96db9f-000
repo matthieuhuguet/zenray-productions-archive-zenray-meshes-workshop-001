@@ -9,17 +9,18 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', seeds: 'data/seeds_v752.json' },
+    preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
       meshOk: [0.18, 0.55, 0.32, 1], meshWarn: [0.9, 0.6, 0.12, 1], meshBad: [0.82, 0.18, 0.18, 1], meshFill: [0.35, 0.7, 0.45, 0.28], meshFillBad: [0.85, 0.3, 0.25, 0.32] },
     sizes: { arc: 2.0, arcSel: 3.2, node: 7, nodeSel: 11, handle: 9, poly: 1.2, mesh: 1.0, draw: 2.4, drawPt: 9 },
     pick: { arcPx: 8, handlePx: 11, nodePx: 11, snapNodePx: 14, snapArcPx: 10, meshVertexPx: 10, hiddenTolM: 0.02, dragStartPx: 3 },
-    edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5 },
+    edit: { minCtrl: 4, roundPasses: 5, nodeMergeM: 0.004, relaxStep: 0.5, centreSnapM: 0.01 },
     perSpan: 24,
   };
   const $ = (id) => document.getElementById(id);
-  const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false };
+  const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null };
   let model = null, view = null;
   const P = () => ({ mirror: $('pMirror').checked, snap: $('pSnap').checked });
   const status = (m, kind) => { $('status').textContent = m; $('status').className = kind || ''; };
@@ -48,18 +49,21 @@
     if ($('pNodes').checked) for (const n of model.doc.nodes) pts.push({ p: n.p, color: S.node === n.id ? CFG.colors.nodeSel : CFG.colors.node, size: S.node === n.id ? CFG.sizes.nodeSel : CFG.sizes.node });
     view.setPoints('nodes', pts, { order: 4 });
     view.setPoints('handles', handles, { onTop: true, order: 5 });
+    renderComponents();
     if (S.draw && S.draw.pts.length) {
       const f = []; for (const q of S.draw.pts) f.push(q.p[0], q.p[1], q.p[2]); if (S.draw.cursor) f.push(...S.draw.cursor);
       view.setRibbons('draw', [{ pts: f, color: CFG.colors.draw }], { width: CFG.sizes.draw, order: 6, noHidden: true });
       view.setPoints('drawPts', S.draw.pts.map((q) => ({ p: q.p, color: CFG.colors.draw, size: CFG.sizes.drawPt })), { onTop: true, order: 7 });
     } else { view.clearLayer('draw'); view.clearLayer('drawPts'); }
-    view.st.showMesh = $('pModel').checked; view.st.xray = $('pXray').checked;
+    if (S.patch && S.patch.length) view.setPoints('patchPts', S.patch.map((q) => ({ p: q.p, color: CFG.colors.draw, size: CFG.sizes.drawPt + 2 })), { onTop: true, order: 7 }); else view.clearLayer('patchPts');
+    view.st.showMesh = $('pModel').checked; view.st.xray = $('pXray').checked; view.st.showHidden = $('pHidden').checked;
     view.setVisible('mesh', $('pMesh').checked); view.setVisible('meshFill', $('pMesh').checked);
     view.draw(); updateInfo();
     document.title = (S.dirty ? '* ' : '') + 'ZenRay Lines 3D';
   }
-  let rafPending = false;
-  const redraw = () => { if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; safe(refresh)(); }); } };
+  let rafPending = false, rebuild = true;
+  // 29 October 2026 : a camera move only redraws (layers kept) ; an edit rebuilds the layers once per frame
+  const redraw = (cameraOnly) => { if (!cameraOnly) rebuild = true; if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; if (rebuild) { rebuild = false; safe(refresh)(); } else { view.draw(); safe(renderTags)(); } }); } };
 
   // ------------------------------------------------------------------ picking (CPU, screen space ; hidden things are skipped)
   function surfaceDist(x, y) { const h = view.pickSurface(x, y); return h ? d3(h.p, view.st.eye) : Infinity; }
@@ -93,12 +97,15 @@
     return null;
   }
   function surfacePoint(x, y, through) {
-    if (P().snap) { const h = view.pickSurface(x, y); if (h) return h.p; }
-    return view.planePoint(x, y, through || view.cam.target);
+    let p = null;
+    if (P().snap) { const h = view.pickSurface(x, y); if (h) p = h.p; }
+    if (!p) p = view.planePoint(x, y, through || view.cam.target);
+    if (P().mirror && Math.abs(p[0]) < CFG.edit.centreSnapM) p = [0, p[1], p[2]];          // 29 October 2026 : on the symmetry plane
+    return p;
   }
 
   // ------------------------------------------------------------------ edits (each takes a checkpoint first)
-  function edit(label, fn) { model.checkpoint(); const r = fn(); model.buildNodeMirror(); S.dirty = true; status(label); redraw(); return r; }
+  function edit(label, fn) { model.checkpoint(); const r = fn(); model.buildNodeMirror(); S.dirty = true; status(label); redraw(); schedulePreview(); return r; }
   function mirrorArcOf(id) { const a = model.arc(id); return a && a.mirror >= 0 && a.mirror !== id ? model.arc(a.mirror) : null; }
   function ensureMinCtrl(ctrl) {
     const c = ctrl.map(clone3);
@@ -182,6 +189,29 @@
       S.sel = new Set([id]); S.handle = { arc: id, i: k + 1 };
     });
   }
+  function surfaceLine(A, B, n) {   // n + 1 points from A to B pulled onto the surface through their screen positions (falls back to the chord)
+    const out = [];
+    for (let k = 0; k <= n; k++) { const t = k / n, p = [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
+      if (k === 0 || k === n) { out.push(p); continue; } const q = view.project(p), h = view.pickSurface(q[0], q[1]); out.push(h && d3(h.p, p) < 0.15 ? h.p : p); }
+    return out;
+  }
+  function finishPatch() {
+    const C = S.patch; S.patch = null;
+    edit('Quad patch created', () => {
+      const ids = C.map((q) => (q.node != null ? q.node : q.arc != null && model.arc(q.arc) ? splitArcAt(q.arc, q.p, false).node : addNode(q.p)));
+      const created = [];
+      for (let k = 0; k < 4; k++) {
+        const a = ids[k], b = ids[(k + 1) % 4]; if (a === b) continue;
+        const exists = model.doc.arcs.find((z) => (z.a === a && z.b === b) || (z.a === b && z.b === a)); if (exists) { created.push(exists.id); continue; }
+        const pts = surfaceLine(model.node(a).p, model.node(b).p, CFG.edit.minCtrl + 1); created.push(addArc(a, b, pts, ['', '']).id);
+      }
+      const c = [0, 1, 2, 3].map((k) => model.node(ids[k]).p).reduce((s, p) => V.add(s, V.mul(p, 0.25)), [0, 0, 0]); const q = view.project(c), h = view.pickSurface(q[0], q[1]);
+      const name = ($('compName').value || '').trim() || ('patch_' + (seeds().length + 1));
+      if (!seeds().some((z) => z.name === name)) seeds().push({ name, p: h ? h.p : c });
+      S.sel = new Set(created); S.comp = name;
+    });
+    renderCompList();
+  }
   function finishDraw() {
     const D = S.draw; if (!D || D.pts.length < 2) { S.draw = null; redraw(); return status('A curve needs at least two points.'); }
     edit('Curve drawn', () => {
@@ -236,7 +266,7 @@
   }
   async function convertToMesh() {
     status('Converting the network to quads...');
-    const body = { lines: JSON.parse(model.serialize()), params: { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10) } };
+    const body = { lines: JSON.parse(model.serialize()), params: meshParams() };
     const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
     if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
@@ -289,9 +319,9 @@
     const res = await r.json().catch(() => ({})); if (!r.ok || !res.ok) return status('Save failed : ' + (res.error || r.status), 'error');
     S.dirty = false; status('Saved to the atelier : ' + res.arcs + ' curves, ' + res.nodes + ' nodes'); redraw();
   }
-  async function loadDoc(url, label) {
+  async function loadDoc(url, label) {   // 29 October 2026 : a new document resets the preview and the selected component
     const r = await fetch(url, { cache: 'no-store' }); if (!r.ok) return status(label + ' not found (HTTP ' + r.status + ')', 'error');
-    const doc = await r.json(); model = Z.createModel(doc); model.buildNodeMirror(); S.sel.clear(); S.node = null; S.handle = null; S.dirty = false; status(label + ' loaded : ' + doc.arcs.length + ' curves, ' + doc.nodes.length + ' nodes'); redraw();
+    const doc = await r.json(); model = Z.createModel(doc); model.buildNodeMirror(); S.sel.clear(); S.node = null; S.handle = null; S.dirty = false; S.faces = null; S.comp = null; renderCompList(); status(label + ' loaded : ' + doc.arcs.length + ' curves, ' + doc.nodes.length + ' nodes'); redraw();
   }
 
   // ------------------------------------------------------------------ selection info
@@ -306,7 +336,7 @@
     if (S.handle) parts.push('control point ' + S.handle.i + ' of curve ' + S.handle.arc);
     $('selInfo').textContent = parts.join('\n') || 'Nothing selected.';
   }
-  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.' };
+  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', seed: 'Click on the model to place the component named in the Components field.' };
   function setTool(t) { S.tool = t; S.draw = t === 'draw' ? (S.draw || { pts: [] }) : null; document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === t)); $('toolHint').textContent = HINTS[t] || ''; redraw(); }
 
   // ------------------------------------------------------------------ mouse
@@ -327,6 +357,13 @@
       if (S.tool === 'insert') insertCtrl(a.id, a.p); else edit('Curve split, new node', () => { const r = splitArcAt(a.id, a.p, P().mirror); S.sel = new Set(); S.node = r.node; });
       return;
     }
+    if (S.tool === 'seed') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); addSeed(h.p); return; }
+    if (S.tool === 'patch') {                                             // 29 October 2026 : four clicks, one quad patch (Quad Draw)
+      const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
+      const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
+      S.patch = S.patch || []; S.patch.push({ p, node: n, arc: a ? a.id : null, sx: x, sy: y }); status('Patch corner ' + S.patch.length + ' of 4');
+      if (S.patch.length === 4) finishPatch(); else redraw(); return;
+    }
     if (S.tool === 'tweak') {
       if (!S.mesh) return status('Convert to a mesh first.');
       let best = -1, bd = CFG.pick.meshVertexPx; for (let i = 0; i < S.mesh.P.length; i += 3) { const q = view.project([S.mesh.P[i], S.mesh.P[i + 1], S.mesh.P[i + 2]]); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd) { bd = d; best = i / 3; } }
@@ -336,10 +373,15 @@
     if (hit && hit.type === 'handle') { S.handle = { arc: hit.arc, i: hit.i }; S.drag = { kind: 'ctrl', hit, x, y, started: false }; redraw(); return; }
     if (hit && hit.type === 'node') { S.node = hit.id; if (!ev.shiftKey) { S.sel.clear(); S.handle = null; } S.drag = { kind: 'node', hit, x, y, started: false }; redraw(); return; }
     if (hit && hit.type === 'arc') { if (ev.shiftKey) { S.sel.has(hit.id) ? S.sel.delete(hit.id) : S.sel.add(hit.id); } else S.sel = new Set([hit.id]); S.node = null; S.handle = null; redraw(); return; }
+    if (S.mesh && $('pMesh').checked) {                                   // 29 October 2026 : a click on the previewed quads selects their component
+      const h = view.pickSurface(x, y);
+      if (h) { let best = -1, bd = 0.04; const M = S.mesh; for (let q = 0; q < M.Q.length / 4; q++) { let c = [0, 0, 0]; for (let k = 0; k < 4; k++) { const i = M.Q[4 * q + k]; c[0] += M.P[3 * i] / 4; c[1] += M.P[3 * i + 1] / 4; c[2] += M.P[3 * i + 2] / 4; } const d = d3(c, h.p); if (d < bd) { bd = d; best = q; } }
+        if (best >= 0) { const fid = M.fq[best], f = (M.faces || []).find((z) => z.id === fid); if (f && f.component) { S.comp = f.component; $('compName').value = S.comp; renderCompList(); status('Face ' + fid + ' : component ' + S.comp + ', ' + (f.status || '') + (f.side_counts ? ', sides ' + f.side_counts.join(' x ') : '')); redraw(); return; } } }
+    }
     S.drag = { kind: 'box', x, y, add: ev.shiftKey };
   }
   function onMove(ev) {
-    const [x, y] = local(ev), D = S.drag;
+    const [x, y] = local(ev), D = S.drag; S.mouse = [x, y];
     if (!D) {
       if (S.tool === 'draw' && S.draw && S.draw.pts.length) { S.draw.cursor = surfacePoint(x, y); redraw(); }
       const h = view.pickSurface(x, y); $('coords').textContent = h ? h.p.map((v) => v.toFixed(3)).join('  ') : '-';
@@ -347,9 +389,9 @@
       return;
     }
     const dx = x - D.x, dy = y - D.y;
-    if (D.kind === 'orbit') { view.orbit(dx, dy); D.x = x; D.y = y; redraw(); return; }
-    if (D.kind === 'pan') { view.pan(dx, dy); D.x = x; D.y = y; redraw(); return; }
-    if (D.kind === 'zoom') { view.zoom(-dx + dy); D.x = x; D.y = y; redraw(); return; }
+    if (D.kind === 'orbit') { view.orbit(dx, dy); D.x = x; D.y = y; redraw(true); return; }
+    if (D.kind === 'pan') { view.pan(dx, dy); D.x = x; D.y = y; redraw(true); return; }
+    if (D.kind === 'zoom') { view.zoom(-dx + dy); D.x = x; D.y = y; redraw(true); return; }
     if (D.kind === 'box') { const b = $('boxSel'); Object.assign(b.style, { display: 'block', left: Math.min(x, D.x) + 'px', top: Math.min(y, D.y) + 'px', width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px' }); return; }
     if (D.kind === 'meshVertex') { const h = view.pickSurface(x, y); if (h) { S.mesh.P[3 * D.v] = h.p[0]; S.mesh.P[3 * D.v + 1] = h.p[1]; S.mesh.P[3 * D.v + 2] = h.p[2]; buildMeshLayers(); } return; }
     if ((D.kind === 'ctrl' || D.kind === 'node') && !D.started) {
@@ -366,13 +408,21 @@
       $('boxSel').style.display = 'none'; const [x, y] = local(ev), x0 = Math.min(x, D.x), x1 = Math.max(x, D.x), y0 = Math.min(y, D.y), y1 = Math.max(y, D.y);
       if (x1 - x0 < 3 && y1 - y0 < 3) { if (!D.add) { S.sel.clear(); S.node = null; S.handle = null; } redraw(); return; }
       if (!D.add) S.sel.clear();
-      for (const a of model.doc.arcs) { const s = arcPts(a.id); for (let i = 0; i < s.length; i += 9) { const q = view.project([s[i], s[i + 1], s[i + 2]]); if (q[3] > 0 && q[0] >= x0 && q[0] <= x1 && q[1] >= y0 && q[1] <= y1) { S.sel.add(a.id); break; } } }
+      const through = $('pXray').checked, buf = through ? null : view.pickRect(x0, y0, x1, y1), eye = view.st.eye;   // 29 October 2026 : only what is seen, unless X-ray
+      for (const a of model.doc.arcs) {
+        const s = arcPts(a.id);
+        for (let i = 0; i < s.length; i += 6) {
+          const p = [s[i], s[i + 1], s[i + 2]], q = view.project(p); if (!(q[3] > 0 && q[0] >= x0 && q[0] <= x1 && q[1] >= y0 && q[1] <= y1)) continue;
+          if (buf) { const sp = buf.at(q[0], q[1]); if (sp && d3(p, eye) > d3(sp, eye) + CFG.pick.hiddenTolM) continue; }
+          S.sel.add(a.id); break;
+        }
+      }
       S.handle = null; status(S.sel.size + ' curve(s) selected'); redraw(); return;
     }
-    if (D.started) { model.buildNodeMirror(); status(D.kind === 'ctrl' ? 'Control point moved' + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
+    if (D.started) { schedulePreview(); model.buildNodeMirror(); status(D.kind === 'ctrl' ? 'Control point moved' + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
     if (D.kind === 'meshVertex') status('Mesh vertex moved');
   }
-  function onWheel(ev) { ev.preventDefault(); view.zoom(ev.deltaY); redraw(); }
+  function onWheel(ev) { ev.preventDefault(); view.zoom(ev.deltaY); redraw(true); }
   function onKey(ev) {
     if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
     const k = ev.key.toLowerCase(), mod = ev.metaKey || ev.ctrlKey;
@@ -381,19 +431,99 @@
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
     if (views[k]) { view.preset(views[k]); redraw(); return; }
-    if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
+    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
     else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
     else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
+    else if (k === 'h') { if (ev.shiftKey) { view.showAllParts(); status('Every part shown'); } else { const h = view.pickSurface(S.mouse ? S.mouse[0] : 0, S.mouse ? S.mouse[1] : 0); if (h) { view.setPartHidden(h.part, true); status('Part hidden : ' + (view.st.mesh.head.parts[h.part] || h.part) + ' (Shift H shows all)'); } } redraw(true); }
     else if (k === 'r') smoothSel(CFG.edit.roundPasses); else if (k === 'j') { if (S.node !== null) joinAtNode(S.node); else status('Select a node with two curves.'); }
     else if (k === 'delete' || (k === 'backspace' && S.tool !== 'draw')) { ev.preventDefault(); deleteSelection(); }
     else if (k === 'backspace' && S.tool === 'draw' && S.draw) { S.draw.pts.pop(); redraw(); }
     else if (k === 'enter' && S.tool === 'draw') finishDraw();
-    else if (k === 'escape') { if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
+    else if (k === 'escape') { if (S.patch) S.patch = null; else if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
   }
   function frameSel() {
     const pts = []; for (const id of S.sel) { const s = arcPts(id); for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); }
     if (S.node !== null && model.node(S.node)) { const p = model.node(S.node).p; pts.push(V.add(p, [0.15, 0.15, 0.15]), V.sub(p, [0.15, 0.15, 0.15])); }
     if (!pts.length) { const b = view.st.mesh.head.bbox; pts.push(b[0], b[1]); } view.frame(pts); redraw();
+  }
+
+  // ------------------------------------------------------------------ components : the registry (named seeds), the faces preview, per component options
+  const seeds = () => (model.doc.component_seeds || (model.doc.component_seeds = []));
+  const compOpts = () => (model.doc.component_options || (model.doc.component_options = {}));
+  function hashColour(name) { let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0; const hue = (h % 360) / 360, s = 0.55, l = 0.5; const f = (n) => { const k = (n + hue * 12) % 12, a = s * Math.min(l, 1 - l); return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); }; return [f(0), f(8), f(4), 1]; }
+  function addSeed(p) {
+    const name = ($('compName').value || '').trim() || ('component_' + (seeds().length + 1));
+    if (seeds().some((q) => q.name === name)) return status('A component named ' + name + ' already exists : rename it or pick another name.', 'error');
+    edit('Component ' + name + ' added', () => { seeds().push({ name, p: clone3(p) }); S.comp = name; });
+    renderCompList();
+  }
+  function renameComp() {
+    const to = ($('compName').value || '').trim(); if (!S.comp || !to) return status('Select a component and type its new name.');
+    if (seeds().some((q) => q.name === to)) return status('The name ' + to + ' is taken.', 'error');
+    const from = S.comp;
+    edit('Component ' + from + ' renamed ' + to, () => { for (const q of seeds()) if (q.name === from) q.name = to; for (const a of model.doc.arcs) a.pair = (a.pair || []).map((n) => (n === from ? to : n));
+      if (compOpts()[from]) { compOpts()[to] = compOpts()[from]; delete compOpts()[from]; } S.comp = to; });
+    renderCompList();
+  }
+  function deleteComp() { if (!S.comp) return status('Select a component first.'); const n = S.comp; edit('Component ' + n + ' removed from the registry', () => { model.doc.component_seeds = seeds().filter((q) => q.name !== n); delete compOpts()[n]; S.comp = null; }); renderCompList(); }
+  async function importSeeds() {
+    const r = await fetch(CFG.files.seeds, { cache: 'no-store' }); if (!r.ok) return status('No seeds file (run Scripts/lines/ZrlSeeds.py)', 'error');
+    const list = await r.json(); edit(list.length + ' components imported', () => { const have = new Set(seeds().map((q) => q.name)); for (const q of list) if (!have.has(q.name)) seeds().push({ name: q.name, p: q.p }); });
+    renderCompList();
+  }
+  function setCompOption(key, value) { if (!S.comp) return status('Select a component first.'); edit('Option ' + key + ' of ' + S.comp + ' set to ' + value, () => { const o = compOpts()[S.comp] || (compOpts()[S.comp] = {}); o[key] = value; }); renderCompList(); }
+  function faceOptions() { const out = {}; if (!S.faces) return out; for (const f of S.faces) { const o = f.component && compOpts()[f.component]; if (o) out[f.id] = o; } return out; }
+  function renderCompList() {
+    const list = $('compList'); if (!list) return; const faces = S.faces || [], byComp = {}; for (const f of faces) if (f.component) (byComp[f.component] = byComp[f.component] || []).push(f);
+    const rows = seeds().map((q) => { const fs = byComp[q.name] || [], o = compOpts()[q.name] || {}, c = hashColour(q.name).slice(0, 3).map((v) => Math.round(v * 255));
+      const st = fs.length ? fs.map((f) => f.status + (f.side_counts ? ' ' + f.side_counts.join('x') : '')).join(', ') : (faces.length ? 'no face' : '');
+      return `<div class="row-c${S.comp === q.name ? ' sel' : ''}" data-name="${q.name}"><i style="background:rgb(${c.join(',')})"></i><span>${q.name.replace(/^CAR_/, '')}</span><small>${st}${o.skip ? ' skip' : ''}${o.rotate ? ' rot ' + o.rotate : ''}${o.edge_scale && o.edge_scale !== 1 ? ' density x' + (1 / o.edge_scale).toFixed(2) : ''}</small></div>`; });
+    const unnamed = faces.filter((f) => !f.component).length;
+    list.innerHTML = rows.join('') + (faces.length ? `<div class="hint">${faces.length} faces, ${unnamed} without a component</div>` : '');
+    $('compCount').textContent = seeds().length;
+    list.querySelectorAll('.row-c').forEach((el) => el.addEventListener('click', () => { S.comp = el.dataset.name; $('compName').value = S.comp; const q = seeds().find((z) => z.name === S.comp); if (q && q.p) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]); renderCompList(); redraw(); }));
+  }
+  function renderComponents() {
+    const pts = seeds().map((q) => ({ p: q.p, color: S.comp === q.name ? CFG.colors.sel : hashColour(q.name), size: CFG.preview.seedSize * (S.comp === q.name ? 1.4 : 1) }));
+    view.setPoints('seeds', pts, { onTop: true, order: 8 });
+    if (S.faces && $('pFaces').checked) {
+      const polys = [], corners = [];
+      for (const f of S.faces) { if (!f.boundary || f.boundary.length < 6) continue; const col = f.status === 'skipped' || f.status === 'infeasible' ? [0.6, 0.6, 0.6, 1] : f.component ? hashColour(f.component) : [0.85, 0.2, 0.6, 1];
+        polys.push({ pts: f.boundary, color: S.comp && f.component === S.comp ? CFG.colors.sel : col }); for (const c of f.corner_points || []) corners.push({ p: c, color: [0.95, 0.5, 0.1, 1], size: CFG.preview.cornerSize }); }
+      view.setRibbons('faces', polys, { width: CFG.preview.faceWidth, order: 1.5 }); view.setPoints('corners', corners, { order: 9 });
+    } else { view.clearLayer('faces'); view.clearLayer('corners'); }
+    renderTags();
+  }
+  function renderTags() {   // 29 October 2026 : name tags of the seeds, an HTML layer over the canvas, hidden when the seed faces away
+    const host = $('tags'); if (!host) return; const show = $('pTags').checked, c3 = view.st.mesh ? view.st.mesh.head.bbox : null; let html = '';
+    if (show && c3) { const ctr = [(c3[0][0] + c3[1][0]) / 2, (c3[0][1] + c3[1][1]) / 2, (c3[0][2] + c3[1][2]) / 2];
+      for (const q of seeds()) { const v = view.project(q.p); if (v[3] <= 0) continue; const facing = V.dot(V.sub(q.p, ctr), V.sub(view.st.eye, q.p)) > 0; if (!facing && !$('pXray').checked) continue;
+        html += `<div class="tag${S.comp === q.name ? ' sel' : ''}" style="left:${v[0].toFixed(0)}px;top:${v[1].toFixed(0)}px">${q.name.replace(/^CAR_/, '')}</div>`; } }
+    host.innerHTML = html;
+  }
+  let facesTimer = null, meshTimer = null, previewSeq = 0;
+  function schedulePreview() {
+    if (!$('pLive') || !$('pLive').checked) return; clearTimeout(facesTimer); clearTimeout(meshTimer);
+    facesTimer = setTimeout(() => safe(previewFaces)(), CFG.preview.facesDelayMs);
+    if ($('pLiveMesh').checked) meshTimer = setTimeout(() => safe(convertToMesh)(), CFG.preview.meshDelayMs);
+  }
+  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), face_options: faceOptions() }; }
+  async function previewFaces() {
+    const seq = ++previewSeq; const t0 = performance.now();
+    const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: JSON.parse(model.serialize()), params: meshParams() }) });
+    if (r.status === 404 || r.status === 501) { if (!S.noFaces) { S.noFaces = true; status('Live preview needs the updated server (POST /faces)', 'error'); } return; }   // 29 October 2026 : said once
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (seq !== previewSeq) return;
+    if (!r.ok || res.ok === false) return status('Preview failed : ' + (res.error || r.status), 'error');
+    S.faces = res.faces || []; const by = {}; for (const f of S.faces) by[f.status] = (by[f.status] || 0) + 1;
+    status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
+    renderCompList(); redraw();
+  }
+  async function sendToHoudini() {
+    if (!S.mesh) await convertToMesh(); if (!S.mesh) return;
+    const names = {}; for (const f of S.mesh.faces || []) if (f.component) names[f.id] = f.component;      // 29 October 2026 : the mesh as shown, tweaks included
+    const r = await fetch(CFG.files.houdini, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ P: Array.from(S.mesh.P), Q: Array.from(S.mesh.Q), face_of_quad: S.mesh.fq, face_names: names }) });
+    const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Houdini : ' + (res.error || r.status), 'error');
+    status('Sent to Houdini : ' + (res.node || '') + ' ' + (res.prims != null ? res.prims + ' quads' : ''));
   }
 
   // ------------------------------------------------------------------ boot
@@ -418,15 +548,23 @@
     on('bSelText', () => { const t = $('selText').value.trim().toLowerCase(); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).some((n) => n && n.toLowerCase().includes(t)) || String(a.id) === t).map((a) => a.id)); status(S.sel.size + ' curve(s) selected'); redraw(); });
     on('bSelAll', () => { S.sel = new Set(model.doc.arcs.map((a) => a.id)); redraw(); }); on('bSelNone', () => { S.sel.clear(); S.node = null; S.handle = null; redraw(); });
     on('bSelInvert', () => { S.sel = new Set(model.doc.arcs.filter((a) => !S.sel.has(a.id)).map((a) => a.id)); redraw(); });
+    on('bCompImport', importSeeds); on('bCompRename', renameComp); on('bCompDelete', deleteComp); on('bCompAdd', () => setTool('seed'));
+    on('bCompSkip', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('skip', !(o && o.skip)); schedulePreview(); });
+    on('bCompRotate', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('rotate', ((o && o.rotate) || 0) + 1 & 3); schedulePreview(); });
+    on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
+    on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
+    on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
+    on('bCompCurves', () => { if (!S.comp) return status('Select a component first.'); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).includes(S.comp)).map((a) => a.id)); status(S.sel.size + ' curve(s) border ' + S.comp); redraw(); });
+    for (const id of ['pFaces', 'pTags']) $(id).addEventListener('change', redraw);
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
     on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network'));
     for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
-    for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh']) $(id).addEventListener('change', redraw);
+    for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
-    view.preset('persp'); setTool('select'); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh } };
+    view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles');
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

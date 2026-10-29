@@ -8,7 +8,7 @@
 const View3D = (() => {
   const CFG = {   // 29 October 2026 : every tunable value of the engine
     fov: 32, near: 0.02, far: 60, bg: [0.965, 0.965, 0.96, 1], meshColor: [0.80, 0.82, 0.86], xrayAlpha: 0.28, highlight: [0.95, 0.55, 0.2],
-    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.05, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.22,
+    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.05, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14,
   };
   const V = {
     sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
@@ -30,12 +30,12 @@ uniform mat4 uMVP; out vec3 vN; out vec3 vP; flat out float vPart;
 void main(){ vN=aN; vP=aP; vPart=aPart; gl_Position=uMVP*vec4(aP,1.0); }`,
     meshF: `#version 300 es
 precision highp float; in vec3 vN; in vec3 vP; flat in float vPart;
-uniform vec3 uEye; uniform vec3 uColor; uniform float uAlpha; uniform float uHiPart; uniform vec3 uHi; out vec4 o;
-void main(){ vec3 n=normalize(vN); vec3 v=normalize(uEye-vP); float d=abs(dot(n,v)); vec3 c=uColor*(0.32+0.68*d)+0.10*pow(1.0-d,3.0);
+uniform vec3 uEye; uniform vec3 uColor; uniform float uAlpha; uniform float uHiPart; uniform vec3 uHi; uniform highp sampler2D uHidden; out vec4 o;
+void main(){ if(texelFetch(uHidden, ivec2(int(vPart+0.5),0), 0).r>0.5) discard; vec3 n=normalize(vN); vec3 v=normalize(uEye-vP); float d=abs(dot(n,v)); vec3 c=uColor*(0.32+0.68*d)+0.10*pow(1.0-d,3.0);
  if(abs(vPart-uHiPart)<0.5) c=mix(c,uHi,0.35); o=vec4(c,uAlpha); }`,
     pickF: `#version 300 es
-precision highp float; in vec3 vN; in vec3 vP; flat in float vPart;
-layout(location=0) out vec4 oP; layout(location=1) out vec4 oN; void main(){ oP=vec4(vP,1.0); oN=vec4(normalize(vN), vPart); }`,
+precision highp float; in vec3 vN; in vec3 vP; flat in float vPart; uniform highp sampler2D uHidden;
+layout(location=0) out vec4 oP; layout(location=1) out vec4 oN; void main(){ if(texelFetch(uHidden, ivec2(int(vPart+0.5),0), 0).r>0.5) discard; oP=vec4(vP,1.0); oN=vec4(normalize(vN), vPart); }`,
     ribV: `#version 300 es
 layout(location=0) in vec3 a0; layout(location=1) in vec3 a1; layout(location=2) in vec2 aTS; layout(location=3) in vec4 aC;
 uniform mat4 uMVP; uniform vec2 uVP; uniform float uW; uniform float uBias; out vec4 vC;
@@ -79,6 +79,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
       gl.bindVertexArray(null);
       st.mesh = { vao, count: nt * 3, head, pos, idx, part };
+      st.hidden = new Uint8Array(Math.max(1, head.parts.length)); st.hiddenTex = gl.createTexture(); uploadHidden();
       const b = head.bbox; cam.target = [(b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2, (b[0][2] + b[1][2]) / 2];
       cam.dist = 1.6 * Math.max(b[1][0] - b[0][0], b[1][1] - b[0][1], b[1][2] - b[0][2]);
     }
@@ -122,6 +123,13 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, L.bufs[2]); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, tris, gl.DYNAMIC_DRAW); gl.bindVertexArray(null);
       Object.assign(L, { count: tris.length, visible: true, order: -1 });
     }
+    function uploadHidden() {   // 29 October 2026 : one texel per part, 255 = hidden (not drawn, not picked)
+      gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, st.hidden.length, 1, 0, gl.RED, gl.UNSIGNED_BYTE, st.hidden);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    }
+    const setPartHidden = (part, v) => { if (!st.hidden || part < 0 || part >= st.hidden.length) return; st.hidden[part] = v ? 255 : 0; uploadHidden(); };
+    const showAllParts = () => { if (st.hidden) { st.hidden.fill(0); uploadHidden(); } };
     const setVisible = (name, v) => { if (st.layers[name]) st.layers[name].visible = v; };
     const clearLayer = (name) => { if (st.layers[name]) st.layers[name].visible = false; };
 
@@ -143,6 +151,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       if (st.mesh && st.showMesh) {
         gl.useProgram(P.mesh.p); gl.uniformMatrix4fv(P.mesh.u.uMVP, false, st.MVP); gl.uniform3fv(P.mesh.u.uEye, st.eye); gl.uniform3fv(P.mesh.u.uColor, CFG.meshColor);
         gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : 1.0);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.mesh.u.uHidden, 0);
         gl.depthMask(!st.xray); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0); gl.depthMask(true);
       }
       const layers = Object.values(st.layers).filter((L) => L.visible && L.count > 0).sort((a, b) => a.order - b.order);
@@ -154,7 +163,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
         } else if (L.kind === 'rib') {
           gl.useProgram(P.rib.p); gl.uniformMatrix4fv(P.rib.u.uMVP, false, st.MVP); gl.uniform2fv(P.rib.u.uVP, vp); gl.uniform1f(P.rib.u.uW, L.width * st.dpr); gl.uniform1f(P.rib.u.uBias, CFG.lineDepthBias);
           gl.bindVertexArray(L.vao);
-          if (L.hidden) { gl.disable(gl.DEPTH_TEST); gl.uniform1f(P.rib.u.uAlpha, CFG.hiddenAlpha); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0); gl.enable(gl.DEPTH_TEST); }
+          if (L.hidden && st.showHidden !== false) { gl.disable(gl.DEPTH_TEST); gl.uniform1f(P.rib.u.uAlpha, CFG.hiddenAlpha); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0); gl.enable(gl.DEPTH_TEST); }
           gl.uniform1f(P.rib.u.uAlpha, 1.0); gl.drawElements(gl.TRIANGLES, L.count, gl.UNSIGNED_INT, 0);
         } else {
           gl.useProgram(P.pt.p); gl.uniformMatrix4fv(P.pt.u.uMVP, false, st.MVP); gl.uniform1f(P.pt.u.uBias, CFG.lineDepthBias * 2); gl.bindVertexArray(L.vao);
@@ -181,12 +190,27 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       matrices(); gl.bindFramebuffer(gl.FRAMEBUFFER, st.pickFbo); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
       gl.viewport(0, 0, w, h); gl.enable(gl.SCISSOR_TEST); gl.scissor(px, py, 1, 1);
       gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, -1]); gl.clear(gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-      gl.useProgram(P.pick.p); gl.uniformMatrix4fv(P.pick.u.uMVP, false, st.MVP); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0);
+      gl.useProgram(P.pick.p); gl.uniformMatrix4fv(P.pick.u.uMVP, false, st.MVP); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.pick.u.uHidden, 0); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0);
       const a = new Float32Array(4), b = new Float32Array(4);
       gl.readBuffer(gl.COLOR_ATTACHMENT0); gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, a); gl.readBuffer(gl.COLOR_ATTACHMENT1); gl.readPixels(px, py, 1, 1, gl.RGBA, gl.FLOAT, b);
       gl.disable(gl.SCISSOR_TEST); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.enable(gl.BLEND); gl.bindVertexArray(null);
       if (a[3] < 0.5) return null;
       return { p: [a[0], a[1], a[2]], n: [b[0], b[1], b[2]], part: Math.round(b[3]) };
+    }
+    // world positions of the model inside a screen rectangle (css px), one float RGBA per device pixel : visibility tests in bulk
+    function pickRect(x0, y0, x1, y1) {
+      if (!st.mesh || !floatOk) return null;
+      pickSurface(Math.round((x0 + x1) / 2), Math.round((y0 + y1) / 2));        // makes sure the pick target exists at this size
+      const w = canvas.width, h = canvas.height, px0 = Math.max(0, Math.floor(x0 * st.dpr)), px1 = Math.min(w, Math.ceil(x1 * st.dpr));
+      const py0 = Math.max(0, Math.floor(h - y1 * st.dpr)), py1 = Math.min(h, Math.ceil(h - y0 * st.dpr)), rw = px1 - px0, rh = py1 - py0;
+      if (rw <= 0 || rh <= 0) return null;
+      matrices(); gl.bindFramebuffer(gl.FRAMEBUFFER, st.pickFbo); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+      gl.viewport(0, 0, w, h); gl.enable(gl.SCISSOR_TEST); gl.scissor(px0, py0, rw, rh);
+      gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, -1]); gl.clear(gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.useProgram(P.pick.p); gl.uniformMatrix4fv(P.pick.u.uMVP, false, st.MVP); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.pick.u.uHidden, 0); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0);
+      const data = new Float32Array(rw * rh * 4); gl.readBuffer(gl.COLOR_ATTACHMENT0); gl.readPixels(px0, py0, rw, rh, gl.RGBA, gl.FLOAT, data);
+      gl.disable(gl.SCISSOR_TEST); gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.enable(gl.BLEND); gl.bindVertexArray(null);
+      return { at(x, y) { const px = Math.floor(x * st.dpr) - px0, py = Math.floor(h - y * st.dpr) - py0; if (px < 0 || py < 0 || px >= rw || py >= rh) return null; const i = 4 * (py * rw + px); return data[i + 3] > 0.5 ? [data[i], data[i + 1], data[i + 2]] : null; } };
     }
     function project(p) {
       const m = st.MVP; const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15];
@@ -217,7 +241,7 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, CFG.pitchLimit], bottom: [0, -CFG.pitchLimit], persp: [0.9, 0.35] }[name];
       if (t) { cam.yaw = t[0]; cam.pitch = t[1]; }
     }
-    return { gl, CFG, cam, st, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
+    return { gl, CFG, cam, st, setPartHidden, showAllParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas };
   }
   return { create, CFG, V };
 })();

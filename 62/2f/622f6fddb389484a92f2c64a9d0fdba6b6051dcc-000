@@ -1,54 +1,93 @@
 """29 October 2026 : ZenRay Lines COUNTS, the interval assignment of a component layout (Mitchell 2000 ; Bessmeltsev et al. 2012 ;
 Lyon, Campen, Kobbelt 2021) : ONE integer edge count per shared arc, so two neighbours sample the same arc the same way (welded) and
-every patch closes : a four sided patch has equal counts on opposite sides ; a three sided patch (one pole of valence 3, Tarini 2022)
-needs e_i = s_(i-1) + s_(i+1) with s positive integers ; mirrored arcs carry the same count. Objective : the smallest relative
-deviation from the target counts (length / edge_m), solved by scipy.optimize.milp (HiGHS).
+every patch closes : a four sided patch has equal counts on opposite sides ; a 3, 5 or 6 sided patch (one pole of valence N, Tarini
+2022) needs e_i = s_(i-1) + s_(i+1) with s positive integers (the s_i are the spoke lengths) ; mirrored arcs carry the same count.
+Objective : the smallest relative deviation from the target counts (length / edge_m), solved by scipy.optimize.milp (HiGHS).
 EN: layout json : {"arcs": {"a1": length_m, ...}, "mirror": [["a1", "a2"], ...], "patches": [{"name": .., "sides": [["a1", "a3"], ...]}]}
+    solve(layout, edge_m, elastic=False) : elastic=True adds slack to every patch / mirror row (heavily penalised) so that an infeasible
+    layout still returns counts and "violations" tells which patches could not close (the caller drops them and solves again, hard).
 python ZrlCounts.py <layout.json> [edge_m]   |   python ZrlCounts.py selftest
 FR : un nombre d'arêtes entier par arc partagé, pour que deux voisins soient soudés et que chaque patch ferme."""
 import json, sys
 import numpy as np
 from scipy.optimize import milp, LinearConstraint, Bounds
+from scipy.sparse import coo_matrix
 
-PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000}   # 29 October 2026
+PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000, "slack_patch": 1000.0, "slack_mirror": 30.0, "time_limit_s": 20.0}   # 29 October 2026
+SIDES = (3, 4, 5, 6)
 
 
-def solve(layout, edge_m=None):
+def solve(layout, edge_m=None, elastic=False):
     e = edge_m or PARAMS["edge_m"]; arcs = list(layout["arcs"]); ix = {a: i for i, a in enumerate(arcs)}; n = len(arcs)
     tgt = np.array([max(PARAMS["min_count"], layout["arcs"][a] / e) for a in arcs])
-    extra = []                                                    # Tarini s variables of three sided patches
-    rows = []; lo = []; hi = []
+    patches = layout["patches"]
+    s_off = {}; m = 0                                                     # Tarini s variables of the 3, 5, 6 sided patches
+    for pi, p in enumerate(patches):
+        k = len(p["sides"])
+        if k not in SIDES: raise ValueError(f"patch {p['name']} has {k} sides : only 3, 4, 5 or 6 are handled")
+        if k != 4: s_off[pi] = m; m += k
+    rows = []                                                             # (coefficient dict over variables, tag) ; every row is "= 0"
     def side_vec(side):
-        v = np.zeros(n); [v.__setitem__(ix[a], v[ix[a]] + 1) for a in side]; return v
-    for p in layout["patches"]:
-        S = [side_vec(s) for s in p["sides"]]
-        if len(S) == 4:
-            for a, b in ((0, 2), (1, 3)): rows.append(np.r_[S[a] - S[b], np.zeros(0)]); lo.append(0); hi.append(0)
-        elif len(S) == 3:
-            k0 = len(extra); extra += [p["name"]] * 3              # s_0, s_1, s_2 ; side i = s_(i-1) + s_(i+1)
-            for i in range(3):
-                r = list(S[i]); rows.append((np.array(r), {k0 + (i - 1) % 3: -1.0, k0 + (i + 1) % 3: -1.0})); lo.append(0); hi.append(0)
+        d = {}
+        for a in side: d[ix[a]] = d.get(ix[a], 0.0) + 1.0
+        return d
+    def combine(*terms):
+        out = {}
+        for coef, d in terms:
+            for k_, v in d.items(): out[k_] = out.get(k_, 0.0) + coef * v
+        return out
+    for pi, p in enumerate(patches):
+        S = [side_vec(s) for s in p["sides"]]; k = len(S)
+        if k == 4:
+            rows.append((combine((1, S[0]), (-1, S[2])), ("patch", pi))); rows.append((combine((1, S[1]), (-1, S[3])), ("patch", pi)))
         else:
-            raise ValueError(f"patch {p['name']} has {len(S)} sides : only 3 or 4 are handled")
-    m = len(extra); N = n + m + n                                  # counts, tarini s, absolute deviation t
-    A = []
-    for r in rows:
-        v = np.zeros(N)
-        if isinstance(r, tuple): v[:n] = r[0]; [v.__setitem__(n + k, c) for k, c in r[1].items()]
-        else: v[:n] = r[:n]
-        A.append(v)
-    for a, b in layout.get("mirror", []):
-        v = np.zeros(N); v[ix[a]] = 1; v[ix[b]] = -1; A.append(v); lo.append(0); hi.append(0)
-    for i in range(n):                                             # t_i >= |x_i - tgt_i| / tgt_i
-        v = np.zeros(N); v[i] = 1.0 / tgt[i]; v[n + m + i] = -1; A.append(v); lo.append(-np.inf); hi.append(1.0)
-        v = np.zeros(N); v[i] = -1.0 / tgt[i]; v[n + m + i] = -1; A.append(v); lo.append(-np.inf); hi.append(-1.0)
-    c = np.r_[np.zeros(n + m), np.ones(n)]
-    integ = np.r_[np.ones(n + m), np.zeros(n)]
-    b_lo = np.r_[np.full(n, PARAMS["min_count"]), np.ones(m), np.zeros(n)]; b_hi = np.r_[np.full(n, PARAMS["max_count"]), np.full(m, PARAMS["max_count"]), np.full(n, np.inf)]
-    r = milp(c, constraints=LinearConstraint(np.array(A), lo, hi), integrality=integ, bounds=Bounds(b_lo, b_hi))
-    if not r.success: return {"ok": False, "status": r.message}
+            o = s_off[pi]
+            for i in range(k):                                            # side i = s_(i-1) + s_(i+1)
+                rows.append((combine((1, S[i]), (-1, {n + o + (i - 1) % k: 1.0}), (-1, {n + o + (i + 1) % k: 1.0})), ("patch", pi)))
+    for j, (a, b) in enumerate(layout.get("mirror", [])):
+        if a in ix and b in ix and a != b: rows.append(({ix[a]: 1.0, ix[b]: -1.0}, ("mirror", j)))
+    R = len(rows); nv = n + m + n; ns = 2 * R if elastic else 0; N = nv + ns
+    r_i, c_i, vals = [], [], []; lo, hi = [], []
+    for ri, (d, _) in enumerate(rows):
+        for k_, v in d.items(): r_i.append(ri); c_i.append(k_); vals.append(v)
+        if elastic: r_i += [ri, ri]; c_i += [nv + 2 * ri, nv + 2 * ri + 1]; vals += [1.0, -1.0]
+        lo.append(0.0); hi.append(0.0)
+    for i in range(n):                                                    # t_i >= |x_i - tgt_i| / tgt_i
+        base = R + 2 * i
+        r_i += [base, base, base + 1, base + 1]; c_i += [i, n + m + i, i, n + m + i]; vals += [1.0 / tgt[i], -1.0, -1.0 / tgt[i], -1.0]
+        lo += [-np.inf, -np.inf]; hi += [1.0, -1.0]
+    A = coo_matrix((vals, (r_i, c_i)), shape=(R + 2 * n, N)).tocsr()
+    cost = np.r_[np.zeros(n + m), np.ones(n)]
+    if elastic:
+        w = np.array([PARAMS["slack_patch"] if rows[ri][1][0] == "patch" else PARAMS["slack_mirror"] for ri in range(R)])
+        cost = np.r_[cost, np.repeat(w, 2)]
+    integ = np.r_[np.ones(n + m), np.zeros(n + ns)]
+    b_lo = np.r_[np.full(n, PARAMS["min_count"]), np.ones(m), np.zeros(n + ns)]
+    b_hi = np.r_[np.full(n, PARAMS["max_count"]), np.full(m, PARAMS["max_count"]), np.full(n + ns, np.inf)]
+    r = milp(cost, constraints=LinearConstraint(A, lo, hi), integrality=integ, bounds=Bounds(b_lo, b_hi), options={"time_limit": PARAMS["time_limit_s"]})
+    if r.x is None: return {"ok": False, "status": r.message}
     x = np.round(r.x[:n]).astype(int)
-    return {"ok": True, "counts": {a: int(x[ix[a]]) for a in arcs}, "mean_rel_dev": float(np.mean(np.abs(x - tgt) / tgt)), "max_rel_dev": float(np.max(np.abs(x - tgt) / tgt))}
+    out = {"ok": True, "counts": {a: int(x[ix[a]]) for a in arcs}, "mean_rel_dev": float(np.mean(np.abs(x - tgt) / tgt)) if n else 0.0,
+           "max_rel_dev": float(np.max(np.abs(x - tgt) / tgt)) if n else 0.0, "violations": {}, "violated_mirror": []}
+    out["tarini"] = {patches[pi]["name"]: [int(round(v)) for v in r.x[n + o: n + o + len(patches[pi]["sides"])]] for pi, o in s_off.items()}
+    if elastic:
+        sl = r.x[nv:nv + ns].reshape(R, 2).sum(1)
+        for ri, (_, tag) in enumerate(rows):
+            if sl[ri] > 0.5:
+                if tag[0] == "patch": out["violations"][patches[tag[1]]["name"]] = out["violations"].get(patches[tag[1]]["name"], 0.0) + float(sl[ri])
+                else: out["violated_mirror"].append(list(layout["mirror"][tag[1]]))
+    return out
+
+
+def tarini_s(e):
+    """The spoke lengths s of a 3, 5 or 6 sided patch with side counts e (None when no positive integer solution exists)."""
+    k = len(e)
+    M = np.zeros((k, k))
+    for i in range(k): M[i, (i - 1) % k] += 1; M[i, (i + 1) % k] += 1
+    try: s = np.linalg.solve(M, np.asarray(e, float))
+    except np.linalg.LinAlgError: return None
+    r = np.round(s)
+    return [int(v) for v in r] if np.all(np.abs(s - r) < 1e-6) and np.all(r >= 1) else None
 
 
 def check(layout, counts):
@@ -57,11 +96,10 @@ def check(layout, counts):
     for p in layout["patches"]:
         s = [sum(counts[a] for a in side) for side in p["sides"]]
         if len(s) == 4 and (s[0] != s[2] or s[1] != s[3]): bad.append(p["name"])
-        if len(s) == 3:
-            t = sum(s)
-            if t % 2 or any(2 * s[i] >= t for i in range(3)): bad.append(p["name"])
+        elif len(s) in (3, 5, 6) and tarini_s(s) is None: bad.append(p["name"])
+        elif len(s) not in SIDES: bad.append(p["name"])
     for a, b in layout.get("mirror", []):
-        if counts[a] != counts[b]: bad.append(f"mirror {a} {b}")
+        if a in counts and b in counts and counts[a] != counts[b]: bad.append(f"mirror {a} {b}")
     return bad
 
 
@@ -73,7 +111,22 @@ def selftest():
                      {"name": "T", "sides": [["r2"], ["x"], ["y"]]}]}
     s = solve(L, 0.02); good = s["ok"] and not check(L, s["counts"])
     broken = dict(s["counts"]); broken["t1"] += 1; red = bool(check(L, broken))
-    print("solve", s, "\ngreen on the solved counts :", good, "; red on a broken count :", red); return good and red
+    print("solve", s, "\ngreen on the solved counts :", good, "; red on a broken count :", red)
+    # five and six sided patches : lengths are exactly the Tarini counts (6,4,3,5,4) and (4,2,4,2,4,2), the solver must reproduce them
+    e5 = [6, 4, 3, 5, 4]; e6 = [4, 2, 4, 2, 4, 2]
+    L5 = {"arcs": {f"p{i}": 0.02 * v for i, v in enumerate(e5)}, "mirror": [], "patches": [{"name": "P5", "sides": [[f"p{i}"] for i in range(5)]}]}
+    L6 = {"arcs": {f"q{i}": 0.02 * v for i, v in enumerate(e6)}, "mirror": [], "patches": [{"name": "P6", "sides": [[f"q{i}"] for i in range(6)]}]}
+    s5, s6 = solve(L5, 0.02), solve(L6, 0.02)
+    ok5 = s5["ok"] and [s5["counts"][f"p{i}"] for i in range(5)] == e5 and not check(L5, s5["counts"]) and s5["tarini"]["P5"] == [3, 2, 1, 1, 4]
+    ok6 = s6["ok"] and [s6["counts"][f"q{i}"] for i in range(6)] == e6 and not check(L6, s6["counts"]) and s6["tarini"]["P6"] == [1, 2, 1, 2, 1, 2]
+    b5 = dict(s5["counts"]); b5["p0"] += 1; b6 = dict(s6["counts"]); b6["q1"] += 1
+    red56 = bool(check(L5, b5)) and bool(check(L6, b6))
+    print("5 sided", ok5, s5.get("tarini"), "; 6 sided", ok6, s6.get("tarini"), "; red on broken 5 and 6 :", red56)
+    # an infeasible layout (4 sided patch whose opposite sides are the very same arcs of different fixed multiplicity) must be reported by the elastic solve
+    LI = {"arcs": {"u": 0.1, "v": 0.1, "w": 0.1}, "mirror": [], "patches": [{"name": "I", "sides": [["u"], ["v"], ["u", "u"], ["w"]]}]}
+    si = solve(LI, 0.02, elastic=True); infeas = si["ok"] and "I" in si["violations"]
+    print("elastic reports the impossible patch :", infeas, si.get("violations"))
+    return bool(good and red and ok5 and ok6 and red56 and infeas)
 
 
 if __name__ == "__main__":
