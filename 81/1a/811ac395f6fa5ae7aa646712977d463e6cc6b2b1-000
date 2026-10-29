@@ -39,6 +39,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "soft_corner_deg": 45.0,          # ... a bend turning more than this over the window is a corner
     "cross_tol_m": 0.006,             # 29 October 2026 : two curves passing closer than this away from their nodes cross : both are split there, one node
     "cross_min_deg": 20.0,            # ... only when their directions differ by more than this (below, they overlap : reported, not split)
+    "cross_split": False,             # 29 October 2026 : False = crossings are reported (issue "crossing"), not split : splitting merged the roof and the windshield away
     "annulus_check": True,
     "untangle_iters": 400,            # 29 October 2026 : folded patches get a Winslow pass in their own plane (0 = off) ; kept only when the face folds less
     "overlap_check": True,            # 29 October 2026 : two meshable faces covering the same place (doubled curves) : the named one, else the smaller, is kept
@@ -379,10 +380,16 @@ class Net:
                     pa, pb = A["pts"][m], B["pts"][k[m]]
                     ends = [self.nodes[v] for v in (A["a"], A["b"], B["a"], B["b"]) if v >= 0 and v in self.nodes]
                     if ends and min(min(np.linalg.norm(pa - e), np.linalg.norm(pb - e)) for e in ends) < guard: done.add((i, j)); continue
-                    ta = A["pts"][min(m + 1, len(A["pts"]) - 1)] - A["pts"][max(m - 1, 0)]; tb = B["pts"][min(k[m] + 1, len(B["pts"]) - 1)] - B["pts"][max(k[m] - 1, 0)]
+                    w = max(1, int(round(self.prm["tangent_dist_m"] / max(self.prm["step_m"], 1e-6))))   # 29 October 2026 : directions over 2 cm, not one noisy step
+                    ta = A["pts"][min(m + w, len(A["pts"]) - 1)] - A["pts"][max(m - w, 0)]; tb = B["pts"][min(k[m] + w, len(B["pts"]) - 1)] - B["pts"][max(k[m] - w, 0)]
                     ang = math.degrees(math.acos(min(1.0, abs(float(ta @ tb)) / max(np.linalg.norm(ta) * np.linalg.norm(tb), 1e-30))))
                     if ang < self.prm["cross_min_deg"]:
                         done.add((i, j)); self.issues.append({"kind": "overlap", "arc": int(A["parent"]), "value": round(float(d[m]), 6), "fix": "runs along arc %d : delete one of them" % B["parent"]}); continue
+                    nb = self.ref.normals_at(pa[None])[0]; side = lambda q: float(np.cross(q - pa, ta) @ nb); kb = int(k[m]); dlt = max(2, int(round(0.01 / max(self.prm["step_m"], 1e-6))))
+                    if side(B["pts"][max(kb - dlt, 0)]) * side(B["pts"][min(kb + dlt, len(B["pts"]) - 1)]) >= 0: done.add((i, j)); continue   # 29 October 2026 : touching is not crossing
+                    if not self.prm.get("cross_split"):
+                        done.add((i, j)); self.crossings.append([round(float(c), 4) for c in pa])
+                        self.issues.append({"kind": "crossing", "arc": int(A["parent"]), "value": round(float(d[m]), 6), "fix": "crosses arc %d without a node at %s : split one of them there (S) or move it" % (B["parent"], [round(float(c), 3) for c in pa])}); continue
                     found = (i, j, float(A["cum"][m]), float(B["cum"][k[m]]), pa); break
                 if found: break
             if not found: return

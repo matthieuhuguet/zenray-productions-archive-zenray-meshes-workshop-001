@@ -9,7 +9,7 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', seeds: 'data/seeds_v752.json' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', seeds: 'data/seeds_v752.json' },
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -317,7 +317,7 @@
     if (q) votes.set(partAt(q.p), 1e9);
     if (M) { const fids = new Set((M.faces || []).filter((f) => f.component === S.comp).map((f) => f.id)); for (let k = 0; k < M.Q.length / 4; k += 3) if (fids.has(M.fq[k])) { const i = M.Q[4 * k]; const pt = partAt([M.P[3 * i], M.P[3 * i + 1], M.P[3 * i + 2]]); votes.set(pt, (votes.get(pt) || 0) + 1); } }
     const tot = Array.from(votes.values()).filter((v) => v < 1e9).reduce((a, b) => a + b, 0), keep = Array.from(votes.entries()).filter(([p, v]) => p >= 0 && (v >= 1e9 || v >= 0.05 * tot)).map(([p]) => p);
-    view.isolateParts(keep); selectFaceCurves(); $('pSolo').checked = true; S.isolated = true;
+    view.isolateParts(keep); selectFaceCurves(); $('pSolo').checked = true; S.isolated = true; $('pLiveMesh').checked = true; safe(convertToMesh)();   // 29 October 2026 : alone, a conversion takes a tenth of a second : live wireframe on
     const fs = (S.faces || []).find((f) => f.component === S.comp); if (fs && fs.boundary) framePoints(fs.boundary); else if (q) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]);
     redraw(); status(S.comp + ' isolated : ' + keep.map((p) => (view.st.mesh.head.parts[p] || p)).join(', ').replace(/CAR_/g, '') + ' ; Shift H shows everything, P previews, Convert works on its curves only');
   }
@@ -791,10 +791,12 @@
     overlap: 'covering the same place as another face : doubled curves run side by side ; delete the extra ones (Del)',
     annulus: 'a ring around an island : connect the island to this border with two curves (D)',
     overlapArc: 'two curves running along each other ; delete one of them (Del)',
+    crossingArc: 'two curves crossing without a node ; split one at the crossing (S on it) so they meet, or move it away',
   };
   function problems() {
     const out = [], meshFaces = new Map(((S.mesh && S.mesh.faces) || []).map((f) => [f.id, f]));
     for (const id of ((S.doctor && S.doctor.dangling) || [])) if (model.arc(id)) out.push({ kind: 'loose', arc: id });
+    for (const is of ((S.doctor && S.doctor.issues) || [])) if (is.kind === 'crossing' && model.arc(is.arc)) { const other = +((is.fix || '').match(/arc (\d+)/) || [])[1]; out.push({ kind: 'crossingArc', arc: is.arc, other: model.arc(other) ? other : null }); }
     for (const is of ((S.doctor && S.doctor.issues) || [])) if (is.kind === 'overlap' && model.arc(is.arc)) { const other = +((is.fix || '').match(/arc (\d+)/) || [])[1]; out.push({ kind: 'overlapArc', arc: is.arc, other: model.arc(other) ? other : null }); }
     for (const f of S.faces || []) {
       const key = (f.reason || '').split(' ')[0], mf = meshFaces.get(f.id);
@@ -811,11 +813,12 @@
     if (!list.length) return status('No problem left : every curve borders two faces and every face meshes cleanly.');
     S.doctor.k = ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % list.length; const it = list[S.doctor.k], head = 'Problem ' + (S.doctor.k + 1) + ' of ' + list.length + ' : ';
     if (it.kind === 'loose') { S.sel = new Set([it.arc]); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'loose curve ' + it.arc + ' ; drag its free end onto a node or a curve, or delete it.'); }
+    if (it.kind === 'crossingArc') { S.sel = new Set([it.arc].concat(it.other != null ? [it.other] : [])); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'curves ' + Array.from(S.sel).join(' and ') + ' : ' + FIXES.crossingArc + '.'); }
     if (it.kind === 'overlapArc') { S.sel = new Set([it.arc].concat(it.other != null ? [it.other] : [])); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'curves ' + Array.from(S.sel).join(' and ') + ' : ' + FIXES.overlapArc + '.'); }
     const f = it.face; S.sel.clear(); S.face = { id: f.id, p: f.centroid }; S.comp = f.component || null; framePoints(f.boundary || []); renderCompList(); redraw();
     status(head + 'face ' + f.id + (f.component ? ' (' + f.component.replace(/^CAR_/, '') + ')' : '') + ' is ' + FIXES[it.kind] + (it.detail ? ' [' + it.detail + ']' : '') + '.');
   }
-  function problemSummary() { const by = {}; for (const it of problems()) by[it.kind] = (by[it.kind] || 0) + 1; const names = { overlapArc: 'doubled curves', overlap: 'overlapping faces', annulus: 'ring faces', loose: 'loose curves', sliver: 'thin faces', round_face: 'round faces', few_corners: 'faces short of corners', too_many_sides: 'faces with too many sides', wraps_around: 'wrapping faces', area: 'too large faces', complement: 'islands', infeasible: 'faces that cannot close', judge: 'faces with bad quads' };
+  function problemSummary() { const by = {}; for (const it of problems()) by[it.kind] = (by[it.kind] || 0) + 1; const names = { crossingArc: 'crossings without a node', overlapArc: 'doubled curves', overlap: 'overlapping faces', annulus: 'ring faces', loose: 'loose curves', sliver: 'thin faces', round_face: 'round faces', few_corners: 'faces short of corners', too_many_sides: 'faces with too many sides', wraps_around: 'wrapping faces', area: 'too large faces', complement: 'islands', infeasible: 'faces that cannot close', judge: 'faces with bad quads' };
     const parts = Object.entries(by).map(([k, v]) => v + ' ' + names[k]); return parts.length ? parts.join(', ') + ' : N goes to the next one' : 'No problem : every face meshes'; }
   function freeEnds(id) { const a = model.arc(id), out = []; if (!a) return out; for (const [nid, p] of [[a.a, a.ctrl[0]], [a.b, a.ctrl[a.ctrl.length - 1]]]) { if (nid == null || nid < 0) out.push(p); else if (model.node(nid) && model.nodeArcs(nid).length < 2) out.push(model.node(nid).p); } return out; }
   function renderDoctor() {
@@ -882,6 +885,8 @@
   // ------------------------------------------------------------------ boot
   async function boot() {
     view = View3D.create($('cv'));
+    const css = (c) => 'rgb(' + c.slice(0, 3).map((v) => Math.round(v * 255)).join(',') + ')';   // 29 October 2026 : the legend reads the judge colours from CFG, one source
+    $('legend').innerHTML = 'Quads : <i style="background:' + css(CFG.colors.meshOk) + '"></i>good <i style="background:' + css(CFG.colors.meshWarn) + '"></i>squashed (Jacobian under 0.5) <i style="background:' + css(CFG.colors.meshBad) + '"></i>folded';
     if (!view.floatOk) status('Float render targets are missing : snapping to the surface is off in this browser', 'error');
     const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json').then((r) => r.json()), fetch(CFG.files.ref + '.bin').then((r) => r.arrayBuffer())]);
     view.setMesh(head, buf);
@@ -914,7 +919,7 @@
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
     on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
-    on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network'));
+    on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network')); on('bLoadMbo', () => loadDoc(CFG.files.mboNet, 'Component network (borders of the component cut, Scripts/lines/ZrlNetworkFromMbo.py)'));
     for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
