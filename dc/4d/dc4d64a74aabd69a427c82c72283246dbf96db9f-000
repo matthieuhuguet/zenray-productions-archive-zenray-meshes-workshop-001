@@ -353,9 +353,29 @@
     }
     return rows.sort((a, b) => a.folded - b.folded || a.bad - b.bad || b.minJ - a.minJ);
   }
+  // 29 October 2026 : AUTO FIX (chef d'orchestre) : the safe automatic steps in order, each one its own undo step, measured before and after :
+  // repair the ends, snap the curves on the surface, bridge the islands, best pattern of every failing face, convert. The rest is manual (N).
+  async function autoFix() {
+    const measure = async () => { await convertToMesh(); const M = S.mesh; if (!M) return null; const F = (M.faces || []).filter((f) => f.quads);
+      return { meshed: F.length, quads: M.stats.quads, folded: M.res && M.res.stats ? M.res.stats.folded_quads : M.stats.folded, below: M.res && M.res.stats ? M.res.stats.quads_below_jac_min : M.stats.below05, named: F.filter((f) => f.component).length }; };
+    const wasLive = $('pLive').checked; $('pLive').checked = false; const rows = [];
+    const better = (m, p) => !!m && !!p && ((m.folded < p.folded && m.below <= p.below * 1.05) || (m.folded <= p.folded && m.below < p.below) || (m.meshed > p.meshed && m.folded <= p.folded && m.below <= p.below));
+    const step = async (label, fn) => {   // a step is kept only when it measures better ; else every undo step it made is undone
+      const mark = model.undoStack.length, prev = rows[rows.length - 1][1]; await fn(); await previewFaces(); const m = await measure();
+      if (better(m, prev)) return rows.push([label + ' : kept', m]);
+      while (model.undoStack.length > mark) model.undo(); model.buildNodeMirror(); await previewFaces(); rows.push([label + ' : undone (' + (m ? m.folded + ' folded, ' + m.below + ' below' : 'no mesh') + ')', await measure()]);
+    };
+    try {
+      await previewFaces(); rows.push(['start', await measure()]);
+      await step('repair network', async () => repairNetwork()); await step('snap on surface', snapToSurface); await step('bridge islands', bridgeIslands); await step('best patterns', bestPatternsAll);
+    } finally { $('pLive').checked = wasLive; }
+    const line = ([k, m]) => k + '\n   ' + (m ? m.meshed + ' faces, ' + m.quads + ' quads, ' + m.folded + ' folded, ' + m.below + ' below 0.5' : 'no mesh');
+    $('meshInfo').textContent = 'Auto fix, measured after each step, a step that does not improve is undone :\n' + rows.map(line).join('\n') + '\nThe rest is manual : N lists it with its fix.';
+    const a = rows[0][1], b = rows[rows.length - 1][1]; status('Auto fix : ' + (a && b ? a.meshed + ' to ' + b.meshed + ' meshed faces, folded ' + a.folded + ' to ' + b.folded : 'done') + ' ; details in the Quad mesh panel'); $('doctorInfo').textContent = problemSummary(); return rows;
+  }
   async function bestPatternsAll() {   // 29 October 2026 : every meshed face that fails the judge, with 4 corners or more, gets its best pattern (unnamed faces are named part_NN)
     if (!S.mesh) return status('Convert to a mesh first : the faces that fail the judge are the ones improved.');
-    const failing = (S.mesh.faces || []).filter((f) => f.quads && f.judge_ok === false && (f.native_corners || (f.corners || []).length) >= 4); let done = 0, gain = 0; const lines = [];
+    const failing = (S.mesh.faces || []).filter((f) => f.quads && f.judge_ok === false && (f.native_corners || (f.corners || []).length) >= 4); let done = 0, gain = 0; const lines = []; model.checkpoint();   // one undo step for the options
     for (const mf of failing) {
       const f = (S.faces || []).find((z) => z.id === mf.id) || mf, n = f.native_corners || (f.corners || []).length; let comp = f.component;
       if (!comp) { S.face = { id: f.id, p: mf.centroid }; edit('Face named for its pattern', () => { comp = ensureComp(); }); S.face = null; }
@@ -988,7 +1008,7 @@
     on('bPreview', previewFaces); on('bHoudini', sendToHoudini);
     on('bCompDenser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 0.8).toFixed(3)); schedulePreview(); });
     on('bCompCoarser', () => { const o = S.comp && compOpts()[S.comp]; setCompOption('edge_scale', +(((o && o.edge_scale) || 1) * 1.25).toFixed(3)); schedulePreview(); });
-    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bCompName', nameFacesFromModel);
+    on('bCompCurves', selectFaceCurves); on('bCompIsolate', isolateComp); on('bCompBest', () => safe(bestPattern)()); on('bBestAll', () => safe(bestPatternsAll)()); on('bAutoFix', () => safe(autoFix)()); on('bCompName', nameFacesFromModel);
     for (const id of ['pFaces', 'pTags', 'pDoctor']) $(id).addEventListener('change', redraw);
     $('pCompColour').addEventListener('change', () => { if (S.mesh) buildMeshLayers(); });
     on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bBridge', () => safe(bridgeIslands)()); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
@@ -1001,7 +1021,7 @@
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

@@ -277,11 +277,24 @@ def project_doc(doc, params=None):
     prm = dict(PARAMS); prm.update(params or {}); ref = load_ref(prm["ref"]); D = copy.deepcopy(doc)
     pts = [n["p"] for n in D["nodes"]] + [p for a in D["arcs"] for p in a["ctrl"]]
     if not pts: return {"ok": True, "doc": D, "moved": {"points": 0}}
-    q, _, d = ref.closest(np.array(pts, float)); q = q.tolist(); k = 0
-    for n in D["nodes"]: n["p"] = q[k]; k += 1
+    # 29 October 2026 : the CURVE is put on the surface, not its control points (a B-spline passes under its control points on a convex shell) : each arc is
+    # sampled, the samples go to the closest surface point that faces outward (no jump to an inner layer such as a liner), then the same number of control
+    # points is fitted back (ZrlSpline.fit, ends held on their projected nodes). Control points alone had made 8 214 folded quads on the car, this 169.
+    guided = prm.get("project_outward", False)
+    outward = lambda P: ((P - ref.center) / (np.linalg.norm(P - ref.center, axis=1, keepdims=True) + 1e-12)) if guided else None
+    NP = np.array([n["p"] for n in D["nodes"]], float).reshape(-1, 3); moved = []
+    if len(NP): qn, _, dn = ref.closest(NP, guide=outward(NP)); moved.append(dn); pos = {n["id"]: qn[k] for k, n in enumerate(D["nodes"])}
+    else: pos = {}
+    for n in D["nodes"]: n["p"] = pos[n["id"]].tolist()
     for a in D["arcs"]:
-        for i in range(len(a["ctrl"])): a["ctrl"][i] = q[k]; k += 1
-    return native({"ok": True, "doc": D, "moved": {"points": len(pts), "median_m": float(np.median(d)), "p90_m": float(np.percentile(d, 90)), "max_m": float(d.max())}})
+        C = np.array(a["ctrl"], float); m = len(C)
+        if m < 2: continue
+        Q = SP.sample(C, per_span=prm.get("project_per_span", 16)); q, _, dq = ref.closest(Q, guide=outward(Q)); moved.append(dq)
+        if a.get("a", -1) in pos: q[0] = pos[a["a"]]
+        if a.get("b", -1) in pos: q[-1] = pos[a["b"]]
+        a["ctrl"] = SP.fit(q, m).tolist()
+    d = np.concatenate(moved) if moved else np.zeros(1)
+    return native({"ok": True, "doc": D, "moved": {"points": int(len(d)), "median_m": float(np.median(d)), "p90_m": float(np.percentile(d, 90)), "max_m": float(d.max())}})
 
 
 def doctor(doc, params=None):
@@ -303,7 +316,7 @@ class Net:
         if self.prm.get("project_arcs") and self.nodes:      # 29 October 2026 : one batched closest point query for every node and every polyline point
             ids = list(self.nodes); keys = [a["id"] for a in self.fixed["arcs"]]; sizes = [len(polys[k]) for k in keys]
             allp = np.concatenate([np.array([self.nodes[i] for i in ids])] + [polys[k] for k in keys]) if keys else np.array([self.nodes[i] for i in ids])
-            q, _, d = self.ref.closest(allp); self.projected = {"points": int(len(allp)), "median_m": float(np.median(d)), "max_m": float(d.max())}
+            q, _, d = self.ref.closest(allp); self.projected = {"points": int(len(allp)), "median_m": float(np.median(d)), "max_m": float(d.max())}   # 29 October 2026 : no outward guide here (it made 275 folded quads instead of 169 : a wheel arch faces inward)
             for j, i in enumerate(ids): self.nodes[i] = q[j]
             o = len(ids)
             for k, n in zip(keys, sizes): polys[k] = q[o:o + n]; o += n
