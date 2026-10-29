@@ -84,19 +84,42 @@ def footprint(prm, P, faces):
 
 
 def alignment(cm, P, faces, prm=PARAMS):
-    """share of the crease points inside the mesh footprint lying within tol_mm of a mesh edge (front view), strength weighted."""
+    """share of the crease points inside the mesh footprint carried by a mesh edge (front view), strength weighted : an edge passes within tol_mm
+    AND runs along the crease (within max_angle_deg of its tangent ; a grid line crossing the crease does not carry it). Random grid baseline about 0.3."""
     E = set()
     for f in faces:
         for k in range(len(f)): a, b = f[k], f[(k + 1) % len(f)]; E.add((min(a, b), max(a, b)))
-    px = world_to_pixel(prm, P); step = prm["edge_sample_mm"] / 1000.0 * prm["px_per_m"]; S = []
+    px = world_to_pixel(prm, P); step = prm["edge_sample_mm"] / 1000.0 * prm["px_per_m"]; S, D = [], []
     for a, b in E:
-        n = max(2, int(np.ceil(np.linalg.norm(px[b] - px[a]) / step)) + 1); t = np.linspace(0, 1, n)[:, None]; S.append(px[a] * (1 - t) + px[b] * t)
-    tree = cKDTree(np.concatenate(S)); fp = footprint(prm, P, faces)
+        seg = px[b] - px[a]; L = np.linalg.norm(seg); n = max(2, int(np.ceil(L / step)) + 1); t = np.linspace(0, 1, n)[:, None]
+        S.append(px[a] * (1 - t) + px[b] * t); D.append(np.repeat((seg / max(L, 1e-9))[None, :], n, 0))
+    S = np.concatenate(S); D = np.concatenate(D); tree = cKDTree(S); fp = footprint(prm, P, faces)
     inside = fp[cm["rows"], cm["cols"]]; pts = np.stack([cm["cols"], cm["rows"]], 1)[inside].astype(float); w = cm["strength"][inside]
     if not len(pts): return {"crease_points": 0, "aligned": None}
-    d, _ = tree.query(pts); d_mm = d / prm["px_per_m"] * 1000; ok = d_mm <= prm["tol_mm"]
+    across = np.stack([cm["dir"][inside][:, 0], -cm["dir"][inside][:, 1]], 1); tan = np.stack([-across[:, 1], across[:, 0]], 1)   # dir is (x, y up) across the crease ; tangent in (col, row)
+    tol = prm["tol_mm"] / 1000.0 * prm["px_per_m"]; cmin = np.cos(np.radians(prm.get("max_angle_deg", 30.0)))
+    d, idx = tree.query(pts, k=12, distance_upper_bound=tol); ok = np.zeros(len(pts), bool)
+    for j in range(idx.shape[1]):
+        hit = np.isfinite(d[:, j]); ii = np.where(hit, idx[:, j], 0)
+        ok |= hit & (np.abs((D[ii] * tan).sum(1)) >= cmin)
+    d0 = d[:, 0]; d_mm = np.where(np.isfinite(d0), d0, tree.query(pts)[0]) / prm["px_per_m"] * 1000
     return {"crease_points": int(len(pts)), "aligned": round(float((w * ok).sum() / w.sum()), 3), "aligned_unweighted": round(float(ok.mean()), 3),
-            "median_gap_mm": round(float(np.median(d_mm)), 2), "tol_mm": prm["tol_mm"], "far": pts[~ok], "far_strength": w[~ok]}
+            "median_gap_mm": round(float(np.median(d_mm)), 2), "tol_mm": prm["tol_mm"], "max_angle_deg": prm.get("max_angle_deg", 30.0), "far": pts[~ok], "far_strength": w[~ok]}
+
+
+def crease_path(cm, prm, a_xy, b_xy, snap_mm=6.0, floor=0.15, full=80.0):
+    """29 October 2026 : the cheapest path along the creases between two points of the view (x, y metres) : cost 1 / (floor + clip(curv / full, 0, 1)),
+    so a crease costs about 0.9 per pixel and plain skin about 6.7 ; both ends first snap to the strongest crease pixel within snap_mm. Returns (n, 2) x, y."""
+    from skimage.graph import route_through_array
+    curv = np.nan_to_num(cm["curv"], nan=0.0); cost = 1.0 / (floor + np.clip(curv / full, 0, 1)); cost[~cm["mask"]] = 1e3
+    ends = []
+    for xy in (a_xy, b_xy):
+        c, r = world_to_pixel(prm, np.array([[xy[0], xy[1], 0.0]]))[0]; rad = snap_mm / 1000.0 * prm["px_per_m"]
+        r0, r1, c0, c1 = int(max(0, r - rad)), int(min(prm["res"] - 1, r + rad)), int(max(0, c - rad)), int(min(prm["res"] - 1, c + rad))
+        win = curv[r0:r1 + 1, c0:c1 + 1].copy(); rr, cc = np.mgrid[r0:r1 + 1, c0:c1 + 1]; win[(rr - r) ** 2 + (cc - c) ** 2 > rad ** 2] = -1
+        k = np.unravel_index(np.argmax(win), win.shape); ends.append((r0 + k[0], c0 + k[1]) if win[k] > prm["min_curv"] else (int(round(r)), int(round(c))))
+    path, _ = route_through_array(cost, ends[0], ends[1], fully_connected=True, geometric=True); path = np.array(path, float)
+    W = pixel_to_world(prm, path[:, 0], path[:, 1]); return W[:, :2]
 
 
 def board(cm, prm, out, P=None, faces=None, arcs=None, far=None):
