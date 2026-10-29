@@ -1,0 +1,168 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY ON THE SURFACE, the general finisher : no plane, no view, so a component that wraps (a front
+fender from the side to the top, a shoulder band, a roof rail) is handled like a flat door.
+  1 region   : the triangles of the component on the clean partition (closed shell), largest piece, inner holes capped : a disk.
+  2 corners  : four corners on its border loop, the sharpest turns measured in the tangent plane, at least corner_sep apart.
+  3 map      : Tutte embedding of the region onto the unit square (uniform convex combinations, border by arc length on the four sides) :
+               one to one by Tutte 1963 and Floater 2003, whatever the shape of the region in space.
+  4 grid     : the regular grid of the square sent back on the surface (barycentric in the mapped triangles), its four sides faired
+               (RigLib.fit_fair) and resampled by arc length.
+  5 fairing  : thin plate on the grid in 3D plus closest points on the VISIBLE surface of the validated car (iterative closest points),
+               borders held : wrinkles shorter than fair_cut_m removed, the shape kept.
+  6 panel    : rolled edge and 2 mm inner skin (ZrrPatch.panel), judged by the 100 percent gate (ZrrCheck).
+python ZrrSurf.py <component> [...]       writes work/retopo/<component>/surf.npz, versions/Retopo_<component>.png when it is the best
+FR : le finisseur général, sur la surface elle-même : sans plan ni vue, une pièce qui s'enroule se traite comme une porte plate."""
+import json, os, sys, time
+import numpy as np
+from scipy.sparse import coo_matrix, diags
+from scipy.sparse.linalg import spsolve
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrSplit as SP, ZrrShell as SH
+import RigLib as RL
+
+PARAMS = {"edge_m": 0.02, "corner_scale": 0.04, "corner_sep": 0.12, "side_ctrl_per_m": 5.0, "side_ctrl_min": 4, "side_ctrl_max": 16,
+          "side_l0": 0.02, "side_lam": 0.05, "fair_cut_m": 0.30, "icp_iters": 6, "data_max_m": 0.03, "dev_max_m": 0.006,
+          "smooth_loop": 10}   # 29 October 2026
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+_VIS = {}
+
+
+def visible(car):
+    if not _VIS:
+        P, L = SH.visible_points(car, dict(SH.PARAMS)); _VIS.update(P=P, L=L)
+    return _VIS["P"], _VIS["L"]
+
+
+def region(name):
+    S = SP.shell(); k = S["names"].index(name); faces = np.flatnonzero(S["fl"] == k); F = S["F"]
+    A = SP.face_adjacency(F, faces); n, lab = connected_components(A, directed=False); big = np.bincount(lab, weights=S["fa"][faces]).argmax(); faces = faces[lab == big]
+    vid, inv = np.unique(F[faces], return_inverse=True); T = inv.reshape(-1, 3); X = S["V"][vid].astype(float)
+    e = np.r_[T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]; key = np.sort(e, axis=1); u, cnt = np.unique(key, axis=0, return_counts=True); bnd = u[cnt == 1]
+    # border loops, the longest is the outer one ; the others are capped by a centre vertex fan
+    nxt = {}
+    for a, b in e[np.isin(key[:, 0] * len(X) + key[:, 1], bnd[:, 0] * len(X) + bnd[:, 1])]: nxt[a] = b
+    loops = []; seen = set()
+    for s in list(nxt):
+        if s in seen: continue
+        lp = [s]; seen.add(s); c = nxt[s]
+        while c != s and c not in seen and c in nxt: lp.append(c); seen.add(c); c = nxt[c]
+        loops.append(lp)
+    loops.sort(key=len, reverse=True); outer = np.array(loops[0])
+    for lp in loops[1:]:
+        cidx = len(X); X = np.vstack([X, X[lp].mean(0)]); T = np.vstack([T, [[lp[i], cidx, lp[(i + 1) % len(lp)]] for i in range(len(lp))]])
+    return X, T, outer
+
+
+def corners(X, T, loop, prm):
+    L = X[loop]; m = len(L)
+    for _ in range(prm["smooth_loop"]): L = (np.roll(L, 1, 0) + 2 * L + np.roll(L, -1, 0)) / 4
+    fn = np.cross(X[T[:, 1]] - X[T[:, 0]], X[T[:, 2]] - X[T[:, 0]]); vn = np.zeros_like(X); np.add.at(vn, T.ravel(), np.repeat(fn, 3, 0)); vn /= np.linalg.norm(vn, axis=1, keepdims=True) + 1e-20
+    s = np.r_[0, np.cumsum(np.linalg.norm(np.diff(np.vstack([L, L[:1]]), axis=0), axis=1))]; per = s[-1]; k = max(2, int(prm["corner_scale"] * m))
+    a = L - np.roll(L, k, 0); b = np.roll(L, -k, 0) - L; n = vn[loop]
+    a -= (a * n).sum(1, keepdims=True) * n; b -= (b * n).sum(1, keepdims=True) * n
+    turn = np.degrees(np.arctan2((np.cross(a, b) * n).sum(1), (a * b).sum(1)))
+    if np.sum(turn) < 0: turn = -turn            # the loop may run either way round : convex corners positive
+    sep = prm["corner_sep"] * m; cs = []
+    for i in np.argsort(-turn):
+        if all(min(abs(i - c), m - abs(i - c)) >= sep for c in cs): cs.append(int(i))
+        if len(cs) == 4: break
+    return sorted(cs), turn, s
+
+
+def tutte(X, T, loop, cs):
+    m = len(loop); seg = np.linalg.norm(np.diff(np.vstack([X[loop], X[loop[:1]]]), axis=0), axis=1); uvb = np.zeros((m, 2))
+    sq = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], float)
+    for q in range(4):
+        i0, i1 = cs[q], cs[(q + 1) % 4]; ids = np.arange(i0, i1 + 1) if i1 > i0 else np.r_[np.arange(i0, m), np.arange(0, i1 + 1)]
+        ln = np.r_[0, np.cumsum(seg[ids[:-1] % m])]; t = ln / ln[-1]; uvb[ids % m] = sq[q] * (1 - t)[:, None] + sq[(q + 1) % 4] * t[:, None]
+    n = len(X); e = np.r_[T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]; W = coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)); W = ((W + W.T) > 0).astype(float).tocsr()
+    isb = np.zeros(n, bool); isb[loop] = True; fr = np.flatnonzero(~isb); deg = np.asarray(W.sum(1)).ravel()
+    Lff = (diags(deg[fr]) - W[fr][:, fr]).tocsc(); rhs = W[fr][:, loop] @ uvb; UV = np.zeros((n, 2)); UV[loop] = uvb
+    UV[fr] = np.column_stack([spsolve(Lff, rhs[:, 0]), spsolve(Lff, rhs[:, 1])]); return UV
+
+
+def locate(UV, T, X, pts):
+    c = UV[T].mean(1); kd = cKDTree(c); _, cand = kd.query(pts, k=16); out = np.full((len(pts), 3), np.nan)
+    a, b, cc = UV[T[:, 0]], UV[T[:, 1]], UV[T[:, 2]]
+    for j in range(cand.shape[1]):
+        t = cand[:, j]; v0 = b[t] - a[t]; v1 = cc[t] - a[t]; v2 = pts - a[t]; den = v0[:, 0] * v1[:, 1] - v1[:, 0] * v0[:, 1]
+        l1 = (v2[:, 0] * v1[:, 1] - v1[:, 0] * v2[:, 1]) / (den + 1e-30); l2 = (v0[:, 0] * v2[:, 1] - v2[:, 0] * v0[:, 1]) / (den + 1e-30); l0 = 1 - l1 - l2
+        ok = np.isnan(out[:, 0]) & (l0 >= -1e-9) & (l1 >= -1e-9) & (l2 >= -1e-9)
+        out[ok] = (l0[ok, None] * X[T[t[ok], 0]] + l1[ok, None] * X[T[t[ok], 1]] + l2[ok, None] * X[T[t[ok], 2]])
+    miss = np.isnan(out[:, 0])
+    if miss.any(): out[miss] = X[T[cand[miss, 0]]].mean(1)
+    return out
+
+
+def fair_side(P3, prm):
+    Lm = float(np.linalg.norm(np.diff(P3, axis=0), axis=1).sum()); k = int(np.clip(round(Lm * prm["side_ctrl_per_m"]), prm["side_ctrl_min"], prm["side_ctrl_max"]))
+    if len(P3) < 60:
+        Lc = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P3, axis=0), axis=1))]; t = np.linspace(0, Lc[-1], 60); P3 = np.stack([np.interp(t, Lc, P3[:, c]) for c in range(3)], 1)
+    Dn = RL.evaluate(RL.fit_fair(P3, k, l0=prm["side_l0"], lam=prm["side_lam"]), 600)
+    return Dn, float(np.linalg.norm(np.diff(Dn, axis=0), axis=1).sum())   # 29 October 2026 : counts from the FAIR length (the voxel staircase inflated it 1.4 times)
+
+
+def thin_plate_ops(nu, nv):
+    idx = np.arange((nu + 1) * (nv + 1)).reshape(nu + 1, nv + 1); rows, cols, vals = [], [], []; r = 0
+    def add(t, w=1.0):
+        nonlocal r
+        for k_, a_ in t: rows.append(r); cols.append(k_); vals.append(a_ * w)
+        r += 1
+    for i in range(1, nu):
+        for j in range(nv + 1): add([(idx[i - 1, j], 1), (idx[i, j], -2), (idx[i + 1, j], 1)])
+    for i in range(nu + 1):
+        for j in range(1, nv): add([(idx[i, j - 1], 1), (idx[i, j], -2), (idx[i, j + 1], 1)])
+    for i in range(nu):
+        for j in range(nv): add([(idx[i, j], 1), (idx[i + 1, j], -1), (idx[i, j + 1], -1), (idx[i + 1, j + 1], 1)], np.sqrt(2))
+    return coo_matrix((vals, (rows, cols)), shape=(r, (nu + 1) * (nv + 1))).tocsr()
+
+
+def build(name, car, prm=PARAMS):
+    X, T, loop = region(name); cs, turn, s = corners(X, T, loop, prm); UV = tutte(X, T, loop, cs); m = len(loop)
+    sides3 = []
+    for q in range(4):
+        i0, i1 = cs[q], cs[(q + 1) % 4]; ids = np.arange(i0, i1 + 1) if i1 > i0 else np.r_[np.arange(i0, m), np.arange(0, i1 + 1)]; sides3.append(X[loop[ids % m]])
+    fs = [fair_side(sd, prm) for sd in sides3]; e = prm["edge_m"]
+    nu = max(2, int(round((fs[0][1] + fs[2][1]) / 2 / e))); nv = max(2, int(round((fs[1][1] + fs[3][1]) / 2 / e)))
+    U, V = np.meshgrid(np.linspace(0, 1, nu + 1), np.linspace(0, 1, nv + 1), indexing="ij"); G3 = locate(UV, T, X, np.stack([U.ravel(), V.ravel()], 1)).reshape(nu + 1, nv + 1, 3)
+    B = Z.poly_sample(fs[0][0], nu); Rr = Z.poly_sample(fs[1][0], nv); Tp = Z.poly_sample(fs[2][0], nu)[::-1]; Ll = Z.poly_sample(fs[3][0], nv)[::-1]
+    G3[:, 0] = B; G3[:, -1] = Tp; G3[0, :] = Ll; G3[-1, :] = Rr
+    # fairing on the visible surface of the validated car : thin plate + closest points (ICP), borders held
+    # 29 October 2026 : target = the region of the closed shell itself (clean, one layer) ; the visible points of the old car carried its
+    # edges and the stacked parts seen through its gaps, and pulled the door into a kink of 18 degrees
+    bary = X[T].mean(1); mine = np.vstack([X, bary])
+    kd = cKDTree(mine); St = thin_plate_ops(nu, nv); mu = (prm["fair_cut_m"] / (2 * np.pi * e)) ** 4
+    n = (nu + 1) * (nv + 1); fix = np.zeros((nu + 1, nv + 1), bool); fix[0, :] = fix[-1, :] = fix[:, 0] = fix[:, -1] = True; fix = fix.ravel()
+    Xg = G3.reshape(-1, 3).copy(); fr = np.flatnonzero(~fix); fx = np.flatnonzero(fix); StS = (St.T @ St).tocsr() * mu
+    w = np.ones(n)
+    for it in range(prm["icp_iters"]):
+        d, nn = kd.query(Xg); tgt = mine[nn]; wd = np.where(d < prm["data_max_m"], w, 0.0)
+        M = (diags(wd[fr]) + StS[fr][:, fr]).tocsc(); rhs = (wd[:, None] * tgt)[fr] - StS[fr][:, fx] @ Xg[fx]
+        Xg[fr] = np.column_stack([spsolve(M, rhs[:, c]) for c in range(3)])
+        d2, _ = kd.query(Xg); over = d2 > prm["dev_max_m"]; w[over] *= 2.0
+    Xg = Xg.reshape(nu + 1, nv + 1, 3)
+    out_dir = np.mean(np.cross(Xg[1:, :-1] - Xg[:-1, :-1], Xg[:-1, 1:] - Xg[:-1, :-1]).reshape(-1, 3), 0); cen = Xg.reshape(-1, 3).mean(0)
+    outward = cen - car["P"].mean(0); outward = outward if out_dir @ outward >= 0 else outward    # orientation fixed below by the panel
+    sgn = 1.0 if np.dot(out_dir, (cen - car["P"].mean(0))) >= 0 else -1.0
+    if sgn < 0: Xg = Xg[::-1]                       # outer skin seen from outside : the quads must face away from the car
+    P, Q, G = Z.panel(Xg, cen - car["P"].mean(0), Z.PARAMS)
+    dd, _ = kd.query(Xg.reshape(-1, 3)); dev = np.where(dd < prm["data_max_m"], dd, np.nan)
+    j = K.check(P, Q, G, dev=dev, sides=[f[0] for f in fs])
+    return dict(P=P, Q=Q, G=G, X=Xg, nu=nu, nv=nv, judge=j)
+
+
+if __name__ == "__main__":
+    car = D.load()
+    for nm in sys.argv[1:]:
+        try:
+            r = build(nm, car); j = r["judge"]; d = os.path.join(f"{ROOT}/work/retopo", nm); os.makedirs(d, exist_ok=True)
+            np.savez(os.path.join(d, "surf.npz"), P=r["P"], Q=r["Q"], G=r["G"]); json.dump(j, open(os.path.join(d, "surf_judge.json"), "w"), indent=1, default=float)
+            log(f"{nm:30s} {r['nu']:3d} x {r['nv']:3d}  {j['score']['percent']:5.1f} %  failed {[k for k, v in j.items() if k != 'score' and not v['ok']]}  jac {j['jacobian']['min']} ratio {j['edge_ratio']['ratio']} kink {j['kink']['max_deg']}")
+        except Exception as ex:
+            import traceback; log(nm, "ERROR", type(ex).__name__, ex); traceback.print_exc(limit=2)

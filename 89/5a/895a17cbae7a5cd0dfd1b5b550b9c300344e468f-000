@@ -1,0 +1,144 @@
+"""29 October 2026 : ZenRay Meshes RETOPOLOGY SPLIT, the micro-components of a component too curved or too concave for one patch (a front
+fender wraps from the side to the top and goes round its arch : one height field folds on itself, score 46 percent).
+Its region on the clean partition is split recursively, like a variational shape approximation (Cohen-Steiner, Alliez, Desbrun 2004) :
+  too curved   (95th percentile of the normal cone above cone_max_deg) : two means on the smoothed normals, pieces kept connected ;
+  too concave  (area over convex hull area below convex_min in its plane) : cut through the centroid across the longest extent ;
+until every leaf is a height field over its own plane and nearly convex. Every leaf is then finished like a component (ZrrPatch, the
+tournament of ZrrBest) in its own view, its fair field fitted on the component's data a little beyond the leaf, so two leaves meet with
+the same surface along their cut ; every leaf is judged by the 100 percent gate.
+python ZrrSplit.py <component> [...]   writes work/retopo/<component>/leaf_<k>.npz, versions/Retopo_<component>_leaves.png
+FR : les micro-composants d'une pièce trop courbe ou trop concave, découpés jusqu'à ce que chacun soit un champ de hauteur presque convexe."""
+import itertools, json, os, sys, time
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import ConvexHull
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, f"{ROOT}/Scripts"); sys.path.insert(0, f"{ROOT}/Scripts/retopo"); sys.path.insert(0, f"{ROOT}/Scripts/curverig")
+import ZrrData as D, ZrrPatch as Z, ZrrCheck as K, ZrrSheet as S, ZrrBest as B
+import RigLib as RL
+from Raster import Renderer
+
+PARAMS = {"cone_max_deg": 32.0, "convex_min": 0.86, "max_depth": 6, "min_leaf_m2": 0.012, "normal_smooth_iters": 12,
+          "data_band_m": 0.03, "shell": f"{ROOT}/work/retopo/shell.npz"}   # 29 October 2026
+
+
+def log(*a): print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+_S = {}
+
+
+def shell():
+    if not _S:
+        S_ = np.load(PARAMS["shell"], allow_pickle=True); V, F, lab = S_["verts"], S_["faces"], S_["lab"]; names = [str(n) for n in S_["names"]]
+        tl = lab[F]; fl = np.where(tl[:, 1] == tl[:, 2], tl[:, 1], tl[:, 0])
+        n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]); a = 0.5 * np.linalg.norm(n, axis=1); n /= (2 * a[:, None] + 1e-20)
+        cen = V[F].mean(1)
+        if ((cen - V.mean(0)) * n).sum(1).mean() < 0: n = -n   # 29 October 2026 : marching cubes gave inward normals : the view looked through the car
+        _S.update(V=V, F=F, fl=fl, names=names, fn=n, fa=a, cent=V[F].mean(1))
+    return _S
+
+
+def face_adjacency(F, faces):
+    sub = F[faces]; e = np.r_[sub[:, [0, 1]], sub[:, [1, 2]], sub[:, [2, 0]]]; owner = np.tile(np.arange(len(faces)), 3)
+    key = np.sort(e, axis=1); k = key[:, 0] * (F.max() + 1) + key[:, 1]; o = np.argsort(k); k, owner = k[o], owner[o]
+    same = k[1:] == k[:-1]; a, b = owner[:-1][same], owner[1:][same]
+    return coo_matrix((np.ones(len(a)), (a, b)), shape=(len(faces), len(faces))).tocsr()
+
+
+def smooth_normals(n, A, iters):
+    A = A + A.T; d = np.asarray(A.sum(1)).ravel() + 1
+    for _ in range(iters): n = (A @ n + n) / d[:, None]; n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-20
+    return n
+
+
+def stats(faces, sn, fa, cent):
+    w = fa[faces]; nb = (sn[faces] * w[:, None]).sum(0); nb /= np.linalg.norm(nb) + 1e-20
+    ang = np.degrees(np.arccos(np.clip(sn[faces] @ nb, -1, 1))); cone = float(np.percentile(ang, 95))
+    rx, uy, tz = D.frame(nb); P = cent[faces]; xy = np.stack([P @ rx, P @ uy], 1)
+    try: conv = float(w.sum() * abs(nb @ (sn[faces] * w[:, None]).sum(0) / w.sum()) / ConvexHull(xy).volume)
+    except Exception: conv = 1.0
+    return nb, cone, min(conv, 1.0), (rx, uy, tz), xy
+
+
+def split(faces, sn, fa, cent, A_full_idx, depth, out, prm):
+    nb, cone, conv, fr, xy = stats(faces, sn, fa, cent)
+    area = float(fa[faces].sum())
+    if depth >= prm["max_depth"] or area < 2 * prm["min_leaf_m2"] or (cone <= prm["cone_max_deg"] and conv >= prm["convex_min"]):
+        out.append(dict(faces=faces, normal=nb, cone=cone, convex=conv, area=area)); return
+    if cone > prm["cone_max_deg"]:   # two means on the normals
+        a = sn[faces][np.argmin(sn[faces] @ nb)]; b = nb
+        for _ in range(10):
+            g = (sn[faces] @ a) > (sn[faces] @ b); a = (sn[faces][g] * fa[faces][g, None]).sum(0); b = (sn[faces][~g] * fa[faces][~g, None]).sum(0)
+            a /= np.linalg.norm(a) + 1e-20; b /= np.linalg.norm(b) + 1e-20
+    else:                              # cut across the longest extent, through the centroid
+        c = xy - np.average(xy, axis=0, weights=fa[faces]); u, s_, vt = np.linalg.svd(c * np.sqrt(fa[faces])[:, None], full_matrices=False); g = (c @ vt[0]) > 0
+    A = face_adjacency(_S["F"], faces); parts = []
+    for side in (g, ~g):   # each side kept connected : its largest piece ; the rest joins the other side
+        idx = np.flatnonzero(side)
+        if len(idx) == 0: continue
+        n_, lab = connected_components(A[idx][:, idx], directed=False); big = np.bincount(lab, weights=fa[faces][idx]).argmax(); parts.append(idx[lab == big])
+    if len(parts) < 2 or min(fa[faces][p].sum() for p in parts) < prm["min_leaf_m2"]:
+        out.append(dict(faces=faces, normal=nb, cone=cone, convex=conv, area=area)); return
+    rest = np.setdiff1d(np.arange(len(faces)), np.concatenate(parts))
+    if len(rest):   # leftovers join the part they touch most
+        for r in rest:
+            nbr = A[r].indices; votes = [np.isin(nbr, p).sum() for p in parts]; parts[int(np.argmax(votes))] = np.r_[parts[int(np.argmax(votes))], r]
+    for p in parts: split(faces[p], sn, fa, cent, None, depth + 1, out, prm)
+
+
+def leaves_of(name, prm=PARAMS):
+    S_ = shell(); k = S_["names"].index(name); faces = np.flatnonzero(S_["fl"] == k)
+    A = face_adjacency(S_["F"], faces); sn = np.zeros_like(S_["fn"]); sn[faces] = smooth_normals(S_["fn"][faces], A, prm["normal_smooth_iters"])
+    out = []; split(faces, sn, S_["fa"], S_["cent"], None, 0, out, prm); return out
+
+
+def build_leaf(car, name, leaf, prm):
+    S_ = shell(); rx, uy, tz = D.frame(leaf["normal"]); P = S_["cent"][leaf["faces"]]; c0 = P.mean(0)
+    x, y = (P - c0) @ rx, (P - c0) @ uy; ext = max(x.max() - x.min(), y.max() - y.min()) + 2 * prm["margin_m"]
+    s = prm["px_per_m"]; res = int(min(prm["res_max"], 2 ** np.ceil(np.log2(ext * s))))
+    if res < ext * s: s = res / ext
+    c3 = c0 + rx * (x.max() + x.min()) / 2 + uy * (y.max() + y.min()) / 2
+    pm = D.body_poly_mask(car); tri, owner = D.triangulate(car, pm); R = Renderer(car["P"], tri); mask, depth, N, fid = R.render(c3, s, (rx, uy, tz), res); R.release()
+    lab = np.full(mask.shape, -1); ok = fid >= 0; lab[ok] = car["T"][owner[fid[ok]]]
+    pid = car["names"].index(name); v = dict(pid=pid, rx=rx, uy=uy, tz=tz, c3=c3, s=s, res=res, lab=lab, depth=depth)
+    key = np.zeros(len(S_["F"]), np.int64); key[leaf["faces"]] = 1
+    R = Renderer(S_["V"], S_["F"]); m2, d2, N2, f2 = R.render(c3, s, (rx, uy, tz), res); R.release()
+    M = np.zeros(mask.shape, bool); M[f2 >= 0] = key[f2[f2 >= 0]] == 1
+    Lc, n = ndi.label(M)
+    if n == 0: raise ValueError("leaf not visible in its own view")
+    M = Lc == (np.argmax(np.bincount(Lc.ravel())[1:]) + 1); M = ndi.binary_fill_holes(M)
+    band = int(round(PARAMS["data_band_m"] * s)); Md = ndi.binary_dilation(M, iterations=band) & (lab == pid)
+    prmF = dict(prm); prmF["partition"] = ""; F = Z.Field(v, Md, prmF)
+    sides, Q2, C2, turns = Z.outline(v, M, F, prm); curves = Z.fair_sides(sides, prm, v, F)
+    X, P2, nu, nv = Z.grid(v, F, curves, prm); Pp, Qq, G = Z.panel(X, v["tz"], prm)
+    res_ = dict(P=Pp, Q=Qq, G=G, X=X, P2=P2, view=v, M=M, field=F, curves=curves, info={"component": name, "nu": nu, "nv": nv}, outline2d=Q2)
+    Me = ndi.binary_erosion(M & (lab == pid), iterations=prm["erode_px"]); q = X.reshape(-1, 3) - c3; r_, cc = Z.plane_to_px(v, q @ rx, q @ uy)
+    ri = np.clip(np.round(r_).astype(int), 0, res - 1); ci = np.clip(np.round(cc).astype(int), 0, res - 1); okd = Me[ri, ci] & np.isfinite(depth[ri, ci])
+    dev = np.full(len(q), np.nan); dev[okd] = (q @ tz)[okd] - depth[ri, ci][okd]
+    j = K.check(Pp, Qq, G, dev=dev, sides=[c["CV"] for c in curves]); return res_, j
+
+
+def finish_component(name, car=None):
+    car = car or D.load(); lv = leaves_of(name); log(name, "leaves", len(lv), [(round(l["area"], 3), round(l["cone"], 1), round(l["convex"], 2)) for l in lv])
+    d = os.path.join(f"{ROOT}/work/retopo", name); os.makedirs(d, exist_ok=True); kept = []
+    for k, leaf in enumerate(lv):
+        top = None
+        for vals in itertools.product(*B.VARIANTS.values()):
+            prm = dict(Z.PARAMS); prm.update(dict(zip(B.VARIANTS.keys(), vals)))
+            try: r, j = build_leaf(car, name, leaf, prm)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"; continue
+            if top is None or B.rank(j) > B.rank(top[1]): top = (r, j, prm)
+        if top is None: log(name, "leaf", k, "no variant built", err); continue
+        r, j, prm = top; np.savez(os.path.join(d, f"leaf_{k:02d}.npz"), P=r["P"], Q=r["Q"], G=r["G"])
+        kept.append((r, j)); log(f"  leaf {k:02d}  {r['info']['nu']:3d} x {r['info']['nv']:3d}  {j['score']['percent']:5.1f} %  failed {[q for q, v in j.items() if q != 'score' and not v['ok']]}")
+    json.dump([{"leaf": k, "judge": j} for k, (r, j) in enumerate(kept)], open(os.path.join(d, "leaves_judge.json"), "w"), indent=1, default=float)
+    return kept
+
+
+if __name__ == "__main__":
+    car = D.load()
+    for nm in sys.argv[1:]: finish_component(nm, car)
