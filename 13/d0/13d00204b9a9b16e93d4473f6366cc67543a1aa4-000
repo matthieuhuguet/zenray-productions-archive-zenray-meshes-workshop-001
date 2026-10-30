@@ -1,0 +1,107 @@
+"""29 October 2026 : ZenRay Lines OPENINGS, concentric loops around an opening of the surface : an eye, a mouth, a nostril, a wheel arch, a headlight.
+EN: the source is a curve on the surface (the lid margin, the lip line, the edge of an arch) or one point. The distance to it (heat method, from every vertex of the curve) gives the rings : the
+loop of the surface at each requested distance, closed around the source. Radial seams cross the rings at equal polar angles about the source (angle zero toward the up of the surface) ; the
+faces between two rings and two seams are four sided patches with matching borders. This is the edge flow of an orbicularis : eyelids and lips with even spans, loops that follow the muscle.
+An archetype (the conventions of a face : rings and divisions of an eye, a mouth) is a table of values in ARCHETYPES, not code.
+    python -I ZrlOpenings.py --obj model.obj --source x,y,z[;x,y,z...] [--archetype eye] [--rings-mm 4,12,24] [--n 16] [--name eye_L] --out doc.json
+FR : boucles concentriques autour d'une ouverture : l'édge flow d'un orbiculaire, paupières et lèvres à espacement régulier.
+"""
+import argparse, collections, json, os, sys
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlTubes as TB, ZrlTubeNet as TN, ZrlSpline as SP
+
+ARCHETYPES = {   # 29 October 2026 : conventions of a character face, from the sources of SKILL.md section 256 : loops follow the muscle (orbicularis oculi, oris), even spans between the lids and between the lips ;
+    # rings_mm are distances from the opening, divisions the number of radial seams. A value to be tuned on a real face, never a fact.
+    "eye": {"rings_mm": [3, 8, 15], "n": 16, "heat_len_m": 0.012, "unit": 0.1},
+    "mouth": {"rings_mm": [4, 10, 18, 28], "n": 24, "heat_len_m": 0.015, "unit": 0.1},
+    "nostril": {"rings_mm": [2, 5], "n": 8, "heat_len_m": 0.008, "unit": 0.05},
+    "arch": {"rings_mm": [20, 55, 110], "n": 24, "heat_len_m": 0.04, "unit": 1.0},
+}
+
+PARAMS = {
+    "fine_step_m": 0.001,        # spacing of the distances a seam is read at
+    "ctrl_step_m": 0.012,        # one control point per 12 mm on an arc (at least four)
+    "edge_scale": 0.35,          # mesh edge scale of the component
+    "up": [0.0, 1.0, 0.0],       # angle zero of the seams : up on the surface
+    "source_step_m": 0.002,      # a source curve is sampled this finely before it is turned into vertices
+}
+
+
+def surface_normal(V, T, point):
+    """outward normal at the surface point nearest to `point` (winding order : the model is a closed oriented surface) from the faces around the nearest vertex."""
+    i = int(np.argmin(np.linalg.norm(V - point, axis=1))); f = np.nonzero((T == i).any(1))[0]; a, b, c = V[T[f, 0]], V[T[f, 1]], V[T[f, 2]]; n = np.cross(b - a, c - a).sum(0)
+    return n / max(np.linalg.norm(n), 1e-12), i
+
+
+def rings_around(V, T, source_pts, rings_m, n, name, prm, doc, heat_len=0.012, unit=1.0):
+    """append the rings and seams around the source to doc ; returns a report."""
+    P = np.asarray(source_pts, float); step = prm["source_step_m"]
+    if len(P) > 1:                                                                          # a polyline : sample it finely so that its vertices are near every point of it
+        cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; t = np.arange(0, cum[-1] + step, step); P = np.stack([np.interp(t, cum, P[:, k]) for k in range(3)], 1)
+    roots = np.unique([int(np.argmin(np.linalg.norm(V - p, axis=1))) for p in P]); centre = np.asarray(source_pts, float).mean(0)
+    normal, _ = surface_normal(V, T, centre); up = np.asarray(prm["up"], float); e1 = up - np.dot(up, normal) * normal
+    if np.linalg.norm(e1) < 0.3: e1 = np.array([1.0, 0.0, 0.0]) - normal[0] * normal
+    e1 /= np.linalg.norm(e1); e2 = np.cross(normal, e1)                                     # e1 x e2 = normal : counter clockwise seen from outside
+    phi = TB.heat_distance(V, T, roots, dict(TB.PARAMS, heat_len_m=heat_len))
+    def loop_at(d):
+        loops = TN.contour(V, T, phi, d, None)
+        if not loops: return None
+        return min(loops, key=lambda l: float(np.linalg.norm(l.mean(0) - centre)))
+    levels = [float(x) for x in rings_m]; rings = []
+    for d in levels:
+        l = loop_at(d)
+        if l is None: return {"name": name, "ok": False, "why": "no ring at %.1f mm : the surface ends first" % (d * 1000)}
+        rings.append(l)
+    cs = [TN.at_angles(l, centre, e1, e2, n, polar=True) for l in rings]; corner_nodes = []
+    def add_node(p): doc["nodes"].append({"id": len(doc["nodes"]), "p": [round(float(x), 6) for x in p]}); return len(doc["nodes"]) - 1
+    def add_arc(a, b, C): doc["arcs"].append({"id": len(doc["arcs"]), "a": a, "b": b, "closed": False, "pair": [name, name], "ctrl": np.round(C, 6).tolist(), "mirror": -1})
+    for corners, arcs in cs: corner_nodes.append([add_node(p) for p in corners])
+    for r, (corners, arcs) in enumerate(cs):
+        for i in range(n):
+            C = TN.fit(arcs[i], prm["ctrl_step_m"])
+            if C is not None: add_arc(corner_nodes[r][i], corner_nodes[r][(i + 1) % n], C)
+    seam_arcs = 0
+    for r in range(len(levels) - 1):
+        fine = np.arange(levels[r], levels[r + 1] + 1e-9, prm["fine_step_m"]); mids = []
+        for d in fine[1:-1]:
+            l = loop_at(float(d))
+            if l is not None: mids.append(TN.at_angles(l, centre, e1, e2, n, polar=True)[0])
+        for i in range(n):
+            Q = [np.array(doc["nodes"][corner_nodes[r][i]]["p"])] + [m[i] for m in mids] + [np.array(doc["nodes"][corner_nodes[r + 1][i]]["p"])]; C = TN.fit(Q, prm["ctrl_step_m"])
+            if C is not None: add_arc(corner_nodes[r][i], corner_nodes[r + 1][i], C); seam_arcs += 1
+    seeds = 0
+    for r in range(len(levels) - 1):
+        l = loop_at((levels[r] + levels[r + 1]) / 2)
+        if l is None: continue
+        _, arcs = TN.at_angles(l, centre, e1, e2, n, polar=True)
+        for i in range(n): doc["component_seeds"].append({"name": name, "p": [round(float(x), 6) for x in arcs[i][len(arcs[i]) // 2]]}); seeds += 1
+    doc.setdefault("component_options", {})[name] = {"edge_scale": prm["edge_scale"], "unit": unit}
+    return {"name": name, "ok": True, "rings": len(levels), "seam_arcs": seam_arcs, "seeds": seeds, "source_vertices": int(len(roots)), "normal": np.round(normal, 3).tolist()}
+
+
+def handle(req):
+    """POST /openings {"ref": the model, "source": [[x, y, z], ...], "archetype": "eye", "rings_mm": [..], "n": 16, "name": "eye_L", "unit": 1} -> {"ok", "doc": nodes arcs seeds options, "report"}."""
+    import ZrlNetMesh as NM
+    arch = dict(ARCHETYPES.get(req.get("archetype") or "", {})); rings = req.get("rings_mm") or arch.get("rings_mm") or [4, 10, 18]; n = int(req.get("n") or arch.get("n") or 16); heat = float(req.get("heat_len_m") or arch.get("heat_len_m") or 0.012); unit = float(req.get("unit") or arch.get("unit") or 1.0)
+    tri = NM.load_ref(req.get("ref") or None); T3 = np.stack([tri.A, tri.B, tri.C], 1); P = T3.reshape(-1, 3); key = np.round(P / 1e-5).astype(np.int64); key -= key.min(0)
+    if key.max() < (1 << 20): _, idx, inv = np.unique((key[:, 0] << 40) | (key[:, 1] << 20) | key[:, 2], return_index=True, return_inverse=True)
+    else: _, idx, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    V = P[idx]; T = inv.reshape(-1, 3)
+    doc = {"version": 1, "date": "29 October 2026", "units": "m", "nodes": [], "arcs": [], "components": [], "component_seeds": [], "component_options": {}}
+    rep = rings_around(V, T, req["source"], [r / 1000.0 for r in rings], n, req.get("name") or (req.get("archetype") or "opening"), dict(PARAMS, **(req.get("params") or {})), doc, heat, unit)
+    return {"ok": bool(rep.get("ok")), "doc": doc, "report": rep, "error": None if rep.get("ok") else rep.get("why")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--source", required=True); ap.add_argument("--archetype", default="")
+    ap.add_argument("--rings-mm"); ap.add_argument("--n", type=int); ap.add_argument("--name", default="opening"); ap.add_argument("--out", required=True); a = ap.parse_args()
+    src = [[float(x) for x in p.split(",")] for p in a.source.split(";")]
+    r = handle({"ref": os.path.abspath(a.obj), "source": src, "archetype": a.archetype, "rings_mm": [float(x) for x in a.rings_mm.split(",")] if a.rings_mm else None, "n": a.n, "name": a.name})
+    json.dump(r["doc"], open(a.out, "w")); print(json.dumps(r["report"])); print("nodes", len(r["doc"]["nodes"]), "arcs", len(r["doc"]["arcs"]), "seeds", len(r["doc"]["component_seeds"]))
+
+
+if __name__ == "__main__":
+    main()

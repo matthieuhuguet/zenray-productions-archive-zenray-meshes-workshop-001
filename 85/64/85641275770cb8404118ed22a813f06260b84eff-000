@@ -1,0 +1,97 @@
+"""29 October 2026 : ZenRay Lines TRUNK, the body of a character between the hips and the armpits as a TUBE of horizontal rings.
+EN: below the armpits and above the crotch the trunk of a standing character is one closed loop at every height (the arms hang apart, the legs have not begun) : a tube. Its rings are the horizontal cross
+sections at regular heights, four corners each : the front centre (where the loop crosses the plane of symmetry, in front), the back centre, and the two sides half way along the arcs between them, so every
+ring and every seam is exactly symmetric. The tube is open at both ends : its bottom ring is a hole of the pelvis junction (with the two legs), its top ring a hole of the chest junction (with the neck and
+the two arms). Rows of quads then run all round the belly, the waist and the ribs, which a single tall hexagon cannot give.
+    used by ZrlJunction.body_junctions ; python -I ZrlTrunk.py doc.json --out doc2.json
+FR : le tronc entre les hanches et les aisselles comme un tube d'anneaux horizontaux, symétrique, ouvert aux deux bouts.
+"""
+import argparse, json, os, sys
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlTubeNet as TN, ZrlStraighten as ST
+
+PARAMS = {   # 29 October 2026 : every value of the trunk
+    "bottom_offset_m": 0.10,      # the bottom ring stands this far above the centres of the hip rings of the legs
+    "top_offset_m": 0.12,         # the top ring stands this far below the centres of the shoulder rings of the arms (under the armpit)
+    "step_m": 0.04,               # distance between two rings
+    "waist_zone_m": 0.035,        # 30 October 2026 : bands this close to the waist ring form the lighter `trunk_joint` zone
+    "waist_gap_m": 0.02,          # extra rows each side of the waist (the narrowest ring)
+    "seams": 12,                  # corners (seams) per ring : the front centre, the back centre, the two sides and the columns in between, all straightened ; a multiple of 4
+    "edge_scale": 0.6,            # mesh edge scale of the trunk (more rows than the legs)
+    "ctrl_step_m": 0.04,
+    "seam_points": 3,
+}
+
+
+def level_loop(V, T, y):
+    """the longest closed section of the surface by the plane of height y (the trunk ; the hands that hang at that height are small loops)."""
+    loops = TN.contour(V, T, V[:, 1], y, None)
+    if not loops: return None
+    return max(loops, key=TN.girth)
+
+
+def ring_corners(loop, x0, ref, n=4):
+    """the four corners of a horizontal ring and its four arcs : front and back where the loop crosses the plane of symmetry x = x0, the sides half way along the two arcs between them."""
+    centre = TN.loop_centre(loop); e1 = np.array([0.0, 0.0, 1.0]); e2 = np.array([1.0, 0.0, 0.0]); axis = np.array([0.0, 1.0, 0.0]); d = loop - centre
+    if float(np.sum(np.cross(d, np.roll(d, -1, axis=0)) @ axis)) < 0: loop = loop[::-1]
+    lp = ST.Loop([np.vstack([loop, loop[:1]])]); P = lp.P; xs = P[:, 0] - x0; hits = []
+    for k in range(len(P) - 1):
+        if xs[k] == 0 or xs[k] * xs[k + 1] < 0:
+            t = 0.0 if xs[k] == 0 else xs[k] / (xs[k] - xs[k + 1]); hits.append((float(lp.cum[k] + t * np.linalg.norm(P[k + 1] - P[k])), float((P[k] + t * (P[k + 1] - P[k]))[2])))
+    if len(hits) < 2: return None
+    hits.sort(key=lambda h: -h[1]); sf, sb = hits[0][0], hits[1][0]                    # the front crossing has the larger z
+    if sb < sf: sb += lp.L
+    h = n // 2; s = [sf + (sb - sf) * j / h for j in range(h)] + [sb + (sf + lp.L - sb) * j / h for j in range(h)]; C = [ref.closest(lp.at(q)[None])[0][0] for q in s]      # equal shares of each half of the loop : exactly symmetric
+    arcs = [lp.between(s[i], s[(i + 1) % n]) for i in range(n)]
+    for i in range(n): arcs[i][0], arcs[i][-1] = C[i], C[(i + 1) % n]
+    return {"centre": centre, "corners": C, "arcs": arcs}
+
+
+def build_trunk(doc, V, T, ref, prm=PARAMS):
+    """append the nodes, arcs, seeds and options of the trunk tube to doc ; rings run from the bottom (base) to the top. Returns a report."""
+    tr = doc["tube_rings"]; legs = [tr[k]["rings"][0]["centre"][1] for k in tr if k.startswith("leg_")]; arms = [tr[k]["rings"][0]["centre"][1] for k in tr if k.startswith("arm_") and k.endswith("_2")]
+    if not legs or not arms: return {"name": "trunk", "ok": False, "why": "no legs or no upper arms in the document"}
+    xs = [tr[k]["rings"][0]["centre"][0] for k in tr if k.startswith("arm_") and k.endswith("_2")]; x0 = float(np.mean(xs))
+    yb = float(np.mean(legs)) + prm["bottom_offset_m"]; yt = float(np.mean(arms)) - prm["top_offset_m"]; k = max(2, int(round((yt - yb) / prm["step_m"]))); levels = np.linspace(yb, yt, k + 1); rings = []
+    if prm.get("waist_gap_m", 0.0) > 0:                                                    # animation : the waist bends and twists, a tight stack of rows on its narrowest ring
+        g = [TN.girth(level_loop(V, T, float(y))) for y in levels]; w = float(levels[int(np.argmin(g))]); gap = prm["waist_gap_m"]
+        extra = [w - gap, w + gap]; levels = np.array(sorted({round(float(y), 5) for y in list(levels) + extra if levels[0] <= y <= levels[-1]})); levels = np.array([y for y in levels if y in set(round(e, 5) for e in extra + [w]) or min(abs(y - e) for e in extra + [w]) >= 0.6 * gap])
+    for y in levels:
+        lp = level_loop(V, T, float(y)); r = None if lp is None else ring_corners(lp, x0, ref, int(prm["seams"]))
+        if r is None: return {"name": "trunk", "ok": False, "why": "no closed section at height %.3f" % y}
+        rings.append(r)
+    nodes = doc["nodes"]; arcs = doc["arcs"]; name = "trunk"; ids = []; n = int(prm["seams"])
+    def add_arc(a, b, Q):
+        C = TN.fit(Q, prm["ctrl_step_m"])
+        if C is not None: arcs.append({"id": len(arcs), "a": a, "b": b, "closed": False, "pair": [name, name], "ctrl": np.round(C, 6).tolist(), "mirror": -1})
+    for r in rings: ids.append([len(nodes) + i for i in range(n)]); nodes.extend({"id": len(nodes), "p": [round(float(x), 6) for x in c]} for c in r["corners"])
+    for ri, r in enumerate(rings):
+        for i in range(n): add_arc(ids[ri][i], ids[ri][(i + 1) % n], r["arcs"][i])
+    for ri in range(len(rings) - 1):
+        for i in range(n):
+            a, b = rings[ri]["corners"][i], rings[ri + 1]["corners"][i]; mid = [ref.closest(((1 - u) * a + u * b)[None])[0][0] for u in np.linspace(0, 1, prm["seam_points"] + 2)[1:-1]]
+            add_arc(ids[ri][i], ids[ri + 1][i], np.vstack([a[None]] + [m[None] for m in mid] + [b[None]]))
+    wy = float(levels[int(np.argmin([TN.girth(level_loop(V, T, float(y))) for y in levels]))]) if prm.get("waist_zone_m", 0.0) > 0 else None; wz = float(prm.get("waist_zone_m", 0.0)); joint_bands = 0      # 30 October 2026 : the waist bends and twists : the bands within waist_zone_m of its narrowest ring are the component `trunk_joint` (lighter colour, like the MetaHuman bands)
+    for ri in range(len(rings) - 1):                                                       # one seed per band face, the middle of its four corners
+        ym = 0.5 * (float(rings[ri]["centre"][1]) + float(rings[ri + 1]["centre"][1])); joint = wy is not None and abs(ym - wy) <= wz; joint_bands += int(joint)
+        for i in range(n):
+            c = np.mean([rings[ri]["corners"][i], rings[ri]["corners"][(i + 1) % n], rings[ri + 1]["corners"][i], rings[ri + 1]["corners"][(i + 1) % n]], axis=0)
+            doc.setdefault("component_seeds", []).append({"name": name + "_joint" if joint else name, "p": [round(float(x), 6) for x in ref.closest(c[None])[0][0]]})
+    unit = next((o.get("unit") for o in doc["component_options"].values() if o.get("unit")), 1.0); doc["component_options"][name] = {"edge_scale": prm["edge_scale"], "unit": unit}
+    if joint_bands: doc["component_options"][name + "_joint"] = {"edge_scale": prm["edge_scale"], "unit": unit}
+    tr[name] = {"cap": False, "open": ["base", "top"], "rings": [{"nodes": ids[ri], "centre": [float(x) for x in rings[ri]["centre"]], "axis": [0.0, 1.0, 0.0], "e1": [0.0, 0.0, 1.0]} for ri in range(len(rings))]}
+    rep = ST.straighten_tube(doc, name, ref, ST.PARAMS)
+    return {"name": name, "ok": True, "rings": len(rings), "y_bottom": round(yb, 3), "y_top": round(yt, 3), "x0": round(x0, 4), "straighten": rep}
+
+
+def main():
+    import ZrlNetMesh as NM, ZrlTubes as TB
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--out", required=True); a = ap.parse_args()
+    doc = json.load(open(a.doc)); V, T = TB.load_welded(doc["model_ref"]); print(json.dumps(build_trunk(doc, V, T, NM.load_ref(doc["model_ref"])))); json.dump(doc, open(a.out, "w"))
+
+
+if __name__ == "__main__":
+    main()

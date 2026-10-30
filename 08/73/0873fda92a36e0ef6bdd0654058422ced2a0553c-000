@@ -230,14 +230,47 @@ def closest(req, prm=PARAMS):
     """29 October 2026 : the point of the reference nearest to p : the middle of two merged points of the curves goes back on the surface.
     FR : le point de la référence le plus proche de p : le milieu de deux points fusionnés revient sur la surface."""
     import ZrlNetMesh as NM
-    m = mesh(req.get("ref")); p = np.asarray(req["p"], float)
+    m = mesh(req.get("ref"))
     if "ref_all" not in m: m["ref_all"] = NM.Ref(m["P"][m["F"]])
-    q = np.asarray(m["ref_all"].closest(p[None])[0])[0]
+    if "pts" in req:                                                            # many points at once (straighten, duplicate, connect)
+        P = np.asarray(req["pts"], float).reshape(-1, 3); Q = np.asarray(m["ref_all"].closest(P)[0]).reshape(-1, 3)
+        return {"ok": True, "pts": np.round(Q, 6).tolist(), "moved_mm": np.round(np.linalg.norm(Q - P, axis=1) * 1000, 2).tolist()}
+    p = np.asarray(req["p"], float); q = np.asarray(m["ref_all"].closest(p[None])[0])[0]
     return {"ok": True, "p": np.round(q, 6).tolist(), "moved_mm": round(float(np.linalg.norm(q - p)) * 1000, 2)}
 
 
+def part_stats(m):
+    """per part of the reference : area, and the triangle whose centre is nearest the area centroid (the anchor of its patch), cached."""
+    if "part_stats" in m: return m["part_stats"]
+    P, F, G = m["P"], m["F"], m["G"]; n = len(m["names"]); ar = 0.5 * np.linalg.norm(np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]), axis=1)
+    area = np.bincount(G, weights=ar, minlength=n); cen = m["cent"]; C = np.stack([np.bincount(G, weights=ar * cen[:, k], minlength=n) / np.maximum(area, 1e-12) for k in range(3)], 1)
+    d = np.linalg.norm(cen - C[G], axis=1); order = np.lexsort((d, G)); Gs = G[order]; first = order[np.r_[True, Gs[1:] != Gs[:-1]]]
+    m["part_stats"] = {"area": area, "anchor": {int(G[t]): int(t) for t in first}}; return m["part_stats"]
+
+
+def build_parts(req, prm=PARAMS):
+    """29 October 2026 : AUTOMATIC BUILD. One patch (a ring comes as quarters) for each listed part of the reference, grown over the WHOLE part (zone_deg 70 by default),
+    skipping the parts smaller than min_area_m2 (bolts, slots). The editor sends the parts in small chunks, mirrors the right side from the left itself, welds and checks.
+    POST /auto_patch {"op": "build_parts", "parts": [0, 1, ...] or "all", "zone_deg": 70, "min_area_m2": 0.004}  -> results [{part, name, ok, corners, sides, seed, patches?, ring?, report | error | skipped}]
+    FR : construction automatique : un patch par pièce, sur toute la pièce ; les petites pièces sont ignorées ; l'éditeur envoie les pièces par lots."""
+    t0 = time.time(); m = mesh(req.get("ref")); st = part_stats(m); names = m["names"]
+    parts = range(len(names)) if req.get("parts") in (None, "all") else [int(g) for g in req["parts"]]
+    zd, min_area, out = float(req.get("zone_deg", 70.0)), float(req.get("min_area_m2", 0.004)), []
+    for g in parts:
+        item = {"part": int(g), "name": names[g], "area_m2": round(float(st["area"][g]), 4)}
+        if g not in st["anchor"]: item.update({"ok": False, "skipped": "empty"}); out.append(item); continue
+        if st["area"][g] < min_area: item.update({"ok": False, "skipped": "small"}); out.append(item); continue
+        a = m["cent"][st["anchor"][g]]
+        try: r = patch({"p": a.tolist(), "part": int(g), "zone_deg": zd, "max_radius_m": float(req.get("max_radius_m", 6.0)), "max_triangles": int(req.get("max_triangles", 150000)), "ref": req.get("ref")}, prm)
+        except Exception as e: r = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if r.get("ok"): item.update({k: r[k] for k in ("corners", "sides", "seed", "patches", "ring", "report") if k in r}); item["ok"] = True
+        else: item.update({"ok": False, "error": r.get("error", "no patch"), "ring": bool(r.get("ring"))})
+        out.append(item)
+    return {"ok": True, "results": out, "seconds": round(time.time() - t0, 2)}
+
+
 def handle(req):
-    return {"snap": snap, "closest": closest}.get(req.get("op"), patch)(req)
+    return {"snap": snap, "closest": closest, "build_parts": build_parts}.get(req.get("op"), patch)(req)
 
 
 if __name__ == "__main__":

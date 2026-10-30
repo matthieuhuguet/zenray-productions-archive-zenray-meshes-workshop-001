@@ -1,0 +1,44 @@
+"""29 October 2026 : ZenRay Lines CLOSED CHECK : mesh a document and prove the result is one closed sphere : V - E + F = 2, no border edge, every edge shared by two quads, one connected piece, no face left unmeshed.
+    python -I ZrlClosedCheck.py doc.json --ref model.obj [--unit 0.1] [--feature-unit 1.0] [--edge 0.02]       exit code 0 when closed
+FR : prouve que le maillage final est une sphère fermée (Euler 2, aucune arête de bord, une seule pièce, aucune face non maillée)."""
+import argparse, collections, json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlNetMesh as NM
+
+
+def closed_report(P, Q):
+    P = np.asarray(P, float).reshape(-1, 3); Q = np.asarray(Q, np.int64).reshape(-1, 4); used = np.unique(Q); E = np.sort(np.stack([Q, np.roll(Q, -1, 1)], 2).reshape(-1, 2), 1); key = E[:, 0] * len(P) + E[:, 1]
+    uk, cnt = np.unique(key, return_counts=True); border = int((cnt == 1).sum()); nonman = int((cnt > 2).sum()); V, Ne, F = len(used), len(uk), len(Q)
+    parent = {int(i): int(i) for i in used}
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for q in Q:
+        for k in range(4): parent[find(int(q[k]))] = find(int(q[(k + 1) % 4]))
+    pieces = len({find(int(i)) for i in used}); dup = len(P) - len(np.unique(np.round(P, 7), axis=0))
+    return {"V": V, "E": Ne, "F": F, "chi": V - Ne + F, "border_edges": border, "non_manifold_edges": nonman, "pieces": pieces, "duplicate_vertices": dup, "closed": border == 0 and nonman == 0 and pieces == 1 and V - Ne + F == 2}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--unit", type=float); ap.add_argument("--feature-unit", type=float); ap.add_argument("--edge", type=float, default=0.02); ap.add_argument("--obj"); ap.add_argument("--time-limit", type=float, help="seconds the integer solver of the counts may use"); ap.add_argument("--param", action="append", default=[], help="engine parameter KEY=VALUE, on top of doc[mesh_params]")
+    a = ap.parse_args(); doc = json.load(open(a.doc)); unit = a.unit if a.unit is not None else doc.get("mesh_unit", 1.0); fu = a.feature_unit if a.feature_unit is not None else doc.get("mesh_feature_unit")
+    if a.time_limit:
+        import ZrlCounts as CT; CT.PARAMS["time_limit_s"] = a.time_limit
+    extra = dict(doc.get("mesh_params", {})); extra.update({k: (int(float(v)) if k.endswith("_iters") else float(v)) for k, v in (x.split("=") for x in a.param)})
+    res = NM.build(doc, dict({"ref": os.path.abspath(a.ref), "unit": unit, "feature_unit": fu, "edge_m": a.edge, "component_options": doc.get("component_options", {}), "corners_force": doc.get("corners_force", {}), "write_obj": False, "auto_fallback": True}, **extra))      # what the editor sends : the options of every component
+    st = collections.Counter(f["status"] for f in res["faces"]); skipped = collections.Counter(f["reason"] for f in res["faces"] if f["status"] != "meshed")
+    rep = closed_report(res["P"], res["Q"]); rep["faces_of_network"] = len(res["faces"]); rep["status"] = dict(st); rep["skipped_reasons"] = dict(skipped); rep["quads_below_jac"] = res["stats"].get("quads_below_jac_min"); rep["count_deviation"] = res["stats"].get("count_deviation")
+    print(json.dumps(rep, indent=1))
+    if a.obj:
+        P = np.asarray(res["P"], float).reshape(-1, 3); Q = np.asarray(res["Q"], np.int64).reshape(-1, 4)
+        with open(a.obj, "w") as f:
+            for p in P: f.write("v %.6f %.6f %.6f\n" % tuple(p))
+            for q in Q: f.write("f %d %d %d %d\n" % tuple(q + 1))
+        comp = {fc["id"]: fc.get("component") or "face_%s" % fc["id"] for fc in res["faces"]}      # 30 October 2026 : the component of every quad, for the zone colours of ZrlMeshView --parts
+        json.dump([comp.get(i, "face") for i in res["face_of_quad"]], open(a.obj + ".parts.json", "w"))
+    sys.exit(0 if rep["closed"] and not skipped else 1)
+
+
+if __name__ == "__main__":
+    main()

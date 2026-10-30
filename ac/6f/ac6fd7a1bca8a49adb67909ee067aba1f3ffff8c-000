@@ -1,0 +1,54 @@
+"""30 October 2026 : ZenRay Lines QUAD STATS : the numbers that say whether a quad mesh is even : folded quads (a negative Jacobian at a corner), squashed quads (Jacobian below 0.3), the aspect ratio of the quads and their mean edge length, by height band of the character.
+    python -I ZrlQuadStats.py mesh.obj [--band 0.1] [--json]
+FR : quads repliés, écrasés, rapport d'aspect et longueur d'arête moyenne par tranche de hauteur."""
+import argparse, json
+import numpy as np
+
+
+def load(path):
+    V, Q = [], []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": Q.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), np.array([q for q in Q if len(q) == 4])
+
+
+def stats(V, Q):
+    P = V[Q]; e = [np.linalg.norm(P[:, (k + 1) % 4] - P[:, k], axis=1) for k in range(4)]; edge = np.mean(e, axis=0)
+    a = (e[0] + e[2]) / 2; b = (e[1] + e[3]) / 2; aspect = np.maximum(a, b) / np.maximum(np.minimum(a, b), 1e-9)
+    n0 = np.cross(P[:, 1] - P[:, 0], P[:, 3] - P[:, 0]); nm = n0 / np.maximum(np.linalg.norm(n0, axis=1, keepdims=True), 1e-12); jac = np.empty((len(Q), 4))
+    for k in range(4):
+        u = P[:, (k + 1) % 4] - P[:, k]; v = P[:, (k - 1) % 4] - P[:, k]; c = np.einsum("ij,ij->i", np.cross(u, v), nm); jac[:, k] = c / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(v, axis=1), 1e-12)
+    return edge, aspect, jac.min(1), P.mean(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("obj"); ap.add_argument("--band", type=float, default=0.1); ap.add_argument("--json", action="store_true"); a = ap.parse_args()
+    V, Q = load(a.obj); edge, aspect, jmin, C = stats(V, Q); out = {"quads": int(len(Q)), "folded": int((jmin < 0).sum()), "squashed_below_0.3": int((jmin < 0.3).sum()), "aspect_mean": round(float(aspect.mean()), 2), "aspect_p90": round(float(np.percentile(aspect, 90)), 2), "edge_mm_mean": round(float(edge.mean() * 1000), 1), "bands": []}
+    for y0 in np.arange(C[:, 1].min(), C[:, 1].max(), a.band):
+        m = (C[:, 1] >= y0) & (C[:, 1] < y0 + a.band)
+        if m.sum(): out["bands"].append({"y": round(float(y0), 2), "n": int(m.sum()), "edge_mm": round(float(edge[m].mean() * 1000), 1), "aspect": round(float(aspect[m].mean()), 2), "folded": int((jmin[m] < 0).sum())})
+    if a.json: print(json.dumps(out)); return
+    print({k: v for k, v in out.items() if k != "bands"})
+    for b in out["bands"]: print("y %.2f n=%5d edge %5.1f mm aspect %.2f folded %d" % (b["y"], b["n"], b["edge_mm"], b["aspect"], b["folded"]))
+
+
+if __name__ == "__main__":
+    main()
+
+
+def regions(path):
+    """30 October 2026 : mean edge length (mm), aspect and folded count of the regions of a standing character, to equalise the densities : head, neck, chest, abdomen, pelvis, thighs, calves, feet, upper arms, forearms, hands."""
+    V, Q = load(path); edge, aspect, jmin, C = stats(V, Q); x = np.abs(C[:, 0]); y = C[:, 1]; top = V[:, 1].max(); sc = top / 1.8
+    R = {"head": y > 1.58 * sc, "neck": (y > 1.46 * sc) & (y <= 1.58 * sc) & (x < 0.1), "chest": (y > 1.2 * sc) & (y <= 1.46 * sc) & (x < 0.2), "abdomen": (y > 0.95 * sc) & (y <= 1.2 * sc) & (x < 0.2), "pelvis": (y > 0.75 * sc) & (y <= 0.95 * sc) & (x < 0.2),
+         "thigh": (y > 0.4 * sc) & (y <= 0.75 * sc), "calf": (y > 0.1 * sc) & (y <= 0.4 * sc), "foot": y <= 0.1 * sc, "upper_arm": (x >= 0.2) & (x < 0.42 * sc) & (y > 0.9 * sc), "forearm": (x >= 0.42 * sc) & (x < 0.62 * sc) & (y > 0.9 * sc), "hand": (x >= 0.62 * sc) & (y > 0.9 * sc)}
+    return {k: {"n": int(m.sum()), "edge_mm": round(float(edge[m].mean() * 1000), 1) if m.sum() else 0, "aspect": round(float(aspect[m].mean()), 2) if m.sum() else 0, "folded": int((jmin[m] < 0).sum())} for k, m in R.items()}
+
+
+def symmetry(path, tol=0.002):
+    """30 October 2026 : how mirror symmetric a mesh is about x = 0 : the share of vertices whose mirror image has a vertex within `tol` metres, by region (the same rows as `regions`)."""
+    from scipy.spatial import cKDTree
+    V, Q = load(path); T = cKDTree(V); M = V * np.array([-1.0, 1.0, 1.0]); d, _ = T.query(M); y = V[:, 1]; x = np.abs(V[:, 0]); top = V[:, 1].max(); sc = top / 1.8
+    R = {"head": y > 1.58 * sc, "neck": (y > 1.46 * sc) & (y <= 1.58 * sc) & (x < 0.1), "chest": (y > 1.2 * sc) & (y <= 1.46 * sc) & (x < 0.2), "abdomen": (y > 0.95 * sc) & (y <= 1.2 * sc) & (x < 0.2), "pelvis": (y > 0.75 * sc) & (y <= 0.95 * sc) & (x < 0.2), "legs": (y <= 0.75 * sc) & (x > 0.005), "arms": (x >= 0.2) & (y > 0.9 * sc)}
+    return {"all": round(float((d < tol).mean()), 4), **{k: round(float((d[m] < tol).mean()), 3) if m.sum() else 1.0 for k, m in R.items()}}

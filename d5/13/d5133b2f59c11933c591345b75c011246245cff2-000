@@ -1,0 +1,57 @@
+"""30 October 2026 : ZenRay Lines CAR SYMMETRIZE : a car is mirror symmetric, so of two panels that are images of each other (name ending _L and _R) the one whose mesh is better (fewer folded and squashed quads, or the only one that meshes) is mirrored onto the other : the weaker patch is replaced by the mirror image of the stronger one, and the pair is exactly symmetric.
+    python -I ZrlCarSymmetrize.py doc.json --ref model.obj --out doc_sym.json [--edge 0.04]
+FR : de deux panneaux images l'un de l'autre, le mieux maillé est reflété sur l'autre."""
+import argparse, copy, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlCarMesh as CM
+
+
+def mirror_component(doc, src, dst):
+    """replace the patch of dst by the mirror image (x to -x) of the patch of src, in place."""
+    keep_n = [n for n in doc["nodes"]]; arcs_src = [a for a in doc["arcs"] if a["pair"][0] == src]; ids = sorted({a["a"] for a in arcs_src} | {a["b"] for a in arcs_src}); by = {n["id"]: n for n in doc["nodes"]}
+    dst_arcs = [a for a in doc["arcs"] if a["pair"][0] == dst]; dst_ids = sorted({a["a"] for a in dst_arcs} | {a["b"] for a in dst_arcs})
+    if len(ids) != len(dst_ids): return False
+    remap = dict(zip(ids, dst_ids))
+    for i, j in remap.items(): p = by[i]["p"]; by[j]["p"] = [-p[0], p[1], p[2]]
+    dst_arcs_new = []
+    for a in arcs_src:
+        b = copy.deepcopy(a); b["pair"] = [dst, dst]; b["a"] = remap[a["a"]]; b["b"] = remap[a["b"]]; b["ctrl"] = [[-p[0], p[1], p[2]] for p in a["ctrl"]]; dst_arcs_new.append(b)
+    doc["arcs"] = [a for a in doc["arcs"] if a["pair"][0] != dst]
+    for b in dst_arcs_new: b["id"] = len(doc["arcs"]); doc["arcs"].append(b)
+    for s in doc["component_seeds"]:
+        if s["name"] == dst:
+            src_s = next(q for q in doc["component_seeds"] if q["name"] == src); s["p"] = [-src_s["p"][0], src_s["p"][1], src_s["p"][2]]
+    return True
+
+
+def mirror_sub(sub, src, dst):
+    """30 October 2026 : the one patch document of src (its cut sides included) mirrored into the one patch document of dst."""
+    import copy
+    m = copy.deepcopy(sub)
+    for n in m["nodes"]: n["p"] = [-n["p"][0], n["p"][1], n["p"][2]]
+    for a in m["arcs"]: a["ctrl"] = [[-p[0], p[1], p[2]] for p in a["ctrl"]]; a["pair"] = [dst, dst]
+    for q in m["component_seeds"]: q["name"] = dst; q["p"] = [-q["p"][0], q["p"][1], q["p"][2]]
+    m["components"] = [dst]; m["component_options"] = {dst: dict(next(iter(sub["component_options"].values())))}; return m
+
+
+def symmetrize(doc, ref, edge=0.04, log=print):
+    P, Q, parts, rows = CM.mesh_all(doc, ref, edge, edge_by=doc.get("component_edge_m")); score = {}
+    for name, status, why, nq, nf, sq in rows: score[name] = 1e9 if status != "meshed" else (nf + 0.2 * sq * nq) / max(nq, 1)
+    done = []
+    for name in list(score):
+        if not name.endswith("_L") or name[:-2] + "_R" not in score: continue
+        r = name[:-2] + "_R"; src, dst = (name, r) if score[name] <= score[r] else (r, name)
+        if score[dst] - score[src] < 0.02: continue
+        subs = doc.setdefault("component_subdocs", {}); src_sub = subs.get(src) or dict(CM.sub_docs(doc)).get(src)
+        if src_sub is not None: subs[dst] = mirror_sub(src_sub, src, dst); doc.setdefault("component_mesh_params", {})[dst] = (doc.get("component_mesh_params") or {}).get(src, {}); doc.get("component_edge_m", {}).pop(dst, None)
+        if src_sub is not None or mirror_component(doc, src, dst): done.append((src, dst, round(score[src], 3), round(score[dst], 3))); log("mirror %s onto %s (score %.3f better than %.3f)" % (src, dst, score[src], score[dst]))
+    return doc, done
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--out", required=True); ap.add_argument("--edge", type=float, default=0.04); a = ap.parse_args()
+    doc, done = symmetrize(json.load(open(a.doc)), a.ref, a.edge); json.dump(doc, open(a.out, "w")); print("mirrored", len(done))
+
+
+if __name__ == "__main__":
+    main()

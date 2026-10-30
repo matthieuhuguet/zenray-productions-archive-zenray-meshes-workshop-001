@@ -1,0 +1,129 @@
+"""30 October 2026 : ZenRay Lines CAR MESH, one component at a time : each patch of a car document (ZrlCarPatches.py) is meshed ALONE by the engine of Manny (sub document of one face : no nesting, no complement, no panel eating its neighbour), judged (meshed ? quads ? folded ? Jacobian ?), and the parts are joined in one OBJ with the component of every quad.
+    python -I ZrlCarMesh.py doc.json --ref model.obj --out out.obj [--edge 0.03]
+FR : chaque patch de la voiture maillé seul par le moteur de Manny, jugé, puis tous les components réunis dans un OBJ."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlNetMesh as NM, ZrlQuadStats as QS
+
+
+def sub_docs(doc):
+    by_node = {n["id"]: n for n in doc["nodes"]}; out = []
+    for name in doc["components"]:
+        arcs = [a for a in doc["arcs"] if a["pair"][0] == name]
+        if not arcs: continue
+        ids = sorted({a["a"] for a in arcs} | {a["b"] for a in arcs}); remap = {i: k for k, i in enumerate(ids)}
+        sub = dict(doc); sub["nodes"] = [{"id": remap[i], "p": by_node[i]["p"]} for i in ids]; sub["arcs"] = [dict(a, id=k, a=remap[a["a"]], b=remap[a["b"]], mirror=-1) for k, a in enumerate(arcs)]
+        sub["component_seeds"] = [s for s in doc["component_seeds"] if s["name"] == name]; sub["components"] = [name]; out.append((name, sub))
+    return out
+
+
+VARIANTS = [dict(harmonic=h, tangential=t, relax_iters=r, untangle_iters=u) for h in (True, False) for t in (False, True) for r in (0, 30, 80) for u in (0, 400, 1500)]   # 30 October 2026 : the fill knobs of the engine
+
+
+def judge(res):
+    P = np.asarray(res["P"], float).reshape(-1, 3); Q = np.asarray(res["Q"], np.int64).reshape(-1, 4)
+    if not len(Q): return 1e9
+    _, _, jmin, _ = QS.stats(P, Q); return float((jmin < 0).sum() + 0.2 * (jmin < 0.3).sum()) / len(Q)
+
+
+def best_params(sub, ref, edge, base):
+    """the fill knobs that fold the fewest quads of this one patch (a small tournament)."""
+    best = None
+    for v in VARIANTS:
+        try: res = NM.build(sub, dict(base, **v))
+        except Exception: continue
+        if not len(res["Q"]): continue
+        sc = judge(res)
+        if best is None or sc < best[0] - 1e-9: best = (sc, v)
+    return best
+
+
+def split_arc(sub, ai, frac=0.5):
+    """30 October 2026 : a patch with FIVE or SIX sides : the arc ai of a one patch document is cut at the fraction frac of its length, the new node is a corner (the engine pairs 5 and 6 sided patches by the Tarini rule)."""
+    import ZrlSpline as SP, ZrlTubeNet as TN
+    a = sub["arcs"][ai]; P = SP.sample(np.asarray(a["ctrl"], float), 24); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; t = frac * cum[-1]; k = int(np.searchsorted(cum, t)); q = P[k - 1] + (P[k] - P[k - 1]) * ((t - cum[k - 1]) / max(cum[k] - cum[k - 1], 1e-12))
+    nid = len(sub["nodes"]); sub["nodes"].append({"id": nid, "p": [round(float(x), 6) for x in q]}); A = np.vstack([P[:k], q[None]]); B = np.vstack([q[None], P[k:]]); step = 0.04
+    fa = TN.fit(A, step); fb = TN.fit(B, step)
+    if fa is None or fb is None: return False
+    old_b = a["b"]; a["b"] = nid; a["ctrl"] = np.round(fa, 6).tolist(); sub["arcs"].append(dict(a, id=len(sub["arcs"]), a=nid, b=old_b, ctrl=np.round(fb, 6).tolist())); sub["corners_force"] = dict(sub.get("corners_force") or {}, **{str(nid): True}); return True
+
+
+def sharpest_bend(sub, ai, window_m=0.03, min_deg=40.0):
+    """(fraction of the arc length, turn in degrees) of the sharpest bend inside the arc ai, or None : a reflex corner of the contour hides in the middle of a side of the four corner patch."""
+    import ZrlSpline as SP
+    P = SP.sample(np.asarray(sub["arcs"][ai]["ctrl"], float), 48); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; L = cum[-1]; best = None
+    for k in range(1, len(P) - 1):
+        a = P[np.searchsorted(cum, max(cum[k] - window_m, 0.0))]; b = P[min(np.searchsorted(cum, cum[k] + window_m), len(P) - 1)]; u = P[k] - a; w = b - P[k]
+        if np.linalg.norm(u) < 1e-9 or np.linalg.norm(w) < 1e-9: continue
+        t = float(np.degrees(np.arccos(np.clip(u @ w / (np.linalg.norm(u) * np.linalg.norm(w)), -1, 1))))
+        if 0.1 * L < cum[k] < 0.9 * L and t >= min_deg and (best is None or t > best[1]): best = (float(cum[k] / L), t)
+    return best
+
+
+def shape_variants(sub):
+    """the patch as drawn (4 sides), with its longest side cut (5 sides), with its two longest sides cut (6 sides), with the longest cut in thirds."""
+    import copy, ZrlSpline as SP
+    L = [float(np.linalg.norm(np.diff(SP.sample(np.asarray(a["ctrl"], float), 24), axis=0), axis=1).sum()) for a in sub["arcs"]]; order = list(np.argsort(L)[::-1]); out = [("4", sub)]
+    v = copy.deepcopy(sub)
+    if split_arc(v, int(order[0])): out.append(("5", v))
+    v2 = copy.deepcopy(sub)
+    if split_arc(v2, int(order[0])) and split_arc(v2, int(order[1])): out.append(("6", v2))
+    v3 = copy.deepcopy(sub)
+    if split_arc(v3, int(order[1])): out.append(("5b", v3))
+    bends = [(i, sharpest_bend(sub, i)) for i in range(len(sub["arcs"]))]; bends = [(i, b) for i, b in bends if b]
+    if bends:                                                                              # the corners at the bends of the contour : the sharpest one, then all of them
+        bends.sort(key=lambda x: -x[1][1]); v4 = copy.deepcopy(sub)
+        if split_arc(v4, bends[0][0], bends[0][1][0]): out.append(("bend1", v4))
+        v5 = copy.deepcopy(sub); done = 0
+        for i, b in sorted(bends[:2], key=lambda x: -x[0]):                                # highest index first : an arc that is cut keeps its index, the new half is appended
+            done += int(split_arc(v5, i, b[0]))
+        if done > 1: out.append(("bend2", v5))
+    return out
+
+
+def mesh_all(doc, ref, edge=0.03, edge_by=None, log=print, tune=False, shapes=False):
+    P_all = []; Q_all = []; parts = []; rows = []
+    for name, sub in sub_docs(doc):
+        sub = (doc.get("component_subdocs") or {}).get(name, sub); e = (edge_by or {}).get(name, edge)
+        base = {"ref": os.path.abspath(ref), "unit": 1.0, "edge_m": e, "write_obj": False, "auto_fallback": True, "component_options": sub.get("component_options", {}), "corners_force": {}, "min_compactness": 0.0, "wrap_min_normal": 0.0, "inherit_component": True, "symmetric_corners": False}
+        knobs = (doc.get("component_mesh_params") or {}).get(name, {})
+        try:
+            res = NM.build(sub, dict(base, **knobs))
+            if tune and judge(res) > 0.0:
+                b = best_params(sub, ref, e, base)
+                if b and b[0] < judge(res): knobs = b[1]; doc.setdefault("component_mesh_params", {})[name] = knobs; res = NM.build(sub, dict(base, **knobs))
+            if shapes and judge(res) > 0.02:                                                # 30 October 2026 : try 5 and 6 sided shapes of the patch, keep the best (judged with the same fill knobs)
+                bestv = (judge(res), "4", sub)
+                for tag, v in shape_variants(sub)[1:]:
+                    try: r2 = NM.build(v, dict(base, **knobs))
+                    except Exception: continue
+                    if len(r2["Q"]) and judge(r2) < bestv[0] - 1e-9: bestv = (judge(r2), tag, v)
+                if bestv[1] != "4":
+                    sub = bestv[2]; res = NM.build(sub, dict(base, **knobs)); doc.setdefault("component_shape", {})[name] = bestv[1]; doc.setdefault("component_subdocs", {})[name] = sub
+                    log("%s : shape %s sides, score %.3f" % (name, bestv[1], bestv[0]))
+        except Exception as ex: rows.append((name, "ERROR", str(ex)[:60], 0, 0, 0)); continue
+        faces = [f for f in res["faces"] if (f.get("reason") or "") != "complement"]; ok = [f for f in faces if f["status"] == "meshed"]      # the sub document holds one patch : the face that is not the complement is the component (its seed may sit a hair outside the loop)
+        if not ok or not len(res["Q"]): rows.append((name, "UNMESHED", ",".join(sorted({(f.get("reason") or "")[:20] for f in faces})), 0, 0, 0)); continue
+        P = np.asarray(res["P"], float).reshape(-1, 3); Q = np.asarray(res["Q"], np.int64).reshape(-1, 4); vo = sum(len(p) for p in P_all)
+        edge_s, asp, jmin, C = QS.stats(P, Q); rows.append((name, "meshed", "", len(Q), int((jmin < 0).sum()), float(np.mean(jmin < 0.3))))
+        P_all.append(P); Q_all.append(Q + vo); parts += [name] * len(Q)
+    return (np.vstack(P_all), np.vstack(Q_all), parts, rows) if P_all else (None, None, [], rows)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--out", required=True); ap.add_argument("--edge", type=float, default=0.03); ap.add_argument("--tune", action="store_true", help="a tournament of the fill knobs for every patch that folds quads ; the winners are written into the document (component_mesh_params)"); ap.add_argument("--auto-edge", type=float, default=0.0, help="N : an edge per panel that gives about N quads (equal density)"); ap.add_argument("--shapes", action="store_true", help="try 5 and 6 sided shapes of every patch that still folds quads"); ap.add_argument("--save-doc"); a = ap.parse_args()
+    doc = json.load(open(a.doc))
+    if a.auto_edge:                                                                        # 30 October 2026 : equal density : each panel gets the edge that gives it about N quads (area / N under a root), clipped between 12 and 50 mm
+        _, _, _, r0 = mesh_all(doc, a.ref, a.edge); doc["component_edge_m"] = {r[0]: float(np.clip(np.sqrt(max(r[3], 1) * a.edge ** 2 / a.auto_edge), 0.012, 0.05)) for r in r0 if r[1] == "meshed"}
+    P, Q, parts, rows = mesh_all(doc, a.ref, a.edge, edge_by=doc.get("component_edge_m"), tune=a.tune, shapes=a.shapes)
+    if a.save_doc: json.dump(doc, open(a.save_doc, "w"))
+    with open(a.out, "w") as f:
+        for p in P: f.write("v %.6f %.6f %.6f\n" % tuple(p))
+        for q in Q: f.write("f %d %d %d %d\n" % tuple(q + 1))
+    json.dump(parts, open(a.out + ".parts.json", "w"))
+    for r in rows: print("%-34s %-9s %-22s quads %5d folded %3d squashed %.2f" % r)
+    print("meshed %d of %d components, %d quads, %d folded" % (sum(1 for r in rows if r[1] == "meshed"), len(rows), sum(r[3] for r in rows), sum(r[4] for r in rows)))
+
+
+if __name__ == "__main__":
+    main()

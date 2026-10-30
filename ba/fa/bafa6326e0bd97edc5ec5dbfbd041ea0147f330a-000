@@ -1,0 +1,26 @@
+"""29 October 2026 : ZenRay Lines UNMESHED : mesh a document and list the faces that did not mesh, with their component, size, position and the tube ring and corner of their nodes.
+    python -I ZrlUnmeshed.py doc.json --ref model.obj [--edge 0.02] [--param key=value]
+FR : liste les faces non maillées, leur composant, leur taille, leur position et leurs coins."""
+import argparse, collections, json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlNetMesh as NM
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--edge", type=float, default=0.02); ap.add_argument("--param", action="append", default=[]); a = ap.parse_args()
+    doc = json.load(open(a.doc)); A = {x["id"]: x for x in doc["arcs"]}; where = {}
+    for nm, t in doc.get("tube_rings", {}).items():
+        for ri, r in enumerate(t["rings"]):
+            for ci, i in enumerate(r["nodes"]): where[i] = (nm, ri, ci)
+    extra = dict(doc.get("mesh_params", {})); extra.update({k: float(v) for k, v in (x.split("=") for x in a.param)})
+    res = NM.build(doc, dict({"ref": os.path.abspath(a.ref), "unit": doc.get("mesh_unit", 1.0), "feature_unit": doc.get("mesh_feature_unit"), "edge_m": a.edge, "component_options": doc.get("component_options", {}), "corners_force": doc.get("corners_force", {}), "write_obj": False, "auto_fallback": True}, **extra))
+    print(collections.Counter((f["status"], f["reason"]) for f in res["faces"] if f["status"] != "meshed"))
+    for f in res["faces"]:
+        if f["status"] == "meshed": continue
+        nodes = [(A[x]["a"] if s > 0 else A[x]["b"]) if x in A else None for x, s in f["arcs"]]
+        print(f["id"], f["reason"], "comp", f.get("component"), "arcs", len(f["arcs"]), "area mm2", round(f["area"] * 1e6), "perim mm", round(f["perimeter"] * 1000), "centroid", np.round(f["centroid"], 2).tolist(), [where.get(n, "pole") for n in nodes][:4])
+
+
+if __name__ == "__main__":
+    main()

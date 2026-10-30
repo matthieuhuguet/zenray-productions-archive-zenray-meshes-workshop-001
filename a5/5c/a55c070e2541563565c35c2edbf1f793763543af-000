@@ -1,0 +1,418 @@
+"""29 October 2026 : ZenRay Lines JUNCTIONS, the surface between tubes closed by bridges, cut like the pattern of a garment.
+EN: the open ends of the tubes (the neck, the shoulders and the hips of a body ; the wrist and the digits of a hand) are holes of a sphere. Bridges join the corners of the open rings to a few POLE nodes
+and to each other, so that every face of the network is a patch of 3 to 6 sides that the engine can mesh.
+  - BODY (torso) : a front centre line and a back centre line run in the plane of symmetry from the front of the neck to the crotch, with two poles on each (chest F1/B1, belly F2/B2) ; the chest pole
+    is joined to the neck and to both armholes, the belly pole to both legs ; the shoulder seams join neck and arms, the side seams join arms and legs, the crotch seam joins the legs. 5 holes give 10
+    faces : 3 pentagons and 2 hexagons per side.
+  - every bridge is the shortest path on the surface (restricted to the trunk side of the holes), smoothed into a clean curve by a flow that is projected back on the surface ; one half is built and
+    MIRRORED for the other (exact symmetry), a curve on the plane of symmetry is projected onto that plane, a curve that crosses it is symmetrized.
+  - HAND : the same smoothed bridges around two poles (palm and back), no mirror.
+    python -I ZrlJunction.py doc.json --out doc2.json
+FR : jonctions coupées comme un patron de vêtement : ligne centrale dans le plan de symétrie, coutures d'épaule et de côté, miroir exact gauche droite, courbes lissées sur la surface.
+"""
+import argparse, json, os, sys
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.csgraph import dijkstra
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlTubes as TB, ZrlTubeNet as TN, ZrlNetMesh as NM, ZrlSpline as SP
+
+PARAMS = {   # 29 October 2026 : every value of the junctions
+    "ctrl_step_m": 0.04,         # one control point per 4 cm on a bridge
+    "edge_scale": 1.0,           # mesh edge scale of a junction component (kept for the arms and the shoulder ring)
+    "leg_edge_scale": 0.85,      # the legs are meshed with edges 0.85 times the global edge (the toe caps close with it : the counts of their columns have the right parity)
+    "torso_edge_scale": 0.6,     # the faces of the torso junction are meshed with edges 0.6 times the global edge : more rows of polygons on the chest, the back and the shoulders
+    "hand_edge_scale": 0.3,      # and the faces of a hand junction with 0.4
+    "side_margin_m": 0.002,      # the tube side starts 2 mm behind the plane of its open ring : a bridge never runs along the tube
+    "side_lateral": 1.5,         # and reaches 1.5 ring radii from the axis of the tube
+    "side_along": 3.0,           # and 3 ring radii along it
+    "endpoint_free_m": 0.012,    # a bridge may use the wall of the rings within 12 mm (one mesh edge) of its two end nodes (the corners of the rings)
+    "smooth_step_m": 0.005,      # the path is resampled every 5 mm before it is smoothed
+    "smooth_iters": 140,         # smoothing steps (Laplacian flow, projected on the surface)
+    "smooth_lambda": 0.5,        # weight of the neighbours in one step
+    "project_every": 4,          # the curve goes back on the surface every 4 steps
+    "centre_tol_m": 0.004,       # a node within 4 mm of the plane of symmetry is on it
+    "mirror_tol_m": 0.012,       # the mirror image of a node is the nearest node within 12 mm
+    "pole_upper": 0.88,          # height of the chest poles between the hips (0) and the shoulders (1)
+    "pole_lower": 0.12,          # height of the belly poles (found by ZrlTuneJunction.py : with 0.12 every junction face of Manny closes)
+    "lead_m": 0.015,             # a bridge leaves a ring corner straight away from its tube for 15 mm before it turns
+    "trunk": 1,                  # 1 : the trunk is a tube of horizontal rings with a chest junction and a pelvis junction ; 0 : one torso junction with two tiers of poles
+    "trunk_seams": 12,           # seams (columns) per ring of the trunk, a multiple of 4
+    "trunk_step_m": 0.04,        # distance between two rings of the trunk
+    "trunk_top_offset_m": 0.09,  # the top ring of the trunk stands this far under the shoulder rings (the arms and the trunk are one loop above 1.34 m on Manny)
+    "trunk_bottom_offset_m": 0.10,   # the bottom ring stands this far over the hip rings
+    "trunk_edge_scale": 0.75,     # mesh edge scale of the trunk rows
+    "chest_ladder": 0,           # 30 October 2026 : rungs between the neighbouring holes of the chest (0 : none, 1 : one rung each side of the bridge N to P)
+    "chest_pole_frac": 0.4,      # the chest poles stand 30 % of the way from the top ring of the trunk up to the shoulder rings (found by ZrlTuneJunction.py : the fewest folded quads)
+    "pelvis_pole_frac": 0.5,     # the pelvis poles stand half way from the hip rings up to the bottom ring of the trunk
+    "weld_m": 0.004,             # nodes of two tubes closer than 4 mm are one node (the elbow ring both segments share)
+    "pinch_ratio": 0.55,         # an end ring whose nearest corner is under 55 % of its farthest from the next ring is a sliver band : dropped
+    "pinch_min_m": 0.008,        # or whose corner comes within 8 mm of the next ring
+    "front": [0.0, 0.0, 1.0],    # the front of the body
+}
+
+
+def graph(V, T, allowed=None):
+    """the mesh edges as a weighted graph ; allowed : a boolean per vertex, the edges that touch a vertex that is not allowed are dropped."""
+    e = np.concatenate([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    if allowed is not None: e = e[allowed[e[:, 0]] & allowed[e[:, 1]]]
+    w = np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1)
+    return sp.coo_matrix((np.r_[w, w], (np.r_[e[:, 0], e[:, 1]], np.r_[e[:, 1], e[:, 0]])), shape=(len(V), len(V))).tocsr()
+
+
+def tube_side(V, doc, tube, end, prm=PARAMS, T=None, ref=None):
+    """the vertices on the tube side of the open ring of a tube. Exact version : the ring curve is a wall (every vertex of every triangle that it crosses), the tube side is the part of the mesh that
+    the interior of the tube reaches without crossing the wall, the wall itself is forbidden too (a bridge keeps one mesh edge away from the ring). When the flood leaks (it reaches more than half
+    of the mesh) or the triangle indexes of the reference do not match, the cylinder around the axis of the tube is used instead."""
+    rings = doc["tube_rings"][tube]["rings"]; ring = rings[0] if end == "base" else rings[-1]; nxt = rings[1] if end == "base" else rings[-2]; nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; ids = set(ring["nodes"])
+    if T is not None and ref is not None and len(ref.A) == len(T):
+        pts = np.vstack([SP.sample(np.asarray(a["ctrl"], float), 40) for a in doc["arcs"] if a["a"] in ids and a["b"] in ids])
+        if len(pts) > 3:
+            _, tri, _ = ref.closest(pts); wall = np.zeros(len(V), bool); wall[T[np.unique(tri)].ravel()] = True; G = graph(V, T, ~wall)
+            seed_p = np.mean([nodes[i] for i in nxt["nodes"]], axis=0); free_ids = np.where(~wall)[0]; seed = int(free_ids[np.argmin(np.linalg.norm(V[free_ids] - seed_p, axis=1))])
+            c0 = np.array(ring["centre"]); out_p = 2 * c0 - seed_p; out = int(free_ids[np.argmin(np.linalg.norm(V[free_ids] - out_p, axis=1))])       # a vertex on the other side of the ring
+            from scipy.sparse.csgraph import connected_components
+            _, lab = connected_components(G, directed=False); inside = (lab == lab[seed]) & ~wall
+            if lab[out] != lab[seed]: return inside | wall                                 # the wall holds : the two sides are not connected (a leak would join them)
+    c = np.array(ring["centre"]); a = np.array(nxt["centre"]) - c; a /= np.linalg.norm(a)
+    R = float(np.mean([np.linalg.norm(nodes[i] - c) for i in ring["nodes"]])); d = V - c; along = d @ a; lat = np.linalg.norm(d - along[:, None] * a, axis=1)
+    return (along > -prm["side_margin_m"]) & (along < prm["side_along"] * R) & (lat < prm["side_lateral"] * R)
+
+
+def ray_hit(V, T, origin, direction):
+    """first intersection of a ray with the triangles (Moller Trumbore, all triangles at once) : the point or None."""
+    a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]; e1, e2 = b - a, c - a; h = np.cross(direction, e2); det = (e1 * h).sum(1); ok = np.abs(det) > 1e-14; inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+    s = origin - a; u = (s * h).sum(1) * inv; q = np.cross(s, e1); v = (q * direction).sum(1) * inv; t = (e2 * q).sum(1) * inv; hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t > 1e-6)
+    return None if not hit.any() else origin + direction * t[hit].min()
+
+
+class Router:
+    """the bridges of one junction : shortest path on the trunk side, smoothed on the surface, mirrored across the plane x = x0."""
+    def __init__(self, V, T, ref, x0=0.0, prm=PARAMS):
+        self.V, self.T, self.ref, self.x0, self.prm = V, T, ref, float(x0), prm; self.forbidden = np.zeros(len(V), bool); self.failed = []
+
+    def surf(self, P): return self.ref.closest(np.asarray(P, float))[0]
+
+    def resample(self, Q, step=None, n=None):
+        Q = np.asarray(Q, float); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]; L = float(cum[-1])
+        if L < 1e-9: return Q[[0, -1]]
+        n = n or max(int(round(L / step)), 2) + 1; t = np.linspace(0, L, n); return np.stack([np.interp(t, cum, Q[:, k]) for k in range(3)], 1)
+
+    def smooth(self, Q):
+        p = self.prm; Q = self.resample(Q, p["smooth_step_m"]); a, b = Q[0].copy(), Q[-1].copy()
+        if len(Q) < 4: return Q
+        for it in range(p["smooth_iters"]):
+            M = (np.roll(Q, 1, 0) + np.roll(Q, -1, 0)) / 2.0; Q[1:-1] = (1 - p["smooth_lambda"]) * Q[1:-1] + p["smooth_lambda"] * M[1:-1]
+            if (it + 1) % p["project_every"] == 0: Q[1:-1] = self.surf(Q[1:-1])
+        Q[1:-1] = self.surf(Q[1:-1]); Q[0], Q[-1] = a, b; return Q
+
+    def route(self, pa, pb, ta=None, tb=None):
+        """shortest path on the trunk side. The two end nodes sit on the wall of their ring : they are joined to every allowed vertex within `endpoint_free_m` (then x2, x4, x8 when no route exists) by a link
+        weighted with its length, so that the path leaves each node on the side where the other node is and never hooks along the ring."""
+        V, p = self.V, self.prm; lead = p["lead_m"]; fa, fb = np.asarray(pa, float), np.asarray(pb, float)
+        va = self.surf((fa + np.asarray(ta, float) * lead)[None])[0] if ta is not None else fa; vb = self.surf((fb + np.asarray(tb, float) * lead)[None])[0] if tb is not None else fb      # a bridge leaves its node away from its tube : first point `lead_m` out along the reversed seam
+        pa, pb = va, vb; n = len(V); da, db = np.linalg.norm(V - pa, axis=1), np.linalg.norm(V - pb, axis=1)
+        for grow in (1, 2, 4, 8):
+            r = p["endpoint_free_m"] * grow; free = self.forbidden & ((da < r) | (db < r)); G = graph(V, self.T, ~self.forbidden | free).tocoo(); ids = np.where(np.asarray(G.tocsr().getnnz(axis=1)) > 0)[0]
+            if len(ids) == 0: continue
+            rc = max(r, 0.015); ca = ids[da[ids] < rc]; cb = ids[db[ids] < rc]
+            if len(ca) == 0: ca = ids[[int(np.argmin(da[ids]))]]
+            if len(cb) == 0: cb = ids[[int(np.argmin(db[ids]))]]
+            rows = np.r_[G.row, np.full(len(ca), n), ca, np.full(len(cb), n + 1), cb]; cols = np.r_[G.col, ca, np.full(len(ca), n), cb, np.full(len(cb), n + 1)]; w = np.r_[G.data, da[ca], da[ca], db[cb], db[cb]]
+            Ga = sp.coo_matrix((w, (rows, cols)), shape=(n + 2, n + 2)).tocsr(); d, pred = dijkstra(Ga, indices=n, return_predecessors=True)
+            if not np.isfinite(d[n + 1]): continue
+            path = []; u = int(pred[n + 1])
+            while u != n: path.append(u); u = int(pred[u])
+            raw = np.vstack([pa[None], V[path[::-1]], pb[None]]); mid = self.smooth(raw) if len(raw) >= 4 else raw
+            return np.vstack([fa[None], mid, fb[None]]) if (ta is not None or tb is not None) else mid
+        return None
+
+    def mirror(self, Q):
+        R = np.array(Q, float); R[:, 0] = 2 * self.x0 - R[:, 0]; return R
+
+    def centre(self, Q):
+        """a curve on the plane of symmetry : the section of the surface by the plane, found by projecting back and forth."""
+        P = np.array(Q, float); a, b = P[0].copy(), P[-1].copy()
+        for _ in range(8): P[:, 0] = self.x0; P[1:-1] = self.surf(P[1:-1])
+        P[:, 0] = self.x0; P[0], P[-1] = a, b; return P
+
+    def symmetrize(self, Q):
+        """a curve that crosses the plane of symmetry between two mirror nodes : equal to its own mirror image read backwards."""
+        Q = self.resample(Q, n=81); S = (Q + self.mirror(Q)[::-1]) / 2.0; a, b = Q[0].copy(), Q[-1].copy(); S[1:-1] = self.surf(S[1:-1]); S[0], S[-1] = a, b; return S
+
+
+def add_bridge(doc, name, a, b, Q, prm):
+    C = TN.fit(Q, prm["ctrl_step_m"])
+    if C is None: return False
+    doc["arcs"].append({"id": len(doc["arcs"]), "a": a, "b": b, "closed": False, "pair": [name, name], "ctrl": np.round(C, 6).tolist(), "mirror": -1}); return True
+
+
+def main_corners(ring):
+    """the four MAIN corners of a ring (front, next, back, previous : every n/4-th) ; the others are the extra seams of a ring of 8 or 12."""
+    ids = ring["nodes"]; q = len(ids) // 4; return [ids[0], ids[q], ids[2 * q], ids[3 * q]]
+
+
+def assign_roles(rings, targets_f, targets_b, centres, nodes):
+    """for every ring the four main corners get the roles F (towards the front pole), N (next hole), B (back pole), P (previous hole) by the cheapest rotation or reflection."""
+    m = len(rings); out = []
+    for i, r in enumerate(rings):
+        mc = main_corners(r); cp = np.array([nodes[n] for n in mc]); tg = [targets_f[i], centres[(i + 1) % m], targets_b[i], centres[(i - 1) % m]]; best = None
+        for rot in range(4):
+            for refl in (1, -1):
+                cost = sum(np.linalg.norm(cp[(rot + refl * k) % 4] - tg[k]) for k in range(4))
+                if best is None or cost < best[0]: best = (cost, [mc[(rot + refl * k) % 4] for k in range(4)])
+        out.append(dict(zip("FNBP", best[1])))
+    return out
+
+
+def build_pairs(doc, router, name, pairs, universe, prm, lead=None):
+    """build every bridge of `pairs` (node, node) : mirrored when its end nodes have a mirror image among `universe`, on the plane when both ends are on it, symmetrized when it joins two mirror nodes."""
+    nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; x0 = router.x0; U = np.array([nodes[i] for i in universe]); built = set(); ok = 0
+    def partner(i):
+        q = nodes[i].copy(); q[0] = 2 * x0 - q[0]; d = np.linalg.norm(U - q, axis=1); k = int(np.argmin(d)); return universe[k] if d[k] < prm["mirror_tol_m"] else None
+    for a, b in pairs:
+        key = frozenset((a, b))
+        if key in built: continue
+        pa, pb = nodes[a], nodes[b]; ac = abs(pa[0] - x0) < prm["centre_tol_m"]; bc = abs(pb[0] - x0) < prm["centre_tol_m"]; ma, mb = partner(a), partner(b); Q = router.route(pa, pb, (lead or {}).get(a), (lead or {}).get(b))
+        if Q is None: router.failed.append([int(a), int(b), "no route"]); continue
+        if ac and bc: jobs = [(a, b, router.centre(Q))]
+        elif ma == b and mb == a: jobs = [(a, b, router.symmetrize(Q))]
+        elif ma is not None and mb is not None and frozenset((ma, mb)) != key:
+            M = router.mirror(Q); M[0], M[-1] = nodes[ma], nodes[mb]; jobs = [(a, b, Q), (ma, mb, M)]; built.add(frozenset((ma, mb)))
+        else: jobs = [(a, b, Q)]
+        built.add(key)
+        for x, y, q in jobs:
+            if add_bridge(doc, name, x, y, q, prm): ok += 1
+            else: router.failed.append([int(x), int(y), "no fit"])
+    return ok
+
+
+def lead_dirs(doc, holes):
+    """for every corner of the open ring of every hole : the unit direction that leaves the tube (from the corner of the next ring to the corner of the end ring)."""
+    nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; out = {}
+    for t, e in holes:
+        rings = doc["tube_rings"][t]["rings"]; ring = rings[0] if e == "base" else rings[-1]; nxt = rings[1] if e == "base" else rings[-2]
+        for k in range(len(ring["nodes"])):
+            d = nodes[ring["nodes"][k]] - nodes[nxt["nodes"][k]]; L = np.linalg.norm(d)
+            if L > 1e-9: out[ring["nodes"][k]] = d / L
+    return out
+
+
+def seed_faces(doc, ref, name, faces, edge_scale):
+    """one component seed per face of a junction (the middle of its corner nodes, put on the surface) so that the face takes the name and the edge scale of its junction."""
+    nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}
+    for f in faces:
+        c = np.mean([nodes[i] for i in f], axis=0); doc.setdefault("component_seeds", []).append({"name": name, "p": [round(float(x), 6) for x in ref.closest(c[None])[0][0]]})
+    doc.setdefault("component_options", {})[name] = {"edge_scale": edge_scale, "unit": next((o.get("unit") for o in doc["component_options"].values() if o.get("unit")), 1.0)}
+
+
+def add_node(doc, p):
+    doc["nodes"].append({"id": len(doc["nodes"]), "p": [round(float(x), 6) for x in p]}); return len(doc["nodes"]) - 1
+
+
+def torso_junction(doc, V, T, ref, prm=PARAMS):
+    """the torso cut like a garment pattern : centre front and centre back lines with a chest pole and a belly pole on each, five holes (neck, two armholes, two hips)."""
+    name = "junction_torso"; tr = doc["tube_rings"]; holes = {"head": ("head_1", "base"), "armL": ("arm_L_2", "base"), "armR": ("arm_R_2", "base"), "legL": ("leg_L_1", "base"), "legR": ("leg_R_1", "base")}
+    ring = {k: (tr[t]["rings"][0] if e == "base" else tr[t]["rings"][-1]) for k, (t, e) in holes.items()}; cen = {k: np.array(r["centre"]) for k, r in ring.items()}
+    x0 = float((cen["armL"][0] + cen["armR"][0]) / 2.0); front = np.asarray(prm["front"], float); front /= np.linalg.norm(front); router = Router(V, T, ref, x0, prm)
+    for k, (t, e) in holes.items(): router.forbidden |= tube_side(V, doc, t, e, prm, T, ref)
+    y_arm = (cen["armL"][1] + cen["armR"][1]) / 2.0; y_leg = (cen["legL"][1] + cen["legR"][1]) / 2.0; zc = float(np.mean([c[2] for c in cen.values()])); poles = {}
+    for tag, frac in (("1", prm["pole_upper"]), ("2", prm["pole_lower"])):
+        y = y_leg + frac * (y_arm - y_leg); f = ray_hit(V, T, np.array([x0, y, zc]), front); bk = ray_hit(V, T, np.array([x0, y, zc]), -front)
+        if f is None or bk is None: return {"name": name, "ok": False, "why": "no surface in front of or behind the centre line at height %.3f" % y}
+        poles["F" + tag], poles["B" + tag] = f, bk
+    pid = {k: add_node(doc, p) for k, p in poles.items()}; nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}
+    C = np.mean(list(cen.values()), axis=0); e1 = np.cross(front, [0.0, 1.0, 0.0]); e1 /= np.linalg.norm(e1); e2 = np.cross(front, e1)
+    order = sorted(holes, key=lambda k: float(np.arctan2((cen[k] - C) @ e2, (cen[k] - C) @ e1))); rings = [ring[k] for k in order]; centres = [cen[k] for k in order]
+    upper = {"head", "armL", "armR"}; tf = [poles["F1"] if k in upper else poles["F2"] for k in order]; tb = [poles["B1"] if k in upper else poles["B2"] for k in order]
+    roles = dict(zip(order, assign_roles(rings, tf, tb, centres, nodes))); m = len(order)
+    pairs = [(pid["F1"], roles["head"]["F"]), (pid["F1"], roles["armL"]["F"]), (pid["F1"], roles["armR"]["F"]), (pid["F2"], roles["legL"]["F"]), (pid["F2"], roles["legR"]["F"]), (pid["F1"], pid["F2"]),
+             (pid["B1"], roles["head"]["B"]), (pid["B1"], roles["armL"]["B"]), (pid["B1"], roles["armR"]["B"]), (pid["B2"], roles["legL"]["B"]), (pid["B2"], roles["legR"]["B"]), (pid["B1"], pid["B2"])]
+    pairs += [(roles[order[i]]["N"], roles[order[(i + 1) % m]]["P"]) for i in range(m)]
+    universe = [n for r in rings for n in r["nodes"]] + list(pid.values()); ok = build_pairs(doc, router, name, pairs, universe, prm, lead_dirs(doc, list(holes.values())))
+    tier = {k: (1 if k in upper else 2) for k in order}; faces = []
+    for i in range(m):                                                                     # the 2 m faces : between the holes i and i + 1, one on the front, one on the back
+        a, b = order[i], order[(i + 1) % m]; ra, rb = roles[a], roles[b]
+        faces.append([ra["F"], ra["N"], rb["P"], rb["F"]] + sorted({pid["F%d" % tier[a]], pid["F%d" % tier[b]]}))
+        faces.append([ra["N"], ra["B"], rb["B"], rb["P"]] + sorted({pid["B%d" % tier[a]], pid["B%d" % tier[b]]}))
+    seed_faces(doc, ref, name, faces, prm["torso_edge_scale"])
+    return {"name": name, "ok": ok == len(pairs), "order": order, "bridges": ok, "expected": len(pairs), "poles": pid, "x0": round(x0, 4), "faces_expected": 2 * m, "failed": router.failed}
+
+
+def ladder_pairs(rings, roles, ladder):
+    """30 October 2026 : LADDER between two neighbouring holes : besides the bridge N to P, the corners next to them on each side are bridged too (the first corner of the arc F to N of the hole i with the first corner of the arc P to F of the hole i + 1, front and back), so the big pentagon between two holes becomes one strip of quads and a smaller pentagon, like the regular collar of the MetaHuman body. Returns (extra bridges, [(front strip corners, back strip corners)] per neighbouring pair)."""
+    m = len(rings); pairs = []; strips = []
+    def seq(i):                                                                              # corners of the ring i in the order F, N, B, P and the step between two neighbours in the list
+        ids = rings[i]["nodes"]; n = len(ids); ix = {k: ids.index(roles[i][k]) for k in "FNBP"}; s = 1 if (ix["N"] - ix["F"]) % n < (ix["P"] - ix["F"]) % n else -1
+        return ids, n, ix, s
+    for i in range(m):
+        a, b = i, (i + 1) % m; ia, na, xa, sa = seq(a); ib, nb, xb, sb = seq(b); K = min(na, nb) // 4 - 1; K = min(K, int(ladder))
+        for k in range(1, K + 1):
+            fa, fb = ia[(xa["N"] - sa * k) % na], ib[(xb["P"] + sb * k) % nb]; ba, bb = ia[(xa["N"] + sa * k) % na], ib[(xb["P"] - sb * k) % nb]; pairs += [(fa, fb), (ba, bb)]
+        strips.append((a, b, K, ia, na, xa, sa, ib, nb, xb, sb))
+    return pairs, strips
+
+
+def symmetric_star(doc, V, T, ref, name, holes, y_pole, x0, edge_scale, prm=PARAMS, ladder=0):
+    """holes joined round two poles on the plane of symmetry (front and back), the bridges mirrored : the chest (neck, two armholes, the top of the trunk) and the pelvis (two hips, the bottom of the trunk)."""
+    tr = doc["tube_rings"]; rings0 = [(tr[t]["rings"][0] if e == "base" else tr[t]["rings"][-1]) for t, e in holes]; router = Router(V, T, ref, x0, prm)
+    for t, e in holes: router.forbidden |= tube_side(V, doc, t, e, prm, T, ref)
+    centres0 = np.array([r["centre"] for r in rings0]); front = np.asarray(prm["front"], float); front /= np.linalg.norm(front); zc = float(centres0[:, 2].mean()); o = np.array([x0, y_pole, zc]); pf = ray_hit(V, T, o, front); pb = ray_hit(V, T, o, -front)
+    if pf is None or pb is None: return {"name": name, "ok": False, "why": "no surface in front of or behind the centre line at height %.3f" % y_pole}
+    C = centres0.mean(0); e1 = np.cross(front, [0.0, 1.0, 0.0]); e1 /= np.linalg.norm(e1); e2 = np.cross(front, e1); order = list(np.argsort(np.arctan2((centres0 - C) @ e2, (centres0 - C) @ e1)))
+    holes_o = [holes[i] for i in order]; rings = [rings0[i] for i in order]; centres = [centres0[i] for i in order]; m = len(rings)
+    nF, nB = add_node(doc, pf), add_node(doc, pb); nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; roles = assign_roles(rings, [pf] * m, [pb] * m, centres, nodes)
+    pairs = [(nF, roles[i]["F"]) for i in range(m)] + [(nB, roles[i]["B"]) for i in range(m)] + [(roles[i]["N"], roles[(i + 1) % m]["P"]) for i in range(m)]
+    lp, strips = ladder_pairs(rings, roles, ladder) if ladder else ([], []); pairs += lp
+    universe = [n for r in rings for n in r["nodes"]] + [nF, nB]; ok = build_pairs(doc, router, name, pairs, universe, prm, lead_dirs(doc, holes_o))
+    faces = []
+    if ladder:
+        doc.setdefault("forced_nodes", []).extend(int(x) for pr in lp for x in pr)                 # the ends of the ladder rungs are corners of their faces (BodyNet leaves the other extra seams free)
+        for (a, b, K, ia, na, xa, sa, ib, nb, xb, sb), i in zip(strips, range(m)):
+            ra, rb = roles[a], roles[b]; fa = [ia[(xa["N"] - sa * k) % na] for k in range(1, K + 1)]; fb = [ib[(xb["P"] + sb * k) % nb] for k in range(1, K + 1)]; ba = [ia[(xa["N"] + sa * k) % na] for k in range(1, K + 1)]; bb = [ib[(xb["P"] - sb * k) % nb] for k in range(1, K + 1)]
+            for A_, B_, pole, FB in ((fa, fb, nF, "F"), (ba, bb, nB, "B")):
+                A_ = [ra["N"]] + A_; B_ = [rb["P"]] + B_
+                for k in range(K): faces.append([A_[k + 1], A_[k], B_[k], B_[k + 1]])              # the rung strips : quads
+                faces.append([pole, ra[FB], A_[K], B_[K], rb[FB]])                                  # what is left of the pentagon
+    else:
+        for i in range(m):
+            ra, rb = roles[i], roles[(i + 1) % m]; faces.append([nF, ra["F"], ra["N"], rb["P"], rb["F"]]); faces.append([nB, ra["N"], ra["B"], rb["B"], rb["P"]])
+    seed_faces(doc, ref, name, faces, edge_scale)
+    return {"name": name, "ok": ok == len(pairs), "holes": [list(h) for h in holes_o], "bridges": ok, "expected": len(pairs), "poles": [nF, nB], "faces_expected": 2 * m, "failed": router.failed}
+
+
+def star_junction(doc, V, T, ref, name, holes, front, prm=PARAMS):
+    """holes joined round two poles (front and back) by smoothed bridges, no mirror : the hand."""
+    tr = doc["tube_rings"]; rings = [(tr[t]["rings"][0] if e == "base" else tr[t]["rings"][-1]) for t, e in holes]; router = Router(V, T, ref, 0.0, prm)
+    for t, e in holes: router.forbidden |= tube_side(V, doc, t, e, prm, T, ref)
+    centres = np.array([r["centre"] for r in rings]); nodes0 = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}
+    radius = [float(np.mean([np.linalg.norm(nodes0[i] - np.array(r["centre"])) for i in r["nodes"]])) for r in rings]; w = int(np.argmax(radius))        # the wrist is the big ring
+    C = 0.5 * (centres[w] + np.delete(centres, w, axis=0).mean(0))                         # the poles sit midway between the wrist and the digits, on the palm and on the back, not at the knuckles
+    hint = np.asarray(front, float); _, _, vt = np.linalg.svd(centres - centres.mean(0)); front = vt[2] if (vt[2] @ hint) >= 0 else -vt[2]       # the poles go along the normal of the plane of the holes (the palm and the back), the wrist frame only says which side is the front
+    pf = ray_hit(V, T, C, front); pb = ray_hit(V, T, C, -front)
+    if pf is None or pb is None: return {"name": name, "ok": False, "why": "no surface in front of or behind the middle of the holes"}
+    e1 = np.cross(front, [0.0, 1.0, 0.0]); e1 = e1 / np.linalg.norm(e1) if np.linalg.norm(e1) > 0.1 else np.array([1.0, 0.0, 0.0]); e2 = np.cross(front, e1)
+    order = np.argsort(np.arctan2((centres - C) @ e2, (centres - C) @ e1)); rings = [rings[i] for i in order]; centres = centres[order]; hole_names = [holes[i] for i in order]; m = len(rings)
+    nF, nB = add_node(doc, pf), add_node(doc, pb); nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; roles = assign_roles(rings, [pf] * m, [pb] * m, list(centres), nodes)
+    pairs = [(nF, roles[i]["F"]) for i in range(m)] + [(nB, roles[i]["B"]) for i in range(m)] + [(roles[i]["N"], roles[(i + 1) % m]["P"]) for i in range(m)]; ok = 0
+    lead = lead_dirs(doc, holes)
+    for a, b in pairs:
+        Q = router.route(nodes[a], nodes[b], lead.get(a), lead.get(b))
+        if Q is None: router.failed.append([int(a), int(b), "no route"]); continue
+        ok += add_bridge(doc, name, a, b, Q, prm)
+    faces = []
+    for i in range(m):
+        ra, rb = roles[i], roles[(i + 1) % m]; faces.append([nF, ra["F"], ra["N"], rb["P"], rb["F"]]); faces.append([nB, ra["N"], ra["B"], rb["B"], rb["P"]])
+    seed_faces(doc, ref, name, faces, prm["hand_edge_scale"])
+    return {"name": name, "failed": router.failed, "ok": ok == 3 * m, "holes": [list(h) for h in hole_names], "bridges": ok, "expected": 3 * m, "poles": [nF, nB], "faces_expected": 2 * m}
+
+
+def join_rings(doc, V, T, ref, tube_a, end_a, tube_b, end_b, prm=PARAMS):
+    """close the gap between two tubes that meet at a joint (the elbow : the forearm and the upper arm are built from different tips and do not share their last ring) : n seams join the corners of
+    the two rings, matched by the cheapest rotation or reflection, and one seed per new patch names it after the first tube. Returns a report."""
+    ra = doc["tube_rings"][tube_a]["rings"]; rb = doc["tube_rings"][tube_b]["rings"]; A = ra[0] if end_a == "base" else ra[-1]; B = rb[0] if end_b == "base" else rb[-1]; n = len(A["nodes"])
+    nodes = {n_["id"]: np.array(n_["p"]) for n_ in doc["nodes"]}; pa = np.array([nodes[i] for i in A["nodes"]]); pb = np.array([nodes[i] for i in B["nodes"]]); best = None; router = Router(V, T, ref, 0.0, prm)
+    for rot in range(n):
+        for refl in (1, -1):
+            cost = sum(np.linalg.norm(pa[k] - pb[(rot + refl * k) % n]) for k in range(n))
+            if best is None or cost < best[0]: best = (cost, [B["nodes"][(rot + refl * k) % n] for k in range(n)])
+    made = 0
+    for k in range(n):
+        a, b = A["nodes"][k], best[1][k]; Q = router.route(nodes[a], nodes[b])
+        if Q is not None: made += add_bridge(doc, tube_a, a, b, Q, prm)
+    for k in range(n):                                                                   # one seed per patch of the belt : the middle of its four corners
+        k2 = (k + 1) % n; mid = (pa[k] + pa[k2] + nodes[best[1][k]] + nodes[best[1][k2]]) / 4.0
+        doc.setdefault("component_seeds", []).append({"name": tube_a, "p": [round(float(x), 6) for x in mid]})
+    return {"name": "%s-%s" % (tube_a, tube_b), "ok": made == n, "seams": made, "gap_mm": round(float(np.mean([np.linalg.norm(nodes[A["nodes"][k]] - nodes[best[1][k]]) for k in range(n)]) * 1000), 1)}
+
+
+def drop_ring(doc, tube, end):
+    """remove the end ring of a tube (its corners, its ring arcs and the seams that reach it) and renumber nodes and arcs so that ids stay indexes."""
+    t = doc["tube_rings"][tube]; rings = t["rings"]; idx = 0 if end == "base" else len(rings) - 1; dead = set(rings[idx]["nodes"])
+    keep_nodes = [n for n in doc["nodes"] if n["id"] not in dead]; nmap = {n["id"]: i for i, n in enumerate(keep_nodes)}; keep_arcs = [a for a in doc["arcs"] if a["a"] not in dead and a["b"] not in dead]; amap = {a["id"]: i for i, a in enumerate(keep_arcs)}
+    for i, n in enumerate(keep_nodes): n["id"] = i
+    for i, a in enumerate(keep_arcs): old_mirror = a.get("mirror", -1); a["a"], a["b"] = nmap[a["a"]], nmap[a["b"]]; a["id"] = i; a["mirror"] = amap.get(old_mirror, -1) if old_mirror >= 0 else -1
+    doc["nodes"], doc["arcs"] = keep_nodes, keep_arcs
+    for tt in doc["tube_rings"].values():
+        for r in tt["rings"]:
+            if r is not rings[idx]: r["nodes"] = [nmap[i] for i in r["nodes"]]
+    rings.pop(idx)
+
+
+def weld_coincident(doc, tol=0.004):
+    """merge nodes that sit at the same place (the two segments of an arm share their elbow ring) and the arcs that become duplicates ; ids are renumbered, mirror links follow. Returns the number of nodes merged."""
+    from scipy.spatial import cKDTree
+    P = np.array([n["p"] for n in doc["nodes"]]); root = list(range(len(P)))
+    def find(x):
+        while root[x] != x: root[x] = root[root[x]]; x = root[x]
+        return x
+    for i, j in cKDTree(P).query_pairs(tol): a, b = find(i), find(j); root[max(a, b)] = min(a, b)
+    rep = [find(i) for i in range(len(P))]; merged = sum(1 for i in range(len(P)) if rep[i] != i)
+    if not merged: return 0
+    keep = [i for i in range(len(P)) if rep[i] == i]; nmap = {old: k for k, old in enumerate(keep)}; seen = {}; amap = {}; arcs = []
+    for a in doc["arcs"]:
+        x, y = nmap[rep[a["a"]]], nmap[rep[a["b"]]]
+        if x == y: continue
+        key = (min(x, y), max(x, y), a.get("closed", False))
+        if key in seen: amap[a["id"]] = seen[key]; continue
+        seen[key] = len(arcs); amap[a["id"]] = len(arcs); b = dict(a); b["a"], b["b"] = x, y; c = [list(q) for q in b["ctrl"]]
+        if rep[a["a"]] != a["a"]: c[0] = list(doc["nodes"][rep[a["a"]]]["p"])                  # an arc that ended on a merged node now ends on the node that stays
+        if rep[a["b"]] != a["b"]: c[-1] = list(doc["nodes"][rep[a["b"]]]["p"])
+        b["ctrl"] = c; arcs.append(b)
+    for k, a in enumerate(arcs): a["id"] = k; m = a.get("mirror", -1); a["mirror"] = amap.get(m, -1) if m >= 0 else -1
+    doc["nodes"] = [{"id": k, "p": doc["nodes"][old]["p"]} for k, old in enumerate(keep)]; doc["arcs"] = arcs
+    for t in doc["tube_rings"].values():
+        for r in t["rings"]: r["nodes"] = [nmap[rep[i]] for i in r["nodes"]]
+    return merged
+
+
+def trim_pinched(doc, prm=PARAMS):
+    """an open end ring whose corners come within `pinch_ratio` of the next ring (a saddle contour that hugs the armpit : the band between the two is a sliver) is dropped, the next ring becomes the end."""
+    dropped = []
+    for tube, t in list(doc["tube_rings"].items()):
+        for end in list(t["open"]):
+            for _ in range(2):
+                rings = t["rings"]
+                if len(rings) < 3: break
+                r0, r1 = (rings[0], rings[1]) if end == "base" else (rings[-1], rings[-2]); nodes = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}
+                d = np.array([np.linalg.norm(nodes[r0["nodes"][i]] - nodes[r1["nodes"][i]]) for i in range(len(r0["nodes"]))])
+                if d.min() / max(d.max(), 1e-9) < prm["pinch_ratio"] or d.min() < prm["pinch_min_m"]: drop_ring(doc, tube, end); dropped.append("%s %s" % (tube, end))
+                else: break
+    return dropped
+
+
+def body_junctions(doc, obj, prm=PARAMS):
+    V, T = TB.load_welded(obj); ref = NM.load_ref(obj); reports = []; tr = doc["tube_rings"]; dropped = trim_pinched(doc, prm); reports.append({"name": "trim_pinched", "dropped": dropped})
+    reports.append({"name": "weld_coincident", "merged": weld_coincident(doc, prm["weld_m"])})
+    for side in ("L", "R"):                                                                  # the elbows first : the arm is one tube again (when the two segments do not share their ring yet, four seams join them)
+        if "arm_%s_1" % side in tr and "arm_%s_2" % side in tr and not (set(tr["arm_%s_1" % side]["rings"][0]["nodes"]) & set(tr["arm_%s_2" % side]["rings"][-1]["nodes"])):
+            reports.append(join_rings(doc, V, T, ref, "arm_%s_1" % side, "base", "arm_%s_2" % side, "top", prm))
+    if all(k in tr for k in ("head_1", "arm_L_2", "arm_R_2", "leg_L_1", "leg_R_1")):
+        if prm.get("trunk", 1):
+            import ZrlTrunk as TK
+            rep = TK.build_trunk(doc, V, T, ref, dict(TK.PARAMS, edge_scale=prm["trunk_edge_scale"], top_offset_m=prm["trunk_top_offset_m"], bottom_offset_m=prm["trunk_bottom_offset_m"], step_m=prm["trunk_step_m"], seams=int(prm["trunk_seams"]))); reports.append(rep)
+            if rep.get("ok"):
+                tr = doc["tube_rings"]; arms = [tr[k]["rings"][0] for k in ("arm_L_2", "arm_R_2")]; legs = [tr[k]["rings"][0] for k in ("leg_L_1", "leg_R_1")]; x0 = rep["x0"]; ay = float(np.mean([r["centre"][1] for r in arms])); ly = float(np.mean([r["centre"][1] for r in legs]))
+                reports.append(symmetric_star(doc, V, T, ref, "junction_chest", [("trunk", "top"), ("arm_R_2", "base"), ("head_1", "base"), ("arm_L_2", "base")], rep["y_top"] + prm["chest_pole_frac"] * (ay - rep["y_top"]), x0, prm["torso_edge_scale"], prm, ladder=int(prm["chest_ladder"])))
+                reports.append(symmetric_star(doc, V, T, ref, "junction_pelvis", [("trunk", "base"), ("leg_R_1", "base"), ("leg_L_1", "base")], ly + prm["pelvis_pole_frac"] * (rep["y_bottom"] - ly), x0, prm["torso_edge_scale"], prm))
+        else: reports.append(torso_junction(doc, V, T, ref, prm))
+    for side in ("L", "R"):
+        digits = [k for k in tr if k.startswith(("thumb_" + side, "finger_" + side))]
+        if "arm_%s_1" % side in tr and len(digits) >= 3:
+            wrist = tr["arm_%s_1" % side]["rings"][-1]; front = np.array(wrist["e1"])
+            reports.append(star_junction(doc, V, T, ref, "junction_hand_" + side, [("arm_%s_1" % side, "top")] + [(d, "base") for d in digits], front, prm))
+    return reports
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--out", required=True); ap.add_argument("--obj"); ap.add_argument("--param", action="append", default=[], help="KEY=VALUE on top of PARAMS"); a = ap.parse_args()
+    prm = dict(PARAMS); prm.update({k: float(v) for k, v in (x.split("=") for x in a.param)})
+    doc = json.load(open(a.doc)); obj = a.obj or doc["model_ref"]; reps = body_junctions(doc, obj, prm)
+    for r in reps: print(json.dumps(r))
+    json.dump(doc, open(a.out, "w")); print("nodes", len(doc["nodes"]), "arcs", len(doc["arcs"]))
+
+
+if __name__ == "__main__":
+    main()

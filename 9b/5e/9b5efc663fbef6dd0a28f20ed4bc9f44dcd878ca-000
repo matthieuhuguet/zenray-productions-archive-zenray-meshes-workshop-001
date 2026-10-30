@@ -1,0 +1,35 @@
+"""30 October 2026 : ZenRay Lines CAR TUNE, the tournament of the parameters of every car component that is not yet at 100 %.
+EN: for each component of work/lines/components_table.json whose score (ZrlBuildOne, the judge) is under 100 %, N random variants of the cut (voxel, mbo, raw), the corners (3, 4), the fairing (fair_cut_m), the data border, the harmonic switch and the Winslow smoothing are built in parallel ; the best score wins and is written back to the table (the table is saved to work/lines/car_parts/ first). Same recipe as the body of Manny : measure, try many, keep what the judge confirms.
+    python -I CarTune.py [--n 20] [--workers 8] [--only NAME ...] [--seed 1]
+FR : le tournoi des paramètres de chaque component de la voiture qui n'est pas à 100 pour cent ; le meilleur score gagne et revient dans la table."""
+import argparse, json, os, random, shutil, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+PY = "/Users/zenray/.venvs/zenray-meshes/bin/python"; TABLE = f"{ROOT}/work/lines/components_table.json"
+SPACE = {"cut": ["voxel", "mbo", "raw"], "corners": [3, 4], "fair_cut_m": [0.15, 0.3, 0.6, 1.0], "data_border_m": [0.004, 0.015, 0.03], "harmonic": [0, 1], "winslow": [0, 1], "edge_m": [0.015, 0.02, 0.03], "hem_steps": [3, 4, 6]}   # 30 October 2026
+
+
+def build(name, prm):
+    r = subprocess.run([PY, "-I", f"{ROOT}/Scripts/lines/ZrlBuildOne.py", name, json.dumps(prm)], capture_output=True, text=True)
+    try: d = json.loads(r.stdout.strip().splitlines()[-1]); return d["score"]["percent"], [k for k in d.get("failed", [])]
+    except Exception: return -1.0, ["BUILD FAILED " + (r.stderr or r.stdout)[-120:]]
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--n", type=int, default=20); ap.add_argument("--workers", type=int, default=8); ap.add_argument("--only", nargs="*"); ap.add_argument("--seed", type=int, default=1); a = ap.parse_args()
+    table = json.load(open(TABLE)); os.makedirs(f"{ROOT}/work/lines/car_parts", exist_ok=True); shutil.copy(TABLE, f"{ROOT}/work/lines/car_parts/components_table_%d.json" % int(time.time()))
+    rng = random.Random(a.seed); names = a.only or list(table); report = {}
+    for name in names:
+        base = table[name]; s0, f0 = build(name, base)
+        if s0 >= 100.0: print("%-30s %5.1f %% already" % (name, s0), flush=True); continue
+        cands = [dict(base, **{k: rng.choice(v) for k, v in SPACE.items()}) for _ in range(a.n)]
+        with ThreadPoolExecutor(a.workers) as ex: res = list(ex.map(lambda c: build(name, c), cands))
+        best = max(range(len(cands)), key=lambda i: res[i][0])
+        if res[best][0] > s0: table[name] = cands[best]; print("%-30s %5.1f %% -> %5.1f %%  failed %s" % (name, s0, res[best][0], res[best][1]), flush=True)
+        else: print("%-30s %5.1f %% stays (best of %d : %5.1f)" % (name, s0, a.n, res[best][0]), flush=True)
+        json.dump(table, open(TABLE, "w"), indent=1)
+    print("done")
+
+
+if __name__ == "__main__":
+    main()

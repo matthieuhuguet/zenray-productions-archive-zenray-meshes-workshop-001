@@ -1,0 +1,383 @@
+"""29 October 2026 : ZenRay Lines TUBE NET, the curve network of one tube of a mannequin (a finger, a limb) from its geometry alone.
+EN: a tube is a branch of the merge tree of the geodesic distance (ZrlTubes.py). Its rings are contours of the distance (exact loops on the surface, perpendicular to the tube),
+its seams are the lines of constant angle around the tube axis through those rings. Rings and seams cross at corner nodes ; the faces between two rings and two seams are four
+sided patches with matching borders, so the network meshes into clean quads. The tip is closed by a ring of three sided patches around the tip point.
+Nothing here is specific to a finger : a limb is the same call with another ring step.
+    python -I ZrlTubeNet.py --obj model.obj --out doc.json [--fingers] [--ring-mm 12]
+FR : les anneaux (contours de distance) et les coutures (lignes à angle constant) d'un tube, noeuds aux croisements, faces à quatre côtés.
+"""
+import argparse, collections, json, os, sys, time
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlTubes as TB, ZrlSpline as SP
+
+PARAMS = {
+    "joint_gap_m": 0.02,        # a joint (knee, ankle, elbow, shoulder, hip, wrist, neck) gets a stack of rings this far apart ; 0 : no joint rings
+    "family": {"arm": {"seams": 8, "ring_step_m": 0.03}, "leg": {"seams": 8, "ring_step_m": 0.04, "joints_from_tip": (0.075,)}, "head": {"seams": 8, "ring_step_m": 0.03, "crown_min_radius_m": 0.04, "base_extend_m": 0.05}},   # per family of tubes (the start of the name) : seams per ring and distance between rings, over the global values (more edge flows along the arms)
+    "corner_polar_blend": 0.0,   # share of the equal polar angle rule in the place of the corners of a ring (0 : equal arc lengths)
+    "joint_zone_m": 0.04,        # 30 October 2026 : a band of an arm or a leg whose middle is within 4 cm of a joint is a joint band (own component, lighter colour)
+    "planar_arms": 1,   # 30 October 2026 : default 1 (the back of the arm and the elbow become a clean tube, folded quads 151 to 113) ; 1 : the rings of an arm are cross sections perpendicular to its axis (regular shapes, jittery corners) ; 0 : level sets of the distance from the hand (a lobe on the torso near the armpit)   # 29 October 2026 : every value of the tube network, metres
+    "planar_rings": False,       # True : a ring is the cross section of the tube by the plane through its centre perpendicular to its axis (true corner angles near hips and shoulders) ; False : the level of the distance
+    "mirror_m": 0.006,           # two curves are mirrors when their samples agree within this after x -> -x
+    "seams": 4,                  # seams around a tube : four patches around
+    "base_margin_m": 0.006,      # the first ring sits this far above the saddle (inside the branch)
+    "cap_m": 0.009,              # the last ring sits this far below the tip : the cap closes the rest
+    "ring_step_m": 0.012,        # distance between two rings along the tube (a finger : 12 mm ; a limb : 40 mm)
+    "fine_step_m": 0.002,        # spacing of the levels a seam is read at
+    "ctrl_step_m": 0.02,         # one control point per 2 cm on an arc (at least four)
+    "edge_scale": 0.35,          # mesh edge scale of the component (the default edge is 20 mm : 7 mm for a finger)
+    "front": [0.0, 0.0, 1.0],    # angle zero of the seams : the front of the character
+    "neck_widen": 1.25,          # a neck is a minimum of the girth that the tube widens after by this factor (ZenRay UV, neck_candidates_band) ...
+    "neck_jump": 1.4,            # ... or the last girth before a jump by this factor (the base of a finger, the armpit)
+    "jump_window": 1.0,          # the jump that ends a tube is looked for within this many radii (a knee widens slowly, a hip or a shoulder at once)
+    "jump_before_tol": 0.4,      # ... and the girth before it must be steady within this fraction
+    "bump_keep": 0.85,           # a widening is lasting when the girth stays above this fraction of it over the next few radii (the elbow is a bump, the shoulder is not)
+    "segments": {"head": 1, "leg": 1, "arm": 2},   # tubes per tip : the head with its neck, a leg from the toe to the hip, an arm as forearm and upper arm (beyond is the torso)
+    "neck_window": 3.0,          # the widening is looked for within this many radii after the neck
+    "min_ring_gap": 0.5,         # two rings are never closer than this fraction of the ring step
+}
+
+
+def contour(V, T, phi, level, branch=None):
+    """the closed loops of phi == level on the surface (marching triangles) : list of (n, 3) arrays. With `branch` (a boolean mask of vertices) only the loop that belongs to it is kept :
+    the one most of whose crossed edges touch the branch (above a saddle every finger has its own loop at a given distance)."""
+    t = T; f = phi[t] - level; neg = f < 0; cnt = neg.sum(1); sel = np.nonzero((cnt > 0) & (cnt < 3))[0]; pts = {}; segs = []
+    for fi in sel:
+        a = t[fi]; pa = []
+        for k in range(3):
+            i, j = a[k], a[(k + 1) % 3]
+            if (phi[i] - level) * (phi[j] - level) < 0:
+                key = (min(i, j), max(i, j))
+                if key not in pts: u = (level - phi[i]) / (phi[j] - phi[i]); pts[key] = V[i] + u * (V[j] - V[i])
+                pa.append(key)
+        if len(pa) == 2: segs.append((pa[0], pa[1]))
+    nb = {}
+    for a, b in segs: nb.setdefault(a, []).append(b); nb.setdefault(b, []).append(a)
+    seen = set(); loops = []
+    for start in nb:
+        if start in seen: continue
+        path = [start]; seen.add(start); cur = start; prev = None
+        while True:
+            nxt = [q for q in nb[cur] if q != prev and q not in seen]
+            if not nxt: break
+            prev, cur = cur, nxt[0]; seen.add(cur); path.append(cur)
+        loops.append((np.array([pts[k] for k in path]), path))
+    if branch is None: return [l for l, _ in loops]
+    best, bs = None, 0.5
+    for l, keys in loops:
+        share = float(np.mean([branch[k[0]] or branch[k[1]] for k in keys]))
+        if share >= bs: best, bs = l, share
+    return [] if best is None else [best]
+
+
+def frame(axis, front):
+    e1 = np.asarray(front, float) - np.dot(front, axis) * axis
+    if np.linalg.norm(e1) < 0.3: e1 = np.array([1.0, 0, 0]) - axis[0] * axis
+    e1 /= np.linalg.norm(e1); return e1, np.cross(axis, e1)
+
+
+def at_angles(loop, centre, e1, e2, n, polar=False):
+    """the n corners of a closed loop and the loop split in n arcs, from the point of the loop most aligned with e1 (the front) and in the sense of the axis. When the loop is star shaped about its
+    centre (the polar angle only grows along it : a limb ring) the corners are at equal POLAR angles, which keeps the corners of an oval ring near 90 degrees ; otherwise (the groove between two
+    fingers, a thumb web) they are at equal ARC LENGTHS, which does not need the loop to be star shaped. The seam i of two rings is the corner i of both, so seams do not twist."""
+    d = loop - centre; a = np.cross(e1, e2)
+    area = float(np.sum(np.cross(d, np.roll(d, -1, axis=0)) @ a)) / 2.0
+    if area < 0: loop = loop[::-1]; d = d[::-1]
+    r = np.linalg.norm(d, axis=1) + 1e-12; ang0 = np.arctan2(d @ e2, d @ e1); nxt = np.roll(ang0, -1); idx = np.where((ang0 < 0) & (nxt >= 0) & (np.abs(ang0) < np.pi / 2) & (np.abs(nxt) < np.pi / 2))[0]
+    if len(idx) == 1:                                                                        # 29 October 2026 : the start is the CONTINUOUS crossing of the loop with the direction e1, not the nearest vertex (one mesh edge of jitter, 5 degrees, made every seam wiggle)
+        j = int(idx[0]); t = -ang0[j] / (nxt[j] - ang0[j]); p0 = loop[j] + t * (loop[(j + 1) % len(loop)] - loop[j]); loop = np.vstack([p0[None], np.roll(loop, -(j + 1), axis=0)]); d = loop - centre
+    else:
+        align = (d @ e1) / r; k0 = int(np.argmax(align - 0.02 * (r.max() - r) / r.max())); loop = np.roll(loop, -k0, axis=0); d = np.roll(d, -k0, axis=0)
+    P = np.vstack([loop, loop[:1]]); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; L = cum[-1]
+    ang = np.unwrap(np.arctan2(d @ e2, d @ e1)); ang = np.r_[ang, ang[0] + 2 * np.pi]; blend = float(polar); star = blend > 0 and bool(np.all(np.diff(ang) > -1e-6)) and abs((ang[-1] - ang[0]) - 2 * np.pi) < 1e-3
+    pos = [L * i / n for i in range(n)]                                                              # equal arc lengths : quads of one size, but an oval ring (an ankle bending into a foot) puts two corners 175 degrees apart
+    if star: pos = [(1 - blend) * pos[i] + blend * float(np.interp(ang[0] + 2 * np.pi * i / n, ang, cum)) for i in range(n)]      # `polar` is the share (0 to 1) of the equal POLAR angle rule : 90 degrees between corners
+    at = lambda s_: np.array([np.interp(s_, cum, P[:, c]) for c in range(3)]); corners = [at(q) for q in pos]; arcs = []
+    for i in range(n):
+        s0, s1 = pos[i], (pos[i + 1] if i + 1 < n else L); m = (cum > s0) & (cum < s1); arcs.append(np.vstack([corners[i][None], P[m], corners[(i + 1) % n][None]]))
+    return corners, arcs
+
+
+def girth(loop): return float(np.linalg.norm(np.diff(np.vstack([loop, loop[:1]]), axis=0), axis=1).sum())
+
+
+def fit(Q, step):
+    Q = SP.clean_polyline(np.asarray(Q)); L = SP.polyline_length(Q); m = max(4, int(round(L / step)) + 1); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]
+    if len(Q) < 2 or cum[-1] < 1e-9: return None
+    t = np.linspace(0, cum[-1], max(4 * m, 16)); S = np.stack([np.interp(t, cum, Q[:, k]) for k in range(3)], 1); C = SP.fit(S, m); C[0], C[-1] = Q[0], Q[-1]; return C
+
+
+def loop_centre(loop):
+    """the centre of a closed loop weighted by arc length (the mean of the vertices leans towards where the contour has more vertices)."""
+    P = np.asarray(loop, float); Q = np.roll(P, -1, axis=0); w = np.linalg.norm(Q - P, axis=1); s = float(w.sum())
+    return P.mean(0) if s < 1e-12 else ((P + Q) / 2.0 * w[:, None]).sum(0) / s
+
+
+def profile(V, T, phi, branch_mask, levels, front, planar=False, span=0.0):
+    """the contour at every level, with its centre, its axis (toward the tip) and a frame carried from ring to ring (the angle zero of a seam never spins) : list of dicts, None when a level is not one loop."""
+    out = []
+    for lvl in levels:
+        r = contour(V, T, phi, lvl, branch_mask); out.append(None if len(r) != 1 else {"level": lvl, "loop": r[0], "centre": loop_centre(r[0])})
+    ok = [k for k, q in enumerate(out) if q is not None]; lv = np.array([out[k]["level"] for k in ok])
+    for a, k in enumerate(ok):                                                            # 29 October 2026 : the axis over a baseline of `span` on each side, not between two levels 2 mm apart (the centre jitters by a millimetre and the frame of the seams spun by 60 degrees)
+        lo = int(np.searchsorted(lv, lv[a] - span, side="right") - 1); hi = int(np.searchsorted(lv, lv[a] + span, side="left")); lo = max(min(lo, a - 1), 0) if a > 0 else 0; hi = min(max(hi, a + 1), len(ok) - 1) if a < len(ok) - 1 else len(ok) - 1
+        ax = out[ok[hi]]["centre"] - out[ok[lo]]["centre"]; out[k]["axis"] = ax / max(np.linalg.norm(ax), 1e-12)
+    if planar:                                                                             # the ring becomes the planar cross section nearest to the centre, kept when its girth stays within 1.5 times the level's
+        for k in ok:
+            q = out[k]; f = (V - q["centre"]) @ q["axis"]; loops = contour(V, T, f, 0.0, None)
+            if not loops: continue
+            best = min(loops, key=lambda l: float(np.linalg.norm(l.mean(0) - q["centre"])))
+            if np.linalg.norm(best.mean(0) - q["centre"]) < 0.5 * girth(q["loop"]) / (2 * np.pi) + 0.01 and girth(best) <= 1.5 * girth(q["loop"]): q["loop"] = best; q["centre"] = best.mean(0)
+    prev = None
+    for k in ok:
+        a = out[k]["axis"]
+        if prev is None: e1, _ = frame(a, front)
+        else:
+            e1 = prev - np.dot(prev, a) * a
+            if np.linalg.norm(e1) < 1e-6: e1, _ = frame(a, front)
+            e1 /= np.linalg.norm(e1)
+        out[k]["e1"], out[k]["e2"] = e1, np.cross(a, e1); prev = e1
+    return out
+
+
+def ring_levels(prof, fine, c0, c1, step, prm):
+    """where the rings of a tube go : the base, the tip side, the NECKS between (a minimum of the girth that the tube widens after by 25 %, or the last girth before a jump of 40 % : the rule of
+    neck_candidates_band of ZenRay UV, rewritten for a loop of the distance), and evenly in between so that no gap is wider than `step`."""
+    G = np.array([girth(q["loop"]) if q is not None else np.nan for q in prof]); ok = ~np.isnan(G); necks = []
+    for k in range(1, len(fine) - 1):
+        if not ok[k] or fine[k] <= c0 + prm["min_ring_gap"] * step or fine[k] >= c1 - prm["min_ring_gap"] * step: continue
+        rho = G[k] / (2 * np.pi); w = max(rho, step); win = (np.abs(fine - fine[k]) <= w) & ok; af = G[(fine > fine[k]) & (fine <= fine[k] + prm["neck_window"] * w) & ok]; bf = G[(fine < fine[k]) & (fine >= fine[k] - 2 * w) & ok]
+        if len(af) == 0: continue
+        is_min = G[k] <= G[win].min() + 1e-12 and af.max() >= prm["neck_widen"] * G[k]; is_knee = len(bf) > 0 and af[:2].max() >= prm["neck_jump"] * G[k] and (bf.max() - bf.min()) <= 0.3 * G[k]
+        if is_min or is_knee: necks.append(float(fine[k]))
+    keep = []
+    for c in necks:
+        if not keep or c - keep[-1] >= prm["min_ring_gap"] * step: keep.append(c)
+    for d_ in prm.get("joints_from_tip", ()):                                              # 29 October 2026 : a joint known by its distance from the tip (the ball of the foot, where the sole bends, 7.5 cm from the toe) joins the necks
+        c_ = float(prm["tip_phi"]) - float(d_)
+        if c0 + 1.5 * float(prm.get("joint_gap_m", 0.0)) < c_ < c1 - 1.5 * float(prm.get("joint_gap_m", 0.0)): keep.append(c_)
+    keep = sorted(keep); marks = [c0] + keep + [c1]; out = [c0]
+    for a, b in zip(marks[:-1], marks[1:]):
+        m = max(1, int(np.ceil((b - a) / step - 1e-9)))
+        for q in range(1, m + 1): out.append(a + (b - a) * q / m)
+    gap = float(prm.get("joint_gap_m", 0.0))
+    if gap > 0:                                                                            # 29 October 2026 : ANIMATION. A joint bends, so it gets a tight stack of rings (the knee, the ankle : a ring on the joint and one each side ; an elbow, a shoulder, a hip, a wrist : the shared ring and one beside it) and the evenly spaced rings step back
+        pads = [c + s_ * gap for c in keep for s_ in (-1, 1)] + ([c0 + gap] if prm.get("pad_base") else []) + ([c1 - gap] if prm.get("pad_top") else [])
+        pads = [round(p_, 6) for p_ in pads if c0 + 0.3 * gap < p_ < c1 - 0.3 * gap]; anchors = [round(a_, 6) for a_ in [c0, c1] + keep]; special = set(anchors) | set(pads)
+        out = sorted({round(float(x), 6) for x in out} | set(pads)); out = [x for x in out if x in special or min(abs(x - y) for y in special) >= 0.6 * gap]
+    return np.array(out), keep
+
+
+def build_tube(V, T, phi, branch_mask, tip_vertex, saddle_phi, name, prm, doc, c_top=None, cap=True):
+    """append the nodes, arcs, component seed and option of one tube to doc ; returns a report. c_top : the distance of the top ring (None : just under the tip) ; cap : close the tip."""
+    tip_phi = phi[tip_vertex]; front = np.asarray(prm["front"], float); n = prm["seams"]
+    c0 = saddle_phi + prm["base_margin_m"]; c1 = (tip_phi - prm["cap_m"]) if c_top is None else c_top
+    if c1 - c0 < prm["ring_step_m"]: return {"name": name, "ok": False, "why": "tube too short for two rings"}
+    fine = np.unique(np.round(np.r_[np.arange(c0, c1, prm["fine_step_m"]), c1] if not cap else np.r_[np.arange(c0, tip_phi - 0.0015, prm["fine_step_m"]), c1, tip_phi - 0.0015], 6)); prof = profile(V, T, phi, branch_mask, fine, front, planar=prm.get("planar_rings", False), span=prm.get("ring_step_m", 0.0))
+    prm["tip_phi"] = float(tip_phi); levels, necks = ring_levels(prof, fine, c0, c1, prm["ring_step_m"], prm)
+    at = {round(float(l), 6): k for k, l in enumerate(fine)}
+    def nearest(l): return min(range(len(fine)), key=lambda k: abs(fine[k] - l))
+    rk = []
+    for l in levels:
+        k = nearest(l)
+        if prof[k] is None:                                                           # a level that is not one loop : the nearest one that is
+            alt = [q for q in range(len(fine)) if prof[q] is not None and abs(fine[q] - l) <= prm["ring_step_m"] * 0.4]
+            if not alt: return {"name": name, "ok": False, "why": "the ring at distance %.3f is not one loop" % l}
+            k = min(alt, key=lambda q: abs(fine[q] - l))
+        if not rk or k > rk[-1]: rk.append(k)
+    rmin = float(prm.get("crown_min_radius_m", 0.0))                                       # 30 October 2026 : the last ring of a capped tube is never narrower than this radius (a crown of a head closed by a 4 cm cap, not a 2 cm one with 32 radial lines crowded into it)
+    while cap and rmin > 0 and len(rk) > 2 and girth(prof[rk[-1]]["loop"]) / (2 * np.pi) < rmin: rk.pop()
+    if len(rk) < 2: return {"name": name, "ok": False, "why": "fewer than two rings"}
+    def add_node(p):
+        doc["nodes"].append({"id": len(doc["nodes"]), "p": [round(float(x), 6) for x in p]}); return len(doc["nodes"]) - 1
+    def add_arc(a, b, C):
+        doc["arcs"].append({"id": len(doc["arcs"]), "a": a, "b": b, "closed": False, "pair": [name, name], "ctrl": np.round(C, 6).tolist(), "mirror": -1}); return len(doc["arcs"]) - 1
+    corner_nodes = []; ring_arcs = []
+    for k in rk:
+        q = prof[k]; cs, arcs = at_angles(q["loop"], q["centre"], q["e1"], q["e2"], n, prm.get("corner_polar_blend", 0.0)); ring_arcs.append(arcs); corner_nodes.append([add_node(p) for p in cs])
+    for r, arcs in enumerate(ring_arcs):                                                     # ring arcs
+        for i in range(n):
+            C = fit(arcs[i], prm["ctrl_step_m"])
+            if C is not None: add_arc(corner_nodes[r][i], corner_nodes[r][(i + 1) % n], C)
+    def seam(i, ka, kb):                                                                    # the seam i read at every fine level from index ka to index kb (inclusive)
+        out = []
+        for k in range(ka, kb + 1):
+            q = prof[k]
+            if q is None: continue
+            cs, _ = at_angles(q["loop"], q["centre"], q["e1"], q["e2"], n, prm.get("corner_polar_blend", 0.0)); out.append(cs[i])
+        return out
+    seam_arcs = 0
+    for r in range(len(rk) - 1):
+        for i in range(n):
+            mid = seam(i, rk[r], rk[r + 1]); mid = mid[1:-1] if len(mid) > 2 else []
+            Q = [np.array(doc["nodes"][corner_nodes[r][i]]["p"])] + mid + [np.array(doc["nodes"][corner_nodes[r + 1][i]]["p"])]; C = fit(Q, prm["ctrl_step_m"])
+            if C is not None: add_arc(corner_nodes[r][i], corner_nodes[r + 1][i], C); seam_arcs += 1
+    if cap and prm.get("cap_mode", "quad") == "quad":                                          # 29 October 2026 : the end of a tube is ONE quad patch bounded by its last ring (four equal arcs : the corners are at quarter arc lengths), not four triangles round a tip ; a triangle needs an even sum of counts, which the columns of the tube do not give
+        doc.setdefault("component_seeds", []).append({"name": name, "p": [round(float(x), 6) for x in V[tip_vertex]]})
+    elif cap:
+        tip = add_node(V[tip_vertex]); last = len(rk) - 1
+        for i in range(n):                                                                  # the cap : from each last ring corner to the tip
+            tail = seam(i, rk[last], len(fine) - 1); Q = [np.array(doc["nodes"][corner_nodes[last][i]]["p"])] + tail[1:] + [V[tip_vertex]]; C = fit(Q, prm["ctrl_step_m"])
+            if C is not None: add_arc(corner_nodes[last][i], tip, C)
+        for i in range(n):                                                                  # 29 October 2026 : one seed per cap triangle, so that the cap takes the name and the edge scale of its tube (a cap of three arcs of one edge each cannot close : odd count)
+            mid = (np.array(doc["nodes"][corner_nodes[last][i]]["p"]) + np.array(doc["nodes"][corner_nodes[last][(i + 1) % n]]["p"]) + V[tip_vertex]) / 3.0
+            doc.setdefault("component_seeds", []).append({"name": name, "p": [round(float(x), 6) for x in mid]})
+    seeds = 0                                                                               # one seed per patch of the tube, all named alike : the middle of the mid ring arc
+    jz = float(prm.get("joint_zone_m", 0.0)) if name.split("_")[0] in ("arm", "leg") else 0.0; joint_bands = 0      # 30 October 2026 : ZONES like the MetaHuman body (legs, torso, arms in pale colours, a lighter band on every joint) : a band whose middle is within joint_zone_m (along the tube) of a joint (a neck of the girth, the ball of the foot, a base or a top shared with another tube : knee, ankle, elbow, wrist, shoulder, hip) is the component `<tube>_joint`, meshed like its tube
+    J = [float(x) for x in necks] + ([float(c0)] if prm.get("pad_base") else []) + ([float(c1)] if prm.get("pad_top") else [])
+    for r in range(len(rk) - 1):
+        q = prof[(rk[r] + rk[r + 1]) // 2]
+        if q is None: continue
+        _, arcs = at_angles(q["loop"], q["centre"], q["e1"], q["e2"], n, prm.get("corner_polar_blend", 0.0))
+        mid_phi = 0.5 * (float(fine[rk[r]]) + float(fine[rk[r + 1]])); joint = jz > 0 and bool(J) and min(abs(mid_phi - j) for j in J) <= jz; joint_bands += int(joint)
+        for i in range(n):
+            doc["component_seeds"].append({"name": name + "_joint" if joint else name, "p": [round(float(x), 6) for x in arcs[i][len(arcs[i]) // 2]]}); seeds += 1
+    doc.setdefault("component_options", {})[name] = {"edge_scale": prm["edge_scale"]}
+    if joint_bands: doc["component_options"][name + "_joint"] = {"edge_scale": prm["edge_scale"]}
+    doc.setdefault("tube_rings", {})[name] = {"cap": cap, "open": ["base"] if cap else [], "rings": [{"nodes": corner_nodes[r], "centre": prof[rk[r]]["centre"].tolist(), "axis": prof[rk[r]]["axis"].tolist(), "e1": prof[rk[r]]["e1"].tolist()} for r in range(len(rk))]}   # base first, top last ; `open` : the ends not joined to another tube, for the junctions
+    return {"name": name, "ok": True, "rings": len(rk), "necks": len(necks), "seam_arcs": seam_arcs, "seeds": seeds, "length_m": round(float(c1 - c0), 3), "e1_end": prof[rk[-1]]["e1"].tolist()}
+
+
+def scan(g, G, lv, k0, prm):
+    """from level index k0 find where the tube ends : the last girth before a lasting jump of the girth, or the end of the single loops. Returns (end index, why) ; why is 'jump' (more tubes may follow), 'loops' (the surface splits) or 'end'."""
+    ok = ~np.isnan(G); step = prm["fine_step_m"]
+    for k in range(k0 + max(3, int(round(2 * prm["ring_step_m"] / step))), len(lv) - 1):                          # a tube has at least two ring steps
+        if not ok[k]: return max(k - 1, k0), "loops"
+        rho = max(G[k] / (2 * np.pi), 0.02); ma = max(2, int(round(prm["jump_window"] * rho / step))); mb = max(2, int(round(2 * rho / step)))
+        after = G[k + 1:k + 1 + ma]; after = after[~np.isnan(after)]; before = G[max(k0, k - mb):k]; before = before[~np.isnan(before)]
+        if len(after) and after.max() >= prm["neck_jump"] * G[k] and (len(before) == 0 or before.max() - before.min() <= prm["jump_before_tol"] * G[k]):   # the last girth before a jump : the base of the tube
+            later = G[k + 1 + ma:k + 1 + 4 * ma]; later = later[~np.isnan(later)]
+            if len(later) and later.min() < prm["bump_keep"] * after.max() and later.min() < 1.15 * G[k]: continue                                         # the girth falls back to where it was : a bump
+            return k, "jump"
+    return len(lv) - 1, "end"
+
+
+def tip_tubes(V, T, tip, name, prm, doc, cap=True, max_segments=4):
+    """the tubes of a tip, measured FROM the tip as ZenRay UV does (neck_candidates_band) : the distance g from the tip, the girth of the loop of g = c at each level, a tube ends at the last
+    girth before a lasting jump (the shoulder, the hip, the elbow bulge of a forearm) and the next tube starts there, sharing the ring. A tube without cap (an arm from its palm) starts at
+    the first level that is one loop again beyond the fingers. Returns the reports."""
+    g = TB.heat_distance(V, T, tip, TB.PARAMS); lv = np.arange(prm["fine_step_m"], g.max(), prm["fine_step_m"]); G = []
+    for c in lv:
+        r = contour(V, T, g, c, None); G.append(girth(r[0]) if len(r) == 1 else np.nan)
+    G = np.array(G); ok = ~np.isnan(G)
+    if not ok.any(): return [{"name": name, "ok": False, "why": "no single loop around the tip"}]
+    k0 = 0 if cap else int(np.argmax(ok & (np.convolve(ok.astype(int), np.ones(6, int), "same") >= 6) & (lv > 0.06))); front = np.asarray(prm["front"], float); reports = []
+    for seg in range(max_segments):
+        end, why = scan(g, G, lv, k0, prm); ext = float(prm.get("family", {}).get(name.split("_")[0], {}).get("base_extend_m", 0.0))
+        if ext > 0 and why == "jump" and seg == 0:                                         # 30 October 2026 : the base of the tube moves on down the neck (while the sections are one loop) : the zone of the head takes the whole neck, the torso starts at the shoulders like the MetaHuman body
+            e2 = end
+            while e2 + 1 < len(lv) and ok[e2 + 1] and lv[e2 + 1] - lv[end] <= ext: e2 += 1
+            end = e2
+        g0, g1 = float(lv[k0]), float(lv[end])
+        if g1 - g0 < prm["ring_step_m"]: break
+        nm = name if seg == 0 and why != "jump" else "%s_%d" % (name, seg + 1)
+        p2 = dict(prm, front=front.tolist()); p2.update(prm.get("family", {}).get(name.split("_")[0], {})); p2["pad_base"] = True; p2["pad_top"] = (seg > 0) or (not cap); p2["planar_rings"] = bool(prm.get("planar_rings")) or name.split("_")[0] in prm.get("planar_for", ()); p2["base_margin_m"] = 0.0 if why == "jump" and seg < max_segments - 1 else prm["base_margin_m"]; rep = build_tube(V, T, g1 - g, None, tip, 0.0, nm, p2, doc, c_top=(None if (cap and seg == 0) else g1 - g0), cap=(cap and seg == 0))
+        rep.update(start_m=round(g0, 3), end_m=round(g1, 3), why_end=why); reports.append(rep)
+        last = (why != "jump") or seg == max_segments - 1; tr = doc.get("tube_rings", {}).get(nm)
+        if tr is not None: tr["open"] = (["top"] if (seg == 0 and not cap) else []) + (["base"] if last else [])     # the first segment of a capless tube opens at the tip side, the last one at the base
+        if why != "jump": break
+        k0 = end
+        lp = contour(V, T, g, g1, None)                                                       # the next tube starts on this ring : its front is the front of this one at the ring
+        if len(lp) == 1 and rep.get("ok") and rep.get("e1_end") is not None: front = np.asarray(rep["e1_end"], float)
+    return reports
+
+
+def classify(V, br, recs):
+    """name the branches : fingers (short, far out to the side ; the digit nearest to the body is the thumb), arms, head, legs ; the trunk (branch 0) is the torso and is not a tube. Returns {branch id: (kind, name)}."""
+    out = {}; count = collections.Counter(); digits = {"L": [], "R": []}
+    for r in sorted(recs, key=lambda z: (V[z["tip"]][0] > 0, -V[z["tip"]][1])):
+        x, y = V[r["tip"]][0], V[r["tip"]][1]; side = "L" if x < 0 else "R"
+        if r["reach_m"] < 0.1:
+            if abs(x) > 0.35 and y > 0.7: count["f" + side] += 1; out[r["id"]] = ("finger", "finger_%s_%d" % (side, count["f" + side])); digits[side].append((abs(x), r["id"]))
+        elif abs(x) > 0.35 and y > 0.7: out[r["id"]] = ("limb", "arm_" + side)
+        elif y > 1.5: out[r["id"]] = ("limb", "head")
+        elif y < 0.3: out[r["id"]] = ("limb", "leg_" + side)
+    for side, d in digits.items():
+        if len(d) >= 4:
+            thumb = min(d)[1]; out[thumb] = ("finger", "thumb_" + side)
+            for n, (_, b) in enumerate(sorted((q for q in d if q[1] != thumb), key=lambda q: -V[[r for r in recs if r["id"] == q[1]][0]["tip"]][1]), 1): out[b] = ("finger", "finger_%s_%d" % (side, n))
+    return out
+
+
+def link_mirrors(doc, tol=0.006):
+    """link the curves that are images of each other through x -> -x : their sampled points agree within tol both ways. Sets arc["mirror"] on both."""
+    from scipy.spatial import cKDTree
+    arcs = doc["arcs"]; samp = [SP.sample(np.array(a["ctrl"]), 12) for a in arcs]; mir = lambda S_: S_ * np.array([-1.0, 1.0, 1.0]); n = 0
+    trees = [cKDTree(x) for x in samp]
+    for i, a in enumerate(arcs):
+        if a["mirror"] >= 0 or np.abs(samp[i][:, 0]).max() < tol: continue
+        M = mir(samp[i]); tm = cKDTree(M); best = None
+        for j, b in enumerate(arcs):
+            if j == i or b["mirror"] >= 0 or a["pair"][0] == b["pair"][0] and False: continue
+            d = max(trees[j].query(M)[0].max(), tm.query(samp[j])[0].max())
+            if d < tol and (best is None or d < best[0]): best = (d, j)
+        if best: a["mirror"] = best[1]; arcs[best[1]]["mirror"] = i; n += 1
+    return n
+
+
+def limbs_from_tips(obj, out=None):
+    """head, legs and arms of a mannequin, each measured from its own tip. Tips : the top of the head, the two toes, and for each hand the vertex nearest to the mean of its finger saddles."""
+    prm = dict(PARAMS); prm.update(ring_step_m=0.04, fine_step_m=0.004, cap_m=0.02, base_margin_m=0.01, edge_scale=1.0, ctrl_step_m=0.04, planar_for=(("arm",) if PARAMS.get("planar_arms") else ()))      # 29 October 2026 : an arm ring is the cross section perpendicular to its axis (the level set of the distance from the hand has a lobe on the torso near the armpit)
+    V, T = TB.load_welded(obj); root = int(np.argmin(np.linalg.norm(V - V.mean(0), axis=1))); phi = TB.heat_distance(V, T, root); br, recs, top = TB.branches(V, T, phi, TB.PARAMS["persistence_m"]); names = classify(V, br, recs)
+    near = lambda p: int(np.argmin(np.linalg.norm(V - np.asarray(p), axis=1)))
+    fingers = collections.defaultdict(list)
+    for r in recs:
+        if r["id"] in names and names[r["id"]][0] == "finger": fingers[names[r["id"]][1].split("_")[1]].append(V[r["saddle"]])
+    right_foot = [V[r["tip"]] for r in recs if r["id"] in names and names[r["id"]][1] == "leg_R"]; rf = right_foot[0] if right_foot else V[top] * np.array([-1.0, 1.0, 1.0])
+    tips = {"head": (int(np.argmax(V[:, 1])), True), "leg_R": (near(rf), True), "leg_L": (near(rf * np.array([-1.0, 1.0, 1.0])), True)}
+    for side, pts in fingers.items(): tips["arm_" + side] = (near(np.mean(pts, axis=0)), False)
+    doc = {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}, "nodes": [], "arcs": [], "components": [], "component_seeds": [], "model_ref": os.path.abspath(obj), "mesh_unit": 1.0}
+    segs = prm["segments"]; reports = [r for name, (t, cap) in tips.items() for r in tip_tubes(V, T, t, name, prm, doc, cap, max_segments=segs.get(name.split("_")[0], 1))]
+    doc["mirrored_pairs"] = link_mirrors(doc, prm["mirror_m"])
+    if out: json.dump(doc, open(out, "w"))
+    return doc, reports
+
+
+def network(obj, kind, ring_mm=None, out=None):
+    prm = dict(PARAMS); V, T = TB.load_welded(obj); root = int(np.argmin(np.linalg.norm(V - V.mean(0), axis=1))); phi = TB.heat_distance(V, T, root)
+    br, recs, _ = TB.branches(V, T, phi, TB.PARAMS["persistence_m"]); names = classify(V, br, recs); by_id = {r["id"]: r for r in recs}
+    if kind == "limbs": prm.update(ring_step_m=0.04, fine_step_m=0.004, cap_m=0.02, base_margin_m=0.02, edge_scale=1.0, ctrl_step_m=0.04)
+    if ring_mm: prm["ring_step_m"] = ring_mm / 1000.0
+    doc = {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}, "nodes": [], "arcs": [], "components": [], "component_seeds": [], "model_ref": os.path.abspath(obj), "mesh_unit": 0.1 if kind == "fingers" else 1.0}
+    reports = []
+    for bid, (k, name) in names.items():
+        if (kind == "fingers") != (k == "finger"): continue
+        r = by_id[bid]; kids = [q for q in recs if br[q["saddle"]] == bid and q["id"] in names and names[q["id"]][0] == "finger"]
+        top = (min(q["saddle_phi"] for q in kids) - 0.02) if kids else None
+        reports.append(build_tube(V, T, phi, br == bid, r["tip"], r["saddle_phi"], name, prm, doc, c_top=top, cap=not kids))
+    if kind == "fingers": reports += arm_fingers(V, T, phi, br, recs, names, by_id, prm, doc)
+    doc["mirrored_pairs"] = link_mirrors(doc, prm["mirror_m"])
+    if out: json.dump(doc, open(out, "w"))
+    return doc, reports
+
+
+def arm_fingers(V, T, phi, br, recs, names, by_id, prm, doc):
+    """30 October 2026 : THE FINGER THAT THE MERGE TREE HIDES. The merge tree (ZrlTubes.branches) lets the piece with the farthest tip go on (elder rule) : in a hand, the finger whose tip is the farthest is not a branch of its own, it is the tip of the ARM branch, so the hand got one finger fewer than the model has (Manny : 3 fingers and a thumb found, 4 and a thumb on the mesh). This gives that finger its own tube : its tip is the tip of the arm record, its base the highest saddle of the other fingers of the same hand, its vertices the piece of the mesh above that distance that holds the tip. Returns the reports of the tubes built."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    out = []
+    for bid, (k, name) in list(names.items()):
+        if k != "limb" or not name.startswith("arm_"): continue
+        side = name[-1]; sibs = [by_id[b]["saddle_phi"] for b, (kk, nn) in names.items() if kk == "finger" and nn.split("_")[1] == side]
+        if len(sibs) < 3: continue
+        tip = by_id[bid]["tip"]; s = max(sibs) + 0.001
+        if phi[tip] - s < 0.03: continue                                                    # not a finger : too short
+        keep = phi >= s; idx = np.where(keep)[0]; mp = -np.ones(len(V), int); mp[idx] = np.arange(len(idx)); ok = keep[T].all(1); E = np.vstack([T[ok][:, [0, 1]], T[ok][:, [1, 2]]])
+        g = coo_matrix((np.ones(len(E)), (mp[E[:, 0]], mp[E[:, 1]])), shape=(len(idx), len(idx))); _, lab = connected_components(g, directed=False); mask = np.zeros(len(V), bool); mask[idx[lab == lab[mp[tip]]]] = True
+        n_f = 1 + max([int(nn.split("_")[2]) for b, (kk, nn) in names.items() if kk == "finger" and nn.startswith("finger_" + side)] or [0]); fname = "finger_%s_%d" % (side, n_f)
+        rep = build_tube(V, T, phi, mask, tip, s, fname, prm, doc, c_top=None, cap=True); rep["from_arm_tip"] = True; out.append(rep)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--out", required=True); ap.add_argument("--kind", choices=["fingers", "limbs", "tips"], default="fingers"); ap.add_argument("--ring-mm", type=float); ap.add_argument("--planar", action="store_true", help="rings as planar cross sections (experimental : better corner angles on arms, breaks the continuity of seams elsewhere)"); a = ap.parse_args()
+    if a.planar: PARAMS["planar_rings"] = True
+    doc, reports = limbs_from_tips(a.obj, a.out) if a.kind == "tips" else network(a.obj, a.kind, a.ring_mm, a.out)
+    for r in reports: print(json.dumps(r))
+    print("nodes", len(doc["nodes"]), "arcs", len(doc["arcs"]), "seeds", len(doc["component_seeds"]))
+
+
+if __name__ == "__main__":
+    main()

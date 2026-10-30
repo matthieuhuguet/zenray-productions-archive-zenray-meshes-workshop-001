@@ -5,9 +5,10 @@
 #     python ZrlServe.py [--port 8765] [--auto-port] [--port-file lines/server.port]
 #     Background :  nohup python ZrlServe.py > lines/server.log 2>&1 & echo $! > lines/server.pid
 # FR : serveur local du dossier lines/, avec POST /save qui écrit lines_edit.json (sauvegarde horodatée de la version précédente).
-import argparse, datetime, json, os, shutil, sys
+import time, argparse, datetime, json, os, shutil, sys
 sys.dont_write_bytecode = True
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
 PARAMS = {   # 29 October 2026 : the interface of the server, every tunable value lives here
@@ -18,13 +19,14 @@ PARAMS = {   # 29 October 2026 : the interface of the server, every tunable valu
     "save_path": "/save",
     "edit_file": "data/lines_edit.json",
     "backup_dir": "data/backups",
+    "auto_backup_s": 600,                # 29 October 2026 : autosaves keep one backup per this many seconds
     "protected": ["data/lines.json"],    # files that /save can never write
     "max_body_mb": 24,
-    "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini", "/project": "project", "/model": "model", "/crease_path": "crease_path", "/creases": "creases", "/crease_align": "crease_align", "/chain": "chain", "/auto_patch": "auto_patch"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
+    "mesh_paths": {"/doctor": "doctor", "/mesh": "mesh", "/faces": "faces", "/houdini": "houdini", "/project": "project", "/model": "model", "/crease_path": "crease_path", "/creases": "creases", "/crease_align": "crease_align", "/chain": "chain", "/auto_patch": "auto_patch", "/crease_net": "crease_net", "/lod": "lod", "/openings": "openings"},   # 29 October 2026 : netmesh endpoints (body {"lines": doc, "params": {...}})
     "lines_dir": f"{ROOT}/Scripts/lines",
     "export_path": "/export",            # 29 October 2026 : the editor's exports (PNG, SVG, OBJ, JSON) land in the atelier, never in Downloads
     "export_dir": f"{ROOT}/work/lines/exports",
-    "export_exts": [".png", ".svg", ".obj", ".json"],
+    "export_exts": [".png", ".svg", ".obj", ".json", ".py"],
 }
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 
@@ -34,26 +36,51 @@ def stamp(now=None):
     return "%d-%s-%d_%s" % (now.day, MONTHS[now.month - 1], now.year, now.strftime("%H%M%S"))     # 29-October-2026_104217
 
 
+def _no_constant(c):
+    raise ValueError("a non finite number (%s) cannot be saved" % c)
+
+
 def check_document(doc):
+    """29 October 2026 : a document is refused before it touches the disk when it is not made of finite control point matrices, when an id repeats, when an arc
+    ends on a point that does not exist or when a mirror points at nothing. A curve is a matrix (n x 3, metres) : nothing else is ever saved (no SVG, no PNG)."""
+    import math
     if not isinstance(doc, dict) or not isinstance(doc.get("nodes"), list) or not isinstance(doc.get("arcs"), list):
         raise ValueError("not a lines document (nodes and arcs expected)")
+    ids = set()
+    for n in doc["nodes"]:
+        p = n.get("p") if isinstance(n, dict) else None
+        if not isinstance(n, dict) or not isinstance(n.get("id"), int) or n["id"] in ids: raise ValueError("node id missing or repeated : %s" % (n.get("id") if isinstance(n, dict) else "?"))
+        if not (isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) and math.isfinite(x) for x in p)): raise ValueError("node %s has a bad position" % n["id"])
+        ids.add(n["id"])
+    arc_ids = set()
     for a in doc["arcs"]:
         c = a.get("ctrl") if isinstance(a, dict) else None
-        if not isinstance(c, list) or len(c) < 2 or not all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) for x in p) for p in c):
-            raise ValueError("arc %s has bad control points" % (a.get("id") if isinstance(a, dict) else "?"))
+        if not isinstance(a, dict) or not isinstance(a.get("id"), int) or a["id"] in arc_ids: raise ValueError("arc id missing or repeated : %s" % (a.get("id") if isinstance(a, dict) else "?"))
+        if not isinstance(c, list) or len(c) < 2 or not all(isinstance(p, list) and len(p) == 3 and all(isinstance(x, (int, float)) and math.isfinite(x) for x in p) for p in c):
+            raise ValueError("arc %s has bad control points" % a["id"])
+        for k in ("a", "b"):
+            if isinstance(a.get(k), int) and a[k] >= 0 and a[k] not in ids: raise ValueError("arc %s ends on point %s, which does not exist" % (a["id"], a[k]))
+        arc_ids.add(a["id"])
+    for a in doc["arcs"]:
+        m = a.get("mirror")
+        if isinstance(m, int) and m >= 0 and m not in arc_ids: raise ValueError("arc %s is mirrored by arc %s, which does not exist" % (a["id"], m))
 
 
-def save_edit(body, root, prm=PARAMS):
-    """Validate the posted document and write it atomically to the edit file. Returns the answer of the endpoint."""
-    doc = json.loads(body.decode("utf-8"))
+def save_edit(body, root, prm=PARAMS, auto=False, project=None):
+    """Validate the posted document and write it atomically to the edit file. Returns the answer of the endpoint.
+    29 October 2026 : an autosave (?auto=1) copies the previous file to backups/ only when the newest backup is older than auto_backup_s : an editing session does not bury the folder."""
+    doc = json.loads(body.decode("utf-8"), parse_constant=_no_constant)       # NaN and Infinity are refused here
     check_document(doc)
-    target = os.path.realpath(os.path.join(root, prm["edit_file"]))
+    import hashlib, ZrlProjects as PR                                      # 29 October 2026 : the edit file of the open project ; the car is lines/data as before
+    pdir = PR.data_dir(project); edit_rel = prm["edit_file"] if pdir == PR.PARAMS["car_dir"] else os.path.relpath(os.path.join(pdir, "lines_edit.json"), root)
+    target = os.path.realpath(os.path.join(root, edit_rel))
     if os.path.relpath(target, os.path.realpath(root)) in [os.path.normpath(p) for p in prm["protected"]]:
         raise ValueError("refusing to write a protected file")
     os.makedirs(os.path.dirname(target), exist_ok=True)
     backup = None
-    if os.path.exists(target):
-        bdir = os.path.join(root, prm["backup_dir"])
+    bdir = os.path.join(os.path.dirname(target), "backups")
+    recent = auto and os.path.isdir(bdir) and any(time.time() - os.path.getmtime(os.path.join(bdir, f)) < prm["auto_backup_s"] for f in os.listdir(bdir))
+    if os.path.exists(target) and not recent:
         os.makedirs(bdir, exist_ok=True)
         backup = os.path.join(bdir, "lines_edit_%s.json" % stamp())
         n = 1
@@ -63,9 +90,15 @@ def save_edit(body, root, prm=PARAMS):
         shutil.copy2(target, backup)
     tmp = target + ".tmp"
     with open(tmp, "wb") as f:
-        f.write(body)
+        f.write(body); f.flush(); os.fsync(f.fileno())                      # 29 October 2026 : on the disk, not only in the cache, before the old file is replaced
     os.replace(tmp, target)
-    return {"ok": True, "path": target, "bytes": len(body), "arcs": len(doc["arcs"]), "nodes": len(doc["nodes"]), "backup": backup}
+    try:
+        fd = os.open(os.path.dirname(target), os.O_RDONLY); os.fsync(fd); os.close(fd)
+    except OSError: pass
+    want = hashlib.sha256(body).hexdigest()
+    with open(target, "rb") as f: got = hashlib.sha256(f.read()).hexdigest()  # read back : the answer says ok only when the file on the disk is the document that was posted
+    if got != want: raise IOError("the saved file does not match the posted document (sha256 %s against %s) ; the previous version is in %s" % (got[:12], want[:12], backup or "backups"))
+    return {"ok": True, "path": target, "bytes": len(body), "arcs": len(doc["arcs"]), "nodes": len(doc["nodes"]), "backup": backup, "sha256": got}
 
 
 def save_export(body, prm=PARAMS):
@@ -97,6 +130,17 @@ def run_netmesh(kind, body, prm=PARAMS):
     if kind == "chain":                                     # 29 October 2026 : the chain file, its build in Houdini and the pull of its curves (ZrlChain.py)
         import ZrlChain
         return ZrlChain.handle(req)
+    if kind == "openings":                                  # 29 October 2026 : concentric rings around an opening, a face convention (ZrlOpenings.py)
+        import ZrlOpenings
+        return ZrlOpenings.handle(req)
+    if kind == "lod":                                       # 29 October 2026 : Catmull-Clark levels of a quad mesh, fitted back to the model (ZrlLod.py)
+        import ZrlLod
+        return ZrlLod.handle(req)
+    if kind == "crease_net":                                # 29 October 2026 : every crease of the model as curves (ZrlCreaseNet.py), in a child process like the other crease endpoints
+        import subprocess
+        r = subprocess.run([sys.executable, "-I", "-B", os.path.join(prm["lines_dir"], "ZrlCreaseNet.py"), "--handle"], input=json.dumps(req), capture_output=True, text=True, timeout=600)
+        if r.returncode != 0: raise RuntimeError("crease net failed : " + (r.stderr or r.stdout)[-400:])
+        return json.loads(r.stdout.strip().splitlines()[-1])
     if kind == "creases": req = dict(req, op="map"); kind = "crease_path"   # 29 October 2026 : the crease layer, same child process
     if kind == "crease_align": req = dict(req, op="align"); kind = "crease_path"   # 29 October 2026 : edges of the mesh on the creases, same child process
     if kind == "crease_path":                               # 29 October 2026 : a drawn curve that follows the creases seen from the camera (ZrlCreases.py), in a child process
@@ -106,7 +150,8 @@ def run_netmesh(kind, body, prm=PARAMS):
         return json.loads(r.stdout.strip().splitlines()[-1])
     if kind == "model":                                     # 29 October 2026 : a new model version becomes the source of truth (ZrlUseModel.py)
         import ZrlUseModel
-        return ZrlUseModel.run(req["obj"], views=req.get("views", True))
+        import ZrlProjects as PR
+        return ZrlUseModel.run(req["obj"], prm=dict(ZrlUseModel.PARAMS, data=PR.data_dir(req.get("project"))), views=req.get("views", True))
     import ZrlNetMesh as NM
     if not isinstance(req, dict) or "lines" not in req: raise ValueError('body must be {"lines": document, "params": {...}}')
     doc = req["lines"]; check_document(doc); params = req.get("params") or {}
@@ -153,6 +198,9 @@ def make_handler(root, prm):
             if path == "/api/lines/version":                   # 29 October 2026 : the page and the launcher ask which code runs (see version-guard.js, ZenRayLines.sh)
                 web, py = code_version(root, prm["lines_dir"]); PY_AT_START.setdefault("py", py)
                 return self.reply(200, {"app": "zenray-lines", "web": web, "py_loaded": PY_AT_START["py"], "py_now": py, "pid": os.getpid()})
+            if path == "/api/projects":                         # 29 October 2026 : the projects (one folder of work per model)
+                import ZrlProjects as PR
+                return self.reply(200, PR.handle({"op": "list"}))
             return super().do_GET()
 
         def do_POST(self):
@@ -162,6 +210,16 @@ def make_handler(root, prm):
                 script = os.path.join(prm["lines_dir"], "ZrlServeRestart.sh")
                 subprocess.Popen(["/bin/zsh", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                 return self.reply(200, {"ok": True, "restarting": True})
+            if path == "/api/projects":
+                try:
+                    import ZrlProjects as PR
+                    n = int(self.headers.get("Content-Length", "0")); req = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                    self.reply(200, PR.handle(req))
+                except BaseException as e:
+                    import traceback; traceback.print_exc(); sys.stderr.flush()
+                    try: self.reply(500, {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+                    except Exception: pass
+                return
             if path in prm["mesh_paths"]:                       # netmesh endpoints : any failure is a JSON 500, the server never crashes
                 try:
                     n = int(self.headers.get("Content-Length", ""))
@@ -190,7 +248,7 @@ def make_handler(root, prm):
             if n <= 0 or n > prm["max_body_mb"] * 1024 * 1024:
                 return self.reply(413, {"ok": False, "error": "body size out of range"})
             try:
-                self.reply(200, save_edit(self.rfile.read(n), root, prm))
+                self.reply(200, save_edit(self.rfile.read(n), root, prm, auto="auto=1" in self.path, project=(parse_qs(urlparse(self.path).query).get("project") or [None])[0]))
             except (ValueError, UnicodeDecodeError) as e:       # json.JSONDecodeError is a ValueError
                 self.reply(400, {"ok": False, "error": str(e)})
             except OSError as e:

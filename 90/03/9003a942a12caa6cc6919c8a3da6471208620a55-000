@@ -1,0 +1,135 @@
+"""29 October 2026 : ZenRay Lines PROJECTS, one folder of work per model (a car, the next car, a character ...).
+EN: the first project, "car", is the existing folder lines/data (nothing moved, every script keeps working). A new project is lines/projects/<id>/data with the same file
+names : project.json (name, model, dates), lines_edit.json (its network), ref_mesh.bin/json (its reference, from an OBJ with one group per part), and views.json
+with sheet_views.json when it has a reference sheet. The editor opens one project at a time (?project=<id>) ; a project is never deleted, it goes to projects/_trash.
+    POST /api/projects {"op": "list"}                                         -> every project with its counts
+    POST /api/projects {"op": "create", "name": "Coupe 2", "obj": "/path/model.obj"}   (obj optional : an empty project)
+    POST /api/projects {"op": "rename", "id": "coupe-2", "name": "..."} | {"op": "duplicate", "id": ..., "name": ...} | {"op": "delete", "id": ...}
+FR : un dossier de travail par modèle ; la voiture existante est le premier projet, rien n'est déplacé ; un projet supprimé va à la corbeille.
+"""
+import datetime, json, os, re, shutil, sys, time
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+PARAMS = {   # 29 October 2026 : every tunable value of the project manager
+    "projects_dir": f"{ROOT}/lines/projects",
+    "car_dir": f"{ROOT}/lines/data",
+    "car_name": "Car (v752)",
+    "copy_skip": ["backups", "__pycache__"],     # not copied when a project is duplicated
+}
+
+
+def slug(name):
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return s[:40] or "project"
+
+
+def data_dir(pid, prm=PARAMS):
+    """the data folder of a project ; none or 'car' is the original lines/data."""
+    if pid in (None, "", "car"): return prm["car_dir"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", pid) or pid == "_trash": raise ValueError("bad project id")
+    return os.path.join(prm["projects_dir"], pid, "data")
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as f: return json.load(f)
+    except Exception: return None
+
+
+def info(pid, prm=PARAMS):
+    d = data_dir(pid, prm); meta = _read(os.path.join(d, "project.json")) or {}
+    car = pid in (None, "", "car")
+    net = _read(os.path.join(d, "lines_edit.json")) or (_read(os.path.join(d, "lines.json")) if car else None) or {}
+    ref = _read(os.path.join(d, "ref_mesh.json")) or {}
+    f = os.path.join(d, "lines_edit.json"); upd = os.path.getmtime(f) if os.path.exists(f) else (os.path.getmtime(d) if os.path.isdir(d) else 0)
+    return {"id": "car" if car else pid, "name": meta.get("name") or (prm["car_name"] if car else pid), "model": meta.get("model_ref") or ref.get("source") or ("v752" if car else ""),
+            "created": meta.get("created"), "updated": datetime.datetime.fromtimestamp(upd).isoformat(timespec="seconds") if upd else None,
+            "curves": len(net.get("arcs", [])), "components": len({q.get("name") for q in net.get("component_seeds", [])}), "parts": len(ref.get("parts", [])), "sheet": os.path.exists(os.path.join(d, "sheet_views.json"))}
+
+
+def list_projects(prm=PARAMS):
+    out = [info("car", prm)]; pd = prm["projects_dir"]
+    if os.path.isdir(pd):
+        for pid in sorted(os.listdir(pd)):
+            if pid.startswith("_") or not os.path.isfile(os.path.join(pd, pid, "data", "project.json")): continue
+            out.append(info(pid, prm))
+    return out
+
+
+def _unique(base, prm):
+    pid, n = base, 2
+    while pid == "car" or os.path.exists(os.path.join(prm["projects_dir"], pid)): pid = "%s-%d" % (base, n); n += 1
+    return pid
+
+
+def _empty_network(model_ref):
+    today = datetime.date.today(); doc = {"version": 1, "date": "%d %s %d" % (today.day, today.strftime("%B"), today.year), "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}, "nodes": [], "arcs": [], "components": []}
+    if model_ref: doc["model_ref"] = model_ref
+    return doc
+
+
+def _write(path, doc):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(doc, f, indent=1)
+    os.replace(tmp, path)
+
+
+def create(req, prm=PARAMS):
+    name = (req.get("name") or "").strip()
+    if not name: raise ValueError("a project needs a name")
+    pid = _unique(slug(name), prm); d = data_dir(pid, prm); os.makedirs(d, exist_ok=True); obj = (req.get("obj") or "").strip(); out = {}
+    try:
+        if obj:
+            import ZrlUseModel as UM
+            out = UM.run(obj, prm=dict(UM.PARAMS, data=d), views=False); obj = out["obj"]       # the reference of the 3D editor ; the six view sheet is a later step
+        _write(os.path.join(d, "lines_edit.json"), _empty_network(obj))
+        _write(os.path.join(d, "project.json"), {"id": pid, "name": name, "model_ref": obj, "created": datetime.datetime.now().isoformat(timespec="seconds")})
+    except BaseException:
+        shutil.rmtree(os.path.dirname(d), ignore_errors=True); raise                                # a failed creation leaves nothing behind
+    return {"ok": True, "project": info(pid, prm), "model": out}
+
+
+def _meta(pid, prm):
+    d = data_dir(pid, prm); p = os.path.join(d, "project.json"); meta = _read(p) or {"id": pid, "created": datetime.datetime.now().isoformat(timespec="seconds")}
+    if pid in (None, "", "car"): meta.setdefault("model_ref", "v752")
+    return p, meta
+
+
+def rename(req, prm=PARAMS):
+    name = (req.get("name") or "").strip()
+    if not name: raise ValueError("a project needs a name")
+    p, meta = _meta(req.get("id"), prm); meta["name"] = name; _write(p, meta); return {"ok": True, "project": info(req.get("id"), prm)}
+
+
+def duplicate(req, prm=PARAMS):
+    src = data_dir(req.get("id"), prm)
+    if not os.path.isdir(src): raise ValueError("no such project")
+    name = (req.get("name") or "").strip() or ("%s copy" % info(req.get("id"), prm)["name"]); pid = _unique(slug(name), prm); dst = data_dir(pid, prm)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(*prm["copy_skip"]))
+    p = os.path.join(dst, "project.json"); meta = _read(p) or {}; meta.update({"id": pid, "name": name, "created": datetime.datetime.now().isoformat(timespec="seconds")}); _write(p, meta)
+    if not os.path.exists(os.path.join(dst, "lines_edit.json")) and os.path.exists(os.path.join(dst, "lines.json")): shutil.copy2(os.path.join(dst, "lines.json"), os.path.join(dst, "lines_edit.json"))   # the car starts from its original network
+    return {"ok": True, "project": info(pid, prm)}
+
+
+def delete(req, prm=PARAMS):
+    pid = req.get("id")
+    if pid in (None, "", "car"): raise ValueError("the car project is the original data and is not deleted")
+    d = data_dir(pid, prm); top = os.path.dirname(d)
+    if not os.path.isdir(top): raise ValueError("no such project")
+    trash = os.path.join(prm["projects_dir"], "_trash"); os.makedirs(trash, exist_ok=True)
+    dest = os.path.join(trash, "%s_%s" % (pid, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))); shutil.move(top, dest)
+    return {"ok": True, "moved_to": dest}
+
+
+def handle(req, prm=PARAMS):
+    op = (req or {}).get("op", "list")
+    if op == "list": return {"ok": True, "projects": list_projects(prm)}
+    fn = {"create": create, "rename": rename, "duplicate": duplicate, "delete": delete}.get(op)
+    if not fn: raise ValueError("unknown operation " + str(op))
+    return fn(req, prm)
+
+
+if __name__ == "__main__":
+    print(json.dumps(handle(json.loads(sys.argv[1]) if len(sys.argv) > 1 else {"op": "list"}), indent=1))

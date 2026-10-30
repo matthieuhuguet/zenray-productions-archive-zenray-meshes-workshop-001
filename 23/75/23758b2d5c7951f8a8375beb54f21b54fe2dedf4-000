@@ -1,0 +1,137 @@
+"""29 October 2026 : ZenRay Lines STRAIGHTEN, the seams of a tube made straight.
+EN: a tube of the network is rings (four corners each) joined by seams. The corners of a ring sit where the contour of the surface puts them, so a seam that runs through ten rings wiggles by a few degrees
+at every ring. This step slides every corner of the INTERIOR rings along its own ring (the contour stays the contour) towards the straight line between the corners of the rings before and after it, a few
+Laplacian steps, limited to a part of the ring so that no quad is pulled out of shape, and the ring arcs and the seam arcs are fitted again through the new corners. The end rings do not move (they
+are shared with a junction, an elbow or a cap). Mirror links between arcs stay valid : only the control points change.
+    python -I ZrlStraighten.py doc.json --out doc2.json [--param iters=10 --param lam=0.5 --param max_shift=0.12]
+FR : redresse les coutures d'un tube : chaque coin des anneaux intérieurs glisse le long de son anneau vers la droite qui joint les coins des anneaux voisins.
+"""
+import argparse, json, math, os, sys
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+import ZrlSpline as SP, ZrlTubeNet as TN
+
+PARAMS = {   # 29 October 2026 : every value of the straightening
+    "iters": 30,            # Laplacian steps
+    "lam": 0.5,             # share of the move towards the straight line taken at each step
+    "max_shift": 0.15,      # a corner never leaves its first place by more than 15 % of the ring (54 degrees of a circle)
+    "max_gap_deg": 125.0,   # two neighbouring corners of a ring are never more than 125 degrees apart (rings that break it get equal polar angles)
+    "min_gap": 0.14,        # and two corners of a ring stay at least 14 % of the ring apart
+    "seam_points": 3,       # points inside a seam, projected on the surface
+    "ctrl_step_m": 0.04,    # control point spacing of the fitted arcs
+}
+
+
+def arc_polyline(arc, per_span=24):
+    return SP.sample(np.asarray(arc["ctrl"], float), per_span)
+
+
+class Loop:
+    """a closed ring as a polyline with arc length, and the arc length of its four corners."""
+    def __init__(self, parts):
+        P = [parts[0][0]]
+        for q in parts: P.extend(q[1:])
+        self.P = np.array(P); self.cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(self.P, axis=0), axis=1))]; self.L = float(self.cum[-1])
+        self.s = [0.0]
+        for q in parts[:-1]: self.s.append(self.s[-1] + float(np.linalg.norm(np.diff(q, axis=0), axis=1).sum()))
+
+    def at(self, s):
+        s = s % self.L; return np.array([np.interp(s, self.cum, self.P[:, c]) for c in range(3)])
+
+    def param(self, T):
+        a, b = self.P[:-1], self.P[1:]; ab = b - a; ll = np.maximum((ab ** 2).sum(1), 1e-18); t = np.clip(((T - a) * ab).sum(1) / ll, 0, 1); q = a + t[:, None] * ab; k = int(np.argmin(np.linalg.norm(q - T, axis=1)))
+        return float(self.cum[k] + t[k] * math.sqrt(ll[k]))
+
+    def between(self, s0, s1):
+        """the polyline from arc length s0 to s1 (going on round the ring)."""
+        s0 %= self.L; s1 %= self.L
+        if s1 <= s0: s1 += self.L
+        ext = np.vstack([self.P, self.P[1:]]); cu = np.r_[self.cum, self.cum[1:] + self.L]; m = (cu > s0) & (cu < s1)
+        p0 = np.array([np.interp(s0, cu, ext[:, c]) for c in range(3)]); p1 = np.array([np.interp(s1, cu, ext[:, c]) for c in range(3)])
+        return np.vstack([p0[None], ext[m], p1[None]])
+
+
+def wrap(d, L): return (d + L / 2.0) % L - L / 2.0
+
+
+def straighten_tube(doc, name, ref, prm=PARAMS):
+    """straighten one tube of doc["tube_rings"] ; returns {"corner_curvature_before", "corner_curvature_after", "moved"} or None when the tube has fewer than three rings."""
+    t = doc["tube_rings"][name]; rings = t["rings"]; R = len(rings); n = len(rings[0]["nodes"])
+    if R < 3: return None
+    nodes = doc["nodes"]; arcs = doc["arcs"]; by = {}
+    for a in arcs: by[(a["a"], a["b"])] = (a["id"], 1); by[(a["b"], a["a"])] = (a["id"], -1)
+    loops = []; ring_ids = []
+    for r in range(R):
+        ids = rings[r]["nodes"]; parts = []; aid = []
+        for i in range(n):
+            key = (ids[i], ids[(i + 1) % n])
+            if key not in by: return None
+            k, sg = by[key]; q = arc_polyline(arcs[k]); parts.append(q if sg > 0 else q[::-1]); aid.append(k)
+        loops.append(Loop(parts)); ring_ids.append(aid)
+    pos0 = [list(l.s) for l in loops]; pos = [list(l.s) for l in loops]; balanced = []
+    for r in range(1, R - 1):                                                              # a ring whose corners are more than max_gap_deg apart (an ankle bending into a foot : an oval with two corners 175 degrees apart) gets its corners at equal polar angles
+        c = np.array(rings[r]["centre"]); a = np.array(rings[r]["axis"]); e1 = np.array(rings[r]["e1"]); e2 = np.cross(a, e1); lp = loops[r]; d = lp.P[:-1] - c
+        ang = np.unwrap(np.arctan2(d @ e2, d @ e1)); ang = np.r_[ang, ang[0] + 2 * np.pi]
+        if not (np.all(np.diff(ang) > -1e-6) and abs((ang[-1] - ang[0]) - 2 * np.pi) < 1e-3): continue                      # not star shaped about its centre : keep the arc length corners
+        ca = np.interp(pos[r], lp.cum, ang); gaps = np.degrees(np.diff(np.r_[ca, ca[0] + 2 * np.pi]))
+        if gaps.max() > prm["max_gap_deg"] * 4.0 / n:
+            a0 = float(ca[0]); tgt = [a0 + k * 2 * np.pi / n for k in range(n)]; pos[r] = [float(np.interp(x, ang, lp.cum)) for x in tgt]; pos0[r] = list(pos[r]); balanced.append(r)
+    def pts(r, ps): return [loops[r].at(s) for s in ps]
+    def curvature(ps):
+        P = np.array([[loops[r].at(ps[r][i]) for i in range(n)] for r in range(R)]); return float(np.mean(np.linalg.norm(P[2:] - 2 * P[1:-1] + P[:-2], axis=2)))
+    before = curvature(pos); centres = np.array([r["centre"] for r in rings]); dist = np.linalg.norm(np.diff(centres, axis=0), axis=1)
+    for _ in range(prm["iters"]):
+        new = [list(p) for p in pos]
+        for r in range(1, R - 1):
+            L = loops[r].L; d1, d2 = max(dist[r - 1], 1e-6), max(dist[r], 1e-6); prev = pts(r - 1, pos[r - 1]); nxt = pts(r + 1, pos[r + 1]); cand = list(pos[r])
+            for i in range(n):
+                T = (d2 * prev[i] + d1 * nxt[i]) / (d1 + d2); star = loops[r].param(T); delta = wrap(star - pos[r][i], L); cand[i] = pos[r][i] + prm["lam"] * delta
+                lim = prm["max_shift"] * L; cand[i] = pos0[r][i] + max(-lim, min(lim, wrap(cand[i] - pos0[r][i], L)))
+            gaps = [(cand[(i + 1) % n] - cand[i]) % L for i in range(n)]
+            if all(prm["min_gap"] * 4.0 / n * L <= g <= 2.0 * L / n for g in gaps): new[r] = cand
+        pos = new
+    after = curvature(pos); moved = 0
+    for r in range(1, R - 1):                                                              # write the interior rings : nodes, ring arcs
+        lp = loops[r]; ids = rings[r]["nodes"]; C = [ref.closest(lp.at(s)[None])[0][0] for s in pos[r]]
+        for i in range(n):
+            nodes[ids[i]]["p"] = [round(float(x), 6) for x in C[i]]
+            q = lp.between(pos[r][i], pos[r][(i + 1) % n]); q[0], q[-1] = C[i], C[(i + 1) % n]; fit = TN.fit(q, prm["ctrl_step_m"]); a = arcs[ring_ids[r][i]]
+            if fit is not None:
+                if a["a"] == ids[i]: a["ctrl"] = np.round(fit, 6).tolist()
+                else: a["ctrl"] = np.round(fit[::-1], 6).tolist()
+        moved += 1
+    P = [[np.array(nodes[rings[r]["nodes"][i]]["p"]) for i in range(n)] for r in range(R)]
+    for r in range(R - 1):                                                                 # seams between the rings (and the ring arcs next to a moved ring keep their ends)
+        for i in range(n):
+            key = (rings[r]["nodes"][i], rings[r + 1]["nodes"][i])
+            if key not in by: continue
+            k, sg = by[key]; a = arcs[k]; ts = np.linspace(0, 1, prm["seam_points"] + 2)[1:-1]; mid = [ref.closest(((1 - u) * P[r][i] + u * P[r + 1][i])[None])[0][0] for u in ts]
+            q = np.vstack([P[r][i][None]] + [m[None] for m in mid] + [P[r + 1][i][None]]); fit = TN.fit(q, prm["ctrl_step_m"])
+            if fit is None: continue
+            a["ctrl"] = np.round(fit if sg > 0 else fit[::-1], 6).tolist()
+    for r in (0, R - 1):                                                                   # end rings keep their place, their ring arcs are untouched
+        pass
+    return {"corner_curvature_before": round(before * 1000, 2), "corner_curvature_after": round(after * 1000, 2), "moved_rings": moved, "balanced_rings": balanced}
+
+
+def straighten_doc(doc, ref, prm=PARAMS):
+    out = {}
+    for name in doc.get("tube_rings", {}):
+        r = straighten_tube(doc, name, ref, prm)
+        if r: out[name] = r
+    return out
+
+
+def main():
+    import ZrlNetMesh as NM
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--out", required=True); ap.add_argument("--param", action="append", default=[]); a = ap.parse_args()
+    prm = dict(PARAMS); prm.update({k: (int(v) if k in ("iters", "seam_points") else float(v)) for k, v in (x.split("=") for x in a.param)})
+    doc = json.load(open(a.doc)); ref = NM.load_ref(doc["model_ref"]); rep = straighten_doc(doc, ref, prm)
+    for k, v in rep.items(): print(k, json.dumps(v))
+    json.dump(doc, open(a.out, "w"))
+
+
+if __name__ == "__main__":
+    main()

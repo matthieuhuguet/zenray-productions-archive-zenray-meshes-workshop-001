@@ -1,0 +1,43 @@
+"""29 October 2026 : ZenRay Lines TUNE JUNCTION : find the heights of the torso poles that let the counts of every patch close, by asking the solver of counts itself.
+EN: the faces of a junction are pentagons and hexagons whose side counts must satisfy the Tarini conditions (e_i = s_(i-1) + s_(i+1), s_i >= 1). Whether they do depends on the lengths of the sides, so on where the
+poles stand. For every candidate (pole_upper, pole_lower) the whole network of the character is built (a few seconds), the whole mesh is computed and the number of
+faces that did not mesh are counted ; the candidate with the fewest (junction faces first) wins (ties : the one nearest to the default). Candidates run in parallel.
+    python -I ZrlTuneJunction.py model.obj [--upper 0.8,0.85,0.9] [--lower 0.05,0.1,0.15] [--edge 0.02] [--workers 6]
+FR : trouve la hauteur des pôles du torse qui laisse fermer les comptes de tous les patchs, en interrogeant le solveur lui-même.
+"""
+import argparse, itertools, json, os, sys, time
+from multiprocessing import Pool
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+
+
+class Done(Exception): pass
+
+
+def evaluate(task):
+    obj, params, edge = task
+    import numpy as np, ZrlBodyNet as BN, ZrlNetMesh as NM
+    t = time.time(); doc = BN.build(obj, params, log=lambda *a: None)
+    res = NM.build(doc, dict({"ref": os.path.abspath(obj), "unit": doc["mesh_unit"], "feature_unit": doc["mesh_feature_unit"], "edge_m": edge, "component_options": doc["component_options"], "corners_force": doc["corners_force"], "write_obj": False, "auto_fallback": True}, **doc.get("mesh_params", {})))
+    bad = [f for f in res["faces"] if f["status"] != "meshed"]; J = np.asarray(res["quad_jac"]) if len(res["Q"]) else np.zeros(0)
+    import ZrlQuadStats as QS
+    P = np.asarray(res["P"], float).reshape(-1, 3); Qd = np.asarray(res["Q"], np.int64).reshape(-1, 4); O = "/tmp/zrl_tune_%d.obj" % os.getpid()
+    with open(O, "w") as fh:
+        for p_ in P: fh.write("v %.6f %.6f %.6f\n" % tuple(p_))
+        for q_ in Qd: fh.write("f %d %d %d %d\n" % tuple(q_ + 1))
+    dens = {k: v["edge_mm"] for k, v in QS.regions(O).items()}; os.remove(O)
+    return {"params": params, "density_mm": dens, "unmeshed": len(bad), "folded": int((J < 0).sum()), "low_jacobian": int((J < 0.3).sum()), "faces": len(res["faces"]), "quads": len(res["Q"]) // 4, "closed": bool(res["stats"].get("closed")), "seconds": round(time.time() - t, 1)}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("obj"); ap.add_argument("--grid", action="append", default=[], help="key=v1,v2,... (repeat for a cross product)"); ap.add_argument("--edge", type=float, default=0.02); ap.add_argument("--workers", type=int, default=6); ap.add_argument("--param", action="append", default=[]); a = ap.parse_args()
+    base = {k: float(v) for k, v in (x.split("=") for x in a.param)}; obj = os.path.abspath(a.obj); keys = []; vals = []
+    for g in a.grid: k, v = g.split("="); keys.append(k); vals.append([float(x) for x in v.split(",")])
+    tasks = [(obj, dict(base, **dict(zip(keys, combo))), a.edge) for combo in itertools.product(*vals)] if keys else [(obj, base, a.edge)]
+    with Pool(a.workers) as p: res = p.map(evaluate, tasks, chunksize=1)
+    res.sort(key=lambda r: (r["unmeshed"], r["folded"], r["low_jacobian"]))
+    for r in res: print(json.dumps(r))
+    print("BEST", json.dumps(res[0]["params"]))
+
+
+if __name__ == "__main__":
+    main()

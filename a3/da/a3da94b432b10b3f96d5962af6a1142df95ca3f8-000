@@ -1,0 +1,31 @@
+"""29 October 2026 : ZenRay Lines TUBE CHECK : mesh a network document and report, per component, how many faces were meshed, judged good, how many quads and how many under the Jacobian threshold.
+    python -I ZrlTubeCheck.py doc.json --ref model.obj [--unit 0.1] [--edge 0.005]       exit code 0 when every face of every component is meshed and judged good
+FR : maille un réseau et compte, par composant, les faces maillées, bonnes, les quads et ceux sous le Jacobien."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlNetMesh as NM
+
+
+def check(doc, ref, unit=None, edge=0.02, feature_unit=None):
+    names = list(doc.get("component_options", {})) or sorted({a["pair"][0] for a in doc["arcs"] if a["pair"][0]})
+    unit = unit if unit is not None else doc.get("mesh_unit", 1.0); feature_unit = feature_unit if feature_unit is not None else doc.get("mesh_feature_unit")      # the document carries its own scales
+    res = NM.build(doc, {"ref": ref, "unit": unit, "feature_unit": feature_unit, "edge_m": edge, "component_options": doc.get("component_options") or {n: {"edge_scale": 1.0} for n in names}, "corners_force": doc.get("corners_force", {}), "write_obj": False, "auto_fallback": True})
+    per = collections.defaultdict(lambda: collections.Counter()); quads_of = collections.Counter(res["face_of_quad"]) if res.get("face_of_quad") else {}
+    for f in res["faces"]:
+        c = f.get("component") or "(none)"; per[c]["faces"] += 1; per[c][f["status"]] += 1
+        if f["status"] == "meshed" and f.get("judge_ok"): per[c]["good"] += 1
+        per[c]["quads"] += int(quads_of.get(f["id"], 0))
+    st = res["stats"]
+    return {"components": {k: dict(v) for k, v in per.items()}, "faces": len(res["faces"]), "meshed": st.get("faces_meshed"), "judge_ok": st.get("faces_judge_ok"), "quads": len(res["Q"]) // 4, "quads_below_jac": st.get("quads_below_jac_min"),
+            "skipped": st.get("skipped_reasons"), "issues": dict(collections.Counter(i["kind"] for i in res["issues"])), "euler": st.get("euler_network")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--unit", type=float); ap.add_argument("--feature-unit", type=float); ap.add_argument("--edge", type=float, default=0.02); a = ap.parse_args()
+    r = check(json.load(open(a.doc)), os.path.abspath(a.ref), a.unit, a.edge, a.feature_unit); print(json.dumps({k: v for k, v in r.items() if k != "components"}, indent=1))
+    for k, v in sorted(r["components"].items()): print("%-12s faces %3d meshed %3d good %3d skipped %3d quads %4d" % (k, v.get("faces", 0), v.get("meshed", 0), v.get("good", 0), v.get("skipped", 0), v.get("quads", 0)))
+    sys.exit(0 if r["meshed"] == r["faces"] - sum(1 for _ in [0] if False) and r["judge_ok"] == r["meshed"] else 1)
+
+
+if __name__ == "__main__":
+    main()

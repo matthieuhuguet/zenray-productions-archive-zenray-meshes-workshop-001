@@ -1,0 +1,42 @@
+"""30 October 2026 : ZenRay Lines COUNTS DIAGNOSTIC : mesh a document and print the integer edge count of every arc of one tube (rings x columns) so a column that is far too coarse (or too fine) shows at once.
+    python -I ZrlCountsDiag.py doc.json --ref model.obj [--tube trunk] [--edge 0.02]
+FR : affiche, pour un tube, le nombre d'arêtes de chaque arc d'anneau (anneau x colonne) et de chaque couture."""
+import argparse, json, os, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlNetMesh as NM
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--tube", default="trunk"); ap.add_argument("--edge", type=float, default=0.02); ap.add_argument("--param", action="append", default=[]); ap.add_argument("--minring", type=int, default=0); a = ap.parse_args()
+    doc = json.load(open(a.doc)); extra = dict(doc.get("mesh_params", {})); extra.update({k: float(v) for k, v in (x.split("=") for x in a.param)})
+    if a.minring:
+        ids = set(); tr = doc["tube_rings"][a.tube]["rings"]; by0 = {}
+        for arc in doc["arcs"]: by0[(arc["a"], arc["b"])] = arc["id"]; by0[(arc["b"], arc["a"])] = arc["id"]
+        for ring in tr:
+            for i in range(len(ring["nodes"])): ids.add(by0.get((ring["nodes"][i], ring["nodes"][(i + 1) % len(ring["nodes"])])))
+        extra["arc_min_counts"] = {str(i): a.minring for i in ids if i is not None}
+    res = NM.build(doc, dict({"ref": os.path.abspath(a.ref), "unit": doc.get("mesh_unit", 1.0), "feature_unit": doc.get("mesh_feature_unit"), "edge_m": a.edge, "component_options": doc.get("component_options", {}), "corners_force": doc.get("corners_force", {}), "write_obj": False, "auto_fallback": True}, **extra))
+    ac = res["arc_counts"]; par = res.get("arc_parents", {}); t = doc["tube_rings"][a.tube]; rings = t["rings"]; by = {}
+    for arc in doc["arcs"]: by[(arc["a"], arc["b"])] = arc["id"]; by[(arc["b"], arc["a"])] = arc["id"]
+    def count(aid):
+        tot = 0; found = False
+        for k, v in ac.items():
+            if str(par.get(k, k)) == str(aid) or str(k) == str(aid): tot += v; found = True
+        return tot if found else None
+    n = len(rings[0]["nodes"]); print("ring arcs : rows = rings from base, columns = %d seams" % n)
+    for r, ring in enumerate(rings):
+        row = []
+        for i in range(n):
+            aid = by.get((ring["nodes"][i], ring["nodes"][(i + 1) % n])); row.append(count(aid) if aid is not None else None)
+        print("ring %2d" % r, row)
+    print("seams : rows = bands, columns = %d seams" % n)
+    for r in range(len(rings) - 1):
+        row = []
+        for i in range(n):
+            aid = by.get((rings[r]["nodes"][i], rings[r + 1]["nodes"][i])); row.append(count(aid) if aid is not None else None)
+        print("band %2d" % r, row)
+
+
+if __name__ == "__main__":
+    main()

@@ -30,6 +30,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "max_face_sides": 6,              # faces with more corners are skipped
     "max_face_area_m2": 3.0,          # faces larger than this are skipped
     "skip_faces": [],                 # face ids skipped on request
+    "wrap_min_normal": 0.3,           # 29 October 2026 : a face whose corner normals average to less than this length wraps round a thin part and is skipped ("wraps_around") ; 0 meshes it anyway
     "corner_deg": 35.0,               # a node of a face loop is a corner when the turn is larger than this
     "corners_force": {},              # {node id: true|false} forces / forbids a corner
     "min_arc_count": 1,               # 29 October 2026 : fewest edges on any curve of a patch side (2 keeps a short side from collapsing a strip to one row)
@@ -52,6 +53,7 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "corner_min_deg": 10.0,           # a face with fewer than 4 corners takes its sharpest remaining nodes (turn above this) as extra corners
     "corner_min_gap_frac": 0.05,      # ... but never closer than this fraction of the face perimeter to another corner
     "drop_failed": False,             # True : quads of faces failing the judge are left out of the mesh (status "rejected")
+    "unit": 1.0,                      # 29 October 2026 : length scale of the features : every absolute tolerance below is multiplied by it (0.1 for the fingers of a hand)
     "edge_m": 0.02,                   # target edge length (counts = length / edge_m)
     "min_spoke": 2,                   # counts : spokes of a 3, 5, 6 sided face have at least this many edges (1 gives a pole stuck on the boundary)
     "min_loop_count": 3,              # a loop arc (both ends on one node) needs at least this many edges
@@ -70,8 +72,25 @@ PARAMS = {   # 29 October 2026 : the interface of this module, every tunable val
     "component_options": {},          # 29 October 2026 : {component name: {skip, corners, rotate, edge_scale}} : stable across edits, unlike face ids ; a face option wins               # {face id: {"skip": bool, "corners": [node ids], "rotate": int}} per face topology choices
     "boundary_step_m": 0.01,          # /faces : spacing of the boundary polyline returned for drawing and picking
     "project_arcs": True,             # 29 October 2026 : nodes and arc polylines are put on the reference surface before the faces (curves drawn off the shell fold the first quad row)
+    "symmetric_corners": False,       # 30 October 2026 : a borderline turn is a corner on both sides of the plane of symmetry or on neither (see _symmetric_corners)
+    "inherit_component": False,       # 30 October 2026 : a face that holds no component seed takes the component (name, edge scale) of the nearest named face by centre : a character gets one family of zones and one density everywhere, no orphan faces at the shoulders, the wrists, the feet
     "seed_plane_tol_m": 0.5,          # component seeds : a face is a candidate when the seed projects inside its loop and lies within this of its plane
 }
+LENGTH_KEYS = ["weld_tol_m", "snap_report_m", "dup_mid_tol_m", "dup_mean_dist_m", "min_arc_len_m", "snap_corner_m", "tjunction_tol_m", "cross_tol_m", "overlap_plane_m", "seed_plane_tol_m", "symmetry_tol_m"]   # 29 October 2026 : the absolute TOLERANCES of the engine, scaled by `unit`
+FEATURE_KEYS = ["step_m", "tangent_dist_m", "node_normal_band_m", "soft_window_m", "boundary_step_m"]   # ... and the lengths that measure the SHAPE (tangents, bends, normals), scaled by `feature_unit` (default : unit)
+
+
+def make_params(params=None):
+    """PARAMS overridden by the request, then every absolute tolerance multiplied by `unit` and every shape length by `feature_unit` (1 : a car or a torso ; 0.1 : the fingers of a hand, features ten
+    times smaller : a 1 cm duplicate tolerance would otherwise merge neighbouring seams). A body that joins limbs and fingers in one network takes a small unit for the tolerances and a feature_unit of 1.
+    edge_m is the wanted edge and is never scaled."""
+    prm = dict(PARAMS); prm.update(params or {}); u = float(prm.get("unit", 1.0)); fu = float(prm.get("feature_unit") or u)
+    for k in LENGTH_KEYS: prm[k] = prm[k] * u
+    for k in FEATURE_KEYS: prm[k] = prm[k] * fu
+    prm["max_face_area_m2"] = prm["max_face_area_m2"] * fu * fu      # a shape size, not a tolerance
+    return prm
+
+
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 
 
@@ -120,6 +139,19 @@ class Ref:
         self.N = n / np.maximum(L, 1e-30)[:, None]
         self.cent = tri.mean(1); self.kd = cKDTree(self.cent)
         pts = tri.reshape(-1, 3); self.center = (pts.min(0) + pts.max(0)) / 2
+        self.sign = self._closed_orientation(tri)                      # 29 October 2026 : +1 or -1 when the surface is closed and consistently wound (outward = the winding, any shape : a mannequin with arms), 0 otherwise (open shells : away from the box centre)
+
+    @staticmethod
+    def _closed_orientation(tri):
+        """+1 if the triangles form a closed, consistently oriented surface with outward winding, -1 if inward, 0 if they do not (open panels, double shells : the car)."""
+        P = tri.reshape(-1, 3); key = np.round(P / 1e-5).astype(np.int64); key -= key.min(0)
+        if key.max() < (1 << 20): _, inv = np.unique((key[:, 0] << 40) | (key[:, 1] << 20) | key[:, 2], return_inverse=True)          # one integer per vertex : unique on a column is ten times faster than on rows
+        else: _, inv = np.unique(key, axis=0, return_inverse=True)
+        inv = inv.reshape(-1, 3).astype(np.int64)
+        n = int(inv.max()) + 1; a = np.concatenate([inv[:, 0], inv[:, 1], inv[:, 2]]); b = np.concatenate([inv[:, 1], inv[:, 2], inv[:, 0]]); code = a * n + b; rev = b * n + a
+        if len(np.unique(code)) != len(code) or not np.isin(rev, code).all(): return 0           # a repeated half edge, or an edge without its twin : not a closed oriented surface
+        vol = float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0); box = float(np.prod(P.max(0) - P.min(0)))
+        return 0 if abs(vol) < 0.01 * box else (1 if vol > 0 else -1)
 
     def closest(self, pts, k=None, guide=None):
         """Closest surface point of pts. guide (M, 3) : expected outward direction per point ; triangles facing away from it
@@ -136,7 +168,9 @@ class Ref:
         return q[sel], i[sel], d[np.arange(M), j]
 
     def outward(self, tri_idx, q):
-        n = self.N[tri_idx]; s = ((q - self.center) * n).sum(1)
+        n = self.N[tri_idx]
+        if self.sign: return n * self.sign                              # a closed oriented surface : outward is the winding, wherever the point is
+        s = ((q - self.center) * n).sum(1)
         return np.where((s < -1e-9)[:, None], -n, n)
 
     def normals_at(self, pts, guide=None):
@@ -148,7 +182,10 @@ class Ref:
         _, idx = self.kd.query(p, k=k); idx = np.atleast_1d(idx)
         q = tri_closest(np.repeat(p[None], len(idx), 0), self.A[idx], self.B[idx], self.C[idx])
         d = np.linalg.norm(q - p, axis=1); near = d <= d.min() + band
-        n = self.outward(idx[near], q[near]); v = n.sum(0); L = np.linalg.norm(v)
+        n = self.outward(idx[near], q[near]); n0 = self.outward(idx[[int(np.argmin(d))]], q[[int(np.argmin(d))]])[0]
+        facing = n @ n0 > -0.5                                                   # 29 October 2026 : a slit (the armpit between the arm and the flank) has two sheets whose normals face each other : the sum cancels or flips, only the sheet of the nearest triangle counts
+        if facing.any(): n = n[facing]
+        v = n.sum(0); L = np.linalg.norm(v)
         return n[0] if L < 1e-9 else v / L
 
 
@@ -167,6 +204,20 @@ def read_obj(path):
     V = np.array(V, float); return V[np.array(F)]
 
 
+def read_obj_cached(path):
+    """the triangles of an OBJ, cached as .npy next to the work files (key : path, size, modification time) : a 2 million triangle model parses in 11 s the first time and loads in a fraction of a second after."""
+    import hashlib
+    st = os.stat(path); key = hashlib.sha1(("%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))).encode()).hexdigest()[:16]; d = os.path.join(PARAMS["out_dir"], "..", "cache"); f = os.path.join(d, key + ".npy")
+    if os.path.exists(f):
+        try: return np.load(f)
+        except Exception: pass
+    tri = read_obj(path)
+    if len(tri) > 50000:                                                      # small models parse faster than they load
+        try: os.makedirs(d, exist_ok=True); np.save(f + ".tmp.npy", tri); os.replace(f + ".tmp.npy", f)
+        except OSError: pass
+    return tri
+
+
 def load_ref(ref=None):
     if isinstance(ref, Ref): return ref
     key = ref or PARAMS["ref"]
@@ -174,7 +225,7 @@ def load_ref(ref=None):
         if key == "v752":
             import ZrrData as D
             car = D.load(); T, _ = D.triangulate(car); tri = car["P"][T]
-        elif isinstance(key, str) and key.lower().endswith(".obj") and os.path.isabs(key): tri = read_obj(key)
+        elif isinstance(key, str) and key.lower().endswith(".obj") and os.path.isabs(key): tri = read_obj_cached(key)
         else: raise ValueError("reference must be 'v752' or an absolute .obj path, got %r" % (key,))
         _REF[key] = Ref(tri)
     return _REF[key]
@@ -277,7 +328,7 @@ def _doctor(doc, prm):
 def project_doc(doc, params=None):
     """29 October 2026 : POST /project : every node and every control point moved to its closest point on the reference surface. The input is not
     modified ; returns the moved document and how far points moved (the curves then follow the shell instead of floating above or below it)."""
-    prm = dict(PARAMS); prm.update(params or {}); ref = load_ref(prm["ref"]); D = copy.deepcopy(doc)
+    prm = make_params(params); ref = load_ref(prm["ref"]); D = copy.deepcopy(doc)
     pts = [n["p"] for n in D["nodes"]] + [p for a in D["arcs"] for p in a["ctrl"]]
     if not pts: return {"ok": True, "doc": D, "moved": {"points": 0}}
     # 29 October 2026 : the CURVE is put on the surface, not its control points (a B-spline passes under its control points on a convex shell) : each arc is
@@ -301,7 +352,7 @@ def project_doc(doc, params=None):
 
 
 def doctor(doc, params=None):
-    prm = dict(PARAMS); prm.update(params or {})
+    prm = make_params(params)
     fixed, issues, _ = _doctor(doc, prm)
     kinds = dict(collections.Counter(i["kind"] for i in issues))
     return native({"ok": True, "issues": issues, "counts_by_kind": kinds, "fixed": fixed, "arcs_in": len(doc["arcs"]), "arcs_out": len(fixed["arcs"]),
@@ -311,7 +362,7 @@ def doctor(doc, params=None):
 # ------------------------------------------------------------------------------------------------------------------------ net
 class Net:
     def __init__(self, doc, ref=None, params=None):
-        self.prm = dict(PARAMS); self.prm.update(params or {})
+        self.prm = make_params(params)
         self.t0 = time.time(); self.timing = {}
         self.ref = load_ref(ref if ref is not None else self.prm["ref"])
         self.fixed, self.issues, polys = _doctor(doc, self.prm)
@@ -493,7 +544,7 @@ class Net:
                 own = find(self.tail(f["he"][0])); n = f["vec_area"] / max(np.linalg.norm(f["vec_area"]), 1e-30); e1 = np.cross(n, [1.0, 0.0, 0.0])
                 if np.linalg.norm(e1) < 0.1: e1 = np.cross(n, [0.0, 1.0, 0.0])
                 e1 /= np.linalg.norm(e1); e2 = np.cross(n, e1); Q = f["poly"] - f["centroid"]; xs, ys = Q @ e1, Q @ e2; xn, yn = np.roll(xs, -1), np.roll(ys, -1)
-                tolp = max(0.05, 0.25 * math.sqrt(max(f["area"], 1e-9)))
+                tolp = max(0.05 * self.prm.get("unit", 1.0), 0.25 * math.sqrt(max(f["area"], 1e-9)))
                 for c, p in reps.items():
                     if c == own: continue
                     d = p - f["centroid"]
@@ -536,6 +587,12 @@ class Net:
         for f in self.faces:                                         # 29 October 2026 : the seed nearest the face centre names it (a patch drawn inside a named panel keeps its own name)
             c = sorted(f.pop("_seed_cands", []))
             if c: f["component"] = c[0][1]; f["extra_seeds"] = [n for _, n in c[1:]]
+        if self.prm.get("inherit_component"):
+            named = [f for f in self.faces if f.get("component")]
+            if named:
+                C = np.array([f["centroid"] for f in named], float)
+                for f in self.faces:
+                    if not f.get("component"): f["component"] = named[int(np.argmin(np.linalg.norm(C - np.asarray(f["centroid"], float), axis=1)))]["component"]; f["inherited"] = True
 
     def _face_opts(self):
         """29 October 2026 : per face options : component_options by the face's component name, then face_options by face id on top."""
@@ -552,7 +609,7 @@ class Net:
         opts = self._face_opts()
         for f in self.faces:
             if f["id"] in skip or opts.get(f["id"], {}).get("skip"): f["status"], f["reason"] = "skipped", "user"
-            elif f["normal_mean_len"] < 0.3 and f["area"] > 0: f["status"], f["reason"] = "skipped", "wraps_around"
+            elif f["normal_mean_len"] < prm["wrap_min_normal"] and f["area"] > 0: f["status"], f["reason"] = "skipped", "wraps_around"
             elif f["area_signed"] <= 0: f["status"], f["reason"] = "skipped", "complement"
             elif f.get("holes"): f["status"], f["reason"] = "skipped", "annulus (%d island%s inside)" % (len(f["holes"]), "s" if len(f["holes"]) > 1 else "")
             elif f["area"] > prm["max_face_area_m2"]: f["status"], f["reason"] = "skipped", "area"
@@ -569,6 +626,10 @@ class Net:
                 elif v in self.force: is_c = self.force[v]
                 else: is_c = turn > prm["corner_deg"]
                 if is_c: f["corner_nodes"].add(v)
+        if prm.get("symmetric_corners"): self._symmetric_corners(opts)
+        for f in self.faces:
+            if f["status"] != "pending": continue
+            he = f["he"]; explicit = "corners" in opts.get(f["id"], {})
             if not explicit: self._fill_corners(f)
             f["reflex"] = int(sum(1 for k, tn, sg in f["turns"] if self.tail(he[k]) in f["corner_nodes"] and sg < 0 and tn > prm["corner_deg"]))
         if prm.get("soft_corners"):                                  # 29 October 2026 : real bends inside the curves before the rotate option and the virtual corners
@@ -593,6 +654,28 @@ class Net:
             elif n > prm["max_face_sides"]: f["status"], f["reason"] = "skipped", "too_many_sides"
             else: self._sides(f)
         self.timing["corners"] = time.time() - t
+
+    def _symmetric_corners(self, opts):
+        """30 October 2026 : a node that turns by about corner_deg is a corner on one side of the plane of symmetry and not on the other (the reference mesh is not exactly symmetric : its normals differ by a degree), so a face and its mirror image get 4 and 3 sides and the counts cannot close. Every borderline turn (within 8 degrees of corner_deg) is decided by the larger of its own turn and the turn of its mirror image : both sides take the same corners."""
+        from scipy.spatial import cKDTree
+        pend = [f for f in self.faces if f["status"] == "pending"]
+        if not pend: return
+        x0 = float(self.prm.get("symmetry_x0_m", 0.0)); M = lambda p: np.array([2 * x0 - p[0], p[1], p[2]]); cd = self.prm["corner_deg"]; band = float(self.prm.get("symmetric_corner_band_deg", 8.0))
+        ids = list(self.nodes); NP = np.array([self.nodes[i] for i in ids]); nt = cKDTree(NP); ft = cKDTree(np.array([f["centroid"] for f in pend]))
+        def partner(v):
+            d, j = nt.query(M(self.nodes[v])); return ids[j] if d < 0.006 else None
+        for f in pend:
+            if "corners" in opts.get(f["id"], {}): continue
+            d, j = ft.query(M(f["centroid"]))
+            if d > 0.01 or pend[j] is f or pend[j].get("component") != f.get("component"): continue
+            g = pend[j]; tg = {self.tail(g["he"][k]): tn for k, tn, sg in g.get("turns", [])}
+            for k, tn, sg in f["turns"]:
+                v = self.tail(f["he"][k])
+                if v in self.force or abs(tn - cd) > band: continue
+                v2 = partner(v); t2 = tg.get(v2)
+                if t2 is None: continue
+                if max(tn, t2) > cd: f["corner_nodes"].add(v)
+                else: f["corner_nodes"].discard(v)
 
     def _fill_corners(self, f):
         """Faces with 1 or 2 sharp corners take the sharpest remaining nodes (turn above corner_min_deg, spaced) up to 4 corners : a node of a
@@ -625,6 +708,7 @@ class Net:
             for B in live[i + 1:]:
                 if A["status"] != "pending" or B["status"] != "pending": continue
                 if np.linalg.norm(A["centroid"] - B["centroid"]) > 0.5 * (math.sqrt(A["area"]) + math.sqrt(B["area"])) + tol: continue
+                if {h[0] for h in A["he"]} & {h[0] for h in B["he"]}: continue         # 29 October 2026 : two faces that share an arc are neighbours, not a doubled panel (the cap triangles of a steep fingertip look folded onto each other from above)
                 if not (self._inside(A, B["centroid"], tol) or self._inside(B, A["centroid"], tol)): continue
                 keep, drop = (A, B) if (A.get("component") and not B.get("component")) or (bool(A.get("component")) == bool(B.get("component")) and A["area"] <= B["area"]) else (B, A)
                 drop["status"], drop["reason"] = "skipped", "overlap (face %d)" % keep["id"]; drop["overlaps"] = keep["id"]
@@ -732,7 +816,7 @@ class Net:
             used = sorted({h[0] for f in fs for side in f["sides"] for h in side})
             L = {"arcs": {a: self.arcs[a]["len"] / max(1e-6, float(np.mean(arc_scales[a]))) for a in used}, "mirror": [], "patches": [], "min": {}}
             for a in used:                                           # 29 October 2026 : min_arc_count, no curve of a patch side below this many edges
-                L["min"][a] = int(self.prm.get("min_arc_count", 1))
+                L["min"][a] = max(int(self.prm.get("min_arc_count", 1)), int((self.prm.get("arc_min_counts") or {}).get(str(self.arcs[a].get("parent")), 0)))      # 30 October 2026 : arc_min_counts = {document arc id : fewest edges}, the columns of a tube that the junction would otherwise leave coarse
                 if self.arcs[a]["a"] == self.arcs[a]["b"]: L["min"][a] = max(L["min"][a], self.prm["min_loop_count"])
             seen = set()
             for a in used:
@@ -741,6 +825,7 @@ class Net:
             for f in fs: L["patches"].append({"name": f["id"], "sides": [[h[0] for h in side] for side in f["sides"]]})
             return L
         self.infeasible = []; self.mirror_dropped = []
+        for k_, v_ in (self.prm.get("counts_params") or {}).items(): CT.PARAMS[k_] = v_                  # 30 October 2026 : counts_params {slack_mirror, mip_rel_gap, time_limit_s ...} of the document override the solver defaults
         if cand:
             L = layout_of(cand); r = CT.solve(L, self.prm["edge_m"], elastic=True, min_spoke=self.prm["min_spoke"])
             if not r["ok"]:
@@ -757,7 +842,7 @@ class Net:
                     if not r["ok"]:
                         for f in cand: f["status"], f["reason"] = "infeasible", "solver: %s" % r.get("status")
                         self.infeasible += [f["id"] for f in cand]; cand = []
-            if cand: self.counts_by_arc = r["counts"]; self.tarini = r["tarini"]; self.count_stats = {k: r[k] for k in ("mean_rel_dev", "max_rel_dev")}
+            if cand: self.counts_by_arc = r["counts"]; self.tarini = r["tarini"]; self.count_stats = {k: r[k] for k in ("mean_rel_dev", "max_rel_dev")}; self.count_stats["mirror_dropped"] = len(self.mirror_dropped)
         for f in self.faces:
             if f["status"] == "ok": f["side_counts"] = [int(sum(self.counts_by_arc[h[0]] for h in side)) for side in f["sides"]]
         self.timing["counts"] = time.time() - t
@@ -982,7 +1067,7 @@ def faces(doc, ref=None, params=None):
     return native({"faces": net.face_report(), "euler": net.euler, "dangling_arcs": net.dangling, "issues": net.issues})
 
 
-def faces_report(doc, params=None):
+def _faces_report_one(doc, params=None):
     """POST /faces : doctor + faces + corners + counts, no fill. Per face : id, component, status, corners, sides, side_counts, boundary polyline."""
     net = Net(doc, None, params); net.trace(); net.corners(); net.counts(); step = net.prm["boundary_step_m"]; out = net.face_report()
     for r, f in zip(out, net.faces):
@@ -1011,7 +1096,7 @@ def _run(doc, params):
     net.trace(); net.corners(); net.counts(); net.fill(); net.conform(); net.untangle(); net.symmetrize(); net.judge(); return net
 
 
-def build(doc, params=None):
+def _build_one(doc, params=None):
     t0 = time.time(); net = _run(doc, params); fallback = []
     if net.prm["auto_fallback"]:                                    # N sided faces (N = 3, 5, 6) that fail the judge : try a 4 sided patch
         bad = [f["id"] for f in net.faces if f["status"] == "meshed" and not f.get("judge_ok", True) and len(f["sides"]) in (5, 6)
@@ -1046,6 +1131,63 @@ def build(doc, params=None):
                    "quad_jac": np.round(np.asarray(getattr(net, "quad_stats", {}).get("jmin", []), float), 3).tolist(),   # 29 October 2026 : the judge per quad (reference normals), drawn by the editor
                    "face_of_quad": net.face_of_quad, "faces": fr, "issues": net.issues, "stats": stats, "obj_path": obj_path, "latest_obj": latest,
                    "arc_counts": net.counts_by_arc, "arc_parents": net.arc_parents()})
+
+
+# ------------------------------------------------------------------------------------------------------------------ components of different scale in one document
+def _split_units(doc, params):
+    """a document whose components do not share one scale (a hand next to a torso : component_options[name].unit, default the request's unit or the document's mesh_unit) is cut in one
+    sub document per scale, each with its own arcs, nodes and seeds. Returns [(unit, doc)] or None when there is only one scale."""
+    p = params or {}; co = p.get("component_options") or doc.get("component_options") or {}; default = float(p.get("unit") or doc.get("mesh_unit") or 1.0)
+    unit_of = lambda name: float((co.get(name) or {}).get("unit", default)) if name else default
+    groups = {}
+    for a in doc["arcs"]: groups.setdefault(unit_of((a.get("pair") or ["", ""])[0]), []).append(a)
+    if len(groups) < 2: return None
+    out = []
+    for u, arcs in sorted(groups.items(), reverse=True):
+        nids = {x for a in arcs for x in (a["a"], a["b"])}; sub = dict(doc); sub["arcs"] = arcs; sub["nodes"] = [n for n in doc["nodes"] if n["id"] in nids]
+        sub["component_seeds"] = [q for q in doc.get("component_seeds", []) if unit_of(q["name"]) == u]; out.append((u, sub))
+    return out
+
+
+def _sum(a, b):
+    if isinstance(a, dict) and isinstance(b, dict): return {k: _sum(a.get(k), b.get(k)) if k in a and k in b else (a.get(k) if k in a else b.get(k)) for k in set(a) | set(b)}
+    if isinstance(a, bool) or isinstance(b, bool): return a
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)): return a + b
+    if isinstance(a, list) and isinstance(b, list): return a + b
+    return a if a is not None else b
+
+
+def _merge_results(kind, parts):
+    """merge the answers of the sub documents : vertex and face indices are offset, counters add up, ids of arcs and nodes are the document's own and never change."""
+    out = None; vo = fo = 0
+    for r in parts:
+        r = json.loads(json.dumps(r))
+        if out is None: out = r; vo = len(r.get("P", [])) // 3; fo = len(r["faces"]); continue
+        if kind == "build":
+            out["Q"] += [q + vo for q in r.get("Q", [])]; out["P"] += r.get("P", []); out["quad_jac"] += r.get("quad_jac", []); out["face_of_quad"] += [f + fo for f in r.get("face_of_quad", [])]
+        for f in r["faces"]: f["id"] += fo
+        out["faces"] += r["faces"]; out["issues"] += r.get("issues", [])
+        for k in ("arc_counts", "arc_parents"): out[k] = dict(out.get(k) or {}, **(r.get(k) or {}))
+        for k in ("stats", "euler", "face_counts"):
+            if k in r and k in out: out[k] = _sum(out[k], r[k])
+        for k in ("dangling_arcs", "unplaced_seeds"):
+            if k in r: out[k] = (out.get(k) or []) + r[k]
+        if "time_s" in r and "time_s" in out: out["time_s"] += r["time_s"]
+        fo += len(r["faces"]); vo += len(r.get("P", [])) // 3
+    out["obj_path"] = out["latest_obj"] = None
+    return out
+
+
+def build(doc, params=None):
+    parts = _split_units(doc, params)
+    if not parts: return _build_one(doc, params)
+    return _merge_results("build", [_build_one(sub, dict(params or {}, unit=u, write_obj=False)) for u, sub in parts])
+
+
+def faces_report(doc, params=None):
+    parts = _split_units(doc, params)
+    if not parts: return _faces_report_one(doc, params)
+    return _merge_results("faces", [_faces_report_one(sub, dict(params or {}, unit=u)) for u, sub in parts])
 
 
 if __name__ == "__main__":

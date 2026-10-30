@@ -1,0 +1,247 @@
+"""29 October 2026 : ZenRay Lines CREASE NET, every crease of a model as curves of a network, from the geometry alone.
+EN: the model is seen from many directions (ZrlCreases.crease_map : the valleys of the depth, one pixel wide), each view is thinned and traced into chains
+of 3D points on the surface, the chains of all views are merged (a crease seen twice is kept once, the best seen first), joined end to end, snapped
+onto the curves they meet (T junctions), cut at those junctions, fitted to cubic B-splines and written as a lines document : nodes and arcs, the left
+and right curves linked as mirrors. Nothing here knows the model : Manny, the car or an arch go through the same code, every value is in PARAMS.
+    python -I ZrlCreaseNet.py --obj model.obj --out lines_creases.json [--board board.png]
+FR : tous les plis d'un modèle en courbes, vus de plusieurs directions, fusionnés, raccordés ; le réseau est un document ZenRay Lines.
+"""
+import argparse, json, os, sys, time
+import numpy as np
+from scipy import ndimage
+from scipy.spatial import cKDTree
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+for p in (HERE, os.path.join(ROOT, "Scripts")):
+    if p not in sys.path: sys.path.insert(0, p)
+import ZrlCreases as ZC, ZrlRefMesh as RM, ZrlSpline as SP
+
+PARAMS = {   # 29 October 2026 : every value of the trace, metres and degrees
+    "px_per_m": 600.0,            # 1.7 mm per pixel ...
+    "max_res": 2000,              # ... but a view is never wider than this many pixels (a car is 4.5 m long : 2.2 mm per pixel)
+    "sigma_mm": 4.0,              # smoothing of the depth before the Hessian (a crease must be wider than the triangles)
+    "min_curv": 25.0,             # 1/m : radius of a crease under 4 cm
+    "min_len_mm": 20.0,           # a crease piece shorter than this in one view is noise
+    "views": [(yaw, 0) for yaw in range(0, 360, 45)] + [(yaw, 40) for yaw in range(0, 360, 90)] + [(yaw, -40) for yaw in range(0, 360, 90)] + [(0, 89), (0, -89)],   # (yaw, pitch) degrees
+    "cover_mm": 3.0,              # a crease point within this of a kept one is the same crease seen again
+    "min_piece_mm": 25.0,         # a kept piece shorter than this is dropped
+    "join_mm": 10.0,              # two ends closer than this are one crease ; an end this close to a curve snaps onto it
+    "join_cos": 0.5,              # the two ends must agree in direction within about 60 degrees
+    "node_mm": 4.0,               # nodes closer than this are one node
+    "ctrl_step_m": 0.04,          # one control point per 4 cm
+    "mirror_mm": 6.0,             # two curves are mirrors when their samples agree within this after x -> -x
+    "smooth_px": 5,               # running mean along a chain
+}
+
+
+def view_axes(yaw, pitch):
+    y, p = np.radians(yaw), np.radians(pitch); cp = np.cos(p); tz = np.array([cp * np.sin(y), np.sin(p), cp * np.cos(y)]); f = -tz
+    up = np.array([0.0, 0.0, -np.sign(p)]) if abs(cp) < 1e-4 else np.array([0.0, 1.0, 0.0])
+    r = np.cross(f, up); r /= np.linalg.norm(r); uy = np.cross(r, f); return [r, uy, tz]
+
+
+def trace_chains(keep, strength):
+    """thin the crease pixels to one pixel lines, cut them at the junctions, and walk each piece : a list of (n, 2) arrays of (row, col)."""
+    from skimage.morphology import skeletonize
+    sk = skeletonize(keep); k = np.ones((3, 3)); deg = ndimage.convolve(sk.astype(int), k, mode="constant") - 1; deg[~sk] = 0
+    pieces = sk & (deg < 3); lab, n = ndimage.label(pieces, structure=np.ones((3, 3))); out = []
+    for i in range(1, n + 1):
+        pts = np.argwhere(lab == i)
+        if len(pts) < 3: continue
+        S = {tuple(p) for p in pts}; nb = lambda p: [(p[0] + a, p[1] + b) for a in (-1, 0, 1) for b in (-1, 0, 1) if (a or b) and (p[0] + a, p[1] + b) in S]
+        ends = [p for p in S if len(nb(p)) <= 1]; cur = ends[0] if ends else min(S); seen = {cur}; path = [cur]
+        while True:
+            c = [q for q in nb(cur) if q not in seen]
+            if not c: break
+            c.sort(key=lambda q: abs(q[0] - cur[0]) + abs(q[1] - cur[1])); cur = c[0]; seen.add(cur); path.append(cur)
+        out.append(np.array(path))
+    return out
+
+
+def smooth(P, w):
+    if len(P) < 3 or w < 2: return P
+    k = np.ones(w) / w; Q = P.copy()
+    for c in range(3): Q[:, c] = np.convolve(np.pad(P[:, c], (w // 2, w // 2), mode="edge"), k, mode="valid")[:len(P)]
+    Q[0], Q[-1] = P[0], P[-1]; return Q
+
+
+def length(P): return float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()) if len(P) > 1 else 0.0
+
+
+def collect(V, F, prm):
+    """all chains of all views as 3D polylines with a score (length times mean strength)."""
+    lo, hi = V.min(0), V.max(0); c = (lo + hi) / 2; ext = float(np.linalg.norm(hi - lo)) * 1.02; ppm = min(prm["px_per_m"], prm["max_res"] / ext); res = int(ext * ppm); chains = []
+    for yaw, pitch in prm["views"]:
+        ax = view_axes(yaw, pitch); vp = dict(ZC.PARAMS, view_axes=[a.tolist() for a in ax], center=c.tolist(), px_per_m=ppm, res=res, sigma_mm=prm["sigma_mm"], min_curv=prm["min_curv"], min_len_mm=prm["min_len_mm"])
+        cm = ZC.crease_map(V, F, vp)
+        for path in trace_chains(cm["keep"], cm["curv"]):
+            r, cc = path[:, 0].astype(float), path[:, 1].astype(float); W = ZC.pixel_to_world(vp, r, cc) + cm["depth"][path[:, 0], path[:, 1]][:, None] * ax[2]
+            if not np.isfinite(W).all(): continue
+            W = smooth(W, prm["smooth_px"]); L = length(W)
+            if L * 1000 >= prm["min_len_mm"]: chains.append({"P": W, "score": L * float(cm["curv"][path[:, 0], path[:, 1]].mean()), "view": (yaw, pitch)})
+    return chains
+
+
+class Occupied:
+    """a voxel set : is a point within about cover of a point already kept ?"""
+    def __init__(self, cell): self.cell = cell; self.s = set()
+    def key(self, P): return np.floor(P / self.cell).astype(np.int64)
+    def covered(self, P):
+        K = self.key(P); out = np.zeros(len(P), bool)
+        for i, k in enumerate(K):
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for d in (-1, 0, 1):
+                        if (k[0] + a, k[1] + b, k[2] + d) in self.s: out[i] = True; break
+                    if out[i]: break
+                if out[i]: break
+        return out
+    def add(self, P):
+        for k in self.key(P): self.s.add((int(k[0]), int(k[1]), int(k[2])))
+
+
+def merge_views(chains, prm):
+    occ = Occupied(prm["cover_mm"] / 1000.0); keep = []
+    for ch in sorted(chains, key=lambda c: -c["score"]):
+        P = ch["P"]; cov = occ.covered(P); run = []
+        for i in range(len(P) + 1):
+            if i < len(P) and not cov[i]: run.append(i); continue
+            if len(run) > 1 and length(P[run[0]:run[-1] + 1]) * 1000 >= prm["min_piece_mm"]:
+                seg = P[run[0]:run[-1] + 1].copy(); keep.append(seg); occ.add(seg)
+            run = []
+    return keep
+
+
+def end_dir(P, at_start, n=6):
+    q = P[:n] if at_start else P[-n:][::-1]
+    d = q[0] - q[-1] if len(q) > 1 else np.zeros(3)
+    return d / max(np.linalg.norm(d), 1e-12)   # pointing out of the piece
+
+
+def join_ends(pieces, prm):
+    """end to end joins by greedy distance, direction checked ; returns the merged pieces."""
+    tol = prm["join_mm"] / 1000.0; pieces = [p.copy() for p in pieces]
+    while True:
+        ends = [(i, s, p[0] if s else p[-1]) for i, p in enumerate(pieces) for s in (True, False)]; best = None
+        for a in range(len(ends)):
+            for b in range(a + 1, len(ends)):
+                ia, sa, pa = ends[a]; ib, sb, pb = ends[b]
+                if ia == ib: continue
+                d = float(np.linalg.norm(pa - pb))
+                if d > tol or (best and d >= best[0]): continue
+                v = (pb - pa) / max(d, 1e-9); ok = (np.dot(end_dir(pieces[ia], sa), v) >= prm["join_cos"] if d > 1e-4 else True) and (np.dot(end_dir(pieces[ib], sb), -v) >= prm["join_cos"] if d > 1e-4 else True)
+                if ok: best = (d, ia, sa, ib, sb)
+        if not best: break
+        _, ia, sa, ib, sb = best; A = pieces[ia] if not sa else pieces[ia][::-1]; B = pieces[ib] if sb else pieces[ib][::-1]
+        pieces = [p for k, p in enumerate(pieces) if k not in (ia, ib)] + [np.vstack([A, B])]
+    return pieces
+
+
+def snap_t(pieces, prm):
+    """an end within join_mm of the body of another piece snaps onto it : returns pieces and the cut points of each piece (junction positions)."""
+    tol = prm["join_mm"] / 1000.0; allp = np.vstack(pieces); owner = np.concatenate([np.full(len(p), i) for i, p in enumerate(pieces)]); tree = cKDTree(allp); cuts = {i: [] for i in range(len(pieces))}
+    for i, p in enumerate(pieces):
+        for s in (True, False):
+            e = p[0] if s else p[-1]; idx = tree.query_ball_point(e, tol); idx = [j for j in idx if owner[j] != i]
+            if not idx: continue
+            j = min(idx, key=lambda j: np.linalg.norm(allp[j] - e)); q = allp[j]; o = owner[j]
+            pieces[i] = np.vstack([q[None, :], p]) if s else np.vstack([p, q[None, :]]); cuts[o].append(q)
+    return pieces, cuts
+
+
+def split_at(P, cuts):
+    if not cuts: return [P]
+    cut_idx = sorted({int(np.argmin(np.linalg.norm(P - c, axis=1))) for c in cuts}); cut_idx = [i for i in cut_idx if 2 <= i <= len(P) - 3]; out = []; a = 0
+    for i in cut_idx: out.append(P[a:i + 1]); a = i
+    out.append(P[a:]); return [q for q in out if len(q) >= 3]
+
+
+def build_doc(pieces, prm, model_ref=None):
+    nodes = []; tree = [None]
+    def node(p):
+        if nodes:
+            d = np.linalg.norm(np.array([n["p"] for n in nodes]) - p, axis=1); k = int(np.argmin(d))
+            if d[k] < prm["node_mm"] / 1000.0: return nodes[k]["id"]
+        nodes.append({"id": len(nodes), "p": [round(float(x), 6) for x in p]}); return nodes[-1]["id"]
+    arcs = []
+    for P in pieces:
+        L = length(P)
+        if L < 0.02: continue
+        if np.linalg.norm(P[0] - P[-1]) < prm["node_mm"] / 1000.0 * 2 and L > 0.1:        # a closed loop is cut in two halves : an arc never starts and ends on the same node
+            cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]; h = int(np.searchsorted(cum, cum[-1] / 2)); parts = [P[:h + 1], P[h:]]
+        else: parts = [P]
+        for Q in parts:
+            if len(Q) < 3: continue
+            a, b = node(Q[0]), node(Q[-1])
+            if a == b: continue
+            m = max(4, int(round(length(Q) / prm["ctrl_step_m"])) + 1); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Q, axis=0), axis=1))]; t = np.linspace(0, cum[-1], max(4 * m, 16))
+            S = np.stack([np.interp(t, cum, Q[:, k]) for k in range(3)], 1); C = SP.fit(S, m); C[0] = np.array(nodes[a]["p"]); C[-1] = np.array(nodes[b]["p"])
+            arcs.append({"id": len(arcs), "a": a, "b": b, "closed": False, "pair": ["", ""], "ctrl": np.round(C, 6).tolist(), "mirror": -1})
+    samp = [SP.sample(np.array(a["ctrl"]), 12) for a in arcs]; mir = lambda S: S * np.array([-1.0, 1.0, 1.0]); tol = prm["mirror_mm"] / 1000.0
+    for i, a in enumerate(arcs):
+        if a["mirror"] >= 0: continue
+        Si = samp[i]
+        if np.abs(Si[:, 0]).max() < tol: continue                                    # on the symmetry plane
+        M = mir(Si); best = None
+        for j, b in enumerate(arcs):
+            if j == i or b["mirror"] >= 0: continue
+            Sj = samp[j]; t = cKDTree(Sj); d1 = t.query(M)[0].max(); d2 = cKDTree(M).query(Sj)[0].max()
+            if max(d1, d2) < tol and (best is None or max(d1, d2) < best[0]): best = (max(d1, d2), j)
+        if best: a["mirror"] = best[1]; arcs[best[1]]["mirror"] = i
+    doc = {"version": 1, "date": "29 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}, "nodes": nodes, "arcs": arcs, "components": []}
+    if model_ref: doc["model_ref"] = model_ref
+    return doc
+
+
+def geometry(ref):
+    """the triangles of a model : an absolute .obj path, or a reference name the editor knows (ZrlNetMesh.load_ref)."""
+    import ZrlNetMesh as NM
+    tri = NM.load_ref(ref or None); tri = np.stack([tri.A, tri.B, tri.C], 1); return tri.reshape(-1, 3), np.arange(len(tri) * 3).reshape(-1, 3)
+
+
+def run(obj, prm=PARAMS, out=None, board=None, log=print):
+    t0 = time.time(); V, F = geometry(obj)
+    chains = collect(V, F, prm); log("views %d : %d chains in %.1f s" % (len(prm["views"]), len(chains), time.time() - t0))
+    pieces = merge_views(chains, prm); log("merged : %d pieces, %.2f m" % (len(pieces), sum(length(p) for p in pieces)))
+    pieces = join_ends(pieces, prm); pieces, cuts = snap_t(pieces, prm); pieces = [q for i, p in enumerate(pieces) for q in split_at(p, cuts.get(i, []))]
+    doc = build_doc(pieces, prm, model_ref=obj); log("network : %d nodes, %d curves (%d mirrored) in %.1f s" % (len(doc["nodes"]), len(doc["arcs"]), sum(1 for a in doc["arcs"] if a["mirror"] >= 0), time.time() - t0))
+    if out: json.dump(doc, open(out, "w"))
+    if board: draw_board(V, F, doc, board)
+    return doc
+
+
+def draw_board(V, F, doc, path, size=900):
+    """front, left, back and top of the model with the curves : a quick look."""
+    from PIL import Image, ImageDraw
+    import ZrlSpline as SPL
+    lo, hi = V.min(0), V.max(0); c = (lo + hi) / 2; ext = float(np.linalg.norm(hi - lo)) * 1.02; img = Image.new("RGB", (size * 2, size * 2), (245, 245, 243))
+    for k, (yaw, pitch) in enumerate([(0, 0), (90, 0), (180, 0), (0, 89)]):
+        ax = view_axes(yaw, pitch); tile = Image.new("RGB", (size, size), (245, 245, 243)); d = ImageDraw.Draw(tile); s = size / ext
+        pr = lambda P: np.stack([(np.asarray(P) - c) @ ax[0] * s + size / 2, size / 2 - (np.asarray(P) - c) @ ax[1] * s], 1)
+        pv = pr(V[::7]); dz = (V[::7] - c) @ ax[2]
+        for (x, y), z in zip(pv, dz): d.point((x, y), fill=(205, 205, 210))
+        for a in doc["arcs"]:
+            Sm = SPL.sample(np.array(a["ctrl"]), 12); dz = (Sm - c) @ ax[2]; q = pr(Sm)
+            d.line([tuple(p) for p in q], fill=(200, 30, 30) if a["mirror"] < 0 else (30, 60, 200), width=2)
+        img.paste(tile, ((k % 2) * size, (k // 2) * size))
+    img.save(path)
+
+
+def handle(req):
+    """29 October 2026 : POST /crease_net {"ref": the model (absolute .obj path or a known name), "params": optional overrides} -> {"ok", "doc": the network, "stats"}."""
+    prm = dict(PARAMS, **(req.get("params") or {})); t0 = time.time(); msgs = []
+    doc = run(req.get("ref"), prm, log=msgs.append)
+    return {"ok": True, "doc": doc, "stats": {"curves": len(doc["arcs"]), "nodes": len(doc["nodes"]), "seconds": round(time.time() - t0, 1), "log": msgs}}
+
+
+def main():
+    if "--handle" in sys.argv:
+        print(json.dumps(handle(json.loads(sys.stdin.read())))); return
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--out"); ap.add_argument("--board"); a = ap.parse_args()
+    doc = run(a.obj, PARAMS, a.out, a.board)
+    lens = sorted((SP.polyline_length(SP.sample(np.array(x["ctrl"]), 12)) for x in doc["arcs"]), reverse=True); print("longest curves (m):", [round(float(v), 2) for v in lens[:10]])
+
+
+if __name__ == "__main__":
+    main()

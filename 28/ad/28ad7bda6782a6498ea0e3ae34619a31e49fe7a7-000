@@ -1,0 +1,37 @@
+"""29 October 2026 : ZenRay Lines JUNCTION CONTACTS : the bridges of a joined document must not touch each other nor run along another arc (that makes sliver faces and faces that use an arc twice).
+    python -I ZrlJunctionContacts.py doc.json [--mm 2.5]       exit code 0 when no bridge touches anything outside 2 cm of its own end nodes
+FR : aucun pont ne doit toucher un autre pont ni longer un autre arc."""
+import argparse, collections, itertools, json, os, sys
+import numpy as np
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlSpline as SP
+
+
+def contacts(doc, mm=2.5, free_m=0.02):
+    N = {n["id"]: np.array(n["p"]) for n in doc["nodes"]}; jn = {n for n in doc.get("component_options", {}) if n.startswith("junction_")}; A = {a["id"]: a for a in doc["arcs"]}
+    poly = {a["id"]: SP.sample(np.asarray(a["ctrl"], float), 30) for a in doc["arcs"]}; bridges = [a for a in doc["arcs"] if a["pair"][0] in jn]
+    pts = []; owner = []
+    for a in doc["arcs"]:
+        for p in poly[a["id"]]: pts.append(p); owner.append(a["id"])
+    tree = cKDTree(np.array(pts)); owner = np.array(owner); out = collections.defaultdict(set)
+    for a in bridges:
+        P = poly[a["id"]]; dd, ii = tree.query(P, k=6, distance_upper_bound=mm / 1000.0)
+        for k in range(len(P)):
+            for dist, i in zip(np.atleast_1d(dd[k]), np.atleast_1d(ii[k])):
+                if not np.isfinite(dist) or i >= len(owner): continue
+                o = A[int(owner[i])]
+                if o["id"] == a["id"]: continue
+                ends = {a["a"], a["b"], o["a"], o["b"]}
+                if any(np.linalg.norm(P[k] - N[s]) < free_m for s in ends): continue
+                out[a["id"]].add(o["id"])
+    return {int(k): sorted(int(x) for x in v) for k, v in out.items()}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("doc"); ap.add_argument("--mm", type=float, default=2.5); a = ap.parse_args(); c = contacts(json.load(open(a.doc)), a.mm)
+    print(json.dumps({"bridges_in_contact": len(c), "contacts": c})); sys.exit(0 if not c else 1)
+
+
+if __name__ == "__main__":
+    main()

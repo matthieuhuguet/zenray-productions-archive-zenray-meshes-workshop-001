@@ -1,0 +1,36 @@
+"""30 October 2026 : ZenRay Lines CAR PATCHES, one independent four sided patch per car component (no flow across a panel gap : the rule of automotive topology).
+EN: for every seed of lines/data/seeds_v752.json the AUTO PATCH (ZrlAutoPatch.patch : the zone of the part under the seed, its real contour, four corners, four fitted sides) is called, and the four corners and four sides become the nodes, arcs and one named face of a ZenRay Lines document. The panels do not share arcs (a panel gap separates them), so the counts solver closes every patch on its own (opposite sides equal). The result opens in ZenRay Lines like any network, and ZrlClosedCheck proves it.
+    python -I ZrlCarPatches.py [--out work/lines/car_parts/car_patches.json] [--zone-deg 25]
+FR : un patch à quatre côtés indépendant par component de la voiture, collé à son vrai contour ; aucun flux ne traverse un joint de panneau."""
+import argparse, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlAutoPatch as AP
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+
+
+def build(zone_deg=25.0, seeds_path=f"{ROOT}/lines/data/seeds_v752.json", obj=f"{ROOT}/versions/ZenRayCar_v752.obj", log=print):
+    seeds = json.load(open(seeds_path)); doc = {"version": 1, "date": "30 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}, "nodes": [], "arcs": [], "components": [], "component_seeds": [], "component_options": {}, "model_ref": obj, "mesh_unit": 1.0}; rep = []
+    for s in seeds:
+        r = None; best = -1.0
+        for zd in [zone_deg] + [z for z in (15.0, 40.0, 60.0, 10.0) if z != zone_deg]:                       # a zone grown at another angle may give a better contour : keep the first whose four corners all turn by at least 20 degrees, else the one with the largest smallest turn
+            q = AP.patch({"op": "patch", "p": s["p"], "zone_deg": zd, "max_radius_m": 1.0, "ref": None})
+            if not q.get("ok") or len(q.get("corners", [])) != 4: continue
+            mt = min(q["report"].get("corner_turns_deg") or [0.0])
+            if mt > best: best, r = mt, q
+            if mt >= 20.0: break
+        if r is None: r = {"ok": False, "error": "no zone angle gives four corners"}
+        if not r.get("ok") or len(r.get("corners", [])) != 4: rep.append((s["name"], False, r.get("error", "no four corners"))); log("%-34s FAILED %s" % (s["name"], r.get("error", "")[:70])); continue
+        ids = []
+        for c in r["corners"]: doc["nodes"].append({"id": len(doc["nodes"]), "p": [round(float(x), 6) for x in c]}); ids.append(len(doc["nodes"]) - 1)
+        for k, side in enumerate(r["sides"]): doc["arcs"].append({"id": len(doc["arcs"]), "a": ids[k], "b": ids[(k + 1) % 4], "closed": False, "pair": [s["name"], s["name"]], "ctrl": [[round(float(x), 6) for x in p] for p in side], "mirror": -1})
+        doc["component_seeds"].append({"name": s["name"], "p": [round(float(x), 6) for x in (r.get("seed") or s["p"])]}); doc["component_options"][s["name"]] = {"edge_scale": 1.0}; doc["components"].append(s["name"]); rep.append((s["name"], True, r["report"].get("fit_dev_mm"))); log("%-34s ok  contour fit %.1f mm  turns %s" % (s["name"], r["report"].get("fit_dev_mm") or -1, r["report"].get("corner_turns_deg")))
+    return doc, rep
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("--out", default=f"{ROOT}/work/lines/car_parts/car_patches.json"); ap.add_argument("--zone-deg", type=float, default=25.0); a = ap.parse_args()
+    doc, rep = build(a.zone_deg); json.dump(doc, open(a.out, "w")); print("patches %d of %d, nodes %d, arcs %d" % (sum(1 for r in rep if r[1]), len(rep), len(doc["nodes"]), len(doc["arcs"])))
+
+
+if __name__ == "__main__":
+    main()

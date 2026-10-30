@@ -1,0 +1,87 @@
+"""29 October 2026 : ZenRay Lines LOD, the level of detail of a quad mesh.
+EN: a quad mesh of the network can be made smoother and denser by Catmull-Clark subdivision (every quad becomes four, the surface becomes the limit surface of the control cage) and then fitted
+back to the reference model (each vertex goes to its nearest point on the model), so the extra polygons follow the curvature of the model and not the straight facets of the cage. The other
+direction of the LOD is the edge length of the network (fewer, larger quads : /mesh with a larger edge). Welded borders stay welded : two vertices at one place are projected to one place.
+    python -I ZrlLod.py mesh.obj levels [--ref model.obj] [--out out.obj]
+FR : niveau de détail d'un maillage de quads : subdivision de Catmull-Clark puis recalage sur le modèle de référence.
+"""
+import json, os, sys, time
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+
+PARAMS = {   # 29 October 2026 : every value of the LOD
+    "max_levels": 4,            # 4 levels multiply the quads by 256
+    "max_quads": 4_000_000,     # refuses a request that would produce more than this
+    "project": True,            # fit each level back to the reference model
+    "project_batch": 200_000,   # vertices projected per batch (memory)
+}
+
+
+def catmull_clark(P, Q):
+    """one Catmull-Clark step on a quad mesh (V, 3) / (F, 4) : returns the new (P, Q). Interior rule (F + 2R + (n - 3) P) / n, boundary rule (A + 6 P + B) / 8, edge points (a + b + f1 + f2) / 4
+    inside and (a + b) / 2 on a border ; an edge shared by more than two quads is a border."""
+    P = np.asarray(P, float); Q = np.asarray(Q, np.int64); nv, nf = len(P), len(Q)
+    FP = P[Q].mean(1)                                                              # face points
+    E = np.stack([Q, np.roll(Q, -1, axis=1)], 2).reshape(-1, 2); Es = np.sort(E, axis=1); key = Es[:, 0] * nv + Es[:, 1]; uk, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1); ne = len(uk); ea = uk // nv; eb = uk % nv; fe = np.repeat(np.arange(nf), 4)                       # edge id of each half edge, and its face
+    interior = cnt == 2; fsum = np.zeros((ne, 3)); np.add.at(fsum, inv, FP[fe]); EP = np.where(interior[:, None], (P[ea] + P[eb] + fsum) / 4.0, (P[ea] + P[eb]) / 2.0)   # for an interior edge fsum = f1 + f2
+    mid = (P[ea] + P[eb]) / 2.0
+    # vertex update
+    fcount = np.zeros(nv); fsumv = np.zeros((nv, 3)); np.add.at(fcount, Q.ravel(), 1.0); np.add.at(fsumv, Q.ravel(), np.repeat(FP, 4, axis=0))
+    ecount = np.zeros(nv); msum = np.zeros((nv, 3)); np.add.at(ecount, ea, 1.0); np.add.at(ecount, eb, 1.0); np.add.at(msum, ea, mid); np.add.at(msum, eb, mid)
+    bcount = np.zeros(nv); bsum = np.zeros((nv, 3)); bd = ~interior                                                             # border edges : the two neighbours along the border
+    np.add.at(bcount, ea[bd], 1.0); np.add.at(bcount, eb[bd], 1.0); np.add.at(bsum, ea[bd], P[eb[bd]]); np.add.at(bsum, eb[bd], P[ea[bd]])
+    n = np.maximum(fcount, 1.0); Fv = fsumv / n[:, None]; Rv = msum / np.maximum(ecount, 1.0)[:, None]
+    P2 = (Fv + 2 * Rv + (n - 3)[:, None] * P) / n[:, None]
+    onb = bcount > 0; two = bcount == 2; P2[onb & two] = (bsum[onb & two] + 6 * P[onb & two]) / 8.0; P2[onb & ~two] = P[onb & ~two]                    # a corner of a border, or a vertex of several borders, stays
+    newP = np.vstack([P2, FP, EP]); fid = nv + np.arange(nf); eid = nv + nf + inv.reshape(nf, 4)                                  # eid[f, k] : the edge point of the edge k of face f (a to b of the quad)
+    a, b, c, d = Q[:, 0], Q[:, 1], Q[:, 2], Q[:, 3]; e0, e1, e2, e3 = eid[:, 0], eid[:, 1], eid[:, 2], eid[:, 3]
+    newQ = np.concatenate([np.stack([a, e0, fid, e3], 1), np.stack([b, e1, fid, e0], 1), np.stack([c, e2, fid, e1], 1), np.stack([d, e3, fid, e2], 1)])
+    return newP, newQ
+
+
+def fit_to_reference(P, ref, batch=PARAMS["project_batch"]):
+    """each vertex to its nearest point of the reference triangles : the cage vertices stay (they are already on the model), the new ones follow the curvature."""
+    out = np.empty_like(P)
+    for i in range(0, len(P), batch): out[i:i + batch] = ref.closest(P[i:i + batch])[0]
+    return out
+
+
+def subdivide(P, Q, levels, ref=None, project=True, prm=PARAMS):
+    P = np.asarray(P, float).reshape(-1, 3); Q = np.asarray(Q, np.int64).reshape(-1, 4); levels = max(0, min(int(levels), prm["max_levels"]))
+    if len(Q) * 4 ** levels > prm["max_quads"]: raise ValueError("%d quads at level %d is over the limit of %d" % (len(Q), levels, prm["max_quads"]))
+    for _ in range(levels):
+        P, Q = catmull_clark(P, Q)
+        if project and ref is not None: P = fit_to_reference(P, ref, prm["project_batch"])
+    return P, Q
+
+
+def handle(req, prm=PARAMS):
+    """POST /lod {"P": flat vertices, "Q": flat quad indices, "levels": 0..4, "ref": the model, "project": true} -> {"ok", "P", "Q", "levels", "quads", "seconds", "fit_mm"}."""
+    import ZrlNetMesh as NM
+    t = time.time(); P = np.asarray(req["P"], float).reshape(-1, 3); Q = np.asarray(req["Q"], np.int64).reshape(-1, 4); lv = int(req.get("levels", 1)); ref = NM.load_ref(req.get("ref") or None) if req.get("project", True) else None
+    P2, Q2 = subdivide(P, Q, lv, ref, bool(req.get("project", True)), prm); fit = None
+    if ref is not None and len(P2):
+        k = np.random.default_rng(0).choice(len(P2), min(len(P2), 5000), replace=False); fit = float(np.linalg.norm(ref.closest(P2[k])[0] - P2[k], axis=1).max() * 1000)
+    return {"ok": True, "P": np.round(P2, 6).ravel().tolist(), "Q": Q2.ravel().tolist(), "levels": lv, "quads": int(len(Q2)), "seconds": round(time.time() - t, 2), "fit_mm": None if fit is None else round(fit, 3)}
+
+
+def main():
+    import ZrlNetMesh as NM
+    a = sys.argv[1:]; V, Q = [], []
+    for l in open(a[0]):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": Q.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    ref = NM.load_ref(a[a.index("--ref") + 1]) if "--ref" in a else None; P2, Q2 = subdivide(np.array(V), np.array(Q), int(a[1]), ref)
+    out = a[a.index("--out") + 1] if "--out" in a else os.path.splitext(a[0])[0] + "_lod%s.obj" % a[1]
+    with open(out, "w") as f:
+        for p in P2: f.write("v %.6f %.6f %.6f\n" % tuple(p))
+        for q in Q2: f.write("f %d %d %d %d\n" % tuple(q + 1))
+    print(out, len(P2), "vertices", len(Q2), "quads")
+
+
+if __name__ == "__main__":
+    main()

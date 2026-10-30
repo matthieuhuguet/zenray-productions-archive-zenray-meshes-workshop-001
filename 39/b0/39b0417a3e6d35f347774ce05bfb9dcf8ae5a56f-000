@@ -1,0 +1,176 @@
+"""29 October 2026 : ZenRay Lines TUBES, the atomic components of a single shell found from its geometry alone (a mannequin : fingers, hands, forearms, arms, legs, feet, neck, torso).
+EN: the geodesic distance from a root point (the heat method : smooth, no grid artefacts) cuts the surface into bands of equal width ; a band is split into its connected pieces ;
+a piece that touches one piece below and one piece above is a ring of a tube, a piece that touches several above or below is a junction (palm, shoulder, crotch). A tube is the chain
+of rings between two junctions or a junction and a tip : a finger is a tube. This is the Reeb graph of the distance, the same idea as the seam cut of ZenRay UV : cut where the
+shape branches. Output : bands, pieces, tubes (ring list, length, radius, centre line).
+    python -I ZrlTubes.py --obj model.obj [--band-mm 15] [--root x,y,z]
+FR : les composants atomiques d'une coque unique (doigts, mains, bras, jambes), trouvés par la distance géodésique : un tube est une chaîne d'anneaux entre deux jonctions.
+"""
+import argparse, json, os, sys, time
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spl
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path: sys.path.insert(0, HERE)
+
+PARAMS = {   # 29 October 2026 : every value of the tube search, metres
+    "band_m": 0.015,           # width of a band : one ring per band (a finger is about 15 mm wide, a limb 50 to 120 mm)
+    "weld_m": 1e-5,            # vertices closer than this are one vertex
+    "heat_len_m": 0.05,        # heat method : the heat spreads about this far in one step (the classic mean edge length is too short for a 1.7 m body : the far field drowns in rounding noise)
+    "min_tube_rings": 2,       # a tube shorter than this many rings is part of its junction
+    "persistence_m": 0.015,    # a branch of the merge tree must reach at least this far beyond where it joins the rest, else it is a bump (a finger is 60 to 80 mm)
+    "root": None,              # x, y, z : the root of the distance ; None = the vertex nearest to the centre of mass
+}
+
+
+def load_welded(obj, weld=PARAMS["weld_m"]):
+    V, F = [], []
+    for l in open(obj):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("f "):
+            ids = [int(t.split("/")[0]) - 1 for t in l.split()[1:]]
+            for k in range(1, len(ids) - 1): F.append([ids[0], ids[k], ids[k + 1]])
+    V = np.array(V); F = np.array(F); key = np.round(V / weld).astype(np.int64); _, idx, inv = np.unique(key, axis=0, return_index=True, return_inverse=True); inv = inv.reshape(-1)
+    return V[idx], inv[F]
+
+
+def cotan_laplacian(V, T):
+    n = len(V); I, J, W = [], [], []
+    for k in range(3):
+        a, b, c = T[:, k], T[:, (k + 1) % 3], T[:, (k + 2) % 3]
+        u, v = V[a] - V[c], V[b] - V[c]; cot = (u * v).sum(1) / np.maximum(np.linalg.norm(np.cross(u, v), axis=1), 1e-18)
+        I += [a, b]; J += [b, a]; W += [cot / 2, cot / 2]
+    I, J, W = np.concatenate(I), np.concatenate(J), np.concatenate(W); Wm = sp.coo_matrix((W, (I, J)), shape=(n, n)).tocsr()
+    return sp.diags(np.asarray(Wm.sum(1)).ravel()) - Wm          # positive semi definite
+
+
+def areas(V, T):
+    A = np.linalg.norm(np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]), axis=1) / 2; M = np.zeros(len(V))
+    for k in range(3): np.add.at(M, T[:, k], A / 3)
+    return A, M
+
+
+def heat_distance(V, T, root, prm=PARAMS):
+    """geodesic distance from a vertex, heat method (Crane, Weischedel, Wardetzky) : one smoothing, one normalisation, one Poisson solve."""
+    n = len(V); L = cotan_laplacian(V, T); A, M = areas(V, T); Md = sp.diags(M)
+    e = np.concatenate([np.linalg.norm(V[T[:, k]] - V[T[:, (k + 1) % 3]], axis=1) for k in range(3)]); h = e.mean(); t = max(prm["heat_len_m"], h) ** 2
+    d0 = np.zeros(n); d0[np.atleast_1d(root)] = 1.0; u = spl.spsolve((Md + t * L).tocsc(), d0)      # root : one vertex or an array of vertices (a curve) ; the distance is to the nearest of them
+    N = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]); N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-18)
+    G = np.zeros((len(T), 3))
+    for k in range(3):
+        a, b, c = T[:, k], T[:, (k + 1) % 3], T[:, (k + 2) % 3]; G += u[a][:, None] * np.cross(N, V[c] - V[b])      # sum over the corners of u_i times the unit normal crossed with the opposite edge
+    G /= (2 * A)[:, None]; Xn = -G / np.maximum(np.linalg.norm(G, axis=1, keepdims=True), 1e-300)
+    div = np.zeros(n)
+    for k in range(3):
+        a, b, c = T[:, k], T[:, (k + 1) % 3], T[:, (k + 2) % 3]
+        cr = np.maximum(np.linalg.norm(np.cross(V[b] - V[a], V[c] - V[a]), axis=1), 1e-18)
+        cot_b = ((V[a] - V[b]) * (V[c] - V[b])).sum(1) / cr; cot_c = ((V[a] - V[c]) * (V[b] - V[c])).sum(1) / cr       # cotangents of the angles at b and at c
+        np.add.at(div, a, 0.5 * (cot_c * (Xn * (V[b] - V[a])).sum(1) + cot_b * (Xn * (V[c] - V[a])).sum(1)))           # the angle opposite the edge a to b is at c
+    phi = spl.spsolve((L + 1e-10 * sp.identity(n)).tocsc(), -div); phi -= phi[np.atleast_1d(root)].mean()
+    return phi - phi.min()
+
+
+def band_graph(V, T, phi, band, min_faces=14):
+    """label the faces by band, split each band into connected pieces, absorb the slivers (a piece under min_faces joins the neighbour it shares the longest border with),
+    then link the pieces of neighbouring bands : returns the band of each face, the piece of each face, the (lower piece, upper piece) links and the band of each piece."""
+    fb = np.floor(phi[T].mean(1) / band).astype(int)
+    E = {}
+    for f, t in enumerate(T):
+        for i in range(3): E.setdefault(tuple(sorted((t[i], t[(i + 1) % 3]))), []).append(f)
+    adj = [(fs[0], fs[1]) for fs in E.values() if len(fs) == 2]
+    par = list(range(len(T)))
+    def find(a):
+        while par[a] != a: par[a] = par[par[a]]; a = par[a]
+        return a
+    for a, b in adj:
+        if fb[a] == fb[b]:
+            ra, rb = find(a), find(b)
+            if ra != rb: par[ra] = rb
+    lab = np.array([find(f) for f in range(len(T))])
+    while True:                                                                  # absorb the slivers, smallest first
+        size = {}; 
+        for l in lab: size[l] = size.get(l, 0) + 1
+        small = sorted((l for l, n in size.items() if n < min_faces), key=lambda l: size[l])
+        if not small: break
+        border = {}
+        for a, b in adj:
+            if lab[a] != lab[b]: border.setdefault((lab[a], lab[b]), 0); border[(lab[a], lab[b])] += 1; border.setdefault((lab[b], lab[a]), 0); border[(lab[b], lab[a])] += 1
+        l = small[0]; cand = [(n, o) for (a, o), n in border.items() if a == l]
+        if not cand: size[l] = 10 ** 9; lab = np.where(lab == l, l, lab); break
+        lab = np.where(lab == l, max(cand)[1], lab)
+    ids = {r: i for i, r in enumerate(sorted(set(lab.tolist())))}; piece = np.array([ids[r] for r in lab]); npc = piece.max() + 1
+    pband = np.zeros(npc, int)
+    for k in range(npc): pband[k] = int(np.median(fb[piece == k]))
+    links = set()
+    for a, b in adj:
+        pa, pb = int(piece[a]), int(piece[b])
+        if pa != pb and pband[pa] != pband[pb]: links.add((pa, pb) if pband[pa] < pband[pb] else (pb, pa))
+    return fb, piece, links, pband
+
+
+def tubes(V, T, fb, piece, links, pband, prm=PARAMS):
+    npc = piece.max() + 1; band_of = pband; bf = {}
+    for f in range(len(T)): bf.setdefault(piece[f], []).append(f)
+    up = {i: [] for i in range(npc)}; dn = {i: [] for i in range(npc)}
+    for a, b in links: up[a].append(b); dn[b].append(a)
+    centre = {i: V[np.unique(T[bf[i]])].mean(0) for i in range(npc)}
+    def radius(i):
+        vs = np.unique(T[bf[i]]); c = centre[i]; return float(np.linalg.norm(V[vs] - c, axis=1).mean())
+    junction = {i for i in range(npc) if len(up[i]) != 1 or len(dn[i]) > 1}   # starts, ends and branches break a chain
+    out = []; seen = set()
+    for i in range(npc):
+        if i in seen: continue
+        if i in junction and not (len(up[i]) == 1 and len(dn[i]) <= 1): continue
+        chain = [i]; seen.add(i); cur = i
+        while len(up[cur]) == 1 and up[cur][0] not in junction and up[cur][0] not in seen: cur = up[cur][0]; chain.append(cur); seen.add(cur)
+        out.append(chain)
+    res = []
+    for ch in out:
+        if len(ch) < prm["min_tube_rings"]: continue
+        c = np.array([centre[i] for i in ch]); rr = [radius(i) for i in ch]
+        res.append({"rings": [int(i) for i in ch], "bands": [int(band_of[i]) for i in ch], "length_m": float(np.linalg.norm(np.diff(c, axis=0), axis=1).sum()), "radius_m": float(np.median(rr)), "start": c[0].round(4).tolist(), "end": c[-1].round(4).tolist(),
+                    "next": [int(x) for x in up[ch[-1]]], "prev": [int(x) for x in dn[ch[0]]]})
+    return res, junction, centre
+
+
+def branches(V, T, phi, persistence):
+    """the MERGE TREE of the distance, robust to the noise of the triangulation : the vertices are swept from the farthest to the nearest ; a vertex with no swept neighbour is a tip (a
+    finger tip, a toe, the top of the head) ; a vertex that touches several swept pieces is a saddle where branches meet. The piece with the farthest tip goes on (elder rule) ; a younger
+    piece that reached less than `persistence` beyond the saddle is a bump and is absorbed ; any other piece ends there as a BRANCH, a tube from its tip to the saddle. Returns the branch
+    of every vertex (0 is the trunk, the branch of the farthest tip) and one record per branch : tip, saddle, reach."""
+    n = len(V); nb = [set() for _ in range(n)]
+    for t in T:
+        for i in range(3): nb[t[i]].add(t[(i + 1) % 3]); nb[t[i]].add(t[(i + 2) % 3])
+    order = np.argsort(-phi, kind="stable"); par = list(range(n)); members = {}; peak = {}; done = np.zeros(n, bool); branch = np.full(n, -1); recs = []
+    def find(a):
+        while par[a] != a: par[a] = par[par[a]]; a = par[a]
+        return a
+    for v in order:
+        roots = {find(u) for u in nb[v] if done[u]}; done[v] = True
+        if not roots: members[v] = [v]; peak[v] = v; continue
+        roots = sorted(roots, key=lambda r: -phi[peak[r]]); keep = roots[0]; par[v] = keep; members[keep].append(v)
+        for r in roots[1:]:
+            reach = phi[peak[r]] - phi[v]
+            if reach >= persistence:                                                  # a real branch ends here : a tube from its tip down to the saddle
+                bid = len(recs) + 1; branch[members[r]] = bid; recs.append({"id": bid, "tip": int(peak[r]), "saddle": int(v), "reach_m": float(reach), "tip_phi": float(phi[peak[r]]), "saddle_phi": float(phi[v]), "vertices": len(members[r])}); members.pop(r)
+                par[r] = keep
+            else:                                                                      # a bump : it belongs to the piece that goes on
+                par[r] = keep; members[keep] += members.pop(r)
+    last = find(order[-1]); branch[members[last]] = 0
+    return branch, recs, int(peak[last])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("--obj", required=True); ap.add_argument("--band-mm", type=float, default=PARAMS["band_m"] * 1000); ap.add_argument("--root"); ap.add_argument("--out"); a = ap.parse_args()
+    prm = dict(PARAMS, band_m=a.band_mm / 1000.0); t0 = time.time(); V, T = load_welded(a.obj, prm["weld_m"]); print("mesh %d vertices %d triangles %.1fs" % (len(V), len(T), time.time() - t0))
+    root = int(np.argmin(np.linalg.norm(V - V.mean(0), axis=1))) if not a.root else int(np.argmin(np.linalg.norm(V - np.array([float(x) for x in a.root.split(",")]), axis=1)))
+    phi = heat_distance(V, T, root, prm); print("distance range %.3f .. %.3f m (root %s) %.1fs" % (phi.min(), phi.max(), V[root].round(3), time.time() - t0))
+    br, recs, top = branches(V, T, phi, prm["persistence_m"]); print("branches %d (trunk tip at %s, distance %.3f)" % (len(recs), V[top].round(3), phi[top]))
+    for r in sorted(recs, key=lambda z: -z["reach_m"]): print("branch %2d reach %.3f m tip %s saddle at %s vertices %d" % (r["id"], r["reach_m"], V[r["tip"]].round(3), V[r["saddle"]].round(3), r["vertices"]))
+    if a.out: np.savez(a.out, V=V, T=T, phi=phi, branch=br)
+
+
+if __name__ == "__main__":
+    main()

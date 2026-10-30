@@ -1,0 +1,37 @@
+"""29 October 2026 : ZenRay Lines MERGE : several network documents become one (the torso of a mannequin, its hands, its limbs). Node and arc ids are shifted, mirror links, component corners and forced corners follow,
+the scale of a source document (`mesh_unit`) becomes the `unit` of each of its components, so a hand is meshed with finger sized tolerances next to a torso.
+    python -I ZrlMerge.py out.json doc1.json doc2.json ...
+FR : plusieurs documents de courbes en un seul, chaque composant gardant l'échelle de son document d'origine."""
+import json, sys
+
+
+def merge_docs(docs, model_ref=None, unit=None):
+    out = {"version": 1, "date": "29 October 2026", "units": "m", "spline": docs[0].get("spline"), "nodes": [], "arcs": [], "components": [], "component_seeds": [], "component_options": {}, "corners_force": {}, "tube_rings": {}}
+    unit_all = unit
+    for d in docs:
+        no, ao = len(out["nodes"]), len(out["arcs"]); unit = float(d.get("mesh_unit") or 1.0)
+        for n in d["nodes"]: out["nodes"].append({"id": n["id"] + no, "p": n["p"]})
+        for a in d["arcs"]:
+            b = dict(a); b["id"] = a["id"] + ao; b["a"] = a["a"] + no; b["b"] = a["b"] + no; b["mirror"] = a["mirror"] + ao if a.get("mirror", -1) >= 0 else -1; out["arcs"].append(b)
+        out["component_seeds"] += [dict(q) for q in d.get("component_seeds", [])]
+        for name, o in (d.get("component_options") or {}).items():
+            o = dict(o)
+            if "corners" in o: o["corners"] = [c + no for c in o["corners"]]
+            if unit_all is not None: o["unit"] = unit_all
+            elif unit != 1.0: o["unit"] = unit
+            out["component_options"][name] = o
+        for k, v in (d.get("corners_force") or {}).items(): out["corners_force"][str(int(k) + no)] = v
+        for name, t in (d.get("tube_rings") or {}).items():
+            t = json.loads(json.dumps(t))
+            for r in t["rings"]: r["nodes"] = [x + no for x in r["nodes"]]
+            out["tube_rings"][name] = t
+    if unit_all is not None: out["mesh_unit"] = unit_all; out["mesh_feature_unit"] = 1.0        # one network joined by its rings : the tolerances at the finest scale, the lengths that measure the shape at the scale of the body
+    if model_ref: out["model_ref"] = model_ref
+    return out
+
+
+if __name__ == "__main__":
+    args = sys.argv[2:]; unit = None
+    if args and args[0].startswith("--unit="): unit = float(args[0].split("=")[1]); args = args[1:]
+    docs = [json.load(open(p)) for p in args]; ref = next((d.get("model_ref") for d in docs if d.get("model_ref")), None); out = merge_docs(docs, ref, unit)
+    json.dump(out, open(sys.argv[1], "w")); print(len(out["nodes"]), "nodes", len(out["arcs"]), "arcs", len(out["component_seeds"]), "seeds", len(out["component_options"]), "components")

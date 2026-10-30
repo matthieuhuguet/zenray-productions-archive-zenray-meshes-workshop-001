@@ -1,0 +1,65 @@
+"""29 October 2026 : ZenRay Lines BODY NET, the whole network of a character in one command (the conductor of the tools, so that the next character takes seconds, not a day).
+EN: fingers and limbs measured from their tips (ZrlTubeNet), the seams of every tube straightened (ZrlStraighten), the tubes merged in one document at the scale of the fingers (ZrlMerge), the elbow rings
+welded, the pinched base rings dropped, the torso and the hands closed by garment pattern junctions (ZrlJunction). Reads a model .obj, writes one lines document that opens in ZenRay Lines.
+    python -I ZrlBodyNet.py model.obj out.json [--param key=value ...]      keys of ZrlJunction.PARAMS and ZrlStraighten.PARAMS
+FR : tout le réseau d'un personnage en une commande : tubes depuis les pointes, coutures redressées, fusion, jonctions en patron de vêtement.
+"""
+import argparse, json, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlTubeNet as TN, ZrlStraighten as ST, ZrlMerge as MG, ZrlJunction as JN, ZrlNetMesh as NM
+
+
+BODY_PARAMS = {   # 30 October 2026 : the values of the conductor itself
+    "arm_edge_scale": 0.6,        # edge scale of the arms (the start of the name) : below 1 a finer mesh
+    "head_edge_scale": 0.8,
+    "trunk_min_count": 4,         # fewest edges on every ring arc of the trunk : without it the counts solver left the back columns at 1 or 3 edges (a quad 80 mm wide, 10 mm high) while the front had 6, the junction patches of the chest closing at the price of the back
+}
+
+
+def build(obj, params=None, log=print):
+    obj = os.path.abspath(obj); t0 = time.time(); jp = dict(JN.PARAMS); sp = dict(ST.PARAMS); bp = dict(BODY_PARAMS)
+    for k, v in (params or {}).items():
+        if k in bp: bp[k] = v
+        if k in jp: jp[k] = v
+        if k in sp: sp[k] = v
+        if k in TN.PARAMS: TN.PARAMS[k] = v
+    ref = NM.load_ref(obj); fingers, _ = TN.network(obj, "fingers", None, None); tips, _ = TN.limbs_from_tips(obj, None)
+    for name, d in (("fingers", fingers), ("tips", tips)):
+        rep = ST.straighten_doc(d, ref, sp); log("straighten %s : %d tubes, corner curvature %s" % (name, len(rep), ", ".join("%s %.1f to %.1f mm" % (k, v["corner_curvature_before"], v["corner_curvature_after"]) for k, v in rep.items() if k in ("leg_R_1", "arm_R_2", "head_1"))))
+    doc = MG.merge_docs([fingers, tips], os.path.abspath(obj), 0.1); reps = JN.body_junctions(doc, obj, jp)
+    for r in reps: log(json.dumps({k: v for k, v in r.items() if k in ("name", "ok", "dropped", "merged", "bridges", "expected", "failed")}))
+    for nm, o in doc["component_options"].items():                                          # the edge scale of every family of components, by the start of its name
+        for pre, v in (("leg", jp["leg_edge_scale"]), ("arm", bp["arm_edge_scale"]), ("head", bp["head_edge_scale"])):
+            if nm.startswith(pre): o["edge_scale"] = v
+    doc["mesh_params"] = {"wrap_min_normal": 0.0, "corner_deg": 55.0, "inherit_component": True, "min_compactness": 0.05}                                          # a band that wraps round a thin part (a foot, a finger) is meshed, not skipped
+    for a in doc["arcs"]:                                                                  # the arcs of the trunk and of the junctions have no mirror partner yet : pair every arc with its image across x = 0 (the counts of two mirror arcs are equal : a symmetric mesh)
+        pass
+    doc["mirrored_pairs"] = TN.link_mirrors(doc, 0.006); log("mirror pairs : %d" % doc["mirrored_pairs"])
+    if "trunk" in doc.get("tube_rings", {}) and bp["trunk_min_count"] > 1:                  # the engine reads mesh_params["arc_min_counts"] : {arc id : fewest edges}
+        by = {}
+        for a in doc["arcs"]: by[(a["a"], a["b"])] = a["id"]; by[(a["b"], a["a"])] = a["id"]
+        mins = {}
+        for ring in doc["tube_rings"]["trunk"]["rings"]:
+            ids = ring["nodes"]
+            for i in range(len(ids)):
+                k = by.get((ids[i], ids[(i + 1) % len(ids)]))
+                if k is not None: mins[str(k)] = int(bp["trunk_min_count"])
+        doc["mesh_params"]["arc_min_counts"] = mins; log("trunk ring arcs with a minimum of %d edges : %d" % (bp["trunk_min_count"], len(mins)))
+    extra = set()                                                                          # the extra seams of a ring of 8 or 12 turn gently along their ring : not forced, the engine reads their turn
+    for t in doc["tube_rings"].values():
+        for r in t["rings"]:
+            q = len(r["nodes"]) // 4
+            for k, i in enumerate(r["nodes"]):
+                if k % q: extra.add(i)
+    extra -= set(doc.get("forced_nodes", []))                                              # the ends of the ladder rungs of a junction are corners
+    doc["corners_force"] = {str(n["id"]): True for n in doc["nodes"] if n["id"] not in extra}      # every node of the network is a corner of every face around it : a patch has the corners the topology gives it, no virtual corner cuts an arc in two
+    log("document : %d nodes, %d arcs, %d seeds in %.1f s" % (len(doc["nodes"]), len(doc["arcs"]), len(doc.get("component_seeds", [])), time.time() - t0)); return doc
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0]); ap.add_argument("obj"); ap.add_argument("out"); ap.add_argument("--param", action="append", default=[]); a = ap.parse_args()
+    params = {k: float(v) for k, v in (x.split("=") for x in a.param)}; doc = build(a.obj, params); json.dump(doc, open(a.out, "w"))
+
+
+if __name__ == "__main__":
+    main()

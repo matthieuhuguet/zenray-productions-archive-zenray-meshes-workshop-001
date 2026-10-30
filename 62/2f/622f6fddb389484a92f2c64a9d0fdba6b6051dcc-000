@@ -13,13 +13,22 @@ import numpy as np
 from scipy.optimize import milp, LinearConstraint, Bounds
 from scipy.sparse import coo_matrix
 
-PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000, "slack_patch": 1000.0, "slack_mirror": 30.0, "time_limit_s": 20.0}   # 29 October 2026
+# 29 October 2026 : time_limit_s was 20 : a solve of 14 to 21 s (Manny) was cut at 20 on a loaded machine and returned a worse answer, so the same network meshed 502 or 516 faces on two runs ; a normal solve takes 3 to 15 s, the limit only guards against a runaway
+PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000, "slack_patch": 1000.0, "slack_mirror": 30.0, "time_limit_s": 90.0, "mip_rel_gap": 0.03, "merge_mirror": False}   # 29 October 2026
 SIDES = (3, 4, 5, 6)
 
 
 def solve(layout, edge_m=None, elastic=False, min_spoke=1):
+    """One integer edge count per shared arc. 30 October 2026 : with PARAMS["merge_mirror"] the two arcs of a mirror pair share ONE variable (the counts are exactly symmetric, the problem has half the variables, and a time limited solve can no longer return a mesh with a few arcs of a pair unequal) ; without it, a pair is an equality row with a slack (the old way)."""
     e = edge_m or PARAMS["edge_m"]; arcs = list(layout["arcs"]); ix = {a: i for i, a in enumerate(arcs)}; n = len(arcs)
     tgt = np.array([max(PARAMS["min_count"], layout["arcs"][a] / e) for a in arcs])
+    col = list(range(n)); merged = bool(PARAMS.get("merge_mirror"))
+    if merged:
+        for a, b in layout.get("mirror", []):
+            if a in ix and b in ix and a != b:
+                ca, cb = col[ix[a]], col[ix[b]]
+                if ca != cb: col = [ca if c == cb else c for c in col]
+    uniq = sorted(set(col)); cmap = {c: k for k, c in enumerate(uniq)}; colx = [cmap[c] for c in col]; nx = len(uniq)          # the variable of every arc
     patches = layout["patches"]
     s_off = {}; m = 0                                                     # Tarini s variables of the 3, 5, 6 sided patches
     for pi, p in enumerate(patches):
@@ -29,7 +38,7 @@ def solve(layout, edge_m=None, elastic=False, min_spoke=1):
     rows = []                                                             # (coefficient dict over variables, tag) ; every row is "= 0"
     def side_vec(side):
         d = {}
-        for a in side: d[ix[a]] = d.get(ix[a], 0.0) + 1.0
+        for a in side: d[colx[ix[a]]] = d.get(colx[ix[a]], 0.0) + 1.0
         return d
     def combine(*terms):
         out = {}
@@ -43,35 +52,37 @@ def solve(layout, edge_m=None, elastic=False, min_spoke=1):
         else:
             o = s_off[pi]
             for i in range(k):                                            # side i = s_(i-1) + s_(i+1)
-                rows.append((combine((1, S[i]), (-1, {n + o + (i - 1) % k: 1.0}), (-1, {n + o + (i + 1) % k: 1.0})), ("patch", pi)))
-    for j, (a, b) in enumerate(layout.get("mirror", [])):
-        if a in ix and b in ix and a != b: rows.append(({ix[a]: 1.0, ix[b]: -1.0}, ("mirror", j)))
-    R = len(rows); nv = n + m + n; ns = 2 * R if elastic else 0; N = nv + ns
+                rows.append((combine((1, S[i]), (-1, {nx + o + (i - 1) % k: 1.0}), (-1, {nx + o + (i + 1) % k: 1.0})), ("patch", pi)))
+    if not merged:
+        for j, (a, b) in enumerate(layout.get("mirror", [])):
+            if a in ix and b in ix and a != b: rows.append(({ix[a]: 1.0, ix[b]: -1.0}, ("mirror", j)))
+    R = len(rows); nv = nx + m + n; ns = 2 * R if elastic else 0; N = nv + ns
     r_i, c_i, vals = [], [], []; lo, hi = [], []
     for ri, (d, _) in enumerate(rows):
         for k_, v in d.items(): r_i.append(ri); c_i.append(k_); vals.append(v)
         if elastic: r_i += [ri, ri]; c_i += [nv + 2 * ri, nv + 2 * ri + 1]; vals += [1.0, -1.0]
         lo.append(0.0); hi.append(0.0)
+    lo_arc = np.array([layout.get("min", {}).get(a, PARAMS["min_count"]) for a in arcs], float); tgt = np.maximum(tgt, lo_arc)       # per arc minimum (a loop arc needs at least 3 edges)
     for i in range(n):                                                    # t_i >= |x_i - tgt_i| / tgt_i
         base = R + 2 * i
-        r_i += [base, base, base + 1, base + 1]; c_i += [i, n + m + i, i, n + m + i]; vals += [1.0 / tgt[i], -1.0, -1.0 / tgt[i], -1.0]
+        r_i += [base, base, base + 1, base + 1]; c_i += [colx[i], nx + m + i, colx[i], nx + m + i]; vals += [1.0 / tgt[i], -1.0, -1.0 / tgt[i], -1.0]
         lo += [-np.inf, -np.inf]; hi += [1.0, -1.0]
     A = coo_matrix((vals, (r_i, c_i)), shape=(R + 2 * n, N)).tocsr()
-    cost = np.r_[np.zeros(n + m), np.ones(n)]
+    cost = np.r_[np.zeros(nx + m), np.ones(n)]
     if elastic:
         w = np.array([PARAMS["slack_patch"] if rows[ri][1][0] == "patch" else PARAMS["slack_mirror"] for ri in range(R)])
         cost = np.r_[cost, np.repeat(w, 2)]
-    integ = np.r_[np.ones(n + m), np.zeros(n + ns)]
-    lo_x = np.array([layout.get("min", {}).get(a, PARAMS["min_count"]) for a in arcs], float)       # per arc minimum (a loop arc needs at least 3 edges)
-    tgt = np.maximum(tgt, lo_x)
+    integ = np.r_[np.ones(nx + m), np.zeros(n + ns)]
+    lo_x = np.zeros(nx)
+    for i in range(n): lo_x[colx[i]] = max(lo_x[colx[i]], lo_arc[i])
     b_lo = np.r_[lo_x, np.full(m, float(min_spoke)), np.zeros(n + ns)]
-    b_hi = np.r_[np.full(n, PARAMS["max_count"]), np.full(m, PARAMS["max_count"]), np.full(n + ns, np.inf)]
-    r = milp(cost, constraints=LinearConstraint(A, lo, hi), integrality=integ, bounds=Bounds(b_lo, b_hi), options={"time_limit": PARAMS["time_limit_s"]})
+    b_hi = np.r_[np.full(nx, PARAMS["max_count"]), np.full(m, PARAMS["max_count"]), np.full(n + ns, np.inf)]
+    r = milp(cost, constraints=LinearConstraint(A, lo, hi), integrality=integ, bounds=Bounds(b_lo, b_hi), options={"time_limit": PARAMS["time_limit_s"], "mip_rel_gap": PARAMS["mip_rel_gap"]})      # 29 October 2026 : stop at 3 % of the bound, the counts do not need the proof of the optimum
     if r.x is None: return {"ok": False, "status": r.message}
-    x = np.round(r.x[:n]).astype(int)
+    xc = np.round(r.x[:nx]).astype(int); x = np.array([xc[colx[i]] for i in range(n)])
     out = {"ok": True, "counts": {a: int(x[ix[a]]) for a in arcs}, "mean_rel_dev": float(np.mean(np.abs(x - tgt) / tgt)) if n else 0.0,
            "max_rel_dev": float(np.max(np.abs(x - tgt) / tgt)) if n else 0.0, "violations": {}, "violated_mirror": []}
-    out["tarini"] = {patches[pi]["name"]: [int(round(v)) for v in r.x[n + o: n + o + len(patches[pi]["sides"])]] for pi, o in s_off.items()}
+    out["tarini"] = {patches[pi]["name"]: [int(round(v)) for v in r.x[nx + o: nx + o + len(patches[pi]["sides"])]] for pi, o in s_off.items()}
     if elastic:
         sl = r.x[nv:nv + ns].reshape(R, 2).sum(1)
         for ri, (_, tag) in enumerate(rows):

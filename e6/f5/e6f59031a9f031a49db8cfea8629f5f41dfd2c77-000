@@ -1,0 +1,35 @@
+"""29 October 2026 : ZenRay Lines SAVE TEST, both ways. EN: a good document is written atomically, read back and its sha256 matches ; every kind of bad document (NaN, a missing end node, a repeated id,
+a mirror pointing at nothing, an SVG instead of curves) is refused before the disk is touched, and the previous file stays byte for byte. FR : sauvegarde éprouvée dans les deux sens.
+    python -I ZrlSaveTest.py        exit code 0 only when everything behaves"""
+import json, os, sys, tempfile, hashlib, copy
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlServe as S
+
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+GOOD = json.load(open(os.path.join(ROOT, "lines/projects/manny/data/lines_edit.json")))
+
+
+def body(d): return json.dumps(d).encode("utf-8")
+
+
+def main():
+    fails = []; tmp = tempfile.mkdtemp(); prm = dict(S.PARAMS, protected=[]); target = os.path.join(tmp, prm["edit_file"])
+    r = S.save_edit(body(GOOD), tmp, prm)
+    if not (r["ok"] and r["sha256"] == hashlib.sha256(open(target, "rb").read()).hexdigest()): fails.append("a good document must be written and read back")
+    before = open(target, "rb").read()
+    bad = {}
+    d = copy.deepcopy(GOOD); d["arcs"][0]["ctrl"][0][0] = float("nan"); bad["NaN control point"] = json.dumps(d).encode()
+    d = copy.deepcopy(GOOD); d["arcs"][0]["a"] = 99999; bad["end on a missing node"] = body(d)
+    d = copy.deepcopy(GOOD); d["arcs"][1]["id"] = d["arcs"][0]["id"]; bad["repeated arc id"] = body(d)
+    d = copy.deepcopy(GOOD); d["nodes"][1]["id"] = d["nodes"][0]["id"]; bad["repeated node id"] = body(d)
+    d = copy.deepcopy(GOOD); d["arcs"][0]["mirror"] = 99999; bad["mirror to nothing"] = body(d)
+    d = copy.deepcopy(GOOD); d["arcs"][0]["ctrl"] = [[0, 0]]; bad["a curve that is not a matrix n x 3"] = body(d)
+    bad["an SVG, not curves"] = b'{"svg": "<svg></svg>"}'
+    for name, b in bad.items():
+        try: S.save_edit(b, tmp, prm); fails.append("refused nothing for : " + name)
+        except (ValueError, KeyError, TypeError): pass
+        if open(target, "rb").read() != before: fails.append("the file changed after a refused save : " + name)
+    print(json.dumps({"good_saved": r["bytes"], "sha256": r["sha256"][:16], "refused": list(bad), "fails": fails}, indent=1)); return 1 if fails else 0
+
+
+if __name__ == "__main__": sys.exit(main())
