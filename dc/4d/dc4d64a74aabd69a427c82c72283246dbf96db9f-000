@@ -9,7 +9,8 @@
 (() => {
   const Z = window.ZRL, V = View3D.V;
   const CFG = {   // 29 October 2026 : every tunable value of the 3D editor
-    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creases: '/creases', creaseAlign: '/crease_align', chain: '/chain', autoPatch: '/auto_patch' },
+    files: { lines: 'data/lines.json', edit: 'data/lines_edit.json', ref: 'data/ref_mesh', save: '/save', mesh: '/mesh', doctor: '/doctor', faces: '/faces', houdini: '/houdini', project: '/project', export: '/export', mboNet: 'data/lines_mbo.json', views: 'data/views.json', sheets: 'data/sheet_views.json', model: '/model', seeds: 'data/seeds_v752.json', creasePath: '/crease_path', creaseNet: '/crease_net', lod: '/lod', openings: '/openings', creases: '/creases', creaseAlign: '/crease_align', chain: '/chain', autoPatch: '/auto_patch' },
+    palette: { families: [{ match: '^(leg|foot)', color: [0.62, 0.82, 0.64] }, { match: '^(arm|finger|thumb|junction_hand)', color: [0.93, 0.64, 0.64] }, { match: '^(trunk|junction_chest|junction_pelvis)', color: [0.52, 0.66, 0.93] }, { match: '^head', color: [0.70, 0.66, 0.92] }], joint_suffix: '_joint', joint_lighten: 0.55, fallback: { saturation: 0.35, lightness: 0.72 } },   // 30 October 2026 : defaults, replaced by lines/palette.json when it loads
     preview: { facesDelayMs: 700, meshDelayMs: 1600, faceWidth: 3.0, cornerSize: 10, seedSize: 13 },
     colors: { arc: [0.16, 0.17, 0.2, 1], arcMirror: [0.32, 0.36, 0.44, 1], sel: [0.86, 0.42, 0.16, 1], hover: [0.18, 0.45, 0.85, 1], node: [0.12, 0.12, 0.14, 1],
       nodeSel: [0.86, 0.42, 0.16, 1], handle: [1, 1, 1, 1], handleSel: [0.86, 0.42, 0.16, 1], poly: [0.86, 0.42, 0.16, 0.55], draw: [0.1, 0.6, 0.35, 1],
@@ -24,10 +25,40 @@
     sheet: { behindM: 1.6 },   // 29 October 2026 : the blueprint planes sit this far behind the view centre, past the model
     // 29 October 2026 : NAME LABELS in the middle of each component : estimated box (charPx per letter), parts labelled only when bigger than minPartPx on screen, at most maxParts, never overlapping
     labels: { charPx: 6.4, padX: 7, h: 18, gap: 3, minPartPx: 34, maxParts: 70, strip: /^CAR_(body_)?/ },
+    topo: { ghost: 0.14, fillAlpha: 0.9 },
+    // 29 October 2026 : DRAWING with the fewest gestures : a drag is a stroke (a point every strokeStepPx pixels, a few anchors at lockTolM for the crease lock, control points every ctrlStepM if no crease is kept), Snap to creases tries snapSamples points per curve ;
+    // a crease path is refused when it is lockLenRatio times longer than what was drawn (a detour along other creases) or strays from the stroke by more than the reach (Automatic settings)
+    draw: { strokeStepPx: 5, snapSamples: 8, ctrlStepM: 0.05, previewMs: 160, lockTolM: 0.03, lockLenRatio: 1.35 },   // ctrlStepM : one control point every 5 cm along a locked curve (light to edit)
+    // 29 October 2026 : AUTOMATION defaults (every one is a control of the Automatic card, remembered between sessions)
+    auto: { minParts: 3, zoneDeg: 70, minAreaCm2: 40, weldMm: 8, straightMm: 6, creaseMinPct: 35, snapMaxMm: 30, lockReachMm: 40, creaseLock: true, chunk: 16, mirror: true, afterMerge: true, afterFix: true, afterQuads: true, afterJump: true },   // 29 October 2026 : the Quads view : the model faint, the quads nearly opaque
+    // 29 October 2026 : STYLES. Hard surface and organic retopology share the same controls ; only the values differ : zone angle (how big a part is), smallest part, merge and straight distances,
+    // how much of a path must lie on a crease, how far Snap may move a curve. Organic keeps more, smaller zones, tighter welds and trusts a crease only when sure (loops around eyes, mouth, joints).
+    styles: { hard: { zoneDeg: 70, minAreaCm2: 40, weldMm: 8, straightMm: 6, creaseMinPct: 35, snapMaxMm: 30, lockReachMm: 40 }, organic: { zoneDeg: 40, minAreaCm2: 15, weldMm: 4, straightMm: 2, creaseMinPct: 60, snapMaxMm: 10, lockReachMm: 20 } },
     isolate: { fit: 1.15 },   // 29 October 2026 : an isolated part is framed whole : its bounding sphere times fit
   };
+  // 29 October 2026 : PROJECTS. One folder of work per model (the car is the original lines/data). The open project is ?project=<id>, else the last one opened, else the car ;
+  // its files are read from BASE, its network is saved there. FR : un dossier de travail par modèle ; le projet ouvert se lit dans l'adresse ou le dernier ouvert.
+  const PROJECT = (() => { let id = new URLSearchParams(location.search).get('project'); if (!id) { try { id = localStorage.getItem('zrl.project'); } catch (e) { /* private window */ } } return id && /^[a-z0-9][a-z0-9-]*$/.test(id) ? id : 'car'; })();
+  const BASE = PROJECT === 'car' ? 'data/' : 'projects/' + PROJECT + '/data/';
+  for (const k of ['lines', 'edit', 'ref', 'views', 'sheets', 'mboNet', 'seeds']) CFG.files[k] = CFG.files[k].replace(/^data\//, BASE);
+  try { localStorage.setItem('zrl.project', PROJECT); } catch (e) { /* ignored */ }
   const $ = (id) => document.getElementById(id);
   const S = { tool: 'select', sel: new Set(), node: null, handle: null, hover: null, drag: null, draw: null, box: null, mesh: null, meshSel: null, dirty: false, comp: null, faces: null, face: null, doctor: null };
+  // 29 October 2026 : SAVE STATE. S.dirty is a property : every change stamps S.rev and the time ; the bar shows Unsaved, Saving (an Apple spinner, only
+  // while a real save runs), Saved (only after the server confirmed) or Save failed (click to retry). Edits made during a save stay marked unsaved.
+  // FR : état de sauvegarde visible ; « Saved » seulement après la confirmation du serveur ; un échec se voit et se rejoue d'un clic.
+  Object.defineProperty(S, 'dirty', { get() { return !!S._dirty; }, set(v) { S._dirty = !!v; if (v) { S.rev = (S.rev || 0) + 1; S.lastEdit = performance.now(); } updateSaveUI(); }, configurable: true });
+  S.rev = 0; S.saving = false; S.saveError = null; S.lastEdit = 0;
+  function updateSaveUI() {
+    const el = document.getElementById('saveState'); if (!el) return;
+    const st = S.saving ? 'saving' : S.saveError ? 'error' : S._dirty ? 'dirty' : 'saved';
+    el.className = 'savestate ' + st; const t = document.getElementById('saveText');
+    t.textContent = { saving: 'Saving', error: 'Save failed, retry', dirty: 'Unsaved changes', saved: 'Saved' }[st];
+    document.title = (S._dirty ? '* ' : '') + 'ZenRay Lines 3D';
+  }
+  // 29 October 2026 : SELECTED POINTS. S.node is the last point clicked, S.nodes all the selected points (Shift adds one) ; setting S.node to null clears them all.
+  S.nodes = new Set(); S._multi = false;
+  Object.defineProperty(S, 'node', { get() { return S._node === undefined ? null : S._node; }, set(v) { S._node = v; if (v === null || v === undefined) S.nodes.clear(); else if (S._multi) S.nodes.add(v); else S.nodes = new Set([v]); }, configurable: true });
   let model = null, view = null;
   const P = () => ({ mirror: $('pMirror').checked, snap: $('pSnap').checked });
   const status = (m, kind) => { $('status').textContent = m; $('status').className = kind || ''; };
@@ -44,7 +75,7 @@
     for (const a of model.doc.arcs) {
       const sel = S.sel.has(a.id), hov = S.hover && S.hover.type === 'arc' && S.hover.id === a.id;
       polys.push({ pts: arcPts(a.id), color: sel ? CFG.colors.sel : hov ? CFG.colors.hover : (a.mirror === a.id ? CFG.colors.arcMirror : CFG.colors.arc) });
-      if (sel && $('pHandles').checked) {
+      if (sel && S.sel.size === 1 && $('pHandles').checked) {   // 29 October 2026 : the control points of ONE selected curve ; several selected, only their ends show
         const c = a.ctrl, f = []; for (const p of c) f.push(p[0], p[1], p[2]); ctrlPolys.push({ pts: f, color: CFG.colors.poly });
         c.forEach((p, i) => handles.push({ p, color: S.handle && S.handle.arc === a.id && S.handle.i === i ? CFG.colors.handleSel : CFG.colors.handle, size: CFG.sizes.handle }));
       }
@@ -54,20 +85,24 @@
     const selPolys = model.doc.arcs.filter((a) => S.sel.has(a.id)).map((a) => ({ pts: arcPts(a.id), color: CFG.colors.sel }));
     view.setRibbons('arcsSel', selPolys, { width: CFG.sizes.arcSel, order: 2 });
     view.setRibbons('ctrlPoly', ctrlPolys, { width: CFG.sizes.poly, order: 3, noHidden: true });
-    if ($('pNodes').checked) for (const n of model.doc.nodes) pts.push({ p: n.p, color: S.node === n.id ? CFG.colors.nodeSel : CFG.colors.node, size: S.node === n.id ? CFG.sizes.nodeSel : CFG.sizes.node });
+    const endNodes = new Set(); for (const id of S.sel) { const a = model.arc(id); if (a) { endNodes.add(a.a); endNodes.add(a.b); } }
+    if ($('pNodes').checked) for (const n of model.doc.nodes) { const picked = S.nodes.has(n.id), end = endNodes.has(n.id), mag = S.magnetNode === n.id;   // picked : large and orange ; ends of the selected curves : orange ; magnet target : blue ; the rest small
+      pts.push({ p: n.p, color: picked ? CFG.colors.nodeSel : mag ? CFG.colors.hover : end ? CFG.colors.sel : CFG.colors.node, size: picked || mag ? CFG.sizes.nodeSel : end ? CFG.sizes.node + 2 : CFG.sizes.node - 2 }); }
     view.setPoints('nodes', pts, { order: 4 });
     view.setPoints('handles', handles, { onTop: true, order: 5 });
     renderComponents();
     if (S.draw && S.draw.pts.length) {
-      const f = []; for (const q of S.draw.pts) f.push(q.p[0], q.p[1], q.p[2]); if (S.draw.cursor) f.push(...S.draw.cursor);
+      const f = []; for (const q of S.draw.pts) f.push(q.p[0], q.p[1], q.p[2]); if (S.draw.cursor && !S.draw.preview) f.push(...S.draw.cursor);
       view.setRibbons('draw', [{ pts: f, color: CFG.colors.draw }], { width: CFG.sizes.draw, order: 6, noHidden: true });
+      if (S.draw.preview) view.setRibbons('drawPreview', [{ pts: S.draw.preview.flat(), color: CFG.colors.hover }], { width: CFG.sizes.draw, order: 6.2, noHidden: true }); else view.clearLayer('drawPreview');   // 29 October 2026 : where the curve will go
       view.setPoints('drawPts', S.draw.pts.map((q) => ({ p: q.p, color: CFG.colors.draw, size: CFG.sizes.drawPt })), { onTop: true, order: 7 });
-    } else { view.clearLayer('draw'); view.clearLayer('drawPts'); }
+    } else { view.clearLayer('draw'); view.clearLayer('drawPts'); view.clearLayer('drawPreview'); }
     if (S.patch && S.patch.length) view.setPoints('patchPts', S.patch.map((q) => ({ p: q.p, color: CFG.colors.draw, size: CFG.sizes.drawPt + 2 })), { onTop: true, order: 7 }); else view.clearLayer('patchPts');
     view.st.showMesh = $('pModel').checked; view.st.xray = $('pXray').checked; view.st.showHidden = $('pHidden').checked;
     view.setVisible('mesh', $('pMesh').checked); view.setVisible('meshFill', $('pMesh').checked);
+    const ib = $('isoBadge'); if (ib) { ib.hidden = !S.isolated; if (S.isolated) ib.textContent = 'Isolated : ' + ((S.isoPart != null ? (view.st.mesh.head.parts[S.isoPart] || '') : (S.comp || '')).replace(CFG.labels.strip, '') || 'a part') + '  \u2715  show everything'; }   // 29 October 2026 : a sign while something is isolated, one click ends it
     view.draw(); updateInfo();
-    document.title = (S.dirty ? '* ' : '') + 'ZenRay Lines 3D';
+    updateSaveUI();
   }
   let rafPending = false, rebuild = true;
   // 29 October 2026 : a camera move only redraws (layers kept) ; an edit rebuilds the layers once per frame
@@ -78,7 +113,7 @@
   function visible(p, sd) { return d3(p, view.st.eye) <= sd + CFG.pick.hiddenTolM; }
   function pickHandle(x, y, sd) {
     let best = null, bd = CFG.pick.handlePx;
-    for (const id of S.sel) { const a = model.arc(id); if (!a) continue; a.ctrl.forEach((p, i) => { const q = view.project(p); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd) { bd = d; best = { arc: id, i }; } }); }
+    if (S.sel.size !== 1) return null; for (const id of S.sel) { const a = model.arc(id); if (!a) continue; a.ctrl.forEach((p, i) => { const q = view.project(p); const d = Math.hypot(q[0] - x, q[1] - y); if (d < bd) { bd = d; best = { arc: id, i }; } }); }
     return best;
   }
   function pickNode(x, y, sd, px, ignore) {
@@ -185,7 +220,7 @@
   async function useModel() {
     const obj = ($('modelPath').value || '').trim(); if (!obj) return status('Type the path of the model (.obj) first.');
     status('Loading ' + obj + ' : reference, views and sheet...');
-    const r = await fetch(CFG.files.model, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ obj, views: $('pModelViews').checked }) });
+    const r = await fetch(CFG.files.model, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ obj, views: $('pModelViews').checked, project: PROJECT }) });
     const res = await r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })); if (!r.ok || res.ok === false) return status('Model failed : ' + (res.error || r.status), 'error');
     const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json', { cache: 'no-store' }).then((x) => x.json()), fetch(CFG.files.ref + '.bin', { cache: 'no-store' }).then((x) => x.arrayBuffer())]);
     view.setMesh(head, buf); refGrid = null; loadSheetPlanes(); if (res.obj === 'v752') delete model.doc.model_ref; else model.doc.model_ref = res.obj;   // 29 October 2026 : 'original' goes back to the validated car
@@ -349,13 +384,16 @@
   // 29 October 2026 : ISOLATE a component of the model : only that part is drawn and picked, framed ; what is drawn lands on it. U toggles : over a part,
   // that part ; else the selected component of the list (isolateComp) ; isolated already, everything comes back. The Isolate tool does it by a click.
   // FR : isoler une pièce du modèle pour dessiner dessus ; U bascule, Maj H montre tout.
+  function frameBox(lo, hi) {   // the box whole in the view, with a margin
+    const r = 0.5 * d3(lo, hi), t = Math.tan(view.CFG.fov * Math.PI / 360) * Math.min(1, view.st.W / view.st.H); view.cam.target = V.mul(V.add(lo, hi), 0.5); view.cam.dist = Math.max(view.CFG.minDist, CFG.isolate.fit * r / t);
+  }
   function isolatePart(part) {
     if (part == null || part < 0) return status('No part of the model there.'); const st = view.st, nm = (st.mesh.head.parts[part] || 'part ' + part).replace(CFG.labels.strip, '');
-    view.isolateParts([part]); S.isolated = true; S.isoPart = part; const a = st.anchors.find((q) => q.part === part);
-    if (a) { const r = 0.5 * d3(a.lo, a.hi), t = Math.tan(view.CFG.fov * Math.PI / 360) * Math.min(1, st.W / st.H); view.cam.target = V.mul(V.add(a.lo, a.hi), 0.5); view.cam.dist = Math.max(view.CFG.minDist, CFG.isolate.fit * r / t); }   // the whole part in the view, with a margin
+    pushView(); view.isolateParts([part]); S.isolated = true; S.isoPart = part; const a = st.anchors.find((q) => q.part === part);
+    if (a) frameBox(a.lo, a.hi);   // the whole part in the view, with a margin
     redraw(); status(nm + ' isolated : draw on it ; U or Shift H shows everything.');
   }
-  function showEverything() { view.showAllParts(); S.isolated = false; S.isoPart = null; $('pSolo').checked = false; status('Every part shown.'); redraw(true); }
+  function showEverything() { view.showAllParts(); view.st.hiPart = -1; S.isolated = false; S.isoPart = null; $('pSolo').checked = false; status('Every part shown.'); redraw(true); }
   function isolateToggle() {
     if (S.isolated) return showEverything();
     const h = S.mouse ? view.pickSurface(S.mouse[0], S.mouse[1]) : null; if (h) return isolatePart(h.part);
@@ -366,23 +404,24 @@
   // them disappears ; with Mirror on, their mirror points merge too (unless the two points are each other's mirror : then they meet on x = 0).
   // FR : fusionner deux points des courbes en leur milieu, mêmes coordonnées exactement ; les courbes suivent sans changer de forme.
   async function closestOnModel(p) { const r = await fetch(CFG.files.autoPatch, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'closest', p, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null); return r && r.ok ? r.p : p; }
+  // 29 October 2026 : the merge of two points, shared by the Merge tool, the selection card and the automatic merge of close points
+  function pinArcEnds(arc) { const n = arc.ctrl.length;
+    for (const [nid, i] of [[arc.a, 0], [arc.b, n - 1]]) { const nd = model.node(nid); if (!nd) continue; const d = V.sub(nd.p, arc.ctrl[i]); if (V.len(d) < 1e-9) continue;
+      arc.ctrl = arc.ctrl.map((q, k) => V.add(q, V.mul(d, n > 1 ? Math.max(0, 1 - Math.abs(k - i) / (n - 1)) : 1))); }
+    model.touch(arc.id); }
+  function mergeNodePair(keep, gone, p) {
+    if (keep == null || gone == null || keep === gone || !model.node(keep) || !model.node(gone)) return false; const polyLen = (c) => c.reduce((t, q, i) => (i ? t + d3(q, c[i - 1]) : 0), 0);
+    for (const arc of model.doc.arcs) { let t = false; if (arc.a === gone) { arc.a = keep; t = true; } if (arc.b === gone) { arc.b = keep; t = true; } if (t) model.touch(arc.id); }
+    const cf = model.doc.corners_force; if (cf && cf[gone] !== undefined) { if (cf[keep] === undefined) cf[keep] = cf[gone]; delete cf[gone]; }
+    model.doc.nodes = model.doc.nodes.filter((n) => n.id !== gone); model.nodeMap.delete(gone); model.node(keep).p = clone3(p);
+    const tiny = model.nodeArcs(keep).filter((x) => x.a === x.b && polyLen(x.ctrl) < 2 * CFG.edit.nodeMergeM).map((x) => x.id); if (tiny.length) removeArcIds(tiny);
+    for (const arc of model.nodeArcs(keep)) pinArcEnds(arc); return true;
+  }
   async function mergeNodes(a, b) {
     const na = model.node(a), nb = model.node(b); if (!na || !nb || a === b) return status('Two different points are needed.');
     const gap = d3(na.p, nb.p), mid0 = V.mul(V.add(na.p, nb.p), 0.5), mid = P().snap ? await closestOnModel(mid0) : mid0;
     const ma = P().mirror ? model.nodeMirror.get(a) : null, mb = P().mirror ? model.nodeMirror.get(b) : null, pairOfMirrors = ma === b && mb === a;
-    const pinEnds = (arc) => { const n = arc.ctrl.length;
-      for (const [nid, i] of [[arc.a, 0], [arc.b, n - 1]]) { const nd = model.node(nid); if (!nd) continue; const d = V.sub(nd.p, arc.ctrl[i]); if (V.len(d) < 1e-9) continue;
-        arc.ctrl = arc.ctrl.map((q, k) => V.add(q, V.mul(d, n > 1 ? Math.max(0, 1 - Math.abs(k - i) / (n - 1)) : 1))); }
-      model.touch(arc.id); };
-    const polyLen = (c) => c.reduce((t, q, i) => (i ? t + d3(q, c[i - 1]) : 0), 0);
-    const doMerge = (keep, gone, p) => {
-      if (keep == null || gone == null || keep === gone || !model.node(keep) || !model.node(gone)) return false;
-      for (const arc of model.doc.arcs) { let t = false; if (arc.a === gone) { arc.a = keep; t = true; } if (arc.b === gone) { arc.b = keep; t = true; } if (t) model.touch(arc.id); }
-      const cf = model.doc.corners_force; if (cf && cf[gone] !== undefined) { if (cf[keep] === undefined) cf[keep] = cf[gone]; delete cf[gone]; }
-      model.doc.nodes = model.doc.nodes.filter((n) => n.id !== gone); model.nodeMap.delete(gone); model.node(keep).p = clone3(p);
-      const tiny = model.nodeArcs(keep).filter((x) => x.a === x.b && polyLen(x.ctrl) < 2 * CFG.edit.nodeMergeM).map((x) => x.id); if (tiny.length) removeArcIds(tiny);
-      for (const arc of model.nodeArcs(keep)) pinEnds(arc); return true;
-    };
+    const doMerge = mergeNodePair;
     edit('Points merged in their middle', () => {
       doMerge(a, b, pairOfMirrors ? [0, mid[1], mid[2]] : mid);
       if (!pairOfMirrors && ma != null && mb != null && ma !== mb && ma !== a && mb !== b) doMerge(ma, mb, mir(mid));
@@ -493,6 +532,44 @@
     if (!S.sel.size) return status('Select curves first.');
     edit('Projected on the surface (visible control points)', () => forSel((a) => { a.ctrl = a.ctrl.map((p) => { const q = view.project(p); const h = view.pickSurface(q[0], q[1]); return h && d3(h.p, p) < 0.1 ? h.p : p; }); }));
   }
+  // 29 October 2026 : STRAIGHTEN, DUPLICATE, CONNECT : each puts its new control points back on the surface (POST /auto_patch op closest, many points at once), one undo step each
+  // FR : redresser, dupliquer, relier : les nouveaux points de contrôle reviennent sur la surface, une seule étape d'annulation.
+  async function closestMany(pts) {
+    const r = await fetch(CFG.files.autoPatch, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'closest', pts, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    return r && r.ok && r.pts && r.pts.length === pts.length ? r.pts : pts;
+  }
+  const lerp3 = (A, B, t) => [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
+  const chord = (A, B, n) => Array.from({ length: n }, (_, k) => lerp3(A, B, k / (n - 1)));
+  const endsOf = (a) => [(model.node(a.a) || {}).p || a.ctrl[0], (model.node(a.b) || {}).p || a.ctrl[a.ctrl.length - 1]];
+  async function straightenSel() {
+    if (!S.sel.size) return status('Select a curve first.'); const ids = new Set(); for (const id of S.sel) { ids.add(id); const m = mirrorArcOf(id); if (P().mirror && m) ids.add(m.id); }
+    const items = [...ids].map((id) => model.arc(id)).filter(Boolean).map((a) => { const [A, B] = endsOf(a), n = Math.max(CFG.edit.minCtrl, Math.min(a.ctrl.length, 8)); return { a, pts: chord(A, B, n) }; });
+    const flat = await closestMany(items.flatMap((it) => it.pts)); let k = 0;
+    edit('Curves straightened', () => { for (const it of items) { const q = flat.slice(k, k += it.pts.length); q[0] = clone3(endsOf(it.a)[0]); q[q.length - 1] = clone3(endsOf(it.a)[1]); it.a.ctrl = q.map(clone3); model.touch(it.a.id); } });
+    status(items.length + ' curve(s) straightened between their ends and put on the surface.');
+  }
+  async function duplicateSel() {
+    if (!S.sel.size) return status('Select a curve first.'); const f = V.norm(V.sub(view.cam.target, view.st.eye)), off = V.mul(V.norm(V.cross(f, [0, 1, 0])), Math.max(0.01, 0.04 * view.cam.dist)), done = new Set(), items = [];
+    for (const id of S.sel) { if (done.has(id)) continue; const a = model.arc(id); if (!a) continue; done.add(id); const m = P().mirror ? mirrorArcOf(id) : null; items.push({ a, mate: m && !done.has(m.id) ? m : null }); if (m) done.add(m.id); }
+    const pts = items.flatMap((it) => it.a.ctrl.map((q) => V.add(q, off)).concat(it.mate ? it.mate.ctrl.map((q) => V.add(q, mir(off))) : []));
+    const flat = await closestMany(pts); let k = 0, created = [];
+    edit('Curves duplicated', () => {
+      const make = (src, pr) => { const c = pr.map(clone3), na = addNode(c[0]), nb = addNode(c[c.length - 1]); return addArc(na, nb, c, (src.pair || ['', '']).slice()); };
+      for (const it of items) { const A = make(it.a, flat.slice(k, k += it.a.ctrl.length)); created.push(A.id); if (it.mate) { const B = make(it.mate, flat.slice(k, k += it.mate.ctrl.length)); A.mirror = B.id; B.mirror = A.id; created.push(B.id); } }
+      S.sel = new Set(created); S.node = null; S.handle = null;
+    });
+    status(created.length + ' curve(s) duplicated next to the originals : drag them where they belong.');
+  }
+  async function connectNodes() {
+    const ns = [...S.nodes]; if (ns.length !== 2) return status('Select two points first.'); const [a, b] = ns, A = model.node(a).p, B = model.node(b).p;
+    const ma = P().mirror ? model.nodeMirror.get(a) : null, mb = P().mirror ? model.nodeMirror.get(b) : null, both = ma != null && mb != null && ma !== a && mb !== b && !(ma === b);
+    const pts = chord(A, B, 5).concat(both ? chord(model.node(ma).p, model.node(mb).p, 5) : []), flat = await closestMany(pts);
+    edit('Two points connected', () => { const c1 = flat.slice(0, 5).map(clone3); c1[0] = clone3(A); c1[4] = clone3(B); const arc = addArc(a, b, c1, ['', ''] );
+      if (both) { const c2 = flat.slice(5).map(clone3); c2[0] = clone3(model.node(ma).p); c2[4] = clone3(model.node(mb).p); const m = addArc(ma, mb, c2, ['', '']); m.mirror = arc.id; arc.mirror = m.id; }
+      S.sel = new Set([arc.id]); S.node = null; });
+    status('Connected with a straight curve on the surface' + (both ? ', and its mirror' : '') + '.');
+  }
+  function mergeSelected() { const ns = [...S.nodes]; if (ns.length !== 2) return status('Select two points first.'); safe(mergeNodes)(ns[0], ns[1]); }
   function joinAtNode(nodeId) {
     const doJoin = (nid) => {
       const arcs = model.nodeArcs(nid); if (arcs.length !== 2 || arcs[0] === arcs[1]) return false;
@@ -589,14 +666,30 @@
     const mirrored = P().mirror && Math.abs(r.seed[0]) > 3 * CFG.edit.centreSnapM;
     status((r.ring ? 'Ring ' + name + ' : ' + r.patches.length + ' four sided patches sharing their seams, around ' : 'Patch ' + name + ' : contour of ') + r.report.part.replace(/^CAR_/, '') + ' followed within ' + r.report.fit_dev_mm + ' mm (' + r.report.triangles + ' triangles, ' + r.report.perimeter_m + ' m round)' + (mirrored ? ', mirrored as ' + mirrorName(name) : '') + '.');
   }
+  // 29 October 2026 : VIEW HISTORY and the way home. Every view change (preset, frame, isolate, the start of a turn or a zoom) is remembered ; the Back
+  // and Forward arrows (keys [ and ]) go through them, Home (key Home) goes to the normal view : perspective, the whole model framed, nothing isolated.
+  // FR : historique des vues (flèches Retour et Avance) et retour à la vue normale en un clic ; plus besoin de recharger l'application.
+  const VH = { back: [], fwd: [], lastWheel: 0 }, sameView = (a, b) => a && b && Math.abs(a.yaw - b.yaw) + Math.abs(a.pitch - b.pitch) < 1e-4 && Math.abs(a.dist - b.dist) < 1e-4 * (1 + a.dist) && d3(a.target, b.target) < 1e-5 && a.ortho === b.ortho;
+  function navButtons() { for (const [id, list] of [['bViewBack', VH.back], ['bViewFwd', VH.fwd]]) if ($(id)) $(id).disabled = !list.length; if ($('bOrtho')) $('bOrtho').classList.toggle('on', view.cam.ortho); }
+  function markPreset(name) { document.querySelectorAll('#viewSeg .btn').forEach((b) => b.classList.toggle('active', b.dataset.view === name)); }   // the view button lit while the camera is exactly on it
+  function pushView() { const cur = view.snapshot(); if (sameView(VH.back[VH.back.length - 1], cur)) return; VH.back.push(cur); if (VH.back.length > 80) VH.back.shift(); VH.fwd = []; navButtons(); }
+  function viewBack() { if (!VH.back.length) return status('No earlier view.'); VH.fwd.push(view.snapshot()); view.restore(VH.back.pop()); markPreset(null); navButtons(); redraw(true); }
+  function viewForward() { if (!VH.fwd.length) return status('No later view.'); VH.back.push(view.snapshot()); view.restore(VH.fwd.pop()); markPreset(null); navButtons(); redraw(true); }
+  function setPreset(name) { pushView(); view.preset(name); markPreset(name); navButtons(); status({ persp: 'Perspective', front: 'Front', back: 'Back', left: 'Left', right: 'Right', top: 'Top', bottom: 'Bottom' }[name] + ' view, the whole model framed.'); redraw(true); }
+  function normalView() {
+    pushView(); if (S.isolated) showEverything(); if (view.st.mesh) view.showAllParts(); view.cam.ortho = false; view.preset('persp'); markPreset('persp'); setShow('both', true); navButtons();
+    status('Normal view : perspective, the whole model, nothing isolated.'); redraw(true);
+  }
   // 29 October 2026 : SWAP between the reference sheet and the current 3D model : model only, sheet only (seen from any angle), or both
-  const SHOW_MODES = ['model', 'reference', 'both'];
-  function setShow(mode) {
-    S.show = mode; const ref = mode !== 'model', mod = mode !== 'reference';
-    $('pModel').checked = mod; $('pSheet').checked = ref; view.st.showMesh = mod; view.st.showPlanes = ref; view.st.planesAlways = mode === 'reference';
+  const SHOW_MODES = ['model', 'quads', 'reference', 'both'];
+  function setShow(mode, silent) {
+    const prev = S.show; S.show = mode; const quads = mode === 'quads', ref = mode === 'reference' || mode === 'both', mod = mode !== 'reference';
+    $('pModel').checked = mod; $('pSheet').checked = ref; view.st.showMesh = mod; view.st.showPlanes = ref; view.st.planesAlways = mode === 'reference'; view.st.ghost = quads ? CFG.topo.ghost : null;
+    if (quads) { $('pMesh').checked = true; $('pLiveMesh').checked = true; } else if (prev === 'quads') $('pLiveMesh').checked = false;   // the quads view keeps the topology live, the others do not convert by themselves
+    if (quads || prev === 'quads') { if (S.mesh) buildMeshLayers(); if (quads) safe(ensureMesh)(); }
     document.querySelectorAll('#showSwitch .btn').forEach((b) => b.classList.toggle('active', b.dataset.show === mode));
     const sheets = Object.values(view.st.planes).filter((p) => p.ready).length;
-    status(mode === 'model' ? 'Showing the current 3D model.' : (sheets ? (mode === 'reference' ? 'Showing the reference sheet (' + sheets + ' views), from any angle.' : 'Showing the 3D model over the reference sheet (aligned views).') : 'No reference sheet for this model : run ZrlSheetViews.py, or Use this model with the views ticked.'));
+    if (!silent) status(quads ? 'Quads view : the topology of your curves, kept up to date as you edit.' : mode === 'model' ? 'Showing the current 3D model.' : (sheets ? (mode === 'reference' ? 'Showing the reference sheet (' + sheets + ' views), from any angle.' : 'Showing the 3D model over the reference sheet (aligned views).') : 'No reference sheet for this model : run ZrlSheetViews.py, or Use this model with the views ticked.'));
     redraw(true); view.draw();
   }
   // 29 October 2026 : SHADING : grey, or each component of the model in its own colour (the converted quads then take their component's colour too)
@@ -632,29 +725,150 @@
     return r;
   }
   function creasesLater() { if ($('pShowCreases') && $('pShowCreases').checked) { clearTimeout(creaseTimer); creaseTimer = setTimeout(safe(showCreases), 400); } }
+  // 29 October 2026 : DRAW with the fewest gestures. A click places a point ; a drag draws a stroke (simplified to a few points) ; ending on a point or a curve finishes the curve ;
+  // with "Lock curves onto creases" the server joins the points along the folds, and keeps that only when the path really lies on a crease (else your points stay).
+  function drawClick(x, y, shift) {
+    if (!S.draw) S.draw = { pts: [] }; if (S.drawBusy) return;
+    const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
+    const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y), ends = (n !== null || !!a) && S.draw.pts.length >= 1 && !shift;
+    const add = (pt, note) => { S.draw.pts.push(pt); S.draw.preview = null; status('Point ' + S.draw.pts.length + note + (ends ? ' : curve finished' : '')); redraw(); if (ends) finishDraw(); };
+    if (n === null && !a && p) { snapToContour(p).then((q) => { if (!S.draw) S.draw = { pts: [] }; add({ p: q.p, node: null, arc: null }, q.snapped ? ' on a contour of the mesh (' + q.moved_mm + ' mm)' : ''); }); return; }
+    add({ p, node: n, arc: a ? a.id : null }, n !== null ? ' on node ' + n : a ? ' on curve ' + a.id : '');
+  }
+  // 29 October 2026 : LIVE PREVIEW : when the mouse rests, the path the curve will take from the last point to the cursor is shown in blue (along the creases), before any click
+  function lockVerdict(r, poly, checkReach) {   // is a crease path acceptable for what was drawn ? (a crease share is not enough : a path can detour along other creases)
+    const o = autoOpts(), len = (a) => a.reduce((t, p, i) => t + (i ? d3(p, a[i - 1]) : 0), 0);
+    if (r.crease_share < o.creaseMinPct / 100) return { ok: false, why: 'only ' + Math.round(100 * r.crease_share) + ' % of the path lies on a crease, under the ' + o.creaseMinPct + ' % needed' };
+    const ratio = len(r.pts) / Math.max(len(poly), 1e-6); if (ratio > CFG.draw.lockLenRatio) return { ok: false, why: 'the crease path is ' + ratio.toFixed(1) + ' times longer than what you drew' };
+    if (checkReach) { let dev = 0; for (const p of poly) { let mn = 9; for (const z of r.pts) { const d = d3(p, z); if (d < mn) mn = d; } if (mn > dev) dev = mn; } if (dev > o.lockReachMm / 1000) return { ok: false, why: 'the crease runs ' + Math.round(dev * 1000) + ' mm from your stroke, over the ' + o.lockReachMm + ' mm reach' }; }
+    return { ok: true, why: '' };
+  }
+  function previewCreaseLater() {
+    if (!$('pCrease') || !$('pCrease').checked || !S.draw || !S.draw.pts.length || S.drawBusy) return;
+    clearTimeout(S.pvTimer);
+    S.pvTimer = setTimeout(async () => {
+      const D = S.draw; if (!D || !D.pts.length || !D.cursor || S.pvBusy || S.drawBusy) return; S.pvBusy = true;
+      try {
+        const last = D.pts[D.pts.length - 1].p, cur = D.cursor;
+        const r = await fetch(CFG.files.creasePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pts: [last, cur], view: viewAxes(), ref: modelRef() || undefined, ctrl_step_m: CFG.draw.ctrlStepM }) }).then((x) => x.json()).catch(() => null);
+        if (!r || !r.pts || S.draw !== D || D.cursor !== cur) return;                       // the mouse moved on, or the curve changed : this answer is stale
+        const v = lockVerdict(r, [last, cur], false); D.preview = v.ok ? r.pts : null; redraw();
+        status(v.ok ? 'Blue : the curve will follow a crease (' + Math.round(100 * r.crease_share) + ' %). Click to place the point.' : 'No crease kept here (' + v.why + ') : the curve will follow your points.');
+      } finally { S.pvBusy = false; }
+    }, CFG.draw.previewMs);
+  }
+  function applyStyle(name) {
+    const st = CFG.styles[name]; if (!st) return;
+    for (const [k, v] of Object.entries(st)) { const el = $(AUTO_IDS[k]); if (!el) continue; el.value = v; el.dispatchEvent(new Event('input')); }
+    try { localStorage.setItem('zrl.style', name); } catch (e) { /* ignored */ }
+    status(name === 'organic' ? 'Organic style : more, smaller zones, tighter welds, a crease is trusted only when sure (loops around eyes, mouth and joints).' : 'Hard surface style : big zones, long straight creases, looser welds.');
+  }
+  function strokeMove(D, x, y) {
+    if (!D.started) { if (Math.hypot(x - D.x, y - D.y) < CFG.pick.dragStartPx) return; D.started = true; D.last = [D.x, D.y]; D.raw = [surfacePoint(D.x, D.y)]; }
+    if (Math.hypot(x - D.last[0], y - D.last[1]) < CFG.draw.strokeStepPx) return;
+    D.last = [x, y]; D.raw.push(surfacePoint(x, y)); S.draw = { pts: D.base.concat(D.raw.map((p) => ({ p }))) }; redraw();
+  }
+  function simplifyStroke(pts, tol) {   // Ramer-Douglas-Peucker in 3D
+    const keep = new Array(pts.length).fill(false); keep[0] = keep[pts.length - 1] = true;
+    const rec = (i, j) => { let m = -1, md = tol; const a = pts[i], ab = V.sub(pts[j], a), l2 = V.dot(ab, ab) || 1e-12;
+      for (let k = i + 1; k < j; k++) { const t = Math.max(0, Math.min(1, V.dot(V.sub(pts[k], a), ab) / l2)), d = d3(pts[k], V.add(a, V.mul(ab, t))); if (d > md) { md = d; m = k; } }
+      if (m >= 0) { keep[m] = true; rec(i, m); rec(m, j); } };
+    rec(0, pts.length - 1); return pts.filter((_, i) => keep[i]);
+  }
+  function resampleEven(pts, step) {   // 29 October 2026 : a stroke kept as drawn : control points evenly spaced along it (a B-spline through them stays within a fraction of a millimetre), never the corners of a simplified polyline
+    const L = [0]; for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + d3(pts[i], pts[i - 1])); const n = Math.max(4, Math.round(L[L.length - 1] / step) + 1), out = [];
+    for (let k = 0; k < n; k++) { const t = L[L.length - 1] * k / (n - 1); let j = 1; while (j < L.length - 1 && L[j] < t) j++; const u = (t - L[j - 1]) / ((L[j] - L[j - 1]) || 1); out.push(pts[j - 1].map((v, c) => v + u * (pts[j][c] - v))); }
+    return out;
+  }
+  function strokeEnd(D, x, y) {
+    if (!D.started) { drawClick(D.x, D.y, D.shift); return; }
+    if (S.drawBusy || D.raw.length < 2) { S.draw = { pts: D.base }; redraw(); return; }
+    const pts = simplifyStroke(D.raw, CFG.draw.lockTolM), fallback = D.base.map((q) => q.p).concat(resampleEven(D.raw, CFG.draw.ctrlStepM));   // few anchors for the crease lock (it must be free to follow the fold), the whole stroke as the fallback
+    const endAt = (px, py, p) => { const sd = surfaceDist(px, py), n = pickNode(px, py, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(px, py, sd, CFG.pick.snapArcPx) : null; return n !== null ? { p: clone3(model.node(n).p), node: n, arc: null } : a ? { p: a.p, node: null, arc: a.id } : { p, node: null, arc: null }; };
+    const out = pts.map((p) => ({ p, node: null, arc: null })); out[0] = endAt(D.x, D.y, pts[0]); out[out.length - 1] = endAt(x, y, pts[pts.length - 1]);
+    S.draw = { pts: D.base.concat(out), fallback }; status('Stroke : ' + out.length + ' anchors, ' + fallback.length + ' control points if no crease is under it'); finishDraw();
+  }
   async function finishDraw() {
-    const D = S.draw; if (!D || D.pts.length < 2) { S.draw = { pts: [] }; redraw(); return status('A curve needs at least two points.'); }   // 29 October 2026 : the tool stays usable (null broke every later click)
-    let follow = null;                                                // 29 October 2026 : with "follow the creases", the server joins the clicks along the valleys
-    if ($('pCrease') && $('pCrease').checked) {
-      status('Following the creases between the ' + D.pts.length + ' points ...');
-      const r = await fetch(CFG.files.creasePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pts: D.pts.map((q) => q.p), view: viewAxes(), ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
-      if (r && r.ctrl && r.ctrl.length >= 2) follow = r; else status('The crease path failed : the clicked points are kept.');
-    }
-    edit('Curve drawn', () => {
-      const endNode = (q) => { if (q.node != null) return q.node; if (q.arc != null && model.arc(q.arc)) return splitArcAt(q.arc, q.p, P().mirror).node; return addNode(q.p); };
-      const a = endNode(D.pts[0]), b = endNode(D.pts[D.pts.length - 1]);
-      const ctrl = (follow ? follow.ctrl : D.pts.map((q) => q.p)).map(clone3); ctrl[0] = clone3(model.node(a).p); ctrl[ctrl.length - 1] = clone3(model.node(b).p);
-      const arc = addArc(a, b, ctrl, ['', '']);
-      const side = ctrl.every((p) => p[0] > 0.01) || ctrl.every((p) => p[0] < -0.01);
-      if (P().mirror && side) {
-        model.buildNodeMirror();
-        const mnode = (nid) => { const m = model.nodeMirror.get(nid); if (m != null && m !== nid) return m; const p = mir(model.node(nid).p); const ex = model.doc.nodes.find((n) => d3(n.p, p) < CFG.edit.nodeMergeM); return ex ? ex.id : addNode(p); };
-        const ma = mnode(a), mb = mnode(b), mc = arc.ctrl.map(mir); mc[0] = clone3(model.node(ma).p); mc[mc.length - 1] = clone3(model.node(mb).p);
-        const m = addArc(ma, mb, mc, ['', '']); m.mirror = arc.id; arc.mirror = m.id;
+    const D = S.draw; if (S.drawBusy) return;
+    if (!D || D.pts.length < 2) { S.draw = { pts: [] }; redraw(); return status('A curve needs at least two points.'); }
+    S.drawBusy = true; let follow = null, note = '';
+    try {
+      if ($('pCrease') && $('pCrease').checked) {
+        status('Locking the curve onto the creases ...');
+        const r = await fetch(CFG.files.creasePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pts: D.pts.map((q) => q.p), view: viewAxes(), ref: modelRef() || undefined, ctrl_step_m: CFG.draw.ctrlStepM }) }).then((x) => x.json()).catch(() => null);
+        if (r && r.ctrl && r.ctrl.length >= 2) { const v = lockVerdict(r, D.fallback || D.pts.map((q) => q.p), !!D.fallback); if (v.ok) follow = r; else note = ' (' + v.why + ' : ' + (D.fallback ? 'your stroke is kept' : 'your points are kept') + ')'; }
+        else note = ' (the crease path failed : your points are kept)';
       }
-      S.sel = new Set([arc.id]); S.draw = { pts: [] };   // 29 October 2026 : ready for the next curve
+      edit('Curve drawn', () => {
+        const endNode = (q) => { if (q.node != null) return q.node; if (q.arc != null && model.arc(q.arc)) return splitArcAt(q.arc, q.p, P().mirror).node; return addNode(q.p); };
+        const a = endNode(D.pts[0]), b = endNode(D.pts[D.pts.length - 1]);
+        const ctrl = (follow ? follow.ctrl : (D.fallback || D.pts.map((q) => q.p))).map(clone3); ctrl[0] = clone3(model.node(a).p); ctrl[ctrl.length - 1] = clone3(model.node(b).p);
+        const arc = addArc(a, b, ctrl, ['', '']);
+        const side = ctrl.every((p) => p[0] > 0.01) || ctrl.every((p) => p[0] < -0.01);
+        if (P().mirror && side) {
+          model.buildNodeMirror();
+          const mnode = (nid) => { const m = model.nodeMirror.get(nid); if (m != null && m !== nid) return m; const p = mir(model.node(nid).p); const ex = model.doc.nodes.find((n) => d3(n.p, p) < CFG.edit.nodeMergeM); return ex ? ex.id : addNode(p); };
+          const ma = mnode(a), mb = mnode(b), mc = arc.ctrl.map(mir); mc[0] = clone3(model.node(ma).p); mc[mc.length - 1] = clone3(model.node(mb).p);
+          const m = addArc(ma, mb, mc, ['', '']); m.mirror = arc.id; arc.mirror = m.id;
+        }
+        S.sel = new Set([arc.id]); S.draw = { pts: [] };   // ready for the next curve
+      });
+    } finally { S.drawBusy = false; }
+    status(follow ? 'Curve drawn along the creases : ' + Math.round(100 * follow.crease_share) + ' % of its length on a crease, ' + follow.ctrl.length + ' control points.' : 'Curve drawn' + note);
+  }
+  // 29 October 2026 : TRACE THE CREASES : every crease of the model, seen from 18 directions, becomes a curve (server, ZrlCreaseNet.py) ; what already carries a curve is skipped, the left and right
+  // curves stay linked, one undo removes all. The geometry gives the lines : what remains is to close them into components.
+  async function traceCreases() {
+    if (S.tracing) return; S.tracing = true; const t0 = performance.now(); status('Tracing the creases of the model from 18 directions ...');
+    const r = await fetch(CFG.files.creaseNet, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    S.tracing = false; if (!r || !r.ok || !r.doc) return status('Crease tracing failed : ' + ((r && r.error) || 'no answer'), 'error');
+    const cell = 0.006, key = (p) => Math.floor(p[0] / cell) + ',' + Math.floor(p[1] / cell) + ',' + Math.floor(p[2] / cell), have = new Set();
+    for (const a of model.doc.arcs) { const sm = arcPts(a.id); for (let i = 0; i < sm.length; i += 3) have.add(key([sm[i], sm[i + 1], sm[i + 2]])); }
+    const near = (p) => { for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) if (have.has(key([p[0] + a * cell, p[1] + b * cell, p[2] + c * cell]))) return true; return false; };
+    const doc = r.doc, nodeMap = new Map(), arcMap = new Map(); let added = 0, skipped = 0;
+    edit('Creases traced : ' + doc.arcs.length + ' curves found', () => {
+      const nodeFor = (id) => { if (nodeMap.has(id)) return nodeMap.get(id); const p = doc.nodes.find((n) => n.id === id).p; let best = null, bd = CFG.edit.nodeMergeM * 2; for (const n of model.doc.nodes) { const d = d3(n.p, p); if (d < bd) { bd = d; best = n.id; } } const nid = best !== null ? best : addNode(p); nodeMap.set(id, nid); return nid; };
+      for (const a of doc.arcs) {
+        const sm = []; const n = a.ctrl.length; for (let k = 0; k < n; k++) sm.push(a.ctrl[k]);
+        const covered = sm.filter(near).length / sm.length; if (covered > 0.8) { skipped++; continue; }
+        const na = nodeFor(a.a), nb = nodeFor(a.b); if (na === nb) { skipped++; continue; }
+        const ctrl = a.ctrl.map(clone3); ctrl[0] = clone3(model.node(na).p); ctrl[ctrl.length - 1] = clone3(model.node(nb).p); const arc = addArc(na, nb, ctrl, ['', '']); arcMap.set(a.id, arc.id); added++;
+      }
+      for (const a of doc.arcs) { const m = arcMap.get(a.id), o = a.mirror >= 0 ? arcMap.get(a.mirror) : undefined; if (m !== undefined && o !== undefined && model.arc(m).mirror < 0) { model.arc(m).mirror = o; model.arc(o).mirror = m; } }
+      S.sel = new Set(arcMap.values());
     });
-    if (follow) status('Curve drawn along the creases : ' + Math.round(100 * follow.crease_share) + ' % of its length on a crease, ' + follow.ctrl.length + ' control points.');
+    status('Creases traced in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + added + ' curves added (' + skipped + ' skipped, already drawn or degenerate), all selected. Close them into components with the Draw tool, Cmd Z removes them all.');
+    return { added, skipped };
+  }
+  // 29 October 2026 : SNAP TO CREASES : each selected curve (else every curve seen from this camera) is joined again along the creases between a few of its own points ; kept only when it
+  // lies on a crease and stays within the set distance of where it was, so a good curve is never spoiled. Look at the part from the front first : the folds are read as the camera sees them.
+  async function snapToCreases() {
+    if (S.snapBusy) return; const o = autoOpts(), w = cv().clientWidth, h = cv().clientHeight, buf = view.pickRect(0, 0, w, h), eye = view.st.eye;
+    const seen = (p) => { const q = view.project(p); if (!(q[3] > 0 && q[0] >= 0 && q[0] <= w && q[1] >= 0 && q[1] <= h)) return false; const sp = buf.at(q[0], q[1]); return !!sp && d3(p, eye) <= d3(sp, eye) + CFG.pick.hiddenTolM; };
+    const wholeModel = !S.sel.size; let ids = wholeModel ? model.doc.arcs.map((a) => a.id) : [...S.sel]; const done = new Set(), acc = [], skipped = { hidden: 0, off: 0, far: 0, same: 0, failed: 0 };
+    S.snapBusy = true;
+    try {
+      let k = 0;
+      for (const id of ids) {
+        if (done.has(id) || !model.arc(id)) continue; done.add(id); const m0 = mirrorArcOf(id); if (m0 && P().mirror) done.add(m0.id);
+        const s = model.samples(id), pts = []; for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); if (pts.length < 4) continue;
+        if (pts.filter(seen).length < 0.9 * pts.length) { skipped.hidden++; continue; }
+        const n = Math.max(3, Math.min(CFG.draw.snapSamples, Math.round(model.length(id) / 0.08) + 2)), q = []; for (let j = 0; j < n; j++) q.push(pts[Math.round(j * (pts.length - 1) / (n - 1))]);
+        status('Snapping onto the creases : curve ' + (++k) + ' ...');
+        const r = await fetch(CFG.files.creasePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pts: q, view: viewAxes(), ref: modelRef() || undefined, ctrl_step_m: CFG.draw.ctrlStepM }) }).then((x) => x.json()).catch(() => null);
+        if (!r || !r.ctrl || r.ctrl.length < 2) { skipped.failed++; continue; }
+        if (r.crease_share < o.creaseMinPct / 100) { skipped.off++; continue; }
+        let dev = 0; for (const p of pts) { let mn = 1e9; for (const z of r.pts) { const d = d3(p, z); if (d < mn) mn = d; } if (mn > dev) dev = mn; }
+        if (dev > o.snapMaxMm / 1000) { skipped.far++; continue; } if (dev < 0.0005) { skipped.same++; continue; }
+        acc.push({ id, ctrl: r.ctrl, dev });
+      }
+      if (acc.length) edit('Snapped ' + acc.length + ' curve(s) onto the creases', () => { for (const { id, ctrl } of acc) {
+        const a = model.arc(id), c = ctrl.map(clone3); c[0] = clone3(a.ctrl[0]); c[c.length - 1] = clone3(a.ctrl[a.ctrl.length - 1]); a.ctrl = c; model.touch(id);
+        const m = P().mirror ? mirrorArcOf(id) : null; if (m && !acc.some((z) => z.id === m.id)) { let mc = c.map(mir); if (d3(mc[0], m.ctrl[0]) > 0.005) mc.reverse(); mc[0] = clone3(m.ctrl[0]); mc[mc.length - 1] = clone3(m.ctrl[m.ctrl.length - 1]); m.ctrl = mc; model.touch(m.id); } } });
+      const parts = []; if (skipped.same) parts.push(skipped.same + ' already on a crease'); if (skipped.off) parts.push(skipped.off + ' not on a crease'); if (skipped.far) parts.push(skipped.far + ' too far from where they were'); if (skipped.hidden) parts.push(skipped.hidden + ' not facing the camera'); if (skipped.failed) parts.push(skipped.failed + ' failed');
+      status((acc.length ? acc.length + ' curve(s) snapped onto the creases (largest move ' + Math.round(1000 * Math.max(...acc.map((z) => z.dev))) + ' mm)' : 'No curve moved') + (parts.length ? ' ; ' + parts.join(', ') : '') + (wholeModel ? ' (every curve seen from this camera)' : '') + '.');
+      return { snapped: acc.length, skipped };
+    } finally { S.snapBusy = false; }
   }
 
   // ------------------------------------------------------------------ mesh (server conversion, display, tweak, relax, export)
@@ -672,7 +886,7 @@
     return J;
   }
   function buildMeshLayers() {
-    const M = S.mesh; if (!M) { view.clearLayer('mesh'); view.clearLayer('meshFill'); return; }
+    const M = S.mesh; if (!M) { view.clearLayer('mesh'); view.clearLayer('meshFill'); renderGallery(); return; }
     const nq = M.Q.length / 4, seen = new Set(), polys = [], tri = new Uint32Array(nq * 6), col = new Float32Array(M.P.length / 3 * 4), pos = Float32Array.from(M.P);
     let bad = 0, warn = 0, Jmin = 1; const byComp = $('pCompColour') && $('pCompColour').checked, compOf = new Map((M.faces || []).map((f) => [f.id, f.component || 'face_' + f.id]));   // 29 October 2026 : fills by component, lines keep the quality colours
     for (let q = 0; q < nq; q++) {
@@ -682,7 +896,7 @@
         polys.push({ pts: [M.P[3 * a], M.P[3 * a + 1], M.P[3 * a + 2], M.P[3 * b], M.P[3 * b + 1], M.P[3 * b + 2]], color: c });
       }
       tri.set([M.Q[4 * q], M.Q[4 * q + 1], M.Q[4 * q + 2], M.Q[4 * q], M.Q[4 * q + 2], M.Q[4 * q + 3]], q * 6);
-      const fc = byComp ? hashColour(compOf.get(M.fq[q]) || 'face').slice(0, 3).concat([0.42]) : J < 0 ? CFG.colors.meshFillBad : CFG.colors.meshFill; for (let k = 0; k < 4; k++) col.set(fc, M.Q[4 * q + k] * 4);
+      const fc = (byComp ? hashColour(compOf.get(M.fq[q]) || 'face').slice(0, 3).concat([0.42]) : (J < 0 ? CFG.colors.meshFillBad : CFG.colors.meshFill)).slice(); if (S.show === 'quads') fc[3] = CFG.topo.fillAlpha; for (let k = 0; k < 4; k++) col.set(fc, M.Q[4 * q + k] * 4);
     }
     view.setRibbons('mesh', polys, { width: CFG.sizes.mesh, order: 1, noHidden: !$('pXray').checked }); view.setFill('meshFill', pos, tri, col);   // 29 October 2026 : the far side's wireframe seen through the body read as an overlap
     M.stats = { quads: nq, vertices: M.P.length / 3, folded: bad, below05: warn, jacobianMin: +Jmin.toFixed(3) };
@@ -691,14 +905,48 @@
       '\nFaces : ' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + (M.res && M.res.stats ? '\n' + JSON.stringify(M.res.stats) : '');
     redraw();
   }
+  async function ensureMesh() {   // the Quads view : convert now when the quads are missing or older than the last edit
+    if (!model.doc.arcs.length) return updateBadge('Nothing to convert yet : draw a curve or click Auto patch.');
+    if (!S.mesh || S.meshRev !== S.rev) { updateBadge('Converting to quads ...'); await convertToMesh(); }
+  }
+  function updateBadge(text) {
+    const el = $('topoBadge'); if (!el) return; if (S.show !== 'quads') { el.hidden = true; return; }
+    const M = S.mesh, pr = problems().length; el.hidden = false;
+    el.innerHTML = text ? text : M && S.meshRev === S.rev ? `<b>${M.stats.quads}</b> quads · <b class="${M.stats.folded ? 'bad' : ''}">${M.stats.folded}</b> folded · ${M.stats.below05} squashed · <b class="${pr ? 'bad' : ''}">${pr}</b> problem${pr === 1 ? '' : 's'}` : 'Updating the quads ...';
+  }
+  // 29 October 2026 : RINGS AROUND AN OPENING (an eye, a mouth, a nostril, a wheel arch) : concentric loops and radial seams by the conventions of a face archetype (server, ZrlOpenings.py)
+  async function ringsAround(source) {
+    const arch = $('pArch').value, txt = ($('pRingsMm').value || '').trim(), n = parseInt($('pRingsN').value, 10) || undefined; if (!source || !source.length) return status('Click on the model, or select one curve : the rings go around it.');
+    const taken = new Set(seeds().map((q) => q.name)); let k = 1; while (taken.has(arch + '_' + k)) k++; const name = arch + '_' + k; status('Rings around the opening (' + arch + ') ...');
+    const r = await fetch(CFG.files.openings, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ref: modelRef() || undefined, source, archetype: arch, rings_mm: txt ? txt.split(/[ ,;]+/).map(Number).filter((v) => v > 0) : undefined, n, name }) }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.ok) return status('Rings failed : ' + ((r && r.error) || 'no answer'), 'error');
+    const d = r.doc, nm = new Map(), am = new Map();
+    edit('Rings around an opening : ' + name, () => {
+      for (const nd of d.nodes) nm.set(nd.id, addNode(nd.p));                                                          // no merging : the nodes of a fine ring are millimetres apart
+      for (const a of d.arcs) { const c = a.ctrl.map(clone3), arc = addArc(nm.get(a.a), nm.get(a.b), c, [name, name]); am.set(a.id, arc.id); }
+      for (const q of d.component_seeds) seeds().push({ name: q.name, p: q.p });
+      for (const [nmx, o] of Object.entries(d.component_options || {})) compOpts()[nmx] = o; S.sel = new Set(am.values());
+    });
+    renderCompList(); status('Rings around the opening : ' + d.arcs.length + ' curves, component ' + name + ' (' + r.report.rings + ' rings, ' + (d.component_seeds.length / Math.max(1, r.report.rings - 1)) + ' radial divisions). Cmd Z removes them.');
+  }
+  function ringsAroundSelection() { const ids = [...S.sel]; if (!ids.length) return status('Select a curve first (the lip line, the edge of an eyelid, an arch).'); const pts = []; for (const id of ids) { const s = arcPts(id); for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); } return ringsAround(pts); }
+  // 29 October 2026 : LOD. The mesh of the network is made smoother and denser by Catmull-Clark levels (server, ZrlLod.py), each level fitted back to the model ; the other direction of the LOD is the quad size.
+  async function applyLod(res) {
+    const lv = parseInt(($('pLod') || { value: '0' }).value, 10) || 0; if (!lv || !res.P || !res.Q) return res;
+    status('Smoothing : ' + lv + ' level(s) of subdivision ...'); const t0 = performance.now();
+    const r = await fetch(CFG.files.lod, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ P: res.P, Q: res.Q, levels: lv, ref: modelRef() || undefined, project: !$('pLodFit') || $('pLodFit').checked }) }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.ok) { status('LOD failed : ' + ((r && r.error) || 'no answer') + ' ; the plain mesh is kept.', 'error'); return res; }
+    const rep = (arr) => { if (!arr) return arr; let o = arr; for (let i = 0; i < lv; i++) o = o.concat(o, o, o); return o; };     // each level writes the quads in four blocks, one per corner of the old quad
+    const out = Object.assign({}, res, { P: r.P, Q: r.Q, face_of_quad: rep(res.face_of_quad), quad_jac: rep(res.quad_jac) }); out.lod = { levels: lv, quads: r.quads, fit_mm: r.fit_mm, seconds: r.seconds, ms: Math.round(performance.now() - t0) }; return out;
+  }
   async function convertToMesh() {
-    status('Converting the network to quads...');
+    status('Converting the network to quads...'); const revAtStart = S.rev;
     const body = { lines: docForServer(), params: meshParams() };
     const t0 = performance.now(); const r = await fetch(CFG.files.mesh, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    const res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
+    let res = await r.json().catch(() => ({ ok: false, error: 'bad answer (HTTP ' + r.status + ')' }));
     if (!r.ok || res.ok === false) return status('Mesh failed : ' + (res.error || r.status), 'error');
-    setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.arc_parents) S.arcParents = res.arc_parents; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], euler: (res.stats && res.stats.euler_network) || (S.doctor && S.doctor.euler) || null, k: S.doctor ? S.doctor.k : null };
-    $('doctorInfo').textContent = problemSummary();
+    res = await applyLod(res); setMesh(res); if (res.faces && !S.faces) S.faces = res.faces; if (res.arc_parents) S.arcParents = res.arc_parents; if (res.dangling_arcs) S.doctor = { dangling: res.dangling_arcs, issues: res.issues || [], euler: (res.stats && res.stats.euler_network) || (S.doctor && S.doctor.euler) || null, k: S.doctor ? S.doctor.k : null };
+    S.meshRev = revAtStart; $('doctorInfo').textContent = problemSummary(); renderProblems(); updateBadge();
     status('Mesh ready in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.mesh.stats.quads + ' quads');
   }
   async function checkNetwork() {
@@ -743,6 +991,14 @@
     const a = document.createElement('a'); a.href = typeof data === 'string' && data.startsWith('data:') ? data : URL.createObjectURL(new Blob([data], { type })); a.download = name; a.click();
     status('Downloaded ' + name + ' (the server could not save it in the atelier)'); return null;
   }
+  // 29 October 2026 : the curves as CODE : Python with numpy, one matrix per curve and the mirror transform, exactly the saved numbers (no drawing)
+  async function exportCode() {
+    const f = (p) => '[' + p.map((v) => +v.toFixed(6)).join(', ') + ']', L = ['# ZenRay Lines : curves as code, project ' + PROJECT + ', ' + new Date().toISOString().slice(0, 10), 'import numpy as np', '', 'UNITS = "m"', 'MIRROR_X = np.diag([-1.0, 1.0, 1.0, 1.0])   # the mirror transform of the symmetric curves', '', 'NODES = {'];
+    for (const n of model.doc.nodes) L.push('    ' + n.id + ': np.array(' + f(n.p) + '),'); L.push('}', '', '# each curve : a, b = its end nodes, ctrl = its matrix of control points (n x 3), mirror = the curve that is its image through MIRROR_X (-1 : none)', 'CURVES = {');
+    for (const a of model.doc.arcs) L.push('    ' + a.id + ': dict(a=' + a.a + ', b=' + a.b + ', mirror=' + (a.mirror ?? -1) + ', names=' + JSON.stringify(a.pair || []) + ', ctrl=np.array([' + a.ctrl.map(f).join(', ') + '])),'); L.push('}', '');
+    const r = await fetch(CFG.files.export, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'curves_' + PROJECT + '.py', data: L.join('\n') }) }).then((x) => x.json()).catch(() => null);
+    status(r && r.ok ? 'Curves written as code : ' + r.path : 'Export failed : ' + ((r && r.error) || 'no answer'));
+  }
   function exportSvg() {   // 29 October 2026 : current camera ; seen curves solid, hidden parts dashed and light (one pick of the whole view decides)
     view.matrices(); const W = view.st.W, H = view.st.H, out = [`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><!-- 29 October 2026 ZenRay Lines 3D, current camera -->`];
     const buf = $('pXray').checked ? null : view.pickRect(0, 0, W, H), eye = view.st.eye;
@@ -765,11 +1021,18 @@
     out.push('</svg>'); return download('zenray_lines_view.svg', out.join('\n'), 'image/svg+xml');
   }
   function exportPng(name) { refresh(); return download((typeof name === 'string' && name) || 'zenray_lines_view.png', view.canvas.toDataURL('image/png')); }
-  async function save() {
-    const body = model.serialize(); const r = await fetch(CFG.files.save, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-    const res = await r.json().catch(() => ({})); if (!r.ok || !res.ok) return status('Save failed : ' + (res.error || r.status), 'error');
-    S.dirty = false; status('Saved to the atelier : ' + res.arcs + ' curves, ' + res.nodes + ' nodes'); redraw();
+  async function save(auto) {
+    if (S.saving) return; const rev = S.rev, body = model.serialize(); S.saving = true; S.saveError = null; updateSaveUI();
+    let res = null, err = null;
+    try { const r = await fetch(CFG.files.save + '?project=' + PROJECT + (auto ? '&auto=1' : ''), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }); res = await r.json().catch(() => ({})); if (!r.ok || !res.ok) err = (res && res.error) || ('HTTP ' + r.status); else if (res.sha256 && window.crypto && crypto.subtle) { const h = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body)))).map((b) => b.toString(16).padStart(2, '0')).join(''); if (h !== res.sha256) err = 'the file on the disk does not match what was sent (check ' + h.slice(0, 8) + ' against ' + res.sha256.slice(0, 8) + ')'; else S.savedSha = h; } }
+    catch (e) { err = e && e.message ? e.message : String(e); }
+    S.saving = false;
+    if (err) { S.saveError = err; S._dirty = true; updateSaveUI(); return status('Save failed : ' + err + ' ; your changes are still here, click Save failed to retry.', 'error'); }
+    S._dirty = S.rev !== rev; updateSaveUI();   // an edit made while saving stays unsaved
+    if (!auto) status('Saved to the atelier : ' + res.arcs + ' curves, ' + res.nodes + ' nodes'); redraw(true);
   }
+  // autosave : a moment after the last edit, never in the middle of a drag, retried every 5 s after a failure
+  setInterval(() => { if (!model || !S._dirty || S.saving || S.noAutosave || S.drag || S.draw && S.draw.pts && S.draw.pts.length) return; const wait = S.saveError ? 5000 : 1500; if (performance.now() - S.lastEdit > wait) safe(save)(true); }, 500);
   function newNetwork() {   // 29 October 2026 : an empty network for a new model : draw, patch and name from scratch
     if (S.dirty && !confirm('Start an empty network ? Unsaved changes of the current one are lost (Cmd Z will not bring them back).')) return;
     const doc = { version: 1, date: '29 October 2026', units: 'm', spline: { degree: 3, knots: 'clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]' }, nodes: [], arcs: [], components: [] };
@@ -783,17 +1046,20 @@
 
   // ------------------------------------------------------------------ selection info
   function updateInfo() {
-    const parts = [];
-    if (S.sel.size) {
-      const arcs = [...S.sel].map((id) => model.arc(id)).filter(Boolean); let L = 0; for (const a of arcs) L += model.length(a.id);
-      parts.push(arcs.length + ' curve(s), ' + L.toFixed(3) + ' m');
-      if (arcs.length === 1) { const a = arcs[0]; parts.push('id ' + a.id + ', nodes ' + a.a + ' to ' + a.b + ', ' + a.ctrl.length + ' control points, mirror ' + a.mirror + '\n' + (a.pair || []).filter(Boolean).join(' / ')); }
-    }
-    if (S.node !== null && model.node(S.node)) parts.push('node ' + S.node + ', ' + model.nodeArcs(S.node).length + ' curves');
-    if (S.handle) parts.push('control point ' + S.handle.i + ' of curve ' + S.handle.arc);
-    $('selInfo').textContent = parts.join('\n') || 'Nothing selected.';
+    const arcs = [...S.sel].map((id) => model.arc(id)).filter(Boolean), nodes = [...S.nodes].filter((id) => model.node(id)); let title = 'Nothing selected', info = 'Click a curve, a point or a name. Shift adds ; drag a box to select several ; click on empty space to deselect.';
+    if (S.handle && arcs.length === 1) { title = 'Control point ' + (S.handle.i + 1) + ' of curve ' + S.handle.arc; info = 'Drag it on the surface. Del removes it (the ends stay).'; }
+    else if (arcs.length) {
+      let L = 0; for (const a of arcs) L += model.length(a.id); const names = [...new Set(arcs.flatMap((a) => (a.pair || []).filter(Boolean)))];
+      title = arcs.length === 1 ? 'Curve ' + arcs[0].id : arcs.length + ' curves';
+      info = L.toFixed(3) + ' m long' + (arcs.length === 1 ? ', ' + arcs[0].ctrl.length + ' control points, points ' + arcs[0].a + ' to ' + arcs[0].b + (arcs[0].mirror >= 0 && arcs[0].mirror !== arcs[0].id ? ', mirrored by curve ' + arcs[0].mirror : '') : '') + (names.length ? '\n' + names.join(' / ') : '') + (S.comp && S.faces && S.faces.some((f) => f.component === S.comp) ? '\nComponent ' + S.comp : '');
+    } else if (nodes.length === 1) { const n = nodes[0]; title = 'Point ' + n; info = model.nodeArcs(n).length + ' curve(s) meet here. Drag it ; the magnet puts it onto a point or a contour.'; }
+    else if (nodes.length === 2) { title = '2 points'; info = (d3(model.node(nodes[0]).p, model.node(nodes[1]).p) * 1000).toFixed(1) + ' mm apart. Merge them in their middle, or connect them with a curve.'; }
+    else if (nodes.length > 2) { title = nodes.length + ' points'; info = 'Drag one : they all move together.'; }
+    $('selTitle').textContent = title; $('selInfo').textContent = info;
+    const ctx = { curve: arcs.length > 0, node: nodes.length === 1, nodes2: nodes.length === 2, any: arcs.length > 0 || nodes.length > 0 || !!S.handle };
+    document.querySelectorAll('#selActions [data-for]').forEach((b) => { b.hidden = !ctx[b.dataset.for]; });
   }
-  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click on the model to place points ; start or end on a node or a curve to connect ; Enter finishes.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', autopatch: 'Click a zone of the model : a four sided patch is fitted on its real contour (type the name first in Components, or rename it in the list). Zone angle : how sharp an edge must be to stop the zone.', seed: 'Click on the model to place the component named in the Components field.', extend: 'Press on a curve and drag : a parallel curve follows the cursor on the surface, joined at both ends : a new strip of quads (Maya Quad Draw extend).', loop: 'Click on a line of the previewed quads : that edge loop becomes a curve of the network, from border to border, and splits its face in two (Maya Insert Edge Loop).', face: 'Click inside a face : its sides, corners and status. The component buttons then change its quads ; Rotate pattern cycles its variants ; K on a node forces or forbids a corner.', isolate: 'Click a component of the model : it stays alone and framed, and the curves you draw land on it. U or Shift H shows everything again.', merge: 'Click a point of the curves (a node or a curve end), then a second one : both become one node in their middle, on the surface ; the curves keep their shape. Mirror on : their mirror points merge too.' };
+  const HINTS = { select: 'Click a curve, a node or a control point ; drag to move it on the surface ; drag on empty space for a box.', draw: 'Click along a fold, or drag a stroke along it : the curve locks onto the creases. Ending on a point or a curve finishes it (Shift keeps going) ; Enter finishes too.', insert: 'Click on a curve to insert a control point there.', split: 'Click on a curve to cut it in two with a new node.', tweak: 'Drag a vertex of the quad mesh along the surface.', patch: 'Click four corners on the model : four curves and a named component, filled with quads at conversion.', rings: 'Click the middle of an opening (an eye, a mouth, a nostril, a wheel arch) : concentric rings and radial seams grow around it. Choose the archetype and the rings below. For a slit, select its curve and use Rings around the selected curve.', autopatch: 'Click a zone of the model : a four sided patch is fitted on its real contour (type the name first in Components, or rename it in the list). Zone angle : how sharp an edge must be to stop the zone.', seed: 'Click on the model to place the component named in the Components field.', extend: 'Press on a curve and drag : a parallel curve follows the cursor on the surface, joined at both ends : a new strip of quads (Maya Quad Draw extend).', loop: 'Click on a line of the previewed quads : that edge loop becomes a curve of the network, from border to border, and splits its face in two (Maya Insert Edge Loop).', face: 'Click inside a face : its sides, corners and status. The component buttons then change its quads ; Rotate pattern cycles its variants ; K on a node forces or forbids a corner.', isolate: 'Click a component of the model : it stays alone and framed, and the curves you draw land on it. U or Shift H shows everything again.', merge: 'Click a point of the curves (a node or a curve end), then a second one : both become one node in their middle, on the surface ; the curves keep their shape. Mirror on : their mirror points merge too.' };
   function setTool(t) { if (t !== 'merge') S.mergeA = null; S.tool = t; S.draw = t === 'draw' ? (S.draw || { pts: [] }) : null; document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === t)); $('toolHint').textContent = HINTS[t] || ''; redraw(); }
 
   // ------------------------------------------------------------------ mouse
@@ -802,14 +1068,10 @@
   function onDown(ev) {
     const [x, y] = local(ev); cv().focus();
     const nav = ev.altKey || ev.button === 1 || ev.button === 2;
-    if (nav) { S.drag = { kind: ev.button === 1 ? 'pan' : (ev.button === 2 ? (ev.altKey ? 'zoom' : 'orbit') : 'orbit'), x, y }; ev.preventDefault(); return; }
+    if (nav) { pushView(); markPreset(null); S.drag = { kind: ev.button === 1 ? 'pan' : (ev.button === 2 ? (ev.altKey ? 'zoom' : 'orbit') : 'orbit'), x, y }; ev.preventDefault(); return; }
     if (ev.button !== 0) return;
-    if (S.tool === 'draw') { if (!S.draw) S.draw = { pts: [] };
-      const sd = surfaceDist(x, y), n = pickNode(x, y, sd, CFG.pick.snapNodePx), a = n === null ? pickArc(x, y, sd, CFG.pick.snapArcPx) : null;
-      const p = n !== null ? clone3(model.node(n).p) : a ? a.p : surfacePoint(x, y);
-      if (n === null && !a && p) { snapToContour(p).then((q) => { if (!S.draw) S.draw = { pts: [] }; S.draw.pts.push({ p: q.p, node: null, arc: null }); status('Point ' + S.draw.pts.length + (q.snapped ? ' on a contour of the mesh (' + q.moved_mm + ' mm)' : '')); redraw(); }); return; }
-      S.draw.pts.push({ p, node: n, arc: a ? a.id : null }); status('Point ' + S.draw.pts.length + (n !== null ? ' on node ' + n : a ? ' on curve ' + a.id : '')); redraw(); return;
-    }
+    if (S.tool === 'draw') { if (!S.draw) S.draw = { pts: [] }; S.drag = { kind: 'stroke', x, y, base: S.draw.pts.slice(), started: false, shift: ev.shiftKey }; return; }   // 29 October 2026 : a click places a point, a drag draws a stroke
+    if (S.tool === 'rings') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); ringsAround([h.p]); return; }
     if (S.tool === 'autopatch') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); autoPatchAt(h); return; }
     if (S.tool === 'isolate') { const h = view.pickSurface(x, y); if (!h) return status('Click on the model.'); isolatePart(h.part); setTool('draw'); return; }   // 29 October 2026 : then draw on it
     if (S.tool === 'merge') { const n = pickNode(x, y, surfaceDist(x, y), CFG.pick.snapNodePx); if (n === null) return status('Click a point of the curves : a node or the end of a curve.');
@@ -838,19 +1100,23 @@
     }
     const hit = hitTest(x, y);
     if (hit && hit.type === 'handle') { S.handle = { arc: hit.arc, i: hit.i }; S.drag = { kind: 'ctrl', hit, x, y, started: false }; redraw(); return; }
-    if (hit && hit.type === 'node') { S.node = hit.id; if (!ev.shiftKey) { S.sel.clear(); S.handle = null; } S.drag = { kind: 'node', hit, x, y, started: false }; redraw(); return; }
+    if (hit && hit.type === 'node') {
+      if (ev.shiftKey && S.nodes.has(hit.id)) { S.nodes.delete(hit.id); S._node = [...S.nodes].pop() ?? null; redraw(); return; }   // Shift on a selected point unselects it
+      if (!ev.shiftKey && S.nodes.has(hit.id) && S.nodes.size > 1) { S._node = hit.id; S.drag = { kind: 'node', hit, x, y, started: false, keep: true }; redraw(); return; }   // pressing one of several selected points keeps them selected : a drag moves them all
+      S._multi = ev.shiftKey; S.node = hit.id; S._multi = false; if (!ev.shiftKey) { S.sel.clear(); S.handle = null; }
+      S.drag = { kind: 'node', hit, x, y, started: false }; redraw(); return; }
     if (hit && hit.type === 'arc') { if (ev.shiftKey) { S.sel.has(hit.id) ? S.sel.delete(hit.id) : S.sel.add(hit.id); } else S.sel = new Set([hit.id]); S.node = null; S.handle = null; redraw(); return; }
     if (S.mesh && $('pMesh').checked) {                                   // 29 October 2026 : a click on the previewed quads selects their component
       const h = view.pickSurface(x, y);
       if (h) { let best = -1, bd = 0.04; const M = S.mesh; for (let q = 0; q < M.Q.length / 4; q++) { let c = [0, 0, 0]; for (let k = 0; k < 4; k++) { const i = M.Q[4 * q + k]; c[0] += M.P[3 * i] / 4; c[1] += M.P[3 * i + 1] / 4; c[2] += M.P[3 * i + 2] / 4; } const d = d3(c, h.p); if (d < bd) { bd = d; best = q; } }
-        if (best >= 0) { const fid = M.fq[best], f = (M.faces || []).find((z) => z.id === fid); if (f && f.component) { S.comp = f.component; $('compName').value = S.comp; renderCompList(); status('Face ' + fid + ' : component ' + S.comp + ', ' + (f.status || '') + (f.side_counts ? ', sides ' + f.side_counts.join(' x ') : '')); redraw(); return; } } }
+        if (best >= 0) { const fid = M.fq[best], f = (M.faces || []).find((z) => z.id === fid); if (f && f.component) { S.comp = f.component; S.face = null; $('compName').value = S.comp; selectFaceCurves(); renderCompList(); status('Face ' + fid + ' : component ' + S.comp + ', ' + (f.status || '') + (f.side_counts ? ', sides ' + f.side_counts.join(' x ') : '')); redraw(); return; } } }
     }
     S.drag = { kind: 'box', x, y, add: ev.shiftKey };
   }
   function onMove(ev) {
     const [x, y] = local(ev), D = S.drag; S.mouse = [x, y];
     if (!D) {
-      if (S.tool === 'draw' && S.draw && S.draw.pts.length) { S.draw.cursor = surfacePoint(x, y); redraw(); }
+      if (S.tool === 'draw' && S.draw && S.draw.pts.length) { S.draw.cursor = surfacePoint(x, y); S.draw.preview = null; redraw(); previewCreaseLater(); }
       const h = view.pickSurface(x, y); $('coords').textContent = h ? h.p.map((v) => v.toFixed(3)).join('  ') : '-';
       if (S.tool === 'select') { const prev = S.hover && S.hover.id; S.hover = hitTest(x, y); if ((S.hover && S.hover.id) !== prev) redraw(); }
       return;
@@ -859,6 +1125,7 @@
     if (D.kind === 'orbit') { view.orbit(dx, dy); D.x = x; D.y = y; redraw(true); return; }
     if (D.kind === 'pan') { view.pan(dx, dy); D.x = x; D.y = y; redraw(true); return; }
     if (D.kind === 'zoom') { view.zoom(-dx + dy); D.x = x; D.y = y; redraw(true); return; }
+    if (D.kind === 'stroke') { strokeMove(D, x, y); return; }
     if (D.kind === 'box') { const b = $('boxSel'); Object.assign(b.style, { display: 'block', left: Math.min(x, D.x) + 'px', top: Math.min(y, D.y) + 'px', width: Math.abs(dx) + 'px', height: Math.abs(dy) + 'px' }); return; }
     if (D.kind === 'extend') { D.preview = extendCurve(D.arc, x, y); if (D.preview) { S.draw = { pts: D.preview.map((p) => ({ p })) }; redraw(); } return; }
     if (D.kind === 'meshVertex') { const h = view.pickSurface(x, y); if (h) { S.mesh.edited = true; S.mesh.P[3 * D.v] = h.p[0]; S.mesh.P[3 * D.v + 1] = h.p[1]; S.mesh.P[3 * D.v + 2] = h.p[2]; buildMeshLayers(); } return; }
@@ -867,11 +1134,21 @@
       model.checkpoint(); D.started = true; S.dirty = true;
       D.op = D.kind === 'ctrl' ? model.beginCtrlDrag(D.hit.arc, D.hit.i, P().mirror) : model.beginNodeDrag(D.hit.id, P().mirror);
       D.through = D.kind === 'ctrl' ? clone3(model.arc(D.hit.arc).ctrl[D.hit.i]) : clone3(model.node(D.hit.id).p);
+      if (D.kind === 'node' && S.nodes.size > 1 && S.nodes.has(D.hit.id)) {   // several points selected : they move together, each keeping its screen offset, each put on the surface
+        const h0 = view.project(model.node(D.hit.id).p); D.group = [];
+        for (const id of S.nodes) { if (id === D.hit.id) continue; const mm = P().mirror ? model.nodeMirror.get(id) : null; if (mm != null && mm !== id && (S.nodes.has(mm) || mm === D.hit.id) && id > mm) continue;   // a point and its mirror are never both moved
+          const q = view.project(model.node(id).p); D.group.push({ op: model.beginNodeDrag(id, P().mirror), through: clone3(model.node(id).p), off: [q[0] - h0[0], q[1] - h0[1]] }); }
+      }
     }
-    if (D.started) { D.op.apply(surfacePoint(x, y, D.through)); redraw(); }
+    if (D.started) {
+      let at = surfacePoint(x, y, D.through);
+      if (D.kind === 'node' && $('pSnapEdge') && $('pSnapEdge').checked) { const t = pickNode(x, y, surfaceDist(x, y), CFG.pick.snapNodePx, D.hit.id); S.magnetNode = t; if (t !== null) at = clone3(model.node(t).p); }   // magnet : near another point, this one goes onto it
+      D.op.apply(at); if (D.group) for (const g of D.group) g.op.apply(surfacePoint(x + g.off[0], y + g.off[1], g.through)); redraw();
+    }
   }
   function onUp(ev) {
     const D = S.drag; S.drag = null; if (!D) return;
+    if (D.kind === 'stroke') { const [ux, uy] = local(ev); strokeEnd(D, ux, uy); return; }
     if (D.kind === 'orbit' || D.kind === 'pan' || D.kind === 'zoom') creasesLater();   // 29 October 2026
     if (D.kind === 'box') {
       $('boxSel').style.display = 'none'; const [x, y] = local(ev), x0 = Math.min(x, D.x), x1 = Math.max(x, D.x), y0 = Math.min(y, D.y), y1 = Math.max(y, D.y);
@@ -889,7 +1166,9 @@
       S.handle = null; status(S.sel.size + ' curve(s) selected'); redraw(); return;
     }
     if (D.kind === 'extend') { S.draw = null; if (D.preview) finishExtend(D.arc, D.preview); else redraw(); return; }
-    if (D.started && D.kind === 'node') { const [ux, uy] = local(ev), t = pickNode(ux, uy, surfaceDist(ux, uy), CFG.pick.snapNodePx, D.hit.id); if (t !== null && t !== D.hit.id) { targetWeld(D.hit.id, t); schedulePreview(); model.buildNodeMirror(); redraw(); return; } }
+    S.magnetNode = null; if (D.keep && !D.started) { S.node = D.hit.id; redraw(); return; }   // a click, not a drag, on one of several selected points : only that one stays selected
+    if (D.started && D.kind === 'node') { const [ux, uy] = local(ev), t = pickNode(ux, uy, surfaceDist(ux, uy), CFG.pick.snapNodePx, D.hit.id); if (t !== null && t !== D.hit.id) { targetWeld(D.hit.id, t); schedulePreview(); model.buildNodeMirror(); redraw(); return; }
+      if ($('pSnapEdge') && $('pSnapEdge').checked && !D.group) { const id = D.hit.id; snapToContour(model.node(id).p).then((q) => { if (q.snapped && q.moved_mm > 0.05) { model.beginNodeDrag(id, P().mirror).apply(q.p); model.buildNodeMirror(); S.dirty = true; status('Point onto a contour of the mesh (' + q.moved_mm + ' mm)'); schedulePreview(); redraw(); } }); } }
     if (D.started) { const [ux, uy] = local(ev), how = D.kind === 'ctrl' ? attachDroppedEnd(D.hit.arc, D.hit.i, ux, uy) : null; schedulePreview(); model.buildNodeMirror(); status(D.kind === 'ctrl' ? (how ? 'End ' + how : 'Control point moved') + (D.op.mismatch ? ' (mirror skipped : different control point counts)' : '') : 'Node moved'); redraw(); }
     if (D.kind === 'meshVertex') status('Mesh vertex moved');
   }
@@ -898,6 +1177,7 @@
   function isTrackpad(ev) { if (ev.ctrlKey) return true; if (ev.deltaMode !== 0) return false; return Math.abs(ev.deltaX) > 0 || !Number.isInteger(ev.deltaY) || Math.abs(ev.deltaY) < 40; }
   function onWheel(ev) {
     ev.preventDefault(); const pad = $('pTrackpad') ? $('pTrackpad').checked : true;
+    if (performance.now() - VH.lastWheel > 600) { pushView(); markPreset(null); } VH.lastWheel = performance.now();   // one history step per gesture, not per wheel tick
     if (ev.ctrlKey) view.zoom(ev.deltaY * 4);                                    // pinch
     else if (pad && isTrackpad(ev)) { if (ev.shiftKey) view.pan(ev.deltaX, ev.deltaY); else view.orbit(ev.deltaX, ev.deltaY); }
     else view.zoom(ev.deltaY);
@@ -908,33 +1188,41 @@
     const k = ev.key.toLowerCase(), mod = ev.metaKey || ev.ctrlKey;
     if (k === 'f2' && S.comp) { ev.preventDefault(); const el = document.querySelector('#compList .row-c.sel .nm'); if (el) el.dispatchEvent(new MouseEvent('dblclick')); return; }   // 29 October 2026 : F2 renames
     if (mod && k === 'z') { ev.preventDefault(); (ev.shiftKey ? model.redo() : model.undo()) && (model.buildNodeMirror(), S.handle = null, renderCompList(), redraw()); return; }   // 29 October 2026 : the components list follows the undo
-    if (mod && k === 's') { ev.preventDefault(); safe(save)(); return; }
+    if (mod && k === 's') { ev.preventDefault(); safe(save)(false); return; }
+    if (mod && k === 'd') { ev.preventDefault(); safe(duplicateSel)(); return; }
     if (mod) return;
     const views = { '0': 'persp', '1': 'front', '2': 'back', '3': 'left', '4': 'right', '5': 'top', '6': 'bottom' };
-    if (views[k]) { view.preset(views[k]); redraw(); return; }
+    if (views[k]) { setPreset(views[k]); return; }
     if (ev.shiftKey && k === 'v') { setShade(S.shade === 'parts' ? 'gray' : 'parts'); return; }   // 29 October 2026 : Shift V : grey or colours ; Shift N : names
     if (ev.shiftKey && k === 'm') { setTool('merge'); return; }   // 29 October 2026 : Shift M : merge two points of the curves in their middle
     if (ev.shiftKey && k === 'n') { $('pTags').checked = !$('pTags').checked; status('Names ' + ($('pTags').checked ? 'shown' : 'hidden')); redraw(true); return; }
-    if (k === 'a') setTool('patch'); else if (k === 'c') setTool('seed'); else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateToggle(); else if (k === 'b') safe(bestPattern)(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
-    else if (k === 'o') { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }
-    else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'w') { setTool('autopatch'); } else if (k === 'v') { setShow(SHOW_MODES[(SHOW_MODES.indexOf(S.show || 'both') + 1) % 3]); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
+    if (k === 'a') setTool('patch'); else if (k === 'c') { if (ev.shiftKey) safe(snapToCreases)(); else setTool('seed'); }   /* 29 October 2026 : Shift C snaps the curves onto the creases */ else if (k === 'g') setTool('face'); else if (k === 'l') setTool('loop'); else if (k === 'e') setTool('extend'); else if (k === 'u') isolateToggle(); else if (k === 'b') safe(bestPattern)(); else if (k === 'n') nextProblem(); else if (k === 'k') toggleCorner(); else if (k === 'p') safe(previewFaces)(); else if (k === 'q') setTool('select'); else if (k === 'd') setTool('draw'); else if (k === 'i') setTool('insert'); else if (k === 's') setTool('split'); else if (k === 't') setTool('tweak');
+    else if (k === 'o') { pushView(); view.cam.ortho = !view.cam.ortho; view.fitAll(); navButtons(); redraw(); }
+    else if (k === '[') viewBack(); else if (k === ']') viewForward(); else if (k === 'home') normalView();
+    else if (k === 'f') frameSel(); else if (k === 'x') { $('pXray').checked = !$('pXray').checked; redraw(); } else if (k === 'w') { setTool('autopatch'); } else if (k === 'v') { setShow(SHOW_MODES[(SHOW_MODES.indexOf(S.show || 'both') + 1) % SHOW_MODES.length]); } else if (k === 'm') { $('pMirror').checked = !$('pMirror').checked; status('Mirror ' + ($('pMirror').checked ? 'on' : 'off')); }
     else if (k === 'h') { if (ev.shiftKey) { view.showAllParts(); if (S.isolated) { S.isolated = false; $('pSolo').checked = false; } status('Every part shown'); } else { const h = view.pickSurface(S.mouse ? S.mouse[0] : 0, S.mouse ? S.mouse[1] : 0); if (h) { view.setPartHidden(h.part, true); status('Part hidden : ' + (view.st.mesh.head.parts[h.part] || h.part) + ' (Shift H shows all)'); } } redraw(true); }
     else if (k === 'r') smoothSel(CFG.edit.roundPasses); else if (k === 'j') { if (S.node !== null) joinAtNode(S.node); else status('Select a node with two curves.'); }
     else if (k === 'delete' || (k === 'backspace' && S.tool !== 'draw')) { ev.preventDefault(); deleteSelection(); }
     else if (k === 'backspace' && S.tool === 'draw' && S.draw) { S.draw.pts.pop(); redraw(); }
     else if (k === 'enter' && S.tool === 'draw') finishDraw();
-    else if (k === 'escape') { if (S.mergeA != null) { S.mergeA = null; S.node = null; status('Merge cancelled.'); } if (S.addTo) { S.addTo = null; setTool('select'); status('Face not added.'); } if (S.patch) S.patch = null; else if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
+    else if (k === 'escape') { if (S.isolated && !(S.draw && S.draw.pts && S.draw.pts.length) && !S.patch && !S.addTo && S.mergeA == null && !S.sel.size && S.node === null) { showEverything(); return; } if (S.mergeA != null) { S.mergeA = null; S.node = null; status('Merge cancelled.'); } if (S.addTo) { S.addTo = null; setTool('select'); status('Face not added.'); } if (S.patch) S.patch = null; else if (S.draw && S.draw.pts.length) S.draw = { pts: [] }; else { S.sel.clear(); S.node = null; S.handle = null; } redraw(); }
   }
   function frameSel() {
     const pts = []; for (const id of S.sel) { const s = arcPts(id); for (let i = 0; i < s.length; i += 3) pts.push([s[i], s[i + 1], s[i + 2]]); }
     if (S.node !== null && model.node(S.node)) { const p = model.node(S.node).p; pts.push(V.add(p, [0.15, 0.15, 0.15]), V.sub(p, [0.15, 0.15, 0.15])); }
-    if (!pts.length) { const b = view.st.mesh.head.bbox; pts.push(b[0], b[1]); } view.frame(pts); redraw();
+    pushView(); if (!pts.length) { view.fitAll(); navButtons(); return redraw(true); } view.frame(pts); navButtons(); redraw();
   }
 
   // ------------------------------------------------------------------ components : the registry (named seeds), the faces preview, per component options
   const seeds = () => (model.doc.component_seeds || (model.doc.component_seeds = []));
   const compOpts = () => (model.doc.component_options || (model.doc.component_options = {}));
-  function hashColour(name) { let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0; const hue = (h % 360) / 360, s = 0.55, l = 0.5; const f = (n) => { const k = (n + hue * 12) % 12, a = s * Math.min(l, 1 - l); return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); }; return [f(0), f(8), f(4), 1]; }
+  // 30 October 2026 : COLOURS BY ZONE like the MetaHuman body : one pale colour per family of components (palette.json : legs pale green, torso blue, arms pale red, head pale violet), a lighter band on every joint (<name>_joint) ; a name that no family matches keeps a pale colour from its hash
+  function hashColour(name) {
+    const P = CFG.palette; if (!P._re) P._re = P.families.map((f) => new RegExp(f.match));
+    const mix = (c, k) => c.map((v) => v + (1 - v) * k).concat([1]); const joint = P.joint_suffix && name.endsWith(P.joint_suffix) ? P.joint_lighten : 0;
+    for (let i = 0; i < P.families.length; i++) if (P._re[i].test(name)) return mix(P.families[i].color, joint);
+    let h = 0; for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0; const hue = (h % 360) / 360, sat = P.fallback.saturation, l = P.fallback.lightness; const f = (n) => { const k = (n + hue * 12) % 12, a = sat * Math.min(l, 1 - l); return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); }; return mix([f(0), f(8), f(4)], joint);
+  }
   function addSeed(p) {   // 29 October 2026 : a new component, or (S.addTo) one more face for an existing component
     if (S.addTo) { const n = S.addTo; S.addTo = null; edit('Face added to ' + n, () => { seeds().push({ name: n, p: clone3(p) }); S.comp = n; }); renderCompList(); setTool('select'); return; }
     const name = ($('compName').value || '').trim() || nextCompName();
@@ -990,7 +1278,7 @@
         + `<small>${st}${quads[n] ? ', ' + quads[n] + ' quads' : ''}${o.skip ? ', skipped' : ''}${o.rotate ? ', pattern ' + o.rotate : ''}${o.edge_scale && o.edge_scale !== 1 ? ', density x' + (1 / o.edge_scale).toFixed(2) : ''}</small></div>`; });
     const unnamed = faces.filter((f) => !f.component).length;
     list.innerHTML = (rows.join('') || '<div class="hint">No component yet : type a name, press Place (C) and click a face.</div>') + (faces.length ? `<div class="hint">${faces.length} faces, ${unnamed} without a component</div>` : '');
-    $('compCount').textContent = names.length;
+    $('compCount').textContent = names.length; renderGallery();
     const select = (n, frame) => { S.comp = n; $('compName').value = n; const q = seeds().find((z) => z.name === n); if (frame && q && q.p) view.frame([V.add(q.p, [0.4, 0.4, 0.4]), V.sub(q.p, [0.4, 0.4, 0.4])]); renderCompList(); redraw(); };
     list.querySelectorAll('.row-c').forEach((el) => {
       const n = el.dataset.name;
@@ -1003,6 +1291,153 @@
         nm.replaceWith(inp); inp.focus(); inp.select(); let done = false;
         const commit = (ok) => { if (done) return; done = true; if (ok && inp.value.trim() && inp.value.trim() !== n) { if (!renameCompTo(n, inp.value)) renderCompList(); } else renderCompList(); };
         inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') commit(true); else if (e.key === 'Escape') commit(false); }); inp.addEventListener('blur', () => commit(true)); });
+    });
+  }
+  // 29 October 2026 : the PROJECT MENU : open, create from a model, rename, duplicate, delete (to the trash). Opening saves first and reloads the page on the other project.
+  // FR : le menu des projets ; ouvrir enregistre d'abord puis recharge la page sur l'autre projet.
+  const projApi = (body) => fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json().catch(() => ({ ok: false, error: 'HTTP ' + r.status })));
+  let projects = [];
+  async function refreshProjects() {
+    const r = await fetch('/api/projects', { cache: 'no-store' }).then((x) => x.json()).catch(() => null); if (!r || !r.projects) return; projects = r.projects;
+    const cur = projects.find((p) => p.id === PROJECT); if ($('projBtn')) $('projBtn').textContent = (cur ? cur.name : PROJECT) + ' \u25BE'; renderProjects();
+  }
+  function renderProjects() {
+    const host = $('projList'); if (!host) return; const esc3 = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+    host.innerHTML = projects.map((p) => `<div class="pm-row${p.id === PROJECT ? ' current' : ''}" data-id="${esc3(p.id)}"><div class="pm-name">${esc3(p.name)}${p.id === PROJECT ? ' <small>(open now)</small>' : ''}</div>`
+      + `<div class="pm-meta">${p.curves} curves, ${p.components} components, ${p.parts} model parts${p.sheet ? ', reference sheet' : ''}${p.updated ? ' &middot; saved ' + esc3(p.updated.replace('T', ' ')) : ''}</div>`
+      + `<div class="pm-acts">${p.id === PROJECT ? '' : '<button class="btn sm primary" data-pa="open">Open</button>'}<button class="btn sm" data-pa="rename">Rename</button><button class="btn sm" data-pa="dup">Duplicate</button>${p.id === 'car' ? '' : '<button class="btn sm danger" data-pa="del">Delete</button>'}</div></div>`).join('');
+    host.querySelectorAll('.pm-row').forEach((row) => row.querySelectorAll('[data-pa]').forEach((b) => b.addEventListener('click', () => safe(projectAction)(row.dataset.id, b.dataset.pa, row, b))));
+  }
+  async function openProject(id) {
+    if (id === PROJECT) return; if (S._dirty || S.saving) { status('Saving before switching ...'); for (let i = 0; i < 30 && S.saving; i++) await new Promise((r) => setTimeout(r, 100)); if (S._dirty) await save(false); if (S._dirty) return status('Not switched : the current project could not be saved.', 'error'); }
+    try { localStorage.setItem('zrl.project', id); } catch (e) { /* ignored */ } location.href = location.pathname + '?project=' + encodeURIComponent(id);
+  }
+  async function projectAction(id, act, row, btn) {
+    const p = projects.find((x) => x.id === id); if (!p) return;
+    if (act === 'open') return openProject(id);
+    if (act === 'rename') { const nm = row.querySelector('.pm-name'), inp = document.createElement('input'); inp.type = 'text'; inp.value = p.name; nm.replaceWith(inp); inp.focus(); inp.select(); let done = false;
+      const commit = async (ok) => { if (done) return; done = true; if (ok && inp.value.trim() && inp.value.trim() !== p.name) { const r = await projApi({ op: 'rename', id, name: inp.value }); if (!r.ok) status('Rename failed : ' + r.error, 'error'); } await refreshProjects(); };
+      inp.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') commit(true); else if (e.key === 'Escape') commit(false); }); inp.addEventListener('blur', () => commit(true)); return; }
+    if (act === 'dup') { btn.disabled = true; status('Duplicating ' + p.name + ' ...'); const r = await projApi({ op: 'duplicate', id }); status(r.ok ? p.name + ' duplicated as ' + r.project.name + '.' : 'Duplicate failed : ' + r.error, r.ok ? '' : 'error'); return refreshProjects(); }
+    if (act === 'del') { if (!confirm('Delete the project ' + p.name + ' ? It goes to the trash folder of the projects, nothing is erased.')) return; const r = await projApi({ op: 'delete', id }); status(r.ok ? p.name + ' moved to the trash.' : 'Delete failed : ' + r.error, r.ok ? '' : 'error'); if (r.ok && id === PROJECT) return openProject('car'); return refreshProjects(); }
+  }
+  async function createProject() {
+    const name = $('projName').value.trim(), obj = $('projObj').value.trim(); if (!name) return ($('projMsg').textContent = 'Give the project a name.');
+    $('bProjCreate').disabled = true; $('projMsg').textContent = obj ? 'Reading the model and writing its reference ... this can take a moment.' : 'Creating ...';
+    const r = await projApi({ op: 'create', name, obj }); $('bProjCreate').disabled = false;
+    if (!r.ok) return ($('projMsg').textContent = 'Failed : ' + r.error); $('projMsg').textContent = 'Created : ' + r.project.name; await openProject(r.project.id);
+  }
+  function toggleProjMenu(show) { const m = $('projMenu'); const on = show === undefined ? m.hidden : show; m.hidden = !on; if (on) { refreshProjects(); $('projMsg').textContent = ''; } }
+  // 29 October 2026 : AUTOMATIC. The editor's aim is to correct what the automatic steps get wrong, not to draw : one click builds the whole network from the parts of the
+  // model (a patch per part grown over the whole part, the right side mirrored from the left, points welded, safe fixes, the Quads view, the first problem framed) ;
+  // each step has its setting and is remembered. FR : automatique : un clic construit tout le réseau ; l'utilisateur ne corrige que ce qui reste.
+  const AUTO_IDS = { zoneDeg: 'pBuildDeg', minAreaCm2: 'pBuildMin', weldMm: 'pWeldMm', straightMm: 'pStraightMm', creaseMinPct: 'pCreaseMin', snapMaxMm: 'pSnapMm', lockReachMm: 'pLockReach', creaseLock: 'pCrease', mirror: 'pBuildMirror', afterMerge: 'pAfterMerge', afterFix: 'pAfterFix', afterQuads: 'pAfterQuads', afterJump: 'pAfterJump' };
+  function autoOpts() { const o = {}; for (const [k, id] of Object.entries(AUTO_IDS)) { const el = $(id); o[k] = !el ? CFG.auto[k] : el.type === 'checkbox' ? el.checked : parseFloat(el.value); } return o; }
+  function autoLoad() { let saved = {}; try { saved = JSON.parse(localStorage.getItem('zrl.auto') || '{}'); } catch (e) { /* private window : the defaults stay */ }
+    for (const [k, id] of Object.entries(AUTO_IDS)) { const el = $(id); if (!el) continue; const v = saved[k] !== undefined ? saved[k] : CFG.auto[k]; if (el.type === 'checkbox') el.checked = !!v; else { el.value = v; const out = $(id + 'Val'); if (out) out.textContent = v; } el.addEventListener('input', () => { const out = $(id + 'Val'); if (out) out.textContent = el.value; try { localStorage.setItem('zrl.auto', JSON.stringify(autoOpts())); } catch (e) { /* ignored */ } }); } }
+  const isRightSide = (n) => /_(R|FR|RR)$/.test(n);
+  function addPatches(name, list, tolM) {   // one component made of one or more four sided patches (a ring comes as four) ; corners within tolM of an existing point reuse it
+    const nodeAt = (pt) => { let bn = null, bd = tolM; for (const n of model.doc.nodes) { const d = d3(n.p, pt); if (d < bd) { bd = d; bn = n.id; } } return bn !== null ? bn : addNode(pt); };
+    const sameArc = (a, b, c) => { const midOf = (x) => V.mul(V.add(x[(x.length - 1) >> 1], x[x.length >> 1]), 0.5); return model.doc.arcs.some((x) => ((x.a === a && x.b === b) || (x.a === b && x.b === a)) && x.ctrl && d3(midOf(x.ctrl), midOf(c)) < CFG.repair.dupM); };
+    for (const q of list) { const ids = q.corners.map(nodeAt);
+      for (let k = 0; k < 4; k++) { const a = ids[k], b = ids[(k + 1) % 4]; if (a === b) continue; const c = q.sides[k].map(clone3); c[0] = clone3(model.node(a).p); c[c.length - 1] = clone3(model.node(b).p); if (!sameArc(a, b, c)) addArc(a, b, c, ['', '']); }
+      seeds().push({ name, p: clone3(q.seed) }); }
+  }
+  const mirrorPatches = (list) => list.map((q) => ({ corners: q.corners.map(mir), sides: q.sides.map((c) => c.map(mir)), seed: mir(q.seed) }));
+  async function buildParts(idx, o) {
+    const r = await fetch(CFG.files.autoPatch, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ op: 'build_parts', parts: idx, zone_deg: o.zoneDeg, min_area_m2: o.minAreaCm2 / 1e4, ref: modelRef() || undefined }) }).then((x) => x.json()).catch(() => null);
+    if (!r || !r.ok) throw new Error((r && r.error) || 'no answer from the server'); return r.results;
+  }
+  function progress(text, frac) { const el = $('autoProgress'); if (!el) return; el.hidden = text === null; if (text !== null) { el.querySelector('span').textContent = text; el.querySelector('i').style.width = Math.round(100 * (frac || 0)) + '%'; } }
+  async function autoBuildAll() {
+    if (S.building) return; const o = autoOpts(), parts = view.st.mesh.head.parts;
+    if (parts.length < CFG.auto.minParts) return status('This model is ' + (parts.length === 1 ? 'one piece' : parts.length + ' pieces') + ' : the automatic build cuts along the named parts of a model, so it would lay one folded patch on it. For a body, a face or any single piece : drag strokes along its creases with the Draw tool (D, the mirror follows), or click zones with Auto patch (W).', 'error');   // 29 October 2026 : said before it makes junk (Manny : 4 curves, 1 face, 140 folded quads)
+    if (model.doc.arcs.length && !confirm('The network already has ' + model.doc.arcs.length + ' curves : the automatic build adds the parts to it (Cmd Z undoes it all). Continue ?')) return;
+    S.building = true; $('bAutoBuild').disabled = true; const t0 = performance.now(); let results = [];
+    try {
+      const idx = []; parts.forEach((nm, i) => { if (o.mirror && isRightSide(nm) && parts.includes(mirrorName(nm))) return; idx.push(i); });
+      for (let i = 0; i < idx.length; i += CFG.auto.chunk) { progress('Fitting patches on the parts : ' + Math.min(i + CFG.auto.chunk, idx.length) + ' of ' + idx.length, i / idx.length); results = results.concat(await buildParts(idx.slice(i, i + CFG.auto.chunk), o)); }
+      progress('Adding the patches ...', 0.95); const names = new Set(seeds().map((q) => q.name)); let made = 0, ring = 0, mirrored = 0; const failed = [], tiny = [];
+      edit('Network built from the parts of the model', () => {
+        for (const r of results) {
+          if (!r.ok) { (r.skipped ? tiny : failed).push((r.name || '').replace(CFG.labels.strip, '') + (r.error ? ' (' + r.error.slice(0, 40) + ')' : '')); continue; }
+          const list = r.patches || [{ corners: r.corners, sides: r.sides, seed: r.seed }]; let nm = r.name.replace(CFG.labels.strip, ''), k = 2; while (names.has(nm)) nm = r.name.replace(CFG.labels.strip, '') + '_' + k++; names.add(nm);
+          addPatches(nm, list, o.weldMm / 1000); made++; if (r.ring) ring++;
+          if (o.mirror && /_(L|FL|RL)$/.test(r.name) && parts.includes(mirrorName(r.name))) { const mn = mirrorName(nm); if (!names.has(mn)) { names.add(mn); addPatches(mn, mirrorPatches(list), o.weldMm / 1000); made++; mirrored++; } }
+        }
+        S.comp = null;
+      });
+      renderCompList(); const parts1 = made + ' components (' + mirrored + ' mirrored, ' + ring + ' rings in quarters)';
+      S.lastBuild = { made, failed, tiny, seconds: (performance.now() - t0) / 1000 };
+      if (o.afterMerge) { progress('Merging close points ...', 0.97); await mergeNearNodes(o.weldMm / 1000, true); }
+      if (o.afterFix) { progress('Fixing what is safe ...', 0.98); try { await autoFix(); } catch (e) { console.error(e); } }
+      if (o.afterQuads) setShow('quads'); else await convertToMesh();
+      progress(null); const pr = problems().length;
+      status('Built ' + parts1 + ' in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s' + (failed.length ? ' ; no patch for ' + failed.slice(0, 4).join(', ') + (failed.length > 4 ? '...' : '') : '') + ' ; ' + pr + ' problem(s) left' + (o.afterJump && pr ? ' : the first one is framed' : '') + '.');
+      if (o.afterJump && pr) nextProblem(0);
+    } catch (e) { console.error(e); progress(null); status('Automatic build failed : ' + (e && e.message ? e.message : e), 'error'); }
+    finally { S.building = false; $('bAutoBuild').disabled = false; progress(null); }
+  }
+  async function autoPatchPart(i) {   // shift click on a part chip : its patch, and its mirror, without choosing a tool
+    const o = autoOpts(), parts = view.st.mesh.head.parts, res = (await buildParts([i], o))[0]; if (!res || !res.ok) return status((parts[i] || 'part') + ' : ' + ((res && (res.error || res.skipped)) || 'no patch') , 'error');
+    const names = new Set(seeds().map((q) => q.name)); let nm = res.name.replace(CFG.labels.strip, ''), k = 2; while (names.has(nm)) nm = res.name.replace(CFG.labels.strip, '') + '_' + k++;
+    const list = res.patches || [{ corners: res.corners, sides: res.sides, seed: res.seed }], mn = mirrorName(nm), both = o.mirror && /_(L|FL|RL|R|FR|RR)$/.test(res.name) && !names.has(mn) && Math.abs(res.seed[0]) > 0.03;
+    edit('Patch ' + nm, () => { addPatches(nm, list, o.weldMm / 1000); if (both) addPatches(mn, mirrorPatches(list), o.weldMm / 1000); S.comp = nm; }); renderCompList(); schedulePreview();
+    status('Patch ' + nm + (both ? ' and its mirror ' + mn : '') + ' fitted on ' + parts[i].replace(CFG.labels.strip, '') + ' within ' + (res.report ? res.report.fit_dev_mm : '?') + ' mm.');
+  }
+  // merge every group of points closer than tol : the centre of the group, put back on the surface ; one undo step
+  async function mergeNearNodes(tol, quiet) {
+    const N = model.doc.nodes, par = new Map(N.map((n) => [n.id, n.id])), find = (x) => { while (par.get(x) !== x) { par.set(x, par.get(par.get(x))); x = par.get(x); } return x; };
+    const cell = tol, grid = new Map(), key = (p) => Math.floor(p[0] / cell) + ',' + Math.floor(p[1] / cell) + ',' + Math.floor(p[2] / cell);
+    for (const n of N) { const k = key(n.p), [i, j, l] = k.split(',').map(Number); for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) for (const o of grid.get((i + a) + ',' + (j + b) + ',' + (l + c)) || []) if (d3(o.p, n.p) < tol) par.set(find(n.id), find(o.id)); (grid.get(k) || grid.set(k, []).get(k)).push(n); }
+    const groups = new Map(); for (const n of N) { const r = find(n.id); (groups.get(r) || groups.set(r, []).get(r)).push(n); }
+    const gs = [...groups.values()].filter((g) => g.length > 1); if (!gs.length) { if (!quiet) status('No points closer than ' + (tol * 1000).toFixed(0) + ' mm.'); return 0; }
+    const cen = gs.map((g) => g.reduce((t, n) => V.add(t, V.mul(n.p, 1 / g.length)), [0, 0, 0])), proj = P().snap ? await closestMany(cen) : cen;
+    edit(gs.reduce((t, g) => t + g.length - 1, 0) + ' close points merged', () => { gs.forEach((g, i) => { for (let k = 1; k < g.length; k++) mergeNodePair(g[0].id, g[k].id, proj[i]); model.node(g[0].id).p = clone3(proj[i]); }); S.node = null; });
+    if (!quiet) status(gs.reduce((t, g) => t + g.length - 1, 0) + ' points merged into ' + gs.length + ' (closer than ' + (tol * 1000).toFixed(0) + ' mm).'); return gs.length;
+  }
+  // every curve that is almost straight (control points within tol of its chord) becomes exactly straight, on the surface
+  async function straightenNear(tolMm) {
+    const tol = tolMm / 1000, items = [];
+    for (const a of model.doc.arcs) { if (a.ctrl.length < 3) continue; const [A, B] = endsOf(a), d = V.sub(B, A), L = V.len(d); if (L < 0.03) continue; let mx = 0; for (const p of a.ctrl) { const w = V.sub(p, A), t = V.dot(w, d) / (L * L); mx = Math.max(mx, V.len(V.sub(w, V.mul(d, t)))); } if (mx > 1e-6 && mx < tol) items.push({ a, pts: chord(A, B, Math.max(CFG.edit.minCtrl, Math.min(a.ctrl.length, 8))) }); }
+    if (!items.length) return status('No curve is almost straight (under ' + tolMm + ' mm) : nothing changed.');
+    const flat = await closestMany(items.flatMap((it) => it.pts)); let k = 0;
+    edit(items.length + ' near-straight curves straightened', () => { for (const it of items) { const q = flat.slice(k, k += it.pts.length); q[0] = clone3(endsOf(it.a)[0]); q[q.length - 1] = clone3(endsOf(it.a)[1]); it.a.ctrl = q.map(clone3); model.touch(it.a.id); } });
+    status(items.length + ' curves that were within ' + tolMm + ' mm of straight are now exactly straight.');
+  }
+  // 29 October 2026 : the GALLERY of components under the top bar : your components first (colour dot, quads, a red mark when something is wrong), a chip to
+  // start an auto patch, then the parts of the model on a toggle. Click selects and frames ; double click isolates ; a filter narrows the list.
+  // FR : la galerie de composants sous la barre du haut : les vôtres d'abord, puis les pièces du modèle ; clic = sélection et cadrage, double clic = isoler.
+  S.galParts = false; S.galFilter = '';
+  function selectComponent(n, frame) {
+    S.comp = n; $('compName').value = n; S.face = null; selectFaceCurves(); const q = seeds().filter((z) => z.name === n), fs = (S.faces || []).find((f) => f.component === n && f.boundary);
+    if (frame) { if (fs) { const pts = []; for (let i = 0; i < fs.boundary.length; i += 3) pts.push([fs.boundary[i], fs.boundary[i + 1], fs.boundary[i + 2]]); view.frame(pts); } else if (q.length) view.frame([V.add(q[0].p, [0.4, 0.4, 0.4]), V.sub(q[0].p, [0.4, 0.4, 0.4])]); }
+    renderCompList(); redraw();
+  }
+  function renderGallery() {
+    const host = $('gallery'); if (!host || !model) return; const filt = (S.galFilter || '').toLowerCase(), esc2 = (t) => String(t).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+    const faces = S.faces || [], quads = {}, bad = {};
+    for (const f of faces) if (f.component) { if (f.status === 'skipped' || f.status === 'infeasible' || f.judge_ok === false) bad[f.component] = (bad[f.component] || 0) + 1; }
+    if (S.mesh && S.mesh.fq && S.mesh.faces) { const nameOf = {}; for (const f of S.mesh.faces) nameOf[f.id] = f.component; for (const id of S.mesh.fq) { const n = nameOf[id]; if (n) quads[n] = (quads[n] || 0) + 1; } }
+    const names = [...new Set(seeds().map((q) => q.name))].filter((n) => !filt || n.toLowerCase().includes(filt)); let html = '<span class="gl-title">Components</span><input id="galFilter" type="search" class="gal-filter" placeholder="Find" value="' + esc2(S.galFilter) + '" autocomplete="off" spellcheck="false">';
+    html += '<button class="gchip add" data-gact="auto" title="Click a zone of the model : a patch is fitted on its contour (W)">+ Auto patch</button>';
+    for (const n of names) { const c = hashColour(n).slice(0, 3).map((v) => Math.round(v * 255)); html += `<button class="gchip${S.comp === n ? ' sel' : ''}${bad[n] ? ' bad' : ''}" data-name="${esc2(n)}" title="Click : select and frame ; double click : isolate"><i style="background:rgb(${c})"></i>${esc2(n.replace(/^CAR_(body_)?/, ''))}${quads[n] ? '<small>' + quads[n] + '</small>' : ''}${bad[n] ? '<small>!</small>' : ''}</button>`; }
+    if (!names.length) html += '<span class="gl-title">' + (filt ? 'no component matches' : 'none yet : click Auto patch, then a zone of the model') + '</span>';
+    const parts = view.st.mesh ? view.st.mesh.head.parts : [];
+    html += '<span class="gl-sep"></span><button class="gchip toggle' + (S.galParts ? ' sel' : '') + '" data-gact="parts" title="The parts of the reference model">Model parts <small>' + parts.length + '</small></button>';
+    if (S.galParts) parts.forEach((nm, i) => { const t = nm.replace(/^CAR_(body_)?/, ''); if (filt && !t.toLowerCase().includes(filt)) return; const c = view.st.partColours ? view.st.partColours[i].map((v) => Math.round(v * 255)) : [150, 150, 150];
+      html += `<button class="gchip part${S.isoPart === i ? ' sel' : ''}" data-part="${i}" title="Click : frame ; double click : isolate ; Shift click : auto patch it"><i style="background:rgb(${c})"></i>${esc2(t)}</button>`; });
+    const keepFocus = document.activeElement && document.activeElement.id === 'galFilter', pos = keepFocus ? document.activeElement.selectionStart : 0; host.innerHTML = html;
+    const fi = $('galFilter'); if (keepFocus) { fi.focus(); fi.setSelectionRange(pos, pos); }
+    fi.addEventListener('input', () => { S.galFilter = fi.value; renderGallery(); }); fi.addEventListener('keydown', (e) => e.stopPropagation());
+    host.querySelectorAll('.gchip').forEach((el) => {
+      el.addEventListener('click', (ev) => { const act = el.dataset.gact;
+        if (act === 'auto') { setTool('autopatch'); return status('Auto patch : click a zone of the model.'); }
+        if (act === 'parts') { S.galParts = !S.galParts; return renderGallery(); }
+        if (el.dataset.part !== undefined && ev.shiftKey) { safe(autoPatchPart)(+el.dataset.part); return; }
+        if (el.dataset.part !== undefined) { const i = +el.dataset.part, a = view.st.anchors.find((q) => q.part === i); if (a) { pushView(); frameBox(a.lo, a.hi); view.st.hiPart = i; navButtons(); redraw(true); status((view.st.mesh.head.parts[i] || '') + ' framed ; double click to isolate it.'); } return; }
+        selectComponent(el.dataset.name, true); });
+      el.addEventListener('dblclick', () => { if (el.dataset.part !== undefined) { if (S.isolated && S.isoPart === +el.dataset.part) showEverything(); else isolatePart(+el.dataset.part); renderGallery(); } else if (el.dataset.name) { selectComponent(el.dataset.name, false); isolateComp(); } });
     });
   }
   // 29 October 2026 : FACES of the network under a surface point : the loop's plane (Newell normal), point inside the projected loop, smallest face wins
@@ -1077,10 +1512,11 @@
     return out;
   }
   function framePoints(flat) { const pts = []; for (let i = 0; i < flat.length; i += 3) pts.push([flat[i], flat[i + 1], flat[i + 2]]); if (pts.length) view.frame(pts); }
-  function nextProblem() {   // 29 October 2026 : N : every problem in turn, loose curves first, then the faces, each with the gesture that fixes it
+  function nextProblem(at) {   // 29 October 2026 : N : every problem in turn, loose curves first, then the faces, each with the gesture that fixes it ; a number goes straight to that one
     const list = problems(); if (!S.faces) return status('Preview the faces first (P).');
     if (!list.length) return status('No problem left : every curve borders two faces and every face meshes cleanly.');
-    S.doctor.k = ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % list.length; const it = list[S.doctor.k], head = 'Problem ' + (S.doctor.k + 1) + ' of ' + list.length + ' : ';
+    if (!S.doctor) S.doctor = { dangling: [], issues: [], k: null };
+    S.doctor.k = typeof at === 'number' ? at % list.length : ((S.doctor.k == null ? -1 : S.doctor.k) + 1) % list.length; const it = list[S.doctor.k], head = 'Problem ' + (S.doctor.k + 1) + ' of ' + list.length + ' : ';
     if (it.kind === 'loose') { S.sel = new Set([it.arc]); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'loose curve ' + it.arc + ' ; drag its free end onto a node or a curve, or delete it.'); }
     if (it.kind === 'crossingArc') { S.sel = new Set([it.arc].concat(it.other != null ? [it.other] : [])); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'curves ' + Array.from(S.sel).join(' and ') + ' : ' + FIXES.crossingArc + '.'); }
     if (it.kind === 'overlapArc') { S.sel = new Set([it.arc].concat(it.other != null ? [it.other] : [])); S.node = null; S.handle = null; S.face = null; frameSel(); return status(head + 'curves ' + Array.from(S.sel).join(' and ') + ' : ' + FIXES.overlapArc + '.'); }
@@ -1095,6 +1531,14 @@
     if (d.spacing_ratio > T.spacing) h.push('quad sizes differ ' + d.spacing_ratio + ' x between sides : Denser, Coarser or a loop (L)');
     return h.length ? h.join(' ; ') : 'the layout is sound (sides ' + (d.opposite_ratio || '-') + ' x, corners from ' + (d.min_corner_deg || '-') + ' degrees) : the folds come from the surface, add a loop along its crease (L)';
   }
+  // 29 October 2026 : the PROBLEMS card : what the automatic steps could not settle, grouped, one click to go to the first of a kind ; the fixes are suggested, the safe ones automatic
+  const PROB_NAMES = { crossingArc: 'curves crossing without a node', overlapArc: 'doubled curves', overlap: 'overlapping faces', annulus: 'ring faces (an island inside)', loose: 'loose curves', sliver: 'thin faces', round_face: 'faces without corners', few_corners: 'faces without enough corners', infeasible: 'faces that cannot be quads', judge: 'faces with bad quads', complement: 'extra outer loops', wraps_around: 'faces that wrap around the body' };
+  function renderProblems() {
+    const host = $('problemList'); if (!host) return; const list = problems(), first = {}, by = {}; list.forEach((it, i) => { by[it.kind] = (by[it.kind] || 0) + 1; if (first[it.kind] === undefined) first[it.kind] = i; });
+    if (!S.faces) { host.innerHTML = '<div class="hint">Turn on the Quads view, or press Preview faces, to look for problems.</div>'; return; }
+    host.innerHTML = list.length ? Object.entries(by).map(([k, n]) => `<button class="prob" data-at="${first[k]}" title="${(FIXES[k] || '').replace(/"/g, '&quot;')}"><b>${n}</b> ${PROB_NAMES[k] || k}</button>`).join('') : '<div class="ok-line">No problem : every face meshes cleanly.</div>';
+    host.querySelectorAll('.prob').forEach((b) => b.addEventListener('click', () => nextProblem(+b.dataset.at)));
+  }
   function problemSummary() { const by = {}; for (const it of problems()) by[it.kind] = (by[it.kind] || 0) + 1; const names = { crossingArc: 'crossings without a node', overlapArc: 'doubled curves', overlap: 'overlapping faces', annulus: 'ring faces', loose: 'loose curves', sliver: 'thin faces', round_face: 'round faces', few_corners: 'faces short of corners', too_many_sides: 'faces with too many sides', wraps_around: 'wrapping faces', area: 'too large faces', complement: 'islands', infeasible: 'faces that cannot close', judge: 'faces with bad quads' };
     const parts = Object.entries(by).map(([k, v]) => v + ' ' + names[k]); return parts.length ? parts.join(', ') + ' : N goes to the next one' : 'No problem : every face meshes'; }
   function freeEnds(id) { const a = model.arc(id), out = []; if (!a) return out; for (const [nid, p] of [[a.a, a.ctrl[0]], [a.b, a.ctrl[a.ctrl.length - 1]]]) { if (nid == null || nid < 0) out.push(p); else if (model.node(nid) && model.nodeArcs(nid).length < 2) out.push(model.node(nid).p); } return out; }
@@ -1108,7 +1552,7 @@
     for (const [k, v] of Object.entries(cf)) { const n = model.node(+k); if (n) pts.push({ p: n.p, color: v ? CFG.colors.forced : CFG.colors.forbidden, size: CFG.sizes.nodeSel + 3 }); }
     view.setPoints('forced', pts, { onTop: true, order: 6.5 }); }
   function renderComponents() {
-    const pts = seeds().map((q) => ({ p: q.p, color: S.comp === q.name ? CFG.colors.sel : hashColour(q.name), size: CFG.preview.seedSize * (S.comp === q.name ? 1.4 : 1) }));
+    const pts = seeds().map((q) => ({ p: q.p, color: S.comp === q.name ? CFG.colors.sel : hashColour(q.name), size: Math.max(3, Math.min(CFG.preview.seedSize, CFG.preview.seedSize * Math.sqrt(120 / Math.max(1, seeds().length)))) * (S.comp === q.name ? 1.4 : 1) }));      // 29 October 2026 : a character has hundreds of seeds : the markers shrink with their number (13 px under 120 seeds, 3 px at 2 000)
     view.setPoints('seeds', pts, { onTop: true, order: 8 });
     if (S.faces && $('pFaces').checked) {
       const polys = [], corners = [];
@@ -1131,14 +1575,14 @@
     const L = CFG.labels, W = st.W, H = st.H, cand = [];
     const byName = new Map(); for (const q of seeds()) (byName.get(q.name) || byName.set(q.name, []).get(q.name)).push(q.p);   // one label per component, on its seed nearest the middle of its seeds (a ring has four)
     for (const [name, ps] of byName) { const g = ps.reduce((s, p) => V.add(s, V.mul(p, 1 / ps.length)), [0, 0, 0]), p = ps.reduce((b, q) => (d3(q, g) < d3(b, g) ? q : b), ps[0]);
-      cand.push({ p, text: name.replace(L.strip, ''), dot: hashColour(name), cls: S.comp === name ? 'sel' : 'comp', mine: true }); }
+      cand.push({ p, text: name.replace(L.strip, ''), dot: hashColour(name), cls: S.comp === name ? 'sel' : 'comp', mine: true, attr: 'data-name="' + esc(name) + '"' }); }
     if (st.shade === 'parts' && st.showMesh) {
       const parts = [];
       for (const a of st.anchors) { if (st.hidden && st.hidden[a.part]) continue; let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
         for (let c = 0; c < 8; c++) { const v = view.project([c & 1 ? a.hi[0] : a.lo[0], c & 2 ? a.hi[1] : a.lo[1], c & 4 ? a.hi[2] : a.lo[2]]); if (v[3] <= 0) continue; x0 = Math.min(x0, v[0]); x1 = Math.max(x1, v[0]); y0 = Math.min(y0, v[1]); y1 = Math.max(y1, v[1]); }
         const size = Math.max(x1 - x0, y1 - y0); if (size >= L.minPartPx) parts.push({ a, size }); }
       parts.sort((u, w) => w.size - u.size);
-      for (const { a } of parts.slice(0, L.maxParts)) { const c = st.partColours[a.part]; cand.push({ p: a.p, text: (st.mesh.head.parts[a.part] || 'part ' + a.part).replace(L.strip, ''), dot: [c[0], c[1], c[2], 1], cls: 'part' }); }
+      for (const { a } of parts.slice(0, L.maxParts)) { const c = st.partColours[a.part]; cand.push({ p: a.p, text: (st.mesh.head.parts[a.part] || 'part ' + a.part).replace(L.strip, ''), dot: [c[0], c[1], c[2], 1], cls: 'part', attr: 'data-part="' + a.part + '"' }); }
     }
     const seen = st.xray ? cand.map(() => true) : view.visible(cand.map((c) => c.p)), placed = [], out = [];
     const free = (x, y, w, h) => placed.every((r) => x >= r[0] + r[2] + L.gap || r[0] >= x + w + L.gap || y >= r[1] + r[3] + L.gap || r[1] >= y + h + L.gap);
@@ -1146,7 +1590,7 @@
       const w = c.text.length * L.charPx + 2 * L.padX + 11, h = L.h, x = v[0] - w / 2, y = v[1] - h / 2;
       if (x + w < 0 || y + h < 0 || x > W || y > H) return; if (!c.mine && !free(x, y, w, h)) return; placed.push([x, y, w, h]);   // your components are always written ; the parts give way
       const rgb = 'rgb(' + c.dot.slice(0, 3).map((t) => Math.round(t * 255)).join(',') + ')';
-      out.push(`<div class="tag ${c.cls}" style="left:${v[0].toFixed(0)}px;top:${v[1].toFixed(0)}px"><i style="background:${rgb}"></i>${esc(c.text)}</div>`); });
+      out.push(`<div class="tag ${c.cls}" ${c.attr || ''} style="left:${v[0].toFixed(0)}px;top:${v[1].toFixed(0)}px"><i style="background:${rgb}"></i>${esc(c.text)}</div>`); });
     host.innerHTML = out.join('');
   }
   let facesTimer = null, meshTimer = null, previewSeq = 0;
@@ -1161,7 +1605,7 @@
     const seedsOk = S.isolated && S.comp ? (doc.component_seeds || []).filter((q) => q.name === S.comp) : doc.component_seeds;   // isolated : its own seed names its face
     return { ...doc, arcs, nodes: doc.nodes.filter((n) => used.has(n.id)), component_seeds: seedsOk };
   }
-  function meshParams() { return { edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), component_options: compOpts(), corners_force: model.doc.corners_force || {}, symmetry_x: $('pSymX').checked, ...(modelRef() ? { ref: modelRef() } : {}) }; }   // 29 October 2026 : exact symmetry for a network built symmetric (the car's lifted network is not : 165 to 181 folded)   // 29 October 2026 : options by component name, stable when face ids change
+  function meshParams() { return { unit: model.doc.mesh_unit || 1, feature_unit: model.doc.mesh_feature_unit || undefined, edge_m: parseFloat($('pEdge').value), corner_deg: parseFloat($('pCorner').value), relax_iters: parseInt($('pRelax').value, 10), component_options: compOpts(), corners_force: model.doc.corners_force || {}, symmetry_x: $('pSymX').checked, ...(model.doc.mesh_params || {}), ...(modelRef() ? { ref: modelRef() } : {}) }; }   // 29 October 2026 : exact symmetry for a network built symmetric (the car's lifted network is not : 165 to 181 folded)   // 29 October 2026 : options by component name, stable when face ids change
   async function previewFaces() {
     const seq = ++previewSeq; const t0 = performance.now();
     const r = await fetch(CFG.files.faces, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lines: docForServer(), params: meshParams() }) });
@@ -1171,7 +1615,7 @@
     S.faces = res.faces || []; const by = {}; for (const f of S.faces) by[f.status] = (by[f.status] || 0) + 1;
     S.doctor = { dangling: res.dangling_arcs || [], issues: res.issues || [], euler: res.euler || null, k: S.doctor ? S.doctor.k : null }; S.arcParents = res.arc_parents || {};
     if (S.face) { const f = faceAt(S.face.p); S.face = f ? { id: f.id, p: S.face.p } : null; }
-    $('doctorInfo').textContent = problemSummary();
+    $('doctorInfo').textContent = problemSummary(); renderProblems(); updateBadge();
     status('Preview in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s : ' + S.faces.length + ' faces (' + Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') + ')');
     renderCompList(); redraw();
   }
@@ -1234,8 +1678,10 @@
     if (!view.floatOk) status('Float render targets are missing : snapping to the surface is off in this browser', 'error');
     const [head, buf] = await Promise.all([fetch(CFG.files.ref + '.json').then((r) => r.json()), fetch(CFG.files.ref + '.bin').then((r) => r.arrayBuffer())]);
     loadSheetPlanes();
+    setShow('both', true); markPreset('persp'); navButtons();   // 29 October 2026 : the current mode is lit from the start
     view.setMesh(head, buf);
     const src = new URLSearchParams(location.search).get('src');
+    try { const pr = await fetch('palette.json', { cache: 'no-store' }); if (pr.ok) { const P = await pr.json(); if (P && P.families) CFG.palette = Object.assign(CFG.palette, P, { _re: null }); } } catch (e) { /* the built in palette stays */ }   // 30 October 2026 : one palette file for the editor and the renders
     let doc = null; for (const u of src ? [src] : [CFG.files.edit, CFG.files.lines]) { const r = await fetch(u, { cache: 'no-store' }); if (r.ok) { doc = await r.json(); break; } }
     model = Z.createModel(doc); model.buildNodeMirror();
     const c = cv(); c.tabIndex = 0;
@@ -1243,10 +1689,11 @@
     c.addEventListener('wheel', safe(onWheel), { passive: false }); c.addEventListener('contextmenu', (e) => e.preventDefault()); window.addEventListener('keydown', safe(onKey));
     c.addEventListener('dblclick', safe(() => { if (S.tool === 'draw') finishDraw(); }));
     document.querySelectorAll('.tool').forEach((b) => b.addEventListener('click', () => setTool(b.dataset.tool)));
-    document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => { view.preset(b.dataset.view); redraw(); }));
+    document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => setPreset(b.dataset.view)));
     const on = (id, fn) => $(id).addEventListener('click', safe(fn));
-    on('bOrtho', () => { view.cam.ortho = !view.cam.ortho; $('bOrtho').classList.toggle('on', view.cam.ortho); redraw(); }); on('bFrame', frameSel);
-    on('bDelete', deleteSelection); on('bSmooth', () => smoothSel(1)); on('bRound', () => smoothSel(CFG.edit.roundPasses)); on('bSimplify', simplifySel); on('bReverse', reverseSel);
+    on('bOrtho', () => { pushView(); view.cam.ortho = !view.cam.ortho; view.fitAll(); navButtons(); redraw(); }); on('bFrame', frameSel); on('bViewBack', viewBack); on('bViewFwd', viewForward); on('bHome', normalView);
+    autoLoad(); on('bAutoBuild', autoBuildAll); on('bAutoMerge', () => safe(mergeNearNodes)(autoOpts().weldMm / 1000)); on('bAutoStraight', () => safe(straightenNear)(autoOpts().straightMm)); on('bAutoCreases', () => safe(snapToCreases)()); if ($('bAutoTrace')) on('bAutoTrace', () => safe(traceCreases)()); if ($('bRingsCurve')) on('bRingsCurve', () => safe(ringsAroundSelection)()); if ($('pStyle')) { let sv = 'hard'; try { sv = localStorage.getItem('zrl.style') || 'hard'; } catch (e) { /* ignored */ } $('pStyle').value = sv; $('pStyle').addEventListener('change', () => applyStyle($('pStyle').value)); } on('bSnapCreases', () => safe(snapToCreases)());
+    on('bStraight', straightenSel); on('bDuplicate', duplicateSel); on('bConnect', connectNodes); on('bMergeSel', mergeSelected); on('bDelete', deleteSelection); on('bSmooth', () => smoothSel(1)); on('bRound', () => smoothSel(CFG.edit.roundPasses)); on('bSimplify', simplifySel); on('bReverse', reverseSel);
     on('bJoin', () => (S.node !== null ? joinAtNode(S.node) : status('Select a node with two curves.'))); on('bWeld', weldSel); on('bProject', projectSel);
     on('bSelText', () => { const t = $('selText').value.trim().toLowerCase(); S.sel = new Set(model.doc.arcs.filter((a) => (a.pair || []).some((n) => n && n.toLowerCase().includes(t)) || String(a.id) === t).map((a) => a.id)); status(S.sel.size + ' curve(s) selected'); redraw(); });
     on('bSelAll', () => { S.sel = new Set(model.doc.arcs.map((a) => a.id)); redraw(); }); on('bSelNone', () => { S.sel.clear(); S.node = null; S.handle = null; redraw(); });
@@ -1265,9 +1712,10 @@
     on('bNextProblem', nextProblem); on('bWeldAll', weldAll); on('bRepair', repairNetwork); on('bBridge', () => safe(bridgeIslands)()); on('bUseModel', () => safe(useModel)()); on('bSnapSurface', () => safe(snapToSurface)()); on('bCorner', toggleCorner); on('bPatternPrev', () => cyclePattern(-1));
     on('bMesh', convertToMesh); on('bDoctor', checkNetwork); on('bRelaxMesh', relaxMesh); on('bClearMesh', () => { S.mesh = null; buildMeshLayers(); $('meshInfo').textContent = ''; redraw(); }); on('bExportObj', exportObj);
     on('bUndo', () => { model.undo() && (model.buildNodeMirror(), redraw()); }); on('bRedo', () => { model.redo() && (model.buildNodeMirror(), redraw()); });
-    on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); on('bExportPng', exportPng);
-    on('bSave', save); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network')); on('bNewNet', newNetwork); on('bLoadMbo', () => loadDoc(CFG.files.mboNet, 'Component network (borders of the component cut, Scripts/lines/ZrlNetworkFromMbo.py)'));
-    for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
+    on('bExportJson', () => download('lines_edit.json', model.serialize(), 'application/json')); on('bExportSvg', exportSvg); if ($('bExportCode')) on('bExportCode', safe(exportCode)); on('bExportPng', exportPng);
+    on('bSave', () => save(false)); on('bLoadSaved', () => loadDoc(CFG.files.edit, 'Saved network')); on('bLoadOriginal', () => loadDoc(CFG.files.lines, 'Original network')); on('bNewNet', newNetwork); on('bLoadMbo', () => loadDoc(CFG.files.mboNet, 'Component network (borders of the component cut, Scripts/lines/ZrlNetworkFromMbo.py)'));
+    for (const [id, out] of [['pEdge', 'pEdgeVal'], ['pCorner', 'pCornerVal'], ['pRelax', 'pRelaxVal'], ['pCtrl', 'pCtrlVal'], ['pLod', 'pLodVal']]) $(id).addEventListener('input', () => { $(out).textContent = $(id).value; });
+    for (const id of ['pLod', 'pLodFit', 'pEdge']) $(id).addEventListener('change', () => { if (S.mesh || S.show === 'quads') safe(convertToMesh)(); });   // 29 October 2026 : a new LOD or quad size converts again
     for (const id of ['pModel', 'pXray', 'pNodes', 'pHandles', 'pMesh', 'pHidden']) $(id).addEventListener('change', redraw);
     $('pSheet').addEventListener('change', () => { view.st.showPlanes = $('pSheet').checked; redraw(true); });
     document.querySelectorAll('#showSwitch .btn').forEach((b) => b.addEventListener('click', () => setShow(b.dataset.show)));   // 29 October 2026 : the swap
@@ -1279,9 +1727,17 @@
     });
     if ($('pShowCreases')) $('pShowCreases').addEventListener('change', safe(showCreases));   // 29 October 2026 : crease layer
     cv().addEventListener('wheel', () => creasesLater(), { passive: true });
+    $('tags').addEventListener('mousedown', (ev) => { const t = ev.target.closest('.tag'); if (!t) return; ev.preventDefault(); ev.stopPropagation();   // a name on the model selects it
+      if (t.dataset.name) { selectComponent(t.dataset.name, false); status(t.dataset.name + ' : its curves are selected.'); }
+      else if (t.dataset.part !== undefined) { const i = +t.dataset.part, a = view.st.anchors.find((q) => q.part === i); if (a) { pushView(); frameBox(a.lo, a.hi); view.st.hiPart = i; navButtons(); redraw(true); status((view.st.mesh.head.parts[i] || '') + ' framed ; double click its chip in the gallery to isolate it.'); } } });
+    $('projBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleProjMenu(); }); on('bProjClose', () => toggleProjMenu(false)); on('bProjCreate', createProject);
+    document.addEventListener('mousedown', (e) => { const m = $('projMenu'); if (!m.hidden && !m.contains(e.target) && e.target !== $('projBtn')) m.hidden = true; });
+    refreshProjects(); if (PROJECT !== 'car' && $('bCompImport')) $('bCompImport').hidden = true;   // the car components list belongs to the car
+    $('isoBadge').addEventListener('click', () => showEverything());
+    $('saveState').addEventListener('click', () => { if (S.saveError) safe(save)(false); });
     window.addEventListener('resize', redraw); window.addEventListener('beforeunload', (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ''; } });
     view.preset('persp'); setTool('select'); renderCompList(); status('Ready : ' + model.doc.arcs.length + ' curves, ' + model.doc.nodes.length + ' nodes on ' + head.triangles + ' triangles'); checkModelMatch();
-    window.ZRL3D = { S, view: () => view, model: () => model, api: { setShade, renderTags, isolatePart, isolateToggle, showEverything, mergeNodes, importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, autoPatchAt, snapToContour, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
+    window.ZRL3D = { S, view: () => view, model: () => model, api: { ringsAround, ringsAroundSelection, applyLod, traceCreases, strokeEnd, exportCode, applyStyle, previewCreaseLater, snapToCreases, drawClick, simplifyStroke, refreshProjects, toggleProjMenu, openProject, autoBuildAll, autoPatchPart, mergeNearNodes, straightenNear, autoOpts, straightenSel, duplicateSel, connectNodes, mergeSelected, setPreset, normalView, viewBack, viewForward, setShade, renderTags, isolatePart, isolateToggle, showEverything, mergeNodes, importSeeds, addSeed, renameComp, deleteComp, setCompOption, previewFaces, sendToHoudini, renderCompList, setTool, refresh, deleteSelection, smoothSel, simplifySel, reverseSel, joinAtNode, splitArcAt, insertCtrl, finishDraw, showCreases, creaseAlignment, setShow, autoPatchAt, snapToContour, renameCompTo, deleteCompNamed, exportChain, buildChain, pullChain, convertToMesh, checkNetwork, relaxMesh, exportObj, exportSvg, exportPng, save, loadDoc, frameSel, hitTest, setMesh, nameFacesFromModel, selectFaceCurves, isolateComp, bestPattern, bestPatternsAll, autoFix, insertLoopAt, extendCurve, finishExtend, targetWeld, meshAdjacency, repairNetwork, snapToSurface, useModel, bridgeIslands, newNetwork, weldAll, toggleCorner, cyclePattern, selectFaceAt, faceAt, nextProblem, attachDroppedEnd } };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => safe(boot)()); else safe(boot)();
 })();

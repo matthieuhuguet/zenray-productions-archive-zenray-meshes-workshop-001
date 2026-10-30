@@ -8,7 +8,7 @@
 const View3D = (() => {
   const CFG = {   // 29 October 2026 : every tunable value of the engine
     fov: 32, near: 0.02, far: 60, nearFrac: 0.01, farFrac: 60,   /* 29 October 2026 : near and far follow the distance (nearFrac x dist, at least 1 mm), nothing is clipped up close */ bg: [0.965, 0.965, 0.96, 1], meshColor: [0.80, 0.82, 0.86], xrayAlpha: 0.28, highlight: [0.95, 0.55, 0.2],
-    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.01, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14, planeAlpha: 0.9, planeAlignCos: 0.97,
+    orbit: 0.0065, pan: 1.0, zoom: 0.0016, minDist: 0.002, maxDist: 40, pitchLimit: 1.55, lineDepthBias: 0.0006, hiddenAlpha: 0.14, planeAlpha: 0.9, planeAlignCos: 0.97,
     // 29 October 2026 : COLOUR SHADING : one hue per part (golden angle), two lightness steps ; the sides of a pair (_L _R, _FL ...) share their colour
     partHueStep: 137.508, partSat: 0.52, partLight: [0.62, 0.72], partPairs: /_(L|R|FL|FR|RL|RR)$/, planeWhite: 250,   // planeWhite : the white margin of a sheet panel (min channel over it) is cut off the plane
     occDiv: 6, occTolM: 0.03, occTolPx: 4,   // 29 October 2026 : labels : a small position render (1 texel per occDiv device px) says which anchors are seen
@@ -219,9 +219,9 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
     const clearLayer = (name) => { if (st.layers[name]) st.layers[name].visible = false; };
 
     function eye() { const c = Math.cos(cam.pitch); return [cam.target[0] + cam.dist * c * Math.sin(cam.yaw), cam.target[1] + cam.dist * Math.sin(cam.pitch), cam.target[2] + cam.dist * c * Math.cos(cam.yaw)]; }
+    const upVec = () => (Math.abs(Math.cos(cam.pitch)) < 1e-4 ? [0, 0, -Math.sign(cam.pitch)] : [0, 1, 0]);   // 29 October 2026 : straight down or up, the screen up is the rear of the car (matches the top sheet)
     function matrices() {
-      const e = eye(), up = Math.abs(Math.cos(cam.pitch)) < 1e-4 ? [0, 0, -Math.sign(cam.pitch)] : [0, 1, 0];
-      const Vw = lookAt(e, cam.target, up), a = st.W / st.H;
+      const e = eye(), up = upVec(), Vw = lookAt(e, cam.target, up), a = st.W / st.H;
       const Pr = cam.ortho ? ortho(cam.dist * Math.tan(CFG.fov * Math.PI / 360), a, -CFG.far, CFG.far) : perspective(CFG.fov * Math.PI / 180, a, Math.max(0.001, Math.min(CFG.near, cam.dist * CFG.nearFrac)), Math.max(CFG.far, cam.dist * CFG.farFrac));
       st.MVP = mmul(Pr, Vw); st.eye = e; st.V = Vw; st.Pr = Pr;
     }
@@ -236,10 +236,10 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       drawPlanes();
       if (st.mesh && st.showMesh) {
         gl.useProgram(P.mesh.p); gl.uniformMatrix4fv(P.mesh.u.uMVP, false, st.MVP); gl.uniform3fv(P.mesh.u.uEye, st.eye); gl.uniform3fv(P.mesh.u.uColor, CFG.meshColor);
-        gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : 1.0);
+        gl.uniform1f(P.mesh.u.uHiPart, st.hiPart); gl.uniform3fv(P.mesh.u.uHi, CFG.highlight); gl.uniform1f(P.mesh.u.uAlpha, st.xray ? CFG.xrayAlpha : (st.ghost != null ? st.ghost : 1.0));   // 29 October 2026 : ghost : the model faint under the quads (Quads view)
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, st.hiddenTex); gl.uniform1i(P.mesh.u.uHidden, 0);
         gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, st.partCol); gl.uniform1i(P.mesh.u.uPartCol, 1); gl.uniform1i(P.mesh.u.uShade, st.shade === 'parts' ? 1 : 0); gl.activeTexture(gl.TEXTURE0);
-        gl.depthMask(!st.xray); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0); gl.depthMask(true);
+        gl.depthMask(!st.xray && st.ghost == null); gl.bindVertexArray(st.mesh.vao); gl.drawElements(gl.TRIANGLES, st.mesh.count, gl.UNSIGNED_INT, 0); gl.depthMask(true);
       }
       const layers = Object.values(st.layers).filter((L) => L.visible && L.count > 0).sort((a, b) => a.order - b.order);
       const vp = [canvas.width, canvas.height];
@@ -326,11 +326,22 @@ void main(){ vec4 c=uMVP*vec4(aP,1.0); c.z-=uBias*c.w; gl_Position=c; vC=aC; }`,
       for (const p of pts) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
       cam.target = V.mul(V.add(lo, hi), 0.5); cam.dist = Math.max(0.2, 1.4 * V.len(V.sub(hi, lo)) / (2 * Math.tan(CFG.fov * Math.PI / 360)) * 0.6);
     }
-    function preset(name) {
-      const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, CFG.pitchLimit], bottom: [0, -CFG.pitchLimit], persp: [0.9, 0.35] }[name];
-      if (t) { cam.yaw = t[0]; cam.pitch = t[1]; }
+    // 29 October 2026 : a preset looks exactly along an axis (top and bottom are exactly straight) and frames the WHOLE model for the size of the view
+    // (before, Top kept the distance of the perspective view and cut the car off). FR : un preset regarde exactement le long d'un axe et cadre tout le modèle.
+    function preset(name, noFit) {
+      const t = { front: [0, 0], back: [Math.PI, 0], left: [Math.PI / 2, 0], right: [-Math.PI / 2, 0], top: [0, Math.PI / 2], bottom: [0, -Math.PI / 2], persp: [0.9, 0.35] }[name];
+      if (t) { cam.yaw = t[0]; cam.pitch = t[1]; cam.ortho = cam.ortho && name !== 'persp' ? cam.ortho : false; if (!noFit) fitAll(); }
     }
-    return { gl, CFG, cam, st, setImagePlane, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas, setShade, visible };
+    function fitAll(margin) {   // the camera target at the middle of the model box, the distance so that the box fits the view in this direction
+      ready(); const b = st.mesh ? st.mesh.head.bbox : null; if (!b) return; const ctr = V.mul(V.add(b[0], b[1]), 0.5); cam.target = ctr;
+      const f = V.norm(V.sub(cam.target, eye())), r = V.norm(V.cross(f, upVec())), u = V.cross(r, f); let er = 0, eu = 0, ed = 0;
+      for (let c = 0; c < 8; c++) { const q = V.sub([c & 1 ? b[1][0] : b[0][0], c & 2 ? b[1][1] : b[0][1], c & 4 ? b[1][2] : b[0][2]], ctr); er = Math.max(er, Math.abs(V.dot(q, r))); eu = Math.max(eu, Math.abs(V.dot(q, u))); ed = Math.max(ed, Math.abs(V.dot(q, f))); }
+      const th = Math.tan(CFG.fov * Math.PI / 360), a = st.W / st.H; cam.dist = Math.min(CFG.maxDist, Math.max(CFG.minDist, (margin || 1.1) * Math.max(eu / th, er / (th * a)) + (cam.ortho ? 0 : ed * 0.5)));
+    }
+    // 29 October 2026 : VIEW HISTORY : snapshot and restore of the camera (the Back and Forward arrows of the editor)
+    const snapshot = () => ({ yaw: cam.yaw, pitch: cam.pitch, dist: cam.dist, target: cam.target.slice(), ortho: cam.ortho });
+    const restore = (s) => { cam.yaw = s.yaw; cam.pitch = s.pitch; cam.dist = s.dist; cam.target = s.target.slice(); cam.ortho = s.ortho; };
+    return { gl, CFG, cam, st, setImagePlane, setPartHidden, showAllParts, isolateParts, setMesh, setRibbons, setPoints, setFill, setVisible, clearLayer, draw, pickSurface, pickRect, project, planePoint, orbit, pan, zoom, frame, preset, matrices, floatOk, canvas, setShade, visible, fitAll, snapshot, restore };
   }
   return { create, CFG, V };
 })();
