@@ -20,6 +20,137 @@ def sub_docs(doc):
 VARIANTS = [dict(harmonic=h, tangential=t, relax_iters=r, untangle_iters=u) for h in (True, False) for t in (False, True) for r in (0, 30, 80) for u in (0, 400, 1500)]   # 30 October 2026 : the fill knobs of the engine
 
 
+def repair_folded(P, Q, ref, rounds=60):
+    """30 October 2026 : local repair of folded and squashed quads of one patch : the vertices of a bad quad (Jacobian under 0.3) that are not on the border of the patch take the mean of their neighbours (a Laplacian step restricted to the bad region and its ring), projected back on the reference surface ; kept only when the number of folded quads does not grow and the squashed ones fall. Returns (P, folded before, folded after)."""
+    import collections
+    R = NM.load_ref(os.path.abspath(ref)); P = np.asarray(P, float).copy(); Q = np.asarray(Q, np.int64); nb = collections.defaultdict(set); ecount = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); nb[a].add(b); nb[b].add(a); ecount[(min(a, b), max(a, b))] += 1
+    border = {v for (a, b), c in ecount.items() if c == 1 for v in (a, b)}
+    def bad():
+        _, _, j, _ = QS.stats(P, Q); return j
+    j0 = bad(); f0 = int((j0 < 0).sum()); s0 = int((j0 < 0.3).sum())
+    if s0 == 0: return P, f0, f0
+    best = (f0, s0, P.copy())
+    for it in range(rounds):
+        j = bad(); badq = np.where(j < 0.3)[0]
+        if not len(badq): break
+        verts = {int(v) for q in Q[badq] for v in q} - border; ring = set(verts)
+        for v in list(verts): ring |= {u for u in nb[v] if u not in border}
+        idx = sorted(ring)
+        for v in idx: P[v] = 0.5 * P[v] + 0.5 * np.mean([P[u] for u in nb[v]], axis=0)
+        P[idx] = R.closest(P[idx])[0]
+        j = bad(); f, sq = int((j < 0).sum()), int((j < 0.3).sum())
+        if (f, sq) < best[:2]: best = (f, sq, P.copy())
+    return best[2], f0, best[0]
+
+
+def thin_strip(sub, edge):
+    """30 October 2026 : a THIN strip (its narrow side under twice the edge, its long side over three times the narrow one) has its four corners moved to its two ends (two per end, one on each long side, a cap width from the tip) : the patch becomes a long rectangle of one row of square quads instead of a rhombus (corners at the middle of the long sides) squeezed into a 16 x 16 grid. Returns a new sub document or None."""
+    import ZrlSpline as SP, ZrlTubeNet as TN
+    arcs = sub["arcs"]; nodes = {n["id"]: np.asarray(n["p"], float) for n in sub["nodes"]}
+    if len(arcs) < 3: return None
+    left = list(range(len(arcs))); chain = [left.pop(0)]; end = arcs[chain[0]]["b"]; polys = []
+    while left:
+        nxt = next((k for k in left if arcs[k]["a"] == end or arcs[k]["b"] == end), None)
+        if nxt is None: return None
+        left.remove(nxt); chain.append(nxt); end = arcs[nxt]["b"] if arcs[nxt]["a"] == end else arcs[nxt]["a"]
+    cur = arcs[chain[0]]["a"]; pts = []
+    for k in chain:
+        P = SP.sample(np.asarray(arcs[k]["ctrl"], float), 24)
+        if arcs[k]["a"] == cur: cur = arcs[k]["b"]
+        else: P = P[::-1]; cur = arcs[k]["a"]
+        pts.append(P[:-1])
+    C = np.vstack(pts); c0 = C.mean(0); U, S, Vt = np.linalg.svd(C - c0, full_matrices=False); s_ = (C - c0) @ Vt[0]; w_ = (C - c0) @ Vt[1]
+    e1 = float(s_.max() - s_.min()); e2 = float(w_.max() - w_.min())
+    if not (e2 < 6.0 * edge and e1 > 3.0 * e2): return None
+    n = len(C); i0 = int(np.argmin(s_)); i1 = int(np.argmax(s_)); order = [(i0 + k) % n for k in range(n)]; pos1 = order.index(i1)
+    A = order[:pos1 + 1]; B = order[pos1:] + [order[0]]; d = 0.15 * e2
+    def first(idx, ok): return next((k for k, i in enumerate(idx) if ok(s_[i])), None)
+    a1 = first(A, lambda v: v >= s_[i0] + d); a2 = len(A) - 1 - first(A[::-1], lambda v: v <= s_[i1] - d) if first(A[::-1], lambda v: v <= s_[i1] - d) is not None else None
+    b2 = first(B, lambda v: v <= s_[i1] - d); b1 = len(B) - 1 - first(B[::-1], lambda v: v >= s_[i0] + d) if first(B[::-1], lambda v: v >= s_[i0] + d) is not None else None
+    if None in (a1, a2, b2, b1) or not (0 < a1 < a2 < len(A) - 1) or not (0 < b2 < b1 < len(B) - 1): return None
+    P_a1, P_a2, P_b2, P_b1 = C[A[a1]], C[A[a2]], C[B[b2]], C[B[b1]]
+    legs = [np.vstack([C[A[a1:a2 + 1]]]), np.vstack([C[A[a2:]], C[B[:b2 + 1]]]), np.vstack([C[B[b2:b1 + 1]]]), np.vstack([C[B[b1:]], C[A[:a1 + 1]]])]
+    new = {k: v for k, v in sub.items() if k not in ("component_subdocs", "component_shape", "component_mesh_params", "component_edge_m")}; new["nodes"] = [{"id": k, "p": [round(float(x), 6) for x in q]} for k, q in enumerate((P_a1, P_a2, P_b2, P_b1))]; new["arcs"] = []
+    for k, L in enumerate(legs):
+        f = TN.fit(L, 0.04)
+        if f is None: return None
+        new["arcs"].append(dict(arcs[0], id=k, a=k, b=(k + 1) % 4, closed=False, pair=arcs[0]["pair"], ctrl=np.round(f, 6).tolist(), mirror=-1))
+    new["corners_force"] = {str(k): True for k in range(4)}; new["strip_edge_m"] = round(min(e2, edge), 4); return new
+
+
+def _loop(sub):
+    """the closed contour of a one patch document as (points, index of every node in the points), or (None, None)."""
+    import ZrlSpline as SP
+    arcs = sub["arcs"]; left = list(range(len(arcs))); chain = [left.pop(0)]; end = arcs[chain[0]]["b"]
+    while left:
+        nxt = next((k for k in left if arcs[k]["a"] == end or arcs[k]["b"] == end), None)
+        if nxt is None: return None, None
+        left.remove(nxt); chain.append(nxt); end = arcs[nxt]["b"] if arcs[nxt]["a"] == end else arcs[nxt]["a"]
+    cur = arcs[chain[0]]["a"]; pts = []; nid = []; n = 0
+    for k in chain:
+        P = SP.sample(np.asarray(arcs[k]["ctrl"], float), 24)
+        if arcs[k]["a"] == cur: cur = arcs[k]["b"]
+        else: P = P[::-1]; cur = arcs[k]["a"]
+        nid.append(n); pts.append(P[:-1]); n += len(P) - 1
+    return np.vstack(pts), nid
+
+
+def reflex_split(sub, pick=None, count_only=False, min_turn=40.0, win_m=0.03, h=0.01):
+    """30 October 2026 : a patch with REFLEX corners (a U or an L : the notch of a diffuser) is cut into rectangles : from every reflex corner the shorter of the two extensions of its sides is drawn to the contour ; the pieces share the cut arcs, so the integer counts close across the cut. Returns a new sub document or None."""
+    import ZrlSpline as SP, ZrlTubeNet as TN
+    C0, nid = _loop(sub)
+    if C0 is None: return None
+    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(np.vstack([C0, C0[:1]]), axis=0), axis=1))]; L = cum[-1]; m = int(L / h)
+    if m < 40: return None
+    t = np.linspace(0, L, m, endpoint=False); C = np.stack([np.interp(t, cum, np.r_[C0[:, k], C0[0, k]]) for k in range(3)], 1)
+    c0 = C.mean(0); U, S, Vt = np.linalg.svd(C - c0, full_matrices=False); Pp = np.stack([(C - c0) @ Vt[0], (C - c0) @ Vt[1]], 1)
+    area = 0.5 * float(np.sum(Pp[:, 0] * np.roll(Pp[:, 1], -1) - np.roll(Pp[:, 0], -1) * Pp[:, 1])); orient = 1.0 if area > 0 else -1.0; k = max(2, int(round(win_m / h)))
+    a = Pp - np.roll(Pp, k, axis=0); b = np.roll(Pp, -k, axis=0) - Pp; turn = np.degrees(np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(1))) * orient
+    mask = turn < -min_turn; clusters = []; i = 0
+    while i < m:
+        if mask[i]:
+            j = i
+            while j + 1 < m and mask[j + 1]: j += 1
+            clusters.append(i + int(np.argmin(turn[i:j + 1]))); i = j + 1
+        else: i += 1
+    if len(clusters) > 1 and mask[0] and mask[-1]: clusters = clusters[1:]
+    if count_only: return len(clusters)
+    if pick is not None: clusters = [clusters[i] for i in pick]
+    if not 1 <= len(clusters) <= 3: return None
+    def cast(r, d):
+        best = None
+        for q in range(m):
+            if min((q - r) % m, (r - q) % m) < 3 * k: continue
+            p, e = Pp[q], Pp[(q + 1) % m] - Pp[q]; M = np.array([[d[0], -e[0]], [d[1], -e[1]]])
+            if abs(np.linalg.det(M)) < 1e-12: continue
+            s_, u = np.linalg.solve(M, p - Pp[r])
+            if s_ > 0.01 and 0 <= u <= 1 and (best is None or s_ < best[0]): best = (s_, q)
+        return best
+    cuts = []
+    for r in clusters:
+        d1 = Pp[r] - Pp[(r - k) % m]; d2 = Pp[r] - Pp[(r + k) % m]; cand = [c for c in (cast(r, d1 / np.linalg.norm(d1)), cast(r, d2 / np.linalg.norm(d2))) if c]
+        if not cand: return None
+        cuts.append((r, min(cand)[1]))
+    special = {int(np.argmin(np.linalg.norm(C - C0[q], axis=1))) for q in nid}
+    for r, q in cuts:
+        near = [x for x in special if min((x - q) % m, (q - x) % m) <= 2]; special.add(near[0] if near else q); special.add(r)
+    cuts = [(r, (next((x for x in special if min((x - q) % m, (q - x) % m) <= 2), q))) for r, q in cuts]
+    ids = {x: k_ for k_, x in enumerate(sorted(special))}; order = sorted(special)
+    new = {k_: v for k_, v in sub.items() if k_ not in ("component_subdocs", "component_shape", "component_mesh_params", "component_edge_m")}; new["nodes"] = [{"id": ids[x], "p": [round(float(v), 6) for v in C[x]]} for x in order]; new["arcs"] = []; proto = sub["arcs"][0]
+    for u in range(len(order)):
+        i, j = order[u], order[(u + 1) % len(order)]; pts = C[i:j + 1] if j > i else np.vstack([C[i:], C[:j + 1]]); f = TN.fit(pts, 0.04)
+        if f is None: return None
+        new["arcs"].append(dict(proto, id=len(new["arcs"]), a=ids[i], b=ids[j], closed=False, ctrl=np.round(f, 6).tolist(), mirror=-1))
+    for r, q in cuts:
+        f = TN.fit(np.linspace(C[r], C[q], 14), 0.04)
+        if f is None: return None
+        new["arcs"].append(dict(proto, id=len(new["arcs"]), a=ids[r], b=ids[q], closed=False, ctrl=np.round(f, 6).tolist(), mirror=-1))
+    new["corners_force"] = {}; return new
+
+
 def judge(res):
     P = np.asarray(res["P"], float).reshape(-1, 3); Q = np.asarray(res["Q"], np.int64).reshape(-1, 4)
     if not len(Q): return 1e9
@@ -105,11 +236,22 @@ def shape_variants(sub):
     return out
 
 
-def mesh_all(doc, ref, edge=0.03, edge_by=None, log=print, tune=False, shapes=False):
+def mesh_all(doc, ref, edge=0.03, edge_by=None, log=print, tune=False, shapes=False, repair=False, reflex=False, sweep=False):
     P_all = []; Q_all = []; parts = []; rows = []
     for name, sub in sub_docs(doc):
         sub = (doc.get("component_subdocs") or {}).get(name, sub); e = (edge_by or {}).get(name, edge)
         base = {"ref": os.path.abspath(ref), "unit": 1.0, "edge_m": e, "write_obj": False, "auto_fallback": True, "component_options": sub.get("component_options", {}), "corners_force": {}, "min_compactness": 0.0, "wrap_min_normal": 0.0, "inherit_component": True, "symmetric_corners": False}
+        ts = thin_strip(sub, e) if (doc.get("component_shape") or {}).get(name) != "nostrip" else None
+        if ts is not None:                                                                  # a thin strip : the strip layout (corners at its ends, one row of square quads) is kept only when it folds fewer quads than the patch as drawn
+            kn = (doc.get("component_mesh_params") or {}).get(name, {})
+            try:
+                rs = NM.build(ts, dict(base, edge_m=max(0.01, float(ts["strip_edge_m"])), corners_force=ts["corners_force"], **kn)); rn = NM.build(sub, dict(base, **kn))
+                keep = len(rs["Q"]) and (not len(rn["Q"]) or judge(rs) <= judge(rn) + 1e-9)
+            except Exception: keep = False
+            if keep: sub = ts; doc.setdefault("component_subdocs", {})[name] = ts; doc.setdefault("component_shape", {})[name] = "strip"; log("%s : thin strip, corners moved to its ends" % name)
+            else: doc.setdefault("component_shape", {})[name] = "nostrip"
+        strip = (doc.get("component_shape") or {}).get(name) == "strip" and "strip_edge_m" in sub
+        if strip: e = max(0.01, float(sub["strip_edge_m"])); base = dict(base, edge_m=e, corners_force=sub["corners_force"], component_options=sub.get("component_options", {}))   # one row of square quads : the edge is the width of the strip
         knobs = (doc.get("component_mesh_params") or {}).get(name, {})
         try:
             res = NM.build(sub, dict(base, **knobs))
@@ -126,20 +268,41 @@ def mesh_all(doc, ref, edge=0.03, edge_by=None, log=print, tune=False, shapes=Fa
                     sub = bestv[2]; res = NM.build(sub, dict(base, **knobs)); doc.setdefault("component_shape", {})[name] = bestv[1]; doc.setdefault("component_subdocs", {})[name] = sub
                     log("%s : shape %s sides, score %.3f" % (name, bestv[1], bestv[0]))
         except Exception as ex: rows.append((name, "ERROR", str(ex)[:60], 0, 0, 0)); continue
+        if reflex and not strip and judge(res) > 0.0:                                         # 30 October 2026 : a patch with reflex corners (a U, an L) : every subset of its cuts is tried, the one that folds the fewest quads is kept
+            import itertools
+            nc = reflex_split(sub, count_only=True); bestv = (judge(res), None)
+            for r_ in range(1, min(3, nc or 0) + 1):
+                for pick in itertools.combinations(range(nc), r_):
+                    v = reflex_split(sub, pick=pick)
+                    if v is None: continue
+                    try: r2 = NM.build(v, dict(base, **knobs))
+                    except Exception: continue
+                    if len(r2["Q"]) and judge(r2) < bestv[0] - 1e-9: bestv = (judge(r2), v, pick)
+            if bestv[1] is not None:
+                sub = bestv[1]; res = NM.build(sub, dict(base, **knobs)); doc.setdefault("component_subdocs", {})[name] = sub; doc.setdefault("component_shape", {})[name] = "reflex"; log("%s : cut at reflex corners %s, score %.3f" % (name, bestv[2], bestv[0]))
+        if sweep and name.endswith("_C") and judge(res) > 0.0:                                                        # 30 October 2026 : a last panel with a fold : the edge length is swept (0.7 to 1.5 times), the one that folds the fewest quads is kept and stored in component_edge_m
+            bestf = (judge(res), 1.0)
+            for f_ in (0.92, 0.96, 1.04, 1.08):
+                try: r2 = NM.build(sub, dict(base, **dict(knobs, edge_m=e * f_)))
+                except Exception: continue
+                if len(r2["Q"]) and judge(r2) < bestf[0] - 1e-9: bestf = (judge(r2), f_)
+            if bestf[1] != 1.0:
+                res = NM.build(sub, dict(base, **dict(knobs, edge_m=e * bestf[1]))); doc.setdefault("component_edge_m", {})[name] = e * bestf[1]; log("%s : edge x%.2f, score %.3f" % (name, bestf[1], bestf[0]))
         faces = [f for f in res["faces"] if (f.get("reason") or "") != "complement"]; ok = [f for f in faces if f["status"] == "meshed"]      # the sub document holds one patch : the face that is not the complement is the component (its seed may sit a hair outside the loop)
         if not ok or not len(res["Q"]): rows.append((name, "UNMESHED", ",".join(sorted({(f.get("reason") or "")[:20] for f in faces})), 0, 0, 0)); continue
         P = np.asarray(res["P"], float).reshape(-1, 3); Q = np.asarray(res["Q"], np.int64).reshape(-1, 4); vo = sum(len(p) for p in P_all)
+        if repair: P, fb, fa = repair_folded(P, Q, ref)
         edge_s, asp, jmin, C = QS.stats(P, Q); rows.append((name, "meshed", "", len(Q), int((jmin < 0).sum()), float(np.mean(jmin < 0.3))))
         P_all.append(P); Q_all.append(Q + vo); parts += [name] * len(Q)
     return (np.vstack(P_all), np.vstack(Q_all), parts, rows) if P_all else (None, None, [], rows)
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--out", required=True); ap.add_argument("--edge", type=float, default=0.03); ap.add_argument("--tune", action="store_true", help="a tournament of the fill knobs for every patch that folds quads ; the winners are written into the document (component_mesh_params)"); ap.add_argument("--auto-edge", type=float, default=0.0, help="N : an edge per panel that gives about N quads (equal density)"); ap.add_argument("--shapes", action="store_true", help="try 5 and 6 sided shapes of every patch that still folds quads"); ap.add_argument("--save-doc"); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("doc"); ap.add_argument("--ref", required=True); ap.add_argument("--out", required=True); ap.add_argument("--edge", type=float, default=0.03); ap.add_argument("--sweep", action="store_true", help="sweep the edge length of the panels that still fold"); ap.add_argument("--reflex", action="store_true", help="cut a patch with reflex corners (U, L) into rectangles when that folds fewer quads"); ap.add_argument("--tune", action="store_true", help="a tournament of the fill knobs for every patch that folds quads ; the winners are written into the document (component_mesh_params)"); ap.add_argument("--auto-edge", type=float, default=0.0, help="N : an edge per panel that gives about N quads (equal density)"); ap.add_argument("--shapes", action="store_true", help="try 5 and 6 sided shapes of every patch that still folds quads"); ap.add_argument("--repair", action="store_true", help="local repair of folded and squashed quads after the fill"); ap.add_argument("--save-doc"); a = ap.parse_args()
     doc = json.load(open(a.doc))
     if a.auto_edge:                                                                        # 30 October 2026 : equal density : each panel gets the edge that gives it about N quads (area / N under a root), clipped between 12 and 50 mm
         _, _, _, r0 = mesh_all(doc, a.ref, a.edge); doc["component_edge_m"] = {r[0]: float(np.clip(np.sqrt(max(r[3], 1) * a.edge ** 2 / a.auto_edge), 0.012, 0.05)) for r in r0 if r[1] == "meshed"}
-    P, Q, parts, rows = mesh_all(doc, a.ref, a.edge, edge_by=doc.get("component_edge_m"), tune=a.tune, shapes=a.shapes)
+    P, Q, parts, rows = mesh_all(doc, a.ref, a.edge, edge_by=doc.get("component_edge_m"), tune=a.tune, shapes=a.shapes, repair=a.repair, reflex=a.reflex, sweep=a.sweep)
     if a.save_doc: json.dump(doc, open(a.save_doc, "w"))
     with open(a.out, "w") as f:
         for p in P: f.write("v %.6f %.6f %.6f\n" % tuple(p))

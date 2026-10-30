@@ -1,0 +1,40 @@
+"""ZrlFoldView : one view of a quad mesh with the FOLDED quads in red and the SQUASHED ones in orange (30 October 2026).
+FR : une vue d'un maillage de quads, les quads plies en rouge et les ecrases en orange.
+python -I ZrlFoldView.py mesh.obj out.png --view back --box x0,y0,x1,y1 [--only NAME_PART] [--size 1400]
+The mesh.obj.parts.json written next to the mesh gives the component of every quad (--only keeps the quads whose component contains the text)."""
+import argparse, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, ZrlQuadStats as QS
+from PIL import Image, ImageDraw
+
+AXES = {"front": ((0, 1), 1.0, 2), "back": ((0, 1), -1.0, 2), "left": ((2, 1), 1.0, 0), "top": ((0, 2), 1.0, 1)}
+
+
+def load(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), np.array([f for f in F if len(f) == 4], np.int64)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("obj"); ap.add_argument("out"); ap.add_argument("--view", default="front"); ap.add_argument("--box"); ap.add_argument("--only"); ap.add_argument("--size", type=int, default=1400); a = ap.parse_args()
+    V, Q = load(a.obj); parts = json.load(open(a.obj + ".parts.json")) if os.path.exists(a.obj + ".parts.json") else [""] * len(Q)
+    keep = np.array([(a.only or "") in p for p in parts[:len(Q)]]); _, _, jmin, _ = QS.stats(V, Q)
+    (ix, iy), sg, idepth = AXES[a.view]; X = sg * V[:, ix]; Y = V[:, iy]
+    if a.box: x0, y0, x1, y1 = [float(v) for v in a.box.split(",")]
+    else: sel = np.unique(Q[keep]); x0, x1 = X[sel].min(), X[sel].max(); y0, y1 = Y[sel].min(), Y[sel].max(); pad = 0.05 * max(x1 - x0, y1 - y0); x0 -= pad; x1 += pad; y0 -= pad; y1 += pad
+    if a.view == "back" and a.box: x0, x1 = -x1, -x0
+    sc = a.size / (x1 - x0); W = a.size; H = max(int((y1 - y0) * sc), 10); img = Image.new("RGB", (W, H), (20, 20, 26)); d = ImageDraw.Draw(img)
+    depth = V[:, idepth] * (-1.0 if a.view == "back" else 1.0); order = np.argsort(-depth[Q].mean(1))
+    for qi in order:
+        if not keep[qi]: continue
+        pts = [((X[v] - x0) * sc, (y1 - Y[v]) * sc) for v in Q[qi]]; j = jmin[qi]
+        col = (230, 40, 40) if j < 0 else (240, 160, 40) if j < 0.3 else (150, 175, 195)
+        d.polygon(pts, fill=col, outline=(40, 40, 50))
+    img.save(a.out); print(a.out, "quads", int(keep.sum()), "folded", int(((jmin < 0) & keep).sum()), "squashed", int(((jmin < 0.3) & keep).sum()))
+
+
+if __name__ == "__main__": main()
