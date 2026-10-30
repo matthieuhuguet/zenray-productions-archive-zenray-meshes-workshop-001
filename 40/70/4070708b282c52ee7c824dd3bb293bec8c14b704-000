@@ -1,0 +1,47 @@
+"""30 October 2026 : ZenRay TOPOLOGY JUDGE : one comparison of any quad mesh against its reference mesh (same numbers for every method).
+    python -I ZrlTopoJudge.py quads.obj reference.obj [--json]
+Numbers : quads share (a perfect topology is 100 percent quads), folded and squashed (Jacobian under 0 and under 0.3), valence-4 share of the interior vertices (the irregular ones are the poles), the poles per 1000 quads, the one sided deviation of the quads' vertices to the reference surface (mean and 99 percent, as a fraction of the bounding diagonal), and the reverse (the reference's points to the quads : holes), the edge length spread (max over mean of the 99th percentile).
+FR : un seul juge pour toute methode : part de quads, plies, ecrases, valence 4, poles, ecart a la reference dans les deux sens, regularite des aretes."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlQuadStats as QS
+from scipy.spatial import cKDTree
+
+
+def load(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+def samples(V, F, n=60000, rng=np.random.default_rng(1)):
+    T = np.array([[f[0], f[k], f[k + 1]] for f in F for k in range(1, len(f) - 1)]); a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]; ar = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    i = rng.choice(len(T), n, p=ar / ar.sum()); u = rng.random((n, 2)); m = u.sum(1) > 1; u[m] = 1 - u[m]
+    return a[i] + u[:, :1] * (b[i] - a[i]) + u[:, 1:] * (c[i] - a[i])
+
+
+def judge(quads_obj, ref_obj):
+    V, F = load(quads_obj); R, RF = load(ref_obj); diag = float(np.linalg.norm(R.max(0) - R.min(0))); Q = np.array([f for f in F if len(f) == 4], np.int64); nq = len(Q); nt = sum(1 for f in F if len(f) == 3)
+    out = {"faces": len(F), "quads": nq, "triangles": nt, "other": len(F) - nq - nt, "quad_share": round(nq / max(len(F), 1), 4)}
+    if nq:
+        _, _, jmin, _ = QS.stats(V, Q); out.update({"folded": int((jmin < 0).sum()), "squashed": int((jmin < 0.3).sum()), "folded_share": round(float((jmin < 0).mean()), 4), "squashed_share": round(float((jmin < 0.3).mean()), 4)})
+        ed = np.concatenate([np.linalg.norm(V[Q[:, k]] - V[Q[:, (k + 1) % 4]], axis=1) for k in range(4)]); out["edge_p99_over_mean"] = round(float(np.percentile(ed, 99) / max(ed.mean(), 1e-12)), 2)
+        cnt = collections.Counter(); ec = collections.Counter()
+        for q in Q:
+            for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
+        bd = set(); nbv = collections.defaultdict(set)
+        for (a, b), c in ec.items():
+            nbv[a].add(b); nbv[b].add(a)
+            if c == 1: bd |= {a, b}
+        inner = [v for v in nbv if v not in bd]; val = np.array([len(nbv[v]) for v in inner]) if inner else np.array([4])
+        out.update({"interior_vertices": len(inner), "valence4_share": round(float((val == 4).mean()), 4), "poles_3": int((val == 3).sum()), "poles_5": int((val == 5).sum()), "poles_other": int(((val != 3) & (val != 4) & (val != 5)).sum()), "poles_per_1000_quads": round(1000.0 * float((val != 4).sum()) / nq, 1), "boundary_vertices": len(bd)})
+    S = samples(V, F) if len(F) else V; tr = cKDTree(samples(R, RF)); d1 = tr.query(S)[0]; tq = cKDTree(S); d2 = tq.query(samples(R, RF, 20000))[0]
+    out.update({"dev_mean_frac_diag": round(float(d1.mean() / diag), 5), "dev_p99_frac_diag": round(float(np.percentile(d1, 99) / diag), 5), "holes_p99_frac_diag": round(float(np.percentile(d2, 99) / diag), 5)})
+    return out
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("quads"); ap.add_argument("ref"); a = ap.parse_args(); print(json.dumps(judge(a.quads, a.ref), indent=1))

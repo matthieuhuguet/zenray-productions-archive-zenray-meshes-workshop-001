@@ -1,0 +1,20 @@
+"""30 October 2026 : Houdini Quad Remesh PART BY PART (hybrid baseline of the any-mesh comparison, run with hython).
+    hython HouQuadParts.py in.obj out.obj edge_m [min_quads] [skip_names.txt]  (writes out.obj.parts.json : [part name, face count] in merge order)
+Every group of the OBJ (a part, a panel) is remeshed alone to quads of the given edge (target count = area / edge^2), so no flow crosses a gap between parts, then the parts are merged.
+FR : le Quad Remesh de Houdini applique piece par piece : aucun flux ne traverse un joint entre deux pieces."""
+import sys, hou
+src, out, edge = sys.argv[1], sys.argv[2], float(sys.argv[3]); minq = int(sys.argv[4]) if len(sys.argv) > 4 else 8; skip = set(open(sys.argv[5]).read().split()) if len(sys.argv) > 5 else set()
+g = hou.node("/obj").createNode("geo", "parts")
+for c in g.children(): c.destroy()
+f = g.createNode("file"); f.parm("file").set(src); f.cook(force=True); geo = f.geometry(); groups = [x.name() for x in geo.primGroups()]
+mg = g.createNode("merge"); k = 0; tot = 0; labels = []
+for name in groups:
+    if name in skip: continue
+    pr = geo.findPrimGroup(name).prims()
+    if not pr: continue
+    area = sum(p.intrinsicValue("measuredarea") for p in pr); n = max(minq, int(area / (edge * edge)))
+    b = g.createNode("blast"); b.setInput(0, f); b.parm("group").set(name); b.parm("negate").set(1); b.parm("grouptype").set(4)
+    q = g.createNode("quadremesh"); q.setInput(0, b); q.parm("targetquadcount").set(n)
+    try: q.cook(force=True); mg.setInput(k, q); k += 1; tot += n; labels.append([name, len(q.geometry().prims())])
+    except Exception as ex: print("fail", name, str(ex)[:60])
+mg.cook(force=True); mg.geometry().saveToFile(out); import json; json.dump(labels, open(out + ".parts.json", "w")); print("saved", out, "parts", k, "target", tot, "prims", len(mg.geometry().prims()))

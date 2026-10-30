@@ -1,0 +1,82 @@
+# Décomposition automatique en patchs pour un maillage quelconque (30 October 2026)
+
+Question du thread principal : le trou est la décomposition automatique en patchs (nos zones par angle de 25 degrés sont minuscules et se recouvrent sur une géométrie morcelée). Statuts : [DOC] lu dans la source citée ; [ESTIMÉ] jugement non vérifié ; "non trouvé". Source la plus détaillée, lue en entier (PDF extrait par pdftotext) : Pietroni, Nuvoli, Alderighi, Cignoni, Tarini, "Reliable Feature-Line Driven Quad-Remeshing", ACM TOG 40(4), article 155, 2021, https://vcg-legacy.isti.cnr.it/Publications/2021/PNACT21/ReliableQuad.pdf .
+
+## 1. QuadWild (Pietroni 2021) : le seul pipeline complet publié, étape par étape [DOC]
+
+Entrée : maillage triangulaire + lignes de features (par défaut les creases à seuil de dièdre de 45 degrés suivi d'une érosion-dilatation pour retirer le bruit ; si plus de deux features se rejoignent en un sommet, pas d'érosion). Paramètre principal : longueur d'arête cible = côté d'un carré d'aire 1/K de la surface, K = 104 par défaut (dans leurs tests : deux fois la longueur moyenne d'arête après optimisation du maillage).
+
+1. Optimisation du maillage d'entrée (opérations locales de remaillage sans jamais toucher une arête de feature).
+2. Champ de croix (cross-field, symétrique par rotation de 90 degrés) lisse, aligné aux features par construction, sinon aux courbures principales ; échantillonné par face, singularités aux sommets.
+3. Construction du layout par tracé de chemins le long du champ : les features deviennent des chemins ; on ajoute des chemins alignés au champ ; jamais à travers une singularité ; ils peuvent se croiser (orthogonalement) ou finir en T.
+4. Quantification par ILP global (nombre d'arêtes entier par arche, parité, isométrie, régularité des patchs, alignement des singularités).
+5. Quadrangulation de chaque patch : stratégie simple de Tarini 2021 (au plus un pôle intérieur, aucun si rectangle) sinon stratégie générale de Takayama 2014 ; lissage final dans l'espace tangent.
+
+### 1.1 Conditions d'un bon patch (le cœur de ce qu'il nous faut) [DOC]
+Conditions de validité (garantissent que Takayama marche) : (a) topologie : homéomorphe à un disque (une seule boucle de bord) ; (b) valence du patch : entre 3 et 6, définie comme le nombre de virages dans la boucle de bord ; (c) convexité : seuls des sommets droits (straight) et des virages à droite sont permis ; interdits : virage à gauche (angle de quad > 180) et demi-tour (U-turn, angle proche de 360). Classification des sommets de bord : k = nombre de rotations de 90 degrés (horaire) pour aligner l'arête précédente et la suivante dans le champ : k = 0 droit, k = 1 virage à droite, k = -1 virage à gauche, k = plus ou moins 2 U-turn.
+Conditions de qualité (souhaitables) : géométrique : les longueurs des côtés doivent vérifier à peu près les inégalités de Tarini (3 côtés : e_i <= e_{i+1} + e_{i+2} ; 4 côtés : e_i = e_{i+2} ; 5 côtés : e_i + e_{i+1} + e_{i+4} >= e_{i+2} + e_{i+3} ; 6 côtés : e_i <= e_{i+2} + e_{i+4}) avec une tolérance égale à la longueur du plus petit côté ; valence : un patch à 4 côtés ne contient aucune singularité du champ, un patch avec une singularité intérieure doit avoir la même valence, aucun patch avec plus d'une singularité.
+
+### 1.2 Tracé d'un chemin candidat [DOC]
+Graphe auxiliaire G : 4 noeuds par sommet du maillage (un par direction du champ) sauf aux singularités ; arête entre deux noeuds si (1) les sommets sont voisins dans le maillage, (2) les directions du champ concordent, (3) l'angle entre l'arête et la direction moyenne du champ est inférieur à 45 degrés. Poids = module de la dérive d_ij = (v_i - v_j) . f_perp (f_perp = f x n). Connexions virtuelles à deux sauts pour limiter le zigzag (somme des dérives signées). Connexion de poids nul entre doublons d'un sommet de feature pour traverser un chemin existant sans jamais le suivre tangentiellement. Plus court chemin par Dijkstra, vers un ensemble de noeuds d'arrivée. Longueur d'un côté : somme des projections des arêtes sur la direction du champ (évite le biais du zigzag).
+
+### 1.3 Boucles d'insertion de chemins [DOC]
+1. Rond de convexité : pour chaque virage à gauche on part de deux noeuds (tout droit ou virage à droite), pour un U-turn de trois noeuds ; arrivée = sommets de bord de direction opposée (deux défauts corrigés d'un coup) ; deuxième passe avec arrivées = tous les noeuds droits (finit en T).
+2. Rond de boucles : sous-ensemble uniforme de sommets internes (Corsini 2012), deux chemins fermés candidats par sommet.
+3. Rond bord à bord : relier des noeuds droits de bord entre eux par petits chemins.
+Choix : trier les candidats par plus grande distance au chemin déjà posé le plus proche (comme LoopyCuts, Livesu 2020), garder un chemin s'il (1) contribue à satisfaire un objectif ou (2) découpe un patch encore non conforme et ne croise pas tangentiellement. Nettoyage : dissoudre en ordre inverse d'insertion les chemins redondants. Récursion : pour un patch encore invalide, relancer les rondes avec des candidats limités au patch (T-jonctions au bord).
+
+### 1.4 Quantification [DOC]
+Variables s_i >= 1 entières par arche ; parité (somme = 2n) ; isométrie sum (s_i - s^_i)^2 ; régularité 4 côtés : e0 = e2 et e1 = e3 (favorisée, pas imposée) ; non rectangulaires : inégalités de Tarini en douceur (variable K >= 0, a <= b + K, K dans l'objectif) ; hexagones : parité des trois côtés pairs et des trois impairs ; alignement des singularités par égalité douce des sous-côtés ; poids 1 (isométrie), 99 et 91 (régularités) dans leurs exemples ; ILP résolu deux fois ; sous-systèmes de m = 300 patchs adjacents. Solveur : Gurobi (version Bi-MDF sans Gurobi, voir methods.json).
+
+### 1.5 Complexité, résultats, ce qui casse [DOC]
+308 modèles en environ 5 heures sur un portable de 2018 (une minute par maillage) : 2 h 30 d'optimisation du maillage, 50 min de layout, 2 h de quadrangulation ; prototype monothread. Thingi10K (10 000 modèles) : échec dans 0,5 % des cas (surtout non orientables). Limites écrites : pas de preuve que les conditions soient toujours satisfaites (heuristique) ; sensible à des features mal classées ou bruitées ; le patch est quadrangulé d'après son seul bord donc perte possible d'isométrie ; features strictes peuvent créer des quads très aigus (Figure 19).
+
+### 1.6 Quelle étape est implémentable en Python/numpy en quelques heures [ESTIMÉ]
+- Classification des virages d'une boucle de bord (k = 0, +1, -1, +-2) : en 2D tangent : 1 heure, scipy suffit.
+- Dijkstra sur graphe auxiliaire G (4 noeuds par sommet, dérive comme poids) : 2 à 3 heures avec scipy.sparse.csgraph, une fois le champ disponible.
+- Conditions de patch et tolérances (Tarini) : 30 minutes, déjà dans le MILP.
+- Rond de convexité et nettoyage inverse : 3 à 4 heures.
+- Champ de croix lisse : 3 à 5 heures (solveur creux d'angle ou résolution par Dirichlet de l'énergie du champ). Alternative plus rapide pour NOTRE cas : champ dérivé de nos courbes B-spline (tangentes des courbes de référence + diffusion).
+- Non réaliste en quelques heures : remaillage du maillage d'entrée avec préservation des features ; ILP global avec solveur exact (on a déjà notre MILP) ; garanties.
+
+## 2. Autres méthodes de décomposition publiées
+
+| Méthode | Entrées | Étapes | Complexité / coût | Ce qui casse | Implémentable en Python en quelques heures |
+|---|---|---|---|---|---|
+| Dual Loops Meshing (Campen, Bommes, Kobbelt, SIGGRAPH 2012, https://graphics.rwth-aachen.de/publication/03212) | surface + champ de directions | boucles sur la surface dont la valence est liée à la courbure totale de la région ; graphe de boucles ; dualisation → layout tout-quad ; algorithme glouton | non trouvé | non trouvé | non : demande une structure de boucles sur surface et un champ |
+| Quad Layout Embedding via Aligned Parameterization (Campen, Kobbelt 2014, https://diglib.eg.org/handle/10.1111/v33i8pp069-081) | structure de layout cible | plongement optimisé par paramétrisation isométrique alignée aux directions principales | non trouvé | non trouvé | non, mais sert à ancrer un réseau fourni par nous |
+| Quantized Global Parametrization (Campen, Bommes, Kobbelt, 2015, https://www.graphics.rwth-aachen.de/publication/03251) | paramétrisation sans couture | quantification entière valide via systèmes diophantiens linéaires ; gère des milliers de singularités ; plus rapide de plusieurs ordres de grandeur | rapide | quantification entière difficile en général | non |
+| Quad Layouts via Constrained T-Mesh Quantization (Lyon 2021, https://graphics.rwth-aachen.de/publication/03330) et Simpler Quad Layouts using Relaxed Singularities (Lyon 2021, https://graphics.rwth-aachen.de/publication/03336) | paramétrisation sans couture | T-mesh construit à partir de la paramétrisation ; ILP sur longueurs entières avec borne angulaire ; le deuxième article autorise le déplacement ou la suppression des sommets du layout | ILP | un layout dont les sommets sont fixés d'abord peut ne pas admettre de solution valide | l'ILP seulement (notre MILP) |
+| Generalized Motorcycle Graphs (Schertler, Panozzo, Gumhold, Tarini, ACM TOG 37(4) 2018, https://cims.nyu.edu/gcl/papers/2018-GMG.pdf) | maillage quad-dominant imparfait | graphe motorcycle généralisé, tolère non-quads, singularités redondantes, T-jonctions ; produit un layout T de patchs rectangulaires en UV | non trouvé | non trouvé | oui pour un maillage quad déjà donné : tracer les boucles entre singularités |
+| Extraction of the Quad Layout guided by the Curve Skeleton (Usai et al. 2015, via recherche) | maillage + squelette de courbes | segments tubulaires le long des branches, calottes aux feuilles, boîtes aux noeuds de branchement, extrusion de sections à n côtés, projection | simple pour tubes, difficile aux jonctions | T-jonctions, combinatoire des jonctions | oui pour tubes (c'est déjà notre mannequin) |
+| Variational Shape Approximation (Cohen-Steiner, Alliez, Desbrun, SIGGRAPH 2004 ; implémentation CGAL https://doc.cgal.org/latest/Surface_mesh_approximation/index.html) | maillage triangulaire manifold | amorçage (aléatoire, incrémental ou hiérarchique) ; partition par plus proche proxy planaire ; ajustement des proxies (point et normale moyens) ; itérations jusqu'à convergence ; métrique L2 ou L2,1 (normales) | 20 000 triangles et 200 proxies en environ 2,0 s ; 62 467 triangles en 7,6 s (CGAL, 20 itérations) | régions qui ne sont pas des disques à 3 à 6 coins : à corriger ensuite | oui (Lloyd en numpy, une demi-journée) : meilleur point de départ pour les panneaux carrosserie |
+| LoopyCuts (Livesu, Pietroni, Puppo, Sheffer, Cignoni, SIGGRAPH 2020, https://arxiv.org/pdf/1903.10754) | maillage + champ | décomposition en blocs par surfaces de coupe bordées de boucles ; hex-meshing mais la logique de candidats triés par distance est reprise par QuadWild | non trouvé | pas de garantie de validité (écrit par les auteurs) | l'idée de tri par distance, oui |
+| Segmentation morphologique ou convexe, SDF (Shape Diameter Function), V-HACD | non lu : aucune source trouvée dans cette passe | | | | à chercher |
+| Sketch-based retopo (Takayama 2013) | réseau de courbes dessiné par l'artiste | patchs = faces du réseau ; remplissage par motifs | quasi immédiat | demande l'artiste | c'est notre approche : voir takayama_patch_templates |
+
+## 3. Proposition de pipeline pour ZenRay Lines : décomposition automatique [ESTIMÉ, à valider par mesure]
+
+Principe : ne pas partir de zones angulaires de 25 degrés mais d'une segmentation qui produit directement des régions-disques à 3 à 6 coins, puis réutiliser notre MILP et les patrons de Takayama et Tarini.
+
+    def autopatch(mesh, k_target):
+        F = features(mesh, dihedral=45, erode_dilate=True)        # QuadWild 4.x
+        # 1. proxy-based regions (VSA, normals, L2,1): few big regions, not 25-degree cells
+        R = vsa_cluster(mesh, seeding="hierarchical", n_proxies=k_target, metric="L21")
+        R = merge_small(R, area_min=0.2*mean_area)                # kill tiny and overlapping slivers
+        R = respect_features(R, F)                                # features = region boundaries
+        # 2. enforce disk topology and boundary conditions (QuadWild 5.1)
+        for region in R:
+            while not is_disk(region): cut_along_shortest_path(region)
+            turns = classify_turns(region.boundary)               # straight/right/left/U-turn
+            while count_corners(turns) > 6 or any(t in (LEFT, UTURN) for t in turns):
+                p = shortest_path_following_principal_curvature(from_bad_turn, to_boundary)
+                region.split(p)                                    # convexity enforcement round
+        # 3. symmetry: process the half, mirror (pairs go in the MILP as equalities)
+        # 4. quantization: your MILP with Tarini inequalities (soft) + parity
+        # 5. fill each patch: Tarini single pole, else Takayama pattern (see takayama_patch_templates)
+        return patches
+
+Points d'attention :
+- Les régions de nos tests de 25 degrés sont trop petites parce que le seuil d'angle fabrique des cellules de normale constante ; un critère L2,1 avec fusion par erreur minimale (opérateurs "merge" et "teleport" de VSA) donne moins de régions plus grandes.
+- Les grosses pièces cachées (doublure d'habitacle, dessous de plancher) donnent 2,7 à 6 % de plis dans le Quad Remesh de Houdini ; ces pièces sont probablement des surfaces à bord morcelé : QuadWild les traite par features + patchs ; on peut les traiter à part par une version à bord libre.
+- Complexité attendue : VSA en secondes pour 20 000 triangles (CGAL) ; tracé de chemins par Dijkstra O(V log V) par candidat ; ILP : le plus coûteux (QuadWild le découpe en sous-systèmes de 300 patchs).

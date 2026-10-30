@@ -1,0 +1,50 @@
+"""30 October 2026 : ZenRay PART TOURNAMENT : for every part of a hybrid OBJ that still folds, the Quad Remesh settings are tried (HouQuadVariants.py), the variant with the best score wins (score = folded share + 0.3 squashed share + 0.0005 poles per 1000 quads), and the winners replace the parts.
+    python -I ZrlPartTournament.py hybrid.obj hybrid.obj.parts.json ref.obj out.obj --ours-parts NAMES.txt [--edge 0.04] [--min-fold 0.005]
+Parts listed in NAMES.txt (the ZenRay patches) are never touched. FR : le meilleur reglage du Quad Remesh pour chaque piece qui plie encore."""
+import argparse, collections, glob, json, os, subprocess, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlQuadStats as QS, ZrlTopoJudge as TJ
+HYTHON = "/Users/zenray/Create/Build/Houdini22/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/bin/hython"
+
+
+def quick(path):
+    V, F = TJ.load(path); Q = np.array([f for f in F if len(f) == 4], np.int64)
+    if not len(Q): return None
+    _, _, j, _ = QS.stats(V, Q); nb = collections.defaultdict(set); ec = collections.Counter()
+    for q in Q:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1; nb[a].add(b); nb[b].add(a)
+    bd = {v for (a, b), c in ec.items() if c == 1 for v in (a, b)}; val = np.array([len(nb[v]) for v in nb if v not in bd]) if len(nb) > len(bd) else np.array([4])
+    fs, ss, pp = float((j < 0).mean()), float((j < 0.3).mean()), 1000.0 * float((val != 4).sum()) / len(Q)
+    return {"quads": len(Q), "folded": fs, "squashed": ss, "poles_per_1000": pp, "score": fs + 0.3 * ss + 0.0005 * pp, "tri_share": 1 - len(Q) / max(len(F), 1)}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("hybrid"); ap.add_argument("parts"); ap.add_argument("ref"); ap.add_argument("out"); ap.add_argument("--ours-parts", required=True); ap.add_argument("--edge", type=float, default=0.04); ap.add_argument("--min-fold", type=float, default=0.005); a = ap.parse_args()
+    V, F = TJ.load(a.hybrid); L = json.load(open(a.parts)); ours = set(open(a.ours_parts).read().split()); idx = [i for i, f in enumerate(F) if len(f) == 4]; by = collections.defaultdict(list)
+    for i in idx: by[L[i]].append(i)
+    todo = []
+    for name, ids in by.items():
+        if name in ours: continue
+        Q = np.array([F[i] for i in ids]); _, _, j, _ = QS.stats(V, Q)
+        if float((j < 0).mean()) >= a.min_fold: todo.append(name)
+    print("parts to tournament", len(todo)); wd = os.path.join(os.path.dirname(os.path.abspath(a.out)), "tournament"); os.makedirs(wd, exist_ok=True)
+    subprocess.run([HYTHON, os.path.join(HERE, "HouQuadVariants.py"), os.path.abspath(a.ref), ",".join(todo), str(a.edge), wd], capture_output=True, text=True)
+    best = {}; cur = {}
+    for name in todo:
+        Q = np.array([F[i] for i in by[name]]); _, _, j, _ = QS.stats(V, Q); cur[name] = float((j < 0).mean())
+        rows = []
+        for p in glob.glob(os.path.join(wd, name, "*.obj")):
+            try: r = quick(p)
+            except Exception: r = None
+            if r and r["tri_share"] < 0.02: rows.append((r["score"], os.path.basename(p)[:-4], p, r))
+        if rows: best[name] = min(rows, key=lambda r: r[0])
+    newV = [V]; newF = [f for i, f in enumerate(F) if not (L[i] in best)]; newL = [L[i] for i, f in enumerate(F) if not (L[i] in best)]; off = len(V); improved = 0
+    for name, (sc, var, p, r) in best.items():
+        V2, F2 = TJ.load(p); newV.append(V2); newF += [[x + off for x in f] for f in F2]; newL += [name] * len(F2); off += len(V2); improved += int(r["folded"] < cur[name])
+    VV = np.vstack(newV)
+    with open(a.out, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in VV)); f.write("".join("f " + " ".join(str(int(x) + 1) for x in q) + "\n" for q in newF))
+    json.dump(newL, open(a.out + ".parts.json", "w")); json.dump({n: {"variant": b[1], "score": round(b[0], 4), "folded": round(b[3]["folded"], 4), "before_folded": round(cur[n], 4)} for n, b in best.items()}, open(a.out + ".tournament.json", "w"), indent=1); print("parts replaced", len(best), "improved", improved)
+
+
+if __name__ == "__main__": main()

@@ -15,7 +15,7 @@ from scipy.sparse import coo_matrix
 
 # 29 October 2026 : time_limit_s was 20 : a solve of 14 to 21 s (Manny) was cut at 20 on a loaded machine and returned a worse answer, so the same network meshed 502 or 516 faces on two runs ; a normal solve takes 3 to 15 s, the limit only guards against a runaway
 PARAMS = {"edge_m": 0.02, "min_count": 1, "max_count": 2000, "slack_patch": 1000.0, "slack_mirror": 30.0, "time_limit_s": 90.0, "mip_rel_gap": 0.03, "merge_mirror": False}   # 29 October 2026
-SIDES = (3, 4, 5, 6)
+SIDES = (3, 4, 5, 6, 7, 8)                                       # 30 October 2026 : 7 and 8 sided patches added (Tarini 2021, one pole of valence N : e_i = s_(i-1) + s_(i+1), s integer >= 1)
 
 
 def solve(layout, edge_m=None, elastic=False, min_spoke=1):
@@ -33,7 +33,7 @@ def solve(layout, edge_m=None, elastic=False, min_spoke=1):
     s_off = {}; m = 0                                                     # Tarini s variables of the 3, 5, 6 sided patches
     for pi, p in enumerate(patches):
         k = len(p["sides"])
-        if k not in SIDES: raise ValueError(f"patch {p['name']} has {k} sides : only 3, 4, 5 or 6 are handled")
+        if k not in SIDES: raise ValueError(f"patch {p['name']} has {k} sides : only 3 to 8 are handled")
         if k != 4: s_off[pi] = m; m += k
     rows = []                                                             # (coefficient dict over variables, tag) ; every row is "= 0"
     def side_vec(side):
@@ -93,14 +93,17 @@ def solve(layout, edge_m=None, elastic=False, min_spoke=1):
 
 
 def tarini_s(e):
-    """The spoke lengths s of a 3, 5 or 6 sided patch with side counts e (None when no positive integer solution exists)."""
+    """The spoke lengths s of a 3 or 5 to 8 sided patch with side counts e (None when no positive integer solution exists). 30 October 2026 : a singular system (N = 8, 4k sides) is solved as a small integer program."""
     k = len(e)
     M = np.zeros((k, k))
     for i in range(k): M[i, (i - 1) % k] += 1; M[i, (i + 1) % k] += 1
-    try: s = np.linalg.solve(M, np.asarray(e, float))
-    except np.linalg.LinAlgError: return None
-    r = np.round(s)
-    return [int(v) for v in r] if np.all(np.abs(s - r) < 1e-6) and np.all(r >= 1) else None
+    try:
+        s = np.linalg.solve(M, np.asarray(e, float)); r = np.round(s)
+        return [int(v) for v in r] if np.all(np.abs(s - r) < 1e-6) and np.all(r >= 1) else None
+    except np.linalg.LinAlgError:
+        from scipy.optimize import milp, LinearConstraint, Bounds
+        res = milp(np.zeros(k), constraints=LinearConstraint(M, np.asarray(e, float), np.asarray(e, float)), integrality=np.ones(k), bounds=Bounds(np.ones(k), np.inf))
+        return [int(round(v)) for v in res.x] if res.success else None
 
 
 def check(layout, counts):
@@ -109,7 +112,7 @@ def check(layout, counts):
     for p in layout["patches"]:
         s = [sum(counts[a] for a in side) for side in p["sides"]]
         if len(s) == 4 and (s[0] != s[2] or s[1] != s[3]): bad.append(p["name"])
-        elif len(s) in (3, 5, 6) and tarini_s(s) is None: bad.append(p["name"])
+        elif len(s) in (3, 5, 6, 7, 8) and tarini_s(s) is None: bad.append(p["name"])
         elif len(s) not in SIDES: bad.append(p["name"])
     for a, b in layout.get("mirror", []):
         if a in counts and b in counts and counts[a] != counts[b]: bad.append(f"mirror {a} {b}")

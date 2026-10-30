@@ -1,0 +1,39 @@
+"""30 October 2026 : ZenRay Lines REPAIR ALL : the local repair of folded and squashed quads (ZrlCarMesh.repair_folded) on every part of any quad OBJ.
+    python -I ZrlRepairAll.py in.obj in.obj.parts.json ref.obj out.obj
+Each part is repaired alone and projected back on the triangles of its OWN part of the reference (the reference groups carry the part names), first with its inside vertices, then with the border vertices of the fold's ring ; a part keeps the result only when its folds fall.
+FR : la reparation locale des quads plies sur chaque piece d'un OBJ de quads quelconque."""
+import json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlAutoPatch as AP, ZrlNetMesh as NM, ZrlQuadStats as QS, ZrlTopoJudge as TJ, ZrlCarMesh as CM
+
+
+class PartRef:
+    """the reference restricted to one part : the closest point on its triangles."""
+    def __init__(self, m, part):
+        ids = np.flatnonzero(m["G"] == part); self.ref = NM.Ref(m["P"][m["F"][ids]]) if len(ids) else None
+    def closest(self, X): return self.ref.closest(X)
+
+
+def main():
+    src, parts_json, ref, out = sys.argv[1:5]; V, F = TJ.load(src); L = json.load(open(parts_json)); m = AP.mesh(os.path.abspath(ref)); pid = {n: i for i, n in enumerate(m["names"])}; V = V.copy(); done = 0; before = after = 0
+    idx = [i for i, f in enumerate(F) if len(f) == 4]; groups = {}
+    for i in idx: groups.setdefault(L[i], []).append(i)
+    for name, ids in groups.items():
+        Q = np.array([F[i] for i in ids], np.int64); vs = np.unique(Q); loc = {v: k for k, v in enumerate(vs)}; Ql = np.vectorize(loc.get)(Q); P = V[vs].copy(); _, _, j, _ = QS.stats(P, Ql); f0 = int((j < 0).sum())
+        if f0 == 0 or name not in pid: continue
+        CM.NM = type("X", (), {"load_ref": staticmethod(lambda path, _r=PartRef(m, pid[name]): _r), "Ref": NM.Ref})                    # the repair projects on the part's own triangles
+        try:
+            P2 = P; f1 = f0
+            for rounds, bo, ring in ((60, False, 1), (60, True, 1), (200, True, 2), (300, True, 3)):          # growing effort : inside only, then the border, then a wider and wider ring
+                if f1 == 0: break
+                P3, _, _ = CM.repair_folded(P2, Ql, ref, rounds=rounds, border_ok=bo, ring=ring); _, _, j3, _ = QS.stats(P3, Ql); f3 = int((j3 < 0).sum())
+                if f3 <= f1: P2, f1 = P3, f3
+        finally: CM.NM = NM
+        before += f0; after += min(f0, f1)
+        if f1 < f0: V[vs] = P2; done += 1
+    with open(out, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V)); f.write("".join("f " + " ".join(str(int(x) + 1) for x in q) + "\n" for q in F))
+    json.dump(L, open(out + ".parts.json", "w")); print("parts repaired", done, "folded", before, "->", after)
+
+
+if __name__ == "__main__": main()

@@ -1,0 +1,32 @@
+"""30 October 2026 : Houdini Quad Remesh CONSTRAINED BY FEATURE EDGES (hython) : an edge group made of the edges whose dihedral angle exceeds feature_deg and of the borders between OBJ groups (parts) is given to the SOP (featuredges), optional symmetry.
+    hython HouQuadFeatures.py in.obj out.obj target_quads feature_deg [parts 0|1] [global_weight] [constrain]
+FR : le Quad Remesh contraint par les aretes vives (angle diedre) et les bords de pieces."""
+import sys, math, hou
+src, out, target, fdeg = sys.argv[1], sys.argv[2], int(sys.argv[3]), float(sys.argv[4]); parts = int(sys.argv[5]) if len(sys.argv) > 5 else 1
+g = hou.node("/obj").createNode("geo", "feat"); f = g.createNode("file"); f.parm("file").set(src)
+pw = g.createNode("python"); pw.setInput(0, f)
+pw.parm("python").set('''
+import hou, math
+geo = hou.pwd().geometry(); grp = geo.createEdgeGroup("feature"); cosf = math.cos(math.radians(%f)); use_parts = %d
+pg = {}
+for gr in geo.primGroups():
+    for p in gr.prims(): pg[p.number()] = gr.name()
+seen = set()
+for p in geo.prims():
+    pts = p.vertices()
+    for k in range(len(pts)):
+        a = pts[k].point(); b = pts[(k + 1) %% len(pts)].point(); key = (min(a.number(), b.number()), max(a.number(), b.number()))
+        if key in seen: continue
+        seen.add(key); e = geo.findEdge(a, b)
+        if e is None: continue
+        nb = [q for q in e.prims()] if hasattr(e, "prims") else []
+        if len(nb) == 2:
+            n1 = nb[0].normal(); n2 = nb[1].normal()
+            if n1.dot(n2) < cosf or (use_parts and pg.get(nb[0].number()) != pg.get(nb[1].number())): grp.add(e)
+        elif len(nb) == 1: grp.add(e)
+''' % (fdeg, parts))
+q = g.createNode("quadremesh"); q.setInput(0, pw); q.parm("targetquadcount").set(target); q.parm("featuredges").set("feature"); q.parm("globalweight").set(float(sys.argv[6]) if len(sys.argv) > 6 else 0.1)
+if len(sys.argv) > 7 and sys.argv[7] == "constrain": q.parm("constrainededgesgroup").set("feature")
+q.cook(force=True); geo = q.geometry(); geo.saveToFile(out); print("saved", out, "prims", len(geo.prims()))
+eg = pw.geometry().findEdgeGroup("feature"); print("feature edges", len(eg.edges()) if eg else None, "of prims", len(pw.geometry().prims()))
+print([ (p.name(), p.eval()) for p in q.parms() if p.name() in ("featuredges","featureboundaries","globalweight","hardenguidestofeatures")])
