@@ -1,0 +1,29 @@
+"""Pass 7 full run : every zone of a mesh through TF7.fill with options, judged like ZrlTutteFill.main. FR : passage complet."""
+import sys, json, os, numpy as np
+sys.path.insert(0, '.'); import TF7 as T
+import ZrlTopoJudge as TJ
+GT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/"
+def write_obj(path, V, F):
+    with open(path, "w") as f: f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V) + "".join("f %d %d %d %d\n" % tuple(int(x) + 1 for x in q) for q in F))
+def run_full(mesh, edge, mf, opts, out=None, tiny=0, hook=None):
+    obj = GT + mesh + ".obj"; m = T.AP.mesh(obj); zones = T.ANY.segment(m, 25.0, max(1, int(mf * len(m["F"]))), merge_deg=35.0, log=lambda s: None)
+    tri = m["P"][m["F"]]; area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); tot = float(area.sum()); V = []; F = []; parts = []; off = 0; fails = {}; fail_area = {}; cov = 0.0
+    for k, (Z, seed) in enumerate(zones):
+        if tiny and len(Z) <= tiny: fails["skipped tiny"] = fails.get("skipped tiny", 0) + 1; fail_area["skipped tiny"] = fail_area.get("skipped tiny", 0.0) + float(area[Z].sum()); continue
+        P3 = Qd = None
+        try:
+            pr = T.prep(m, Z, edge, dict(T.OPTS, **opts))
+            if "fail" in pr and hook is not None and pr["fail"].startswith("loops"): P3, Qd, rep = hook(m, Z, edge, opts)
+            elif "fail" in pr: rep = pr
+            elif opts.get("skip_tiny3") and pr["K"] == 3 and len(Z) <= opts["skip_tiny3"]: rep = {"fail": "skipped tiny triangle"}
+            else: P3, Qd, rep = T.fill(m, Z, edge, dict(T.OPTS, **opts), pr=pr)
+        except Exception as ex: P3, Qd, rep = None, None, {"fail": "error " + str(ex)[:40]}
+        if P3 is None:
+            r = rep.get("fail", "?"); fails[r] = fails.get(r, 0) + 1; fail_area[r] = fail_area.get(r, 0.0) + float(area[Z].sum()); continue
+        V.append(P3); F.append(Qd + off); off += len(P3); parts += [k] * len(Qd); cov += float(area[Z].sum())
+    if not V: return dict(fails=fails)
+    V = np.vstack(V); F = np.vstack(F); out = out or "dbg/_tmp.obj"; write_obj(out, V, F); json.dump(parts, open(out + ".parts.json", "w")); j = TJ.judge(out, obj)
+    return dict(zones=len(zones), patched=len(set(parts)), coverage=round(cov / tot, 3), quads=j["quads"], folded=j["folded"], squashed=j["squashed"], folded_pct=round(100 * j["folded_share"], 2), squashed_pct=round(100 * j["squashed_share"], 2), dev=j["dev_mean_frac_diag"], fails=fails, fail_area={k: round(v / tot, 3) for k, v in fail_area.items()}, obj=out)
+if __name__ == "__main__":
+    mesh, edge, mf = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]); opts = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}; tiny = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+    print(json.dumps(run_full(mesh, edge, mf, opts, "dbg/%s_%s.obj" % (mesh, abs(hash(json.dumps(opts))) % 10**6), tiny)))

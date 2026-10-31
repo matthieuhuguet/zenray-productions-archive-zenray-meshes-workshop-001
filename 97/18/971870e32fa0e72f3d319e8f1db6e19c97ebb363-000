@@ -1,0 +1,203 @@
+"""Pass 8 : common judge for quad meshes, same definitions as the earlier passes. Written 30 October 2026.
+Normal of a quad = normalize((P2 - P0) x (P3 - P1)) (diagonals, Verdict / Knupp). Corner Jacobian = n . (a x b) / (|a| |b|)
+with a, b the two edges leaving the corner. Folded = min corner Jacobian < 0 ; squashed = min corner Jacobian < 0.3.
+FR : juge commun, plie = Jacobien normalise minimal < 0, ecrase = < 0,3."""
+import numpy as np
+import collections
+
+
+def quad_normals(P, Q):
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]])
+    ln = np.linalg.norm(n, axis=1, keepdims=True)
+    return n / np.maximum(ln, 1e-30)
+
+
+def corner_jacobians(P, Q, normals=None):
+    """(nq, 4) normalized Jacobians at the four corners, signed by the diagonal normal."""
+    n = quad_normals(P, Q) if normals is None else normals
+    J = np.zeros((len(Q), 4))
+    for k in range(4):
+        a = P[Q[:, (k + 1) % 4]] - P[Q[:, k]]
+        b = P[Q[:, (k - 1) % 4]] - P[Q[:, k]]
+        # for a counter clockwise quad, a x b points along the quad normal : a regular quad gets +1
+        c = np.cross(a, b)
+        J[:, k] = np.einsum("ij,ij->i", c, n) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-30)
+    return J
+
+
+def judge(P, Q, ref_tris=None, fold_thr=0.0, squash_thr=0.3, verbose=False):
+    """Return a dict of metrics. P (nv, 3), Q (nq, 4) int."""
+    P = np.asarray(P, float); Q = np.asarray(Q, int)
+    nq = len(Q)
+    J = corner_jacobians(P, Q)
+    jmin = J.min(axis=1)
+    res = {"quads": int(nq),
+           "folded_frac": float((jmin < fold_thr).mean()),
+           "squashed_frac": float((jmin < squash_thr).mean()),
+           "jac_mean": float(jmin.mean()),
+           "jac_below_05_frac": float((jmin < 0.5).mean())}
+    # edge length regularity : std over mean of all edge lengths
+    E = np.concatenate([Q[:, [k, (k + 1) % 4]] for k in range(4)])
+    L = np.linalg.norm(P[E[:, 0]] - P[E[:, 1]], axis=1)
+    res["edge_cv"] = float(L.std() / max(L.mean(), 1e-30))
+    # edge length ratio inside each quad (opposite edges) : mean of min/max over the two pairs
+    e = np.stack([np.linalg.norm(P[Q[:, (k + 1) % 4]] - P[Q[:, k]], axis=1) for k in range(4)], axis=1)
+    r1 = np.minimum(e[:, 0], e[:, 2]) / np.maximum(np.maximum(e[:, 0], e[:, 2]), 1e-30)
+    r2 = np.minimum(e[:, 1], e[:, 3]) / np.maximum(np.maximum(e[:, 1], e[:, 3]), 1e-30)
+    res["opposite_ratio_mean"] = float(np.minimum(r1, r2).mean())
+    # side ratio : adjacent edges (aspect)
+    asp = np.minimum(e.min(axis=1) / np.maximum(e.max(axis=1), 1e-30), 1.0)
+    res["aspect_mean"] = float(asp.mean())
+    # area equalization : coefficient of variation of the quad areas (planar approximation by diagonal cross product / 2)
+    A = 0.5 * np.linalg.norm(np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]), axis=1)
+    res["area_cv"] = float(A.std() / max(A.mean(), 1e-30))
+    # topology : valence of vertices, interior vertices only
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4])
+            ec[(a, b) if a < b else (b, a)] += 1
+    nb = collections.Counter(); onb = set(); nonman = 0
+    for (a, b), c in ec.items():
+        nb[a] += 1; nb[b] += 1
+        if c == 1:
+            onb.add(a); onb.add(b)
+        elif c > 2:
+            nonman += 1
+    interior = [v for v in nb if v not in onb]
+    val = np.array([nb[v] for v in interior]) if interior else np.zeros(0, int)
+    res["interior_vertices"] = int(len(val))
+    res["valence4_frac"] = float((val == 4).mean()) if len(val) else 1.0
+    res["poles_per_1000_quads"] = float(((val != 4).sum()) * 1000.0 / nq)
+    res["boundary_edges"] = int(sum(1 for c in ec.values() if c == 1))
+    res["nonmanifold_edges"] = int(nonman)
+    # Euler characteristic of the used vertices
+    used = np.unique(Q)
+    res["euler"] = int(len(used) - len(ec) + nq)
+    if ref_tris is not None:
+        res.update(distance_to_reference(P, Q, ref_tris))
+    return res
+
+
+def distance_to_reference(P, Q, ref):
+    """Mean and 99% distance from quad vertices to the reference surface, as a fraction of the reference bbox diagonal.
+    ref = (V, F) triangle mesh. Needs trimesh."""
+    import trimesh
+    rv, rf = ref
+    m = trimesh.Trimesh(rv, rf, process=False)
+    used = np.unique(Q)
+    _, d, _ = trimesh.proximity.closest_point(m, P[used])
+    diag = np.linalg.norm(rv.max(axis=0) - rv.min(axis=0))
+    return {"dist_mean_frac_diag": float(d.mean() / diag), "dist_p99_frac_diag": float(np.percentile(d, 99) / diag)}
+
+
+def vertex_normals(P, Q):
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]])      # area weighted (length = 2 x area)
+    N = np.zeros_like(P)
+    for k in range(4):
+        np.add.at(N, Q[:, k], n)
+    return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-30)
+
+
+def loop_turn_angles(P, Q):
+    """Turning angle in degrees, in the tangent plane, of the two edge lines through every interior vertex of valence 4.
+    0 = perfectly straight. Tangent plane from the area weighted vertex normal, so a geodesic of a sphere gives about 0."""
+    N = vertex_normals(P, Q)
+    rot = {}
+    cnt = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            v, nxt, prv = int(q[k]), int(q[(k + 1) % 4]), int(q[(k - 1) % 4])
+            rot.setdefault(v, {})[nxt] = prv
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(a, b) if a < b else (b, a)] += 1
+    onb = set()
+    for (a, b), c in ec.items():
+        if c == 1: onb.add(a); onb.add(b)
+    out = []
+    for v, r in rot.items():
+        if v in onb or len(r) != 4:
+            continue
+        n0 = next(iter(r)); ring = [n0]
+        for _ in range(3):
+            ring.append(r[ring[-1]])
+        if r[ring[-1]] != n0 or len(set(ring)) != 4:
+            continue
+        for a, b in ((ring[0], ring[2]), (ring[1], ring[3])):
+            u = P[v] - P[a]; w = P[b] - P[v]
+            u = u - N[v] * (u @ N[v]); w = w - N[v] * (w @ N[v])
+            c = (u @ w) / max(np.linalg.norm(u) * np.linalg.norm(w), 1e-30)
+            out.append(np.degrees(np.arccos(np.clip(c, -1, 1))))
+    return np.array(out)
+
+
+def loop_turn_iso(P, Q):
+    """Intrinsic straightness : at every interior vertex of valence 4, for each of the two lines through it, |left angle sum - right angle sum| / 2
+    in degrees. The angle sums are measured between the edge vectors in 3D, so they are the angles of the unfolded surface : a straight line that
+    crosses a 90 degree crease with equal angles on both sides gets 0, while the extrinsic measure of loop_turn_angles would call it bent."""
+    rot = {}
+    for q in Q:
+        for k in range(4):
+            v, nxt, prv = int(q[k]), int(q[(k + 1) % 4]), int(q[(k - 1) % 4])
+            rot.setdefault(v, {})[nxt] = prv
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(a, b) if a < b else (b, a)] += 1
+    onb = set()
+    for (a, b), c in ec.items():
+        if c == 1: onb.add(a); onb.add(b)
+    out = []
+    for v, r in rot.items():
+        if v in onb or len(r) != 4:
+            continue
+        n0 = next(iter(r)); ring = [n0]
+        for _ in range(3): ring.append(r[ring[-1]])
+        if r[ring[-1]] != n0 or len(set(ring)) != 4:
+            continue
+        ang = []
+        for k in range(4):
+            a = P[ring[k]] - P[v]; b = P[ring[(k + 1) % 4]] - P[v]
+            c = (a @ b) / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-30)
+            ang.append(np.degrees(np.arccos(np.clip(c, -1, 1))))
+        out.append(abs((ang[0] + ang[1]) - (ang[2] + ang[3])) / 2.0)
+        out.append(abs((ang[1] + ang[2]) - (ang[3] + ang[0])) / 2.0)
+    return np.array(out)
+
+
+def corner_angle_dev(P, Q):
+    """|angle - 90| in degrees over the four corners of every quad."""
+    out = []
+    for k in range(4):
+        a = P[Q[:, (k + 1) % 4]] - P[Q[:, k]]; b = P[Q[:, (k - 1) % 4]] - P[Q[:, k]]
+        c = np.einsum("ij,ij->i", a, b) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-30)
+        out.append(np.abs(np.degrees(np.arccos(np.clip(c, -1, 1))) - 90.0))
+    return np.concatenate(out)
+
+
+def judge_plus(P, Q, ref_tris=None):
+    """judge() plus angle deviation and loop straightness statistics."""
+    r = judge(P, Q, ref_tris=ref_tris)
+    ad = corner_angle_dev(np.asarray(P, float), np.asarray(Q, int))
+    r["angle_dev_mean_deg"] = float(ad.mean()); r["angle_dev_p99_deg"] = float(np.percentile(ad, 99))
+    lt = loop_turn_angles(np.asarray(P, float), np.asarray(Q, int))
+    r["loop_turn_mean_deg"] = float(lt.mean()) if len(lt) else 0.0
+    r["loop_turn_p95_deg"] = float(np.percentile(lt, 95)) if len(lt) else 0.0
+    r["loop_turn_p90_deg"] = float(np.percentile(lt, 90)) if len(lt) else 0.0
+    li = loop_turn_iso(np.asarray(P, float), np.asarray(Q, int))
+    r["loop_turn_iso_mean_deg"] = float(li.mean()) if len(li) else 0.0
+    r["loop_turn_iso_p90_deg"] = float(np.percentile(li, 90)) if len(li) else 0.0
+    return r
+
+
+def fmt(res):
+    keys = ["quads", "folded_frac", "squashed_frac", "jac_mean", "jac_below_05_frac", "edge_cv", "area_cv", "valence4_frac",
+            "poles_per_1000_quads", "nonmanifold_edges", "boundary_edges", "euler", "dist_mean_frac_diag"]
+    out = []
+    for k in keys:
+        if k in res:
+            v = res[k]
+            out.append("%s=%s" % (k, ("%.4g" % v) if isinstance(v, float) else v))
+    return " ".join(out)

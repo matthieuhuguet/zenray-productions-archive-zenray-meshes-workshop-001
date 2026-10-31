@@ -1,0 +1,105 @@
+"""Pass 9 : instance transfer on the synthetic car scene (ellipsoid body and four identical torus wheels). Written 30 October 2026.
+Usage : python3 -I run_instances.py base=WORK out=res.json [mode=organic] [scale=2.0]
+Baseline : QuadWild on the whole scene. Instances : components, groups of rigid copies (descriptor and ICP), QuadWild on the body and ONE wheel, the wheel quads
+are transformed onto the three other wheels. Measured : quad counts, time, judge, transfer error to the real wheel surfaces, mirror planes of the scene.
+FR : transfert d'instances sur la scene voiture : un seul calcul pour les quatre roues, comparaison a QuadWild sur la scene entiere."""
+import sys, json, os, time, collections
+sys.path.insert(0, ".")
+import numpy as np, trimesh
+import zr8_io as IO, zr8_judge as J, zr8_symmetry as SY, qw_run as QR
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:]); base = a["base"]; mode = a.get("mode", "organic"); scale = a.get("scale", "2.0")
+wd = base + "/inst"; os.makedirs(wd, exist_ok=True)
+V, F = IO.read_obj_tri_or_quad(base + "/meshes/car_scene.obj"); V = np.array(V); F = np.array(F)
+parts = SY.components(V, F); res = {"components": len(parts), "component_faces": [int(len(p.faces)) for p in parts]}
+edge_tri = float(np.mean([np.linalg.norm(p.vertices[p.edges_unique[:, 0]] - p.vertices[p.edges_unique[:, 1]], axis=1).mean() for p in parts]))
+
+
+def judge(P, Q, ref=None):
+    j = J.judge_plus(P, Q, ref_tris=ref)
+    return {"quads": int(len(Q)), "folded": int(round(j["folded_frac"] * len(Q))), "squashed": int(round(j["squashed_frac"] * len(Q))), "jac_mean": round(j["jac_mean"], 4),
+            "angle_dev": round(j["angle_dev_mean_deg"], 2), "turn_iso": round(j["loop_turn_iso_mean_deg"], 2), "poles_per_1000": round(j["poles_per_1000_quads"], 1),
+            "euler": j["euler"], "boundary_edges": j["boundary_edges"], "nonmanifold": j["nonmanifold_edges"]}
+
+
+def components_of_quads(Q):
+    parent = list(range(int(Q.max()) + 1))
+    def f(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for q in Q:
+        for k in range(1, 4): parent[f(int(q[k]))] = f(int(q[0]))
+    lab = np.array([f(int(q[0])) for q in Q]); _, inv = np.unique(lab, return_inverse=True); return inv
+
+
+# ==== mirror planes of the scene
+planes = SY.detect_mirror_planes(V, F, edge_tri)
+res["mirror_planes"] = [{"normal": np.round(n, 3).tolist(), "offset": round(float(d), 4), "median_edges": round(m, 3), "inliers": round(i, 3)} for n, d, m, i in planes]
+
+# ==== instance groups
+t = time.time(); groups = SY.match_instances(parts, edge_tri); res["match_seconds"] = round(time.time() - t, 2)
+res["groups"] = [{"rep": int(i), "members": [{"index": int(j), "rms_over_edge": round(float(r) / edge_tri, 4)} for j, R, t_, r in g]} for i, g in groups]
+
+# ==== baseline : QuadWild on the whole scene
+mp = base + "/meshes/car_scene.obj"
+t = time.time(); rb = QR.run({"mesh": mp, "workdir": wd, "mode": mode, "scale": scale}); res["baseline_seconds"] = round(time.time() - t, 1)
+if rb["ok"]:
+    P, Q = IO.read_obj_tri_or_quad(rb["quad_smooth"]); P = np.array(P); Q = np.array(Q)
+    res["baseline"] = judge(P, Q, (V, F)); lab = components_of_quads(Q)
+    per = []
+    for c in range(lab.max() + 1):
+        qc = Q[lab == c]; used = np.unique(qc); rm = -np.ones(len(P), int); rm[used] = np.arange(len(used)); jj = J.judge_plus(P[used], rm[qc])
+        deg = collections.Counter(np.bincount(rm[qc].ravel()).tolist())
+        hq_c = float(np.mean([np.linalg.norm(P[qc[:, k]] - P[qc[:, (k + 1) % 4]], axis=1).mean() for k in range(4)]))
+        per.append({"quads": int(len(qc)), "h": round(hq_c, 5), "euler": jj["euler"], "valence_histogram": {str(k): int(v) for k, v in sorted(collections.Counter(np.bincount(rm[qc].ravel())).items())}})
+    res["baseline_components"] = sorted(per, key=lambda x: x["quads"])
+    res["baseline_h_wheel"] = round(float(np.mean([x["h"] for x in res["baseline_components"][:4]])), 5); res["baseline_h_body"] = res["baseline_components"][-1]["h"]
+else:
+    res["baseline"] = "failed"; res["baseline_tail"] = rb.get("tail")
+
+# ==== instances : body and one wheel only, density matched to the baseline components
+def mean_edge_tri(Vv, Ff):
+    e = np.concatenate([Ff[:, [0, 1]], Ff[:, [1, 2]], Ff[:, [2, 0]]]); return float(np.linalg.norm(Vv[e[:, 0]] - Vv[e[:, 1]], axis=1).mean())
+
+
+def mean_edge_quad(P, Q):
+    return float(np.mean([np.linalg.norm(P[Q[:, k]] - P[Q[:, (k + 1) % 4]], axis=1).mean() for k in range(4)]))
+
+
+def run_matched(path, target_h):
+    """QuadWild run whose mean quad edge is within 6 percent of target_h (scaleFact from the remeshed layer, then secant corrections)."""
+    r = QR.run({"mesh": path, "workdir": wd, "mode": mode, "scale": "1.0"}); Vr, Fr = IO.read_obj_tri_or_quad(r["rem"]); s = target_h / mean_edge_tri(np.array(Vr), np.array(Fr))
+    r = QR.run({"mesh": path, "workdir": wd, "mode": mode, "scale": "%.5f" % s}); hm = None
+    for _ in range(3):
+        P_, Q_ = IO.read_obj_tri_or_quad(r["quad_smooth"]); hm = mean_edge_quad(np.array(P_), np.array(Q_))
+        if abs(hm / target_h - 1) < 0.06: break
+        s *= target_h / hm; r = QR.run({"mesh": path, "workdir": wd, "mode": mode, "scale": "%.5f" % s})
+    return r, s, hm
+
+
+wheels = max(groups, key=lambda g: len(g[1])); rep = wheels[0]; members = wheels[1]
+body_idx = [i for i in range(len(parts)) if i not in {m[0] for m in members}]
+res["wheel_group_size"] = len(members); res["body_components"] = body_idx
+paths = {}
+for tag, comps in (("wheel", [rep]), ("body", body_idx)):
+    m = trimesh.util.concatenate([parts[i] for i in comps]); p = "%s/%s.obj" % (wd, tag); IO.write_obj(p, np.asarray(m.vertices), np.asarray(m.faces)); paths[tag] = p
+hs = sorted(res["baseline_components"], key=lambda x: x["quads"]) if rb["ok"] else None
+t = time.time()
+rw, sw, hw = run_matched(paths["wheel"], res["baseline_h_wheel"]); rbod, sb, hb = run_matched(paths["body"], res["baseline_h_body"])
+res["instance_seconds_matched_runs_incl_corrections"] = round(time.time() - t, 1); res["matched_scale"] = {"wheel": round(sw, 4), "body": round(sb, 4)}
+res["matched_quad_edge"] = {"wheel": round(hw, 5), "body": round(hb, 5), "target_wheel": res["baseline_h_wheel"], "target_body": res["baseline_h_body"]}
+if rw["ok"] and rbod["ok"]:
+    Pw, Qw = IO.read_obj_tri_or_quad(rw["quad_smooth"]); Pw = np.array(Pw); Qw = np.array(Qw)
+    Pb, Qb = IO.read_obj_tri_or_quad(rbod["quad_smooth"]); Pb = np.array(Pb); Qb = np.array(Qb)
+    allP = [Pb]; allQ = [Qb]; off = len(Pb); errs = []
+    for j, R, t_, r in members:
+        Pj = Pw @ R.T + t_; allP.append(Pj); allQ.append(Qw + off); off += len(Pj)
+        errs.append(np.asarray(trimesh.proximity.closest_point(parts[j], Pj)[1]))
+    P = np.vstack(allP); Q = np.vstack(allQ)
+    res["instance"] = judge(P, Q, (V, F)); res["wheel_quads"] = int(len(Qw)); res["body_quads"] = int(len(Qb))
+    e = np.concatenate(errs); hq = mean_edge_quad(Pw, Qw)
+    res["transfer_error_over_quad_edge"] = {"median": round(float(np.median(e)) / hq, 4), "p99": round(float(np.percentile(e, 99)) / hq, 4), "max": round(float(e.max()) / hq, 4), "wheel_quad_edge": round(hq, 5)}
+    IO.write_obj(wd + "/car_instances_quads.obj", P, Q)
+else:
+    res["instance"] = "failed"
+json.dump(res, open(a["out"], "w"), indent=1); print(json.dumps({k: res[k] for k in res if k not in ("groups",)}, indent=1)[:4000])

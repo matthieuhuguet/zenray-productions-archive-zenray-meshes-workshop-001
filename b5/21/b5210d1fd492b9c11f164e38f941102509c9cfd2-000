@@ -1,0 +1,139 @@
+"""30 October 2026 : ZenRay QUAD STRAIGHTEN : make the lines of a quad mesh straight and the quads regular WITHOUT changing its layout (same faces, same connectivity), the step that follows QuadWild (whose own smoothing is one pass of 30 steps, no fold test).
+EN: every iteration moves each free vertex toward the centroid of its neighbours (at a valence 4 vertex this is the point that makes both lines through it straight), then projects it back on the reference surface (exact closest point on the triangles), and a vertex move is refused when it would fold a quad or worsen a squashed one (scaled Jacobian of the corners). Hard edges : vertices on a crease (adjacent quad normals differing by more than --feature-deg) slide along the crease only, a crease corner or a patch boundary corner is locked. Open boundary : slides along the boundary, corners locked.
+    python -I ZrlQuadStraighten.py quads.obj reference.obj out.obj [--iters 80] [--feature-deg 35] [--lam 0.6] [--json]
+Report : angle and straightness error before and after, folded and squashed counts, deviation to the reference.
+FR : redresse les lignes d'un maillage de quads sans changer son decoupage : chaque sommet va vers le centre de ses voisins puis est reprojete sur la reference, un deplacement qui plie un quad est refuse, les aretes vives glissent le long du pli, les coins sont verrouilles."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+from scipy.spatial import cKDTree
+import scipy.sparse as sp
+
+
+def load_obj(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V, float), F
+
+
+def save_obj(path, V, F):
+    with open(path, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V)); f.write("".join("f " + " ".join(str(int(i) + 1) for i in q) + "\n" for q in F))
+
+
+def closest_on_tri(p, a, b, c):
+    """exact closest point of p (n,3) on the triangles (a, b, c) (n,3 each) : Ericson, every region, vectorised."""
+    ab = b - a; ac = c - a; ap = p - a; d1 = (ab * ap).sum(1); d2 = (ac * ap).sum(1); bp = p - b; d3 = (ab * bp).sum(1); d4 = (ac * bp).sum(1); cp = p - c; d5 = (ab * cp).sum(1); d6 = (ac * cp).sum(1)
+    vc = d1 * d4 - d3 * d2; vb = d5 * d2 - d1 * d6; va = d3 * d6 - d5 * d4; den = np.where(np.abs(va + vb + vc) < 1e-30, 1e-30, va + vb + vc); res = a + ab * (vb / den)[:, None] + ac * (vc / den)[:, None]
+    m6 = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0); w = (d4 - d3) / np.where(np.abs((d4 - d3) + (d5 - d6)) < 1e-30, 1e-30, (d4 - d3) + (d5 - d6)); res = np.where(m6[:, None], b + (c - b) * w[:, None], res)
+    m5 = (vb <= 0) & (d2 >= 0) & (d6 <= 0); w = d2 / np.where(np.abs(d2 - d6) < 1e-30, 1e-30, d2 - d6); res = np.where(m5[:, None], a + ac * w[:, None], res)
+    m4 = (d6 >= 0) & (d5 <= d6); res = np.where(m4[:, None], c, res)
+    m3 = (vc <= 0) & (d1 >= 0) & (d3 <= 0); w = d1 / np.where(np.abs(d1 - d3) < 1e-30, 1e-30, d1 - d3); res = np.where(m3[:, None], a + ab * w[:, None], res)
+    m2 = (d3 >= 0) & (d4 <= d3); res = np.where(m2[:, None], b, res)
+    m1 = (d1 <= 0) & (d2 <= 0); res = np.where(m1[:, None], a, res); return res
+
+
+class Surface:
+    """the reference surface : triangles, centroid tree, projection of points on it (k nearest triangles, exact closest point)."""
+    def __init__(self, V, F, k=10):
+        T = []
+        for f in F:
+            for i in range(1, len(f) - 1): T.append((f[0], f[i], f[i + 1]))
+        self.V = V; self.T = np.array(T, np.int64); self.A = V[self.T[:, 0]]; self.B = V[self.T[:, 1]]; self.C = V[self.T[:, 2]]; self.cent = (self.A + self.B + self.C) / 3; self.tree = cKDTree(self.cent); self.k = min(k, len(self.T))
+    def project(self, P):
+        _, idx = self.tree.query(P, k=self.k); n = len(P); best = np.full(n, 1e30); out = P.copy()
+        for j in range(self.k):
+            t = idx[:, j]; c = closest_on_tri(P, self.A[t], self.B[t], self.C[t]); d = ((c - P) ** 2).sum(1); m = d < best; best[m] = d[m]; out[m] = c[m]
+        return out
+
+
+class Curves:
+    """the ORIGINAL crease and boundary segments : a vertex that slides is projected back on them (not on the surface, which would bevel the crease)."""
+    def __init__(self, V, segs, k=6):
+        s = np.array(sorted(segs), np.int64).reshape(-1, 2); self.A = V[s[:, 0]] if len(s) else np.zeros((0, 3)); self.B = V[s[:, 1]] if len(s) else np.zeros((0, 3)); self.tree = cKDTree((self.A + self.B) / 2) if len(s) else None; self.k = min(k, len(s))
+    def project(self, P):
+        _, idx = self.tree.query(P, k=self.k); idx = idx.reshape(len(P), -1); best = np.full(len(P), 1e30); out = P.copy()
+        for j in range(idx.shape[1]):
+            t = idx[:, j]; a = self.A[t]; b = self.B[t]; ab = b - a; u = np.clip(((P - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-30), 0, 1); c = a + ab * u[:, None]; d = ((c - P) ** 2).sum(1); m = d < best; best[m] = d[m]; out[m] = c[m]
+        return out
+
+
+def quad_jmin(V, Q):
+    """smallest scaled Jacobian of the four corners of every quad (Verdict, diagonal normal) : negative = folded."""
+    P = V[Q]; n = np.cross(P[:, 2] - P[:, 0], P[:, 3] - P[:, 1]); nn = np.linalg.norm(n, axis=1, keepdims=True); n = n / np.maximum(nn, 1e-30); j = np.empty((len(Q), 4))
+    for k in range(4):
+        a = P[:, (k + 1) % 4] - P[:, k]; b = P[:, (k - 1) % 4] - P[:, k]; j[:, k] = (np.cross(a, b) * n).sum(1) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-30)
+    return j.min(1)
+
+
+def topology(Q, nv):
+    ec = collections.Counter(); ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); e = (min(a, b), max(a, b)); ec[e] += 1; ef[e].append(qi)
+    return ec, ef
+
+
+def straighten(V, F, ref, iters=80, lam=0.6, feature_deg=35.0, corner_deg=30.0, lock_boundary_corners=True, slide=True, log=print):
+    """returns the new vertex array (same faces). V (n,3), F list of faces (quads are moved, other faces keep their vertices only as anchors)."""
+    Q = np.array([f for f in F if len(f) == 4], np.int64); nv = len(V); surf = Surface(*ref); ec, ef = topology(Q, nv)
+    P = V.copy(); used = np.zeros(nv, bool); used[Q.ravel()] = True; qn = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); qn /= np.maximum(np.linalg.norm(qn, axis=1, keepdims=True), 1e-30); cosf = np.cos(np.radians(feature_deg))
+    nbr = [set() for _ in range(nv)]; feat_nb = [set() for _ in range(nv)]; bnd_nb = [set() for _ in range(nv)]
+    for (a, b), c in ec.items():
+        nbr[a].add(b); nbr[b].add(a)
+        if c == 1: bnd_nb[a].add(b); bnd_nb[b].add(a)
+        elif c == 2 and float(qn[ef[(a, b)][0]] @ qn[ef[(a, b)][1]]) < cosf: feat_nb[a].add(b); feat_nb[b].add(a)
+    kind = np.zeros(nv, np.int8)                                                              # 0 free, 1 slides on a crease or boundary, 2 locked
+    for v in range(nv):
+        if not used[v]: kind[v] = 2; continue
+        if bnd_nb[v]:
+            if len(bnd_nb[v]) != 2: kind[v] = 2
+            else:
+                a, b = list(bnd_nb[v]); u = V[a] - V[v]; w = V[b] - V[v]; ang = np.degrees(np.arccos(np.clip(u @ w / max(np.linalg.norm(u) * np.linalg.norm(w), 1e-30), -1, 1)))
+                kind[v] = 2 if (180.0 - ang > corner_deg and lock_boundary_corners) else 1
+        elif feat_nb[v]:
+            kind[v] = 1 if len(feat_nb[v]) == 2 else 2
+    if not slide: kind[kind == 1] = 2                                                         # 30 October 2026 : --no-slide locks every crease vertex (only the free vertices relax)
+    slide = {v: (list(bnd_nb[v]) if bnd_nb[v] else list(feat_nb[v])) for v in range(nv) if kind[v] == 1}
+    segs = {(min(a, b), max(a, b)) for v in range(nv) if kind[v] == 1 for a in [v] for b in (bnd_nb[v] if bnd_nb[v] else feat_nb[v])}; curves = Curves(V, segs) if segs else None
+    free = np.flatnonzero((kind == 0) & used); sl = np.array(sorted(slide), np.int64) if slide else np.zeros(0, np.int64)
+    rows = []; cols = []; vals = []
+    for v in free:
+        ns = list(nbr[v]); rows += [v] * len(ns); cols += ns; vals += [1.0 / len(ns)] * len(ns)
+    Af = sp.csr_matrix((vals, (rows, cols)), shape=(nv, nv))
+    rows = []; cols = []; vals = []
+    for v in sl:
+        ns = slide[v]; rows += [v] * len(ns); cols += ns; vals += [1.0 / len(ns)] * len(ns)
+    As = sp.csr_matrix((vals, (rows, cols)), shape=(nv, nv)); movable = np.zeros(nv, bool); movable[free] = True; movable[sl] = True
+    vq = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for v in q: vq[int(v)].append(qi)
+    j0 = quad_jmin(P, Q); floor = np.minimum(j0, 0.2); log("straighten : %d vertices, %d free, %d slide, %d locked, %d quads, folded %d" % (nv, len(free), len(sl), int((kind == 2).sum()), len(Q), int((j0 < 0).sum())))
+    for it in range(iters):
+        target = P.copy(); target[free] = (Af @ P)[free];
+        if len(sl): target[sl] = (As @ P)[sl]
+        new = P.copy(); mv = np.flatnonzero(movable); new[mv] = P[mv] + lam * (target[mv] - P[mv]); new[free] = surf.project(new[free])
+        if len(sl): new[sl] = curves.project(new[sl])
+        for _ in range(8):                                                                        # refuse the moves that fold a quad or worsen a squashed one
+            jn = quad_jmin(new, Q); bad = np.flatnonzero(jn < floor - 1e-9)
+            if not len(bad): break
+            for q in Q[bad]: new[q] = P[q]
+        P = new; j1 = quad_jmin(P, Q); floor = np.minimum(floor, np.minimum(j1, 0.2)) if False else np.minimum(j1, 0.2)
+        if it % 20 == 0 or it == iters - 1: log("  iter %d : folded %d, squashed %d, J mean %.3f" % (it, int((j1 < 0).sum()), int((j1 < 0.3).sum()), float(j1.mean())))
+    return P
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("quads"); ap.add_argument("reference"); ap.add_argument("out"); ap.add_argument("--iters", type=int, default=80); ap.add_argument("--lam", type=float, default=0.6); ap.add_argument("--feature-deg", type=float, default=35.0); ap.add_argument("--no-slide", action="store_true"); ap.add_argument("--json", action="store_true"); a = ap.parse_args()
+    import ZrlTopoJudge as TJ
+    V, F = load_obj(a.quads); ref = load_obj(a.reference); before = TJ.judge(a.quads, a.reference); P = straighten(V, F, ref, a.iters, a.lam, a.feature_deg, slide=not a.no_slide); save_obj(a.out, P, F); after = TJ.judge(a.out, a.reference)
+    keys = ("quads", "folded_share", "squashed_share", "jac_mean", "angle_dev_mean_deg", "angle_dev_p90_deg", "straight_dev_mean_deg", "straight_dev_p90_deg", "poles_per_1000_quads", "dev_mean_mm", "symmetry_mean_edge")
+    rep = {"before": {k: before.get(k) for k in keys}, "after": {k: after.get(k) for k in keys}}
+    if a.json: print(json.dumps(rep))
+    else:
+        for k in keys: print("%-24s %10s -> %10s" % (k, before.get(k), after.get(k)))
+
+
+if __name__ == "__main__": main()

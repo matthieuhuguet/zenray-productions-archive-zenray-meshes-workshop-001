@@ -1,0 +1,21 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode=True
+import corners5 as C5, numpy as np
+from PIL import Image, ImageDraw
+S='/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt'; name=sys.argv[1]; start=int(sys.argv[2]); count=int(sys.argv[3]); cols=6; W=300
+m=C5.AP.mesh(S+'/%s.obj'%name); zones=C5.ANY.segment(m,25.0,max(4,int(0.002*len(m['F']))),merge_deg=35.0,log=lambda s:None); lab=C5.zone_labels(m,zones)
+rows=(count+cols-1)//cols; img=Image.new('RGB',(cols*W,rows*W),'white'); dr=ImageDraw.Draw(img); k=0
+for r,(Z,seed) in enumerate(zones):
+    if r<start: continue
+    if k>=count: break
+    ox,oy=(k%cols)*W,(k//cols)*W; Ls,ln=C5.AP.loops(m,Z); k+=1
+    if len(Ls)!=1: dr.text((ox+4,oy+4),'zone %d loops %d'%(r,len(Ls)),fill='black'); continue
+    B=np.asarray(Ls[0]); Nl=C5.vertex_normals_on_loop(m,Z,B); idx,turns,X,per=C5.detect(m['P'][B],Nl)
+    c=X.mean(0); u,s,vt=np.linalg.svd(X-c,full_matrices=False); uv=(X-c)@vt[:2].T; sc=(W-40)/max(np.abs(uv).max()*2,1e-9)
+    def tp(p): return (ox+W/2+p[0]*sc, oy+W/2+20-p[1]*sc)
+    pts=[tp(p) for p in uv]; dr.line(pts+[pts[0]],fill='black',width=1)
+    for i in idx: x,y=tp(uv[i]); dr.ellipse((x-5,y-5,x+5,y+5),fill='red')
+    nrm=m['N'][Z].mean(0); nrm/=np.linalg.norm(nrm); Xa,tot=C5.AP.resample_closed(m['P'][B],C5.AP.PARAMS['step_m']); C4,t4=C5.AP.corners(Xa,tot,nrm,dict(C5.AP.PARAMS,max_corners=4)); uva=(Xa-c)@vt[:2].T
+    for i in C4: x,y=tp(uva[i]); dr.rectangle((x-6,y-6,x+6,y+6),outline='blue',width=2)
+    labs,L=C5.boundary_runs(m,lab,r,Z,B); top,tf=C5.topological_corners(labs,L); dr.text((ox+4,oy+4),'z%d tris%d new=%d top=%d'%(r,len(Z),len(idx),top),fill='black')
+img.save('montage_%s_%d.png'%(name,start))

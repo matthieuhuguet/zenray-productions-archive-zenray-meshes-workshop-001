@@ -1,0 +1,39 @@
+"""31 October 2026 : automatic wheel measurement from a side view crop. Spokes : bright bars found on rings at several radii (peaks kept above 40 % of the strongest), each spoke axis fitted by a line through its peak centres (angle, offset from the hub, width at each radius). Rings : radial gradient edges between the spokes. No drawing by eye.
+    python -I WheelMeasure.py crop.png cx cy px_per_m [out.json]     (cx, cy : rough hub centre in pixels)"""
+import sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+from scipy.signal import find_peaks
+P = dict(ring_radii=[0.12, 0.16, 0.20, 0.24, 0.27, 0.30], keep_ratio=0.40, smooth_deg=3, gap_prominence=2.0)
+img = np.asarray(Image.open(sys.argv[1]).convert("L")).astype(float); cx, cy, s = float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+g = ndimage.gaussian_filter(img, 1.2); N = 720
+def ring(r):
+    a = np.linspace(0, 2 * np.pi, N, endpoint=False); return a, ndimage.map_coordinates(g, [cy - r * s * np.sin(a), cx + r * s * np.cos(a)], order=1, mode="nearest")
+def peaks_at(r):
+    a, p = ring(r); p = ndimage.gaussian_filter1d(p, P["smooth_deg"] * N / 360.0, mode="wrap"); p -= p.mean()
+    pk, pr = find_peaks(np.concatenate([p, p, p]), prominence=3, width=6); out = []
+    for k, w, pm, lo, hi in zip(pk, pr["widths"], pr["prominences"], pr["left_ips"], pr["right_ips"]):
+        if N <= k < 2 * N: out.append(((k % N) * 360.0 / N, w * 360.0 / N, pm))
+    top = max((o[2] for o in out), default=0); return [o for o in out if o[2] >= P["keep_ratio"] * top]
+ref = peaks_at(0.22); base = sorted(o[0] for o in ref)
+spokes = []
+for a0 in base:
+    pts = []; wid = []
+    for r in P["ring_radii"]:
+        near = [o for o in peaks_at(r) if abs(((o[0] - a0 + 180) % 360) - 180) < 14]
+        if near:
+            o = min(near, key=lambda q: abs(((q[0] - a0 + 180) % 360) - 180)); pts.append((r * np.cos(np.radians(o[0])), r * np.sin(np.radians(o[0])))); wid.append((r, round(float(np.radians(o[1]) * r), 4)))
+    if len(pts) >= 3:
+        q = np.array(pts); c = q.mean(0); u, sv, vt = np.linalg.svd(q - c); d = vt[0] if vt[0] @ c >= 0 else -vt[0]
+        ang = float(np.degrees(np.arctan2(d[1], d[0])) % 360); off = float(c[0] * -d[1] + c[1] * d[0])         # signed distance of the axis line from the hub centre
+        spokes.append(dict(angle=round(ang, 1), offset_m=round(off, 4), widths=wid))
+# ring edges from the gaps between the spokes
+gaps = [((base[i] + (base[(i + 1) % len(base)] + (360 if i == len(base) - 1 else 0))) / 2) % 360 for i in range(len(base))]
+rs = np.linspace(0.05, 0.43, 400); prof = np.zeros_like(rs)
+for gd in gaps:
+    for off in np.linspace(-6, 6, 7): t = np.radians(gd + off); prof += ndimage.map_coordinates(g, [cy - rs * s * np.sin(t), cx + rs * s * np.cos(t)], order=1, mode="nearest")
+prof /= len(gaps) * 7; d = np.gradient(ndimage.gaussian_filter1d(prof, 2)); pr, _ = find_peaks(np.abs(d), prominence=P["gap_prominence"], distance=6)
+res = dict(spokes=spokes, ring_edges=[(round(float(rs[k]), 3), round(float(d[k]), 2)) for k in pr], centre_px=[cx, cy], px_per_m=s)
+print(json.dumps(res, indent=None))
+if len(sys.argv) > 5: json.dump(res, open(sys.argv[5], "w"), indent=1)

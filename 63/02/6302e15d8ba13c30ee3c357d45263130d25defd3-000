@@ -1,0 +1,26 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH : shell thickness check of chosen parts. From every face whose normal points away from the part centre, a ray goes inward ; the first hit on the same part is the local thickness. A flattening that squeezes a shell shows as a thin tail (p5) and a minimum near zero (the layers touch or cross).
+    python -I CarShellThickness.py car.obj [--parts CAR_body_hood_C,CAR_body_roof_C,CAR_body_door_L]
+FR : epaisseur des coques : rayon vers l'interieur depuis chaque face exterieure, premiere intersection dans la meme piece."""
+import argparse, numpy as np, trimesh
+
+
+def part(path, name):
+    V = []; cur = None; F = []
+    for l in open(path):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("g "): cur = l[2:].strip()
+        elif l.startswith("f ") and cur == name:
+            f = [int(x.split("/")[0]) - 1 for x in l.split()[1:]]; F.append([f[0], f[1], f[2]]); F.append([f[0], f[2], f[3]])
+    V = np.array(V); F = np.array(F); used = np.unique(F); remap = {v: i for i, v in enumerate(used)}
+    return trimesh.Trimesh(V[used], np.vectorize(remap.get)(F), process=False)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("--parts", default="CAR_body_hood_C,CAR_body_roof_C,CAR_body_door_L,CAR_body_glass_windshield_C"); a = ap.parse_args()
+    for name in a.parts.split(","):
+        m = part(a.inp, name); n = m.face_normals; c = m.triangles_center; out_f = (n * (c - m.vertices.mean(0))).sum(1) > 0; pts = c[out_f]; dirs = -n[out_f]
+        loc, idx, tri = m.ray.intersects_location(pts + dirs * 1e-4, dirs, multiple_hits=False); d = np.linalg.norm(loc - pts[idx], axis=1) * 1000 if len(idx) else np.array([0.0])
+        print("%-30s rays %5d hits %5d  thickness mm: median %5.1f  p5 %5.1f  min %5.1f  under 3 mm %4.1f %%" % (name, out_f.sum(), len(idx), np.median(d), np.percentile(d, 5), d.min(), 100 * (d < 3).mean()))
+
+
+if __name__ == "__main__": main()

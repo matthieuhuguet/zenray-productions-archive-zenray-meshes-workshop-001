@@ -1,0 +1,36 @@
+"""31 October 2026 : spoke fitting by EDGE ALIGNMENT : each spoke is a parametric bar (angle, offset of its axis from the hub, inner width, outer width), the optimiser moves it until its two long sides lie on the strongest reference edges (brightness gradient component perpendicular to the side). Initial guess from WheelMeasure peaks, local search only (angle +-8 deg, offset +-0.03 m), Nelder-Mead.
+    python -I FitSpokes.py crop.png cx cy px_per_m init_angles_comma out.json"""
+import sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage
+from scipy.optimize import minimize
+P = dict(t0=0.10, t1=0.30, samples=60, sigma=1.0, w_init=0.09, max_angle=8.0, max_offset=0.03, w_range=(0.05, 0.13))
+img = np.asarray(Image.open(sys.argv[1]).convert("L")).astype(float); cx, cy, s = float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+g = ndimage.gaussian_filter(img, P["sigma"]); gy, gx = np.gradient(g)                                  # gradient in image coordinates (y down)
+def side_points(a_deg, off, w_in, w_out, sign):
+    a = np.radians(a_deg); u = np.array([np.cos(a), np.sin(a)]); n = np.array([-np.sin(a), np.cos(a)]); t = np.linspace(P["t0"], P["t1"], P["samples"]); w = w_in + (w_out - w_in) * (t - P["t0"]) / (P["t1"] - P["t0"])
+    p = off * n[None, :] + t[:, None] * u[None, :] + sign * (w / 2)[:, None] * n[None, :]; return p, n
+def edge_score(x, a0):
+    a, off, w_in, w_out = x; pen = 0.0
+    if abs(a - a0) > P["max_angle"]: pen += (abs(a - a0) - P["max_angle"]) * 5
+    if abs(off) > P["max_offset"]: pen += (abs(off) - P["max_offset"]) * 4000
+    for w in (w_in, w_out):
+        if not P["w_range"][0] <= w <= P["w_range"][1]: pen += 4000 * (min(abs(w - P["w_range"][0]), abs(w - P["w_range"][1])))
+    tot = 0.0
+    for sign in (1, -1):
+        p, n = side_points(a, off, w_in, w_out, sign); xs = cx + s * p[:, 0]; ys = cy - s * p[:, 1]
+        dgx = ndimage.map_coordinates(gx, [ys, xs], order=1, mode="nearest"); dgy = ndimage.map_coordinates(gy, [ys, xs], order=1, mode="nearest")
+        nx, ny = n[0], -n[1]                                                                             # normal in image coordinates
+        tot += np.abs(dgx * nx + dgy * ny).mean()
+    return -(tot / 2) + pen
+init = [float(v) for v in sys.argv[5].split(",")]; out = []
+for a0 in init:
+    best = None
+    for da in (-4, 0, 4):                                                                            # a few starts, the edge field is multimodal
+        for do in (-0.01, 0.0, 0.01):
+            r = minimize(edge_score, [a0 + da, do, P["w_init"], P["w_init"]], args=(a0,), method="Nelder-Mead", options=dict(xatol=0.02, fatol=1e-4, maxiter=600))
+            if best is None or r.fun < best.fun: best = r
+    a, off, w_in, w_out = best.x; base = edge_score([a0, 0, P["w_init"], P["w_init"]], a0)
+    out.append(dict(angle=round(float(a), 2), offset_m=round(float(off), 4), w_in=round(float(w_in), 4), w_out=round(float(w_out), 4), edge_score=round(float(-best.fun), 2), init_edge_score=round(float(-base), 2)))
+json.dump(out, open(sys.argv[6], "w"), indent=1); print(json.dumps(out))

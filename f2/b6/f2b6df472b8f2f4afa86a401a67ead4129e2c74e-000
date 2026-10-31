@@ -1,0 +1,73 @@
+# Notes de lecture du code source de quadwild-bimdf (30 October 2026)
+
+Lecture seule de /Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf (dernier commit local e722c7e, 3 August 2026, licence GPL-3.0). Rien compilé, rien exécuté, aucun code recopié (seuls des noms, valeurs et schémas sont résumés). Statut : [CODE] = lu dans le fichier cité ; [ESTIMÉ] = interprétation.
+
+## 1. Carte du dépôt
+
+| Rôle | Fichiers [CODE] |
+|---|---|
+| Champ et prétraitement | quadwild/functions.cpp (remeshAndField), config/prep_config/*.txt |
+| Tracé de chemins et patchs | libs/xfield_tracer/tracing/ (patch_tracer.h 5 798 lignes, patch_manager.h, tracer_interface.h, vert_field_graph.h, catmull_clarkability.h), quadwild/trace.cpp |
+| Quantification | libs/quadretopology/quadretopology/qr_flow.cpp (solveur à flot Bi-MDF), includes/qr_ilp.cpp (ILP Gurobi), libs/satsuma (libSatsuma) |
+| Remplissage de patch (motifs) | libs/quadretopology/patterns/patterns/patchgen/Pattern_N_k.h (copie du code de Takayama), generate_patch.cpp, determine_geometry.cpp |
+| Plongement du patch sur la surface | libs/quadretopology/quadretopology/includes/qr_mapping.cpp, qr_patterns.cpp, quadretopology_impl.h (fonction quadrangulate) |
+| Lissage final | components/quad_from_patches/smooth_mesh.h (MultiCostraintSmooth), quadwild/functions.cpp |
+
+## 2. Paramètres par défaut
+
+Prétraitement (quadwild/functions.cpp, [CODE]) : feature_erode_dilate = 4 ; remesher_aspect_ratio = 0,35 ; remesher_iterations = 15 ; remesher_termination_delta = 10 000 ; SharpFactor = 6 ; surf_dist_check = true ; champ : alpha_curv = 0,3, curv_thr = 0,8. Fichiers de réglage : basic_setup.txt = do_remesh 1, sharp_feature_thr 35 degrés (le papier disait 45), alpha 0,01, scaleFact 1 ; Organic : sharp_feature_thr -1 (désactive les features), alpha 0,02 ; Mechanical identique à basic. Taille d'arête cible = moyenne des arêtes du maillage remaillé x scaleFact.
+
+Tracé (quadwild/trace.cpp, [CODE]) : Drift = 100 ; add_only_needed = true ; final_removal = true ; meta_mesh_collapse = true ; force_split = false ; sample_ratio = 0,01 ; CClarkability = 1 ; split_on_removal = true ; away_from_singular = true ; match_valence = true ; check_quality_functor = false ; MinVal = 3 ; MaxVal = 5 (le papier annonce jusqu'à 6, mais le code de trace plafonne à 5) ; Concave_Need = 1. Suit PTr.SmoothPatches() avant d'enregistrer.
+
+Quantification (config/main_config/flow_noalign_lemon.txt, [CODE]) : alpha 0,005 ; ilpMethod 1 ; timeLimit 200 s ; gapLimit 0 ; paliers de temps 3, 5, 10, 20, 30, 60, 90, 120 s associés à des écarts tolérés 0,5 %, 2 %, 5 %, 10 %, 15 %, 20 %, 25 %, 30 % ; minimumGap 0,4 ; isometry 1 ; regularityQuadrilaterals 1 ; regularityNonQuadrilaterals 1 avec poids 0,9 ; alignSingularities 0 (le défaut de flow.txt est 1) avec poids 0,1 ; repeatLosingConstraintsIterations 1 ; hardParityConstraint 1 ; fixedChartClusters 0 (300 dans ilp.txt) ; useFlowSolver 1 ; flow virtual_simple : iso_weight 1, objectif quad au départ puis abs, unalign_weight 2 puis 4 ; satsuma/default.json : double_cover max_deviation 5, matching Lemon, evening MST, méthode HalfAsymmetric, refinement_maxdev 2, deviation_limit NodeThroughflow. Valeurs par défaut en dur (qr_parameters.h) : DEFAULTALPHA 0,5 ; DEFAULTTIMELIMIT 60 ; DEFAULTMINIMUMGAP 0,2 ; DEFAULTCHARTSMOOTHINGITERATIONS 5 ; DEFAULTDOUBLETREMOVAL true ; mais functions.cpp écrase chartSmoothing, fixedSmoothing et nonFixedSmoothing à 0 et utilise à la place un lissage final MultiCostraintSmooth(damp 0,5, 30 pas, 1 pas de reprojection).
+
+## 3. Structures de données (résumé)
+
+- Maillage de travail : triangles VCG ; trois fichiers de sortie du tracé relus par quad_from_patches : _p0.patch (liste de faces par patch), _p0.corners (coins de chaque patch), _p0.feature (arêtes de feature), _p0.c_feature (sommets de coin de feature).
+- Dans le quantificateur : ChartData = charts (faces du patch, chartSides = côtés topologiques, chartSubsides = arches), subsides (liste de sommets, longueur, taille en arêtes du maillage de bord, drapeau isOnBorder) ; un ChartSide contient plusieurs subsides (arches) : l'entier de l'ILP est par ARCHE, la longueur l_i d'un côté de patch est la somme de ses arches.
+- Le résultat ILP (vecteur d'entiers) alimente quadrangulate().
+
+## 4. Remplissage de patch : ce qui est réellement fait (le cœur de la question « sans pli »)
+
+1. Chemin dans quadretopology_impl.h, fonction quadrangulate [CODE] : pour chaque chart, refus si le nombre de côtés n'est pas entre 3 et 6 ; extraction du sous-maillage triangulaire du chart (chartV, chartF) ; calcul de l pour chaque côté par somme des entiers des arches ; computePattern(l) génère le patch de quads ; computeQuadrangulation fait le plongement ; lissage de chart facultatif ; création des sommets de bord (partagés avec les voisins) ; reprojection au plus proche point de la surface ; deux lissages laplaciens à sommets contraints ; suppression des doublets si demandé.
+2. computePattern (qr_patterns.cpp) [CODE] : refuse N hors de 2 à 6, somme impaire, somme inférieure à 4 ; appelle patchgen::generate_topology (Takayama) puis determine_geometry.
+3. determine_geometry [CODE] : les sommets de bord du motif sont placés sur un POLYGONE RÉGULIER (get_boundary_geometry) : N coins sur le cercle unité, coin 0 en bas à gauche (rotation de -pi/2 - pi/N), chaque côté i divisé UNIFORMÉMENT en l_i segments (t = i + j / l_i) ; pour N = 2 des arcs de cercle de plus ou moins 60 degrés (lentille : demi-largeur sin(theta), théta de -pi/3 à +pi/3) ; pour N = 1 un cercle. L'intérieur est obtenu en résolvant un système LAPLACIEN direct (aucune pondération par la forme) avec bord fixé : solution 2D du motif.
+4. computeQuadrangulation (qr_mapping.cpp) [CODE] : (a) bord du chart : chaque arche j du côté i est répartie sur le segment du motif correspondant [début, fin] des sommets du motif, par RAPPORT DE LONGUEUR D'ARC : position uv = premier coin du motif + vecteur du segment x (longueur cumulée de l'arche / longueur totale de l'arche) ; (b) paramétrisation de TOUT le chart sur ce polygone par igl::lscm avec tous les sommets du bord fixés (échange x et y à cause d'un problème de libigl) ; si tout est fixé (aucun sommet intérieur) les uv sont les valeurs du bord ; (c) localisation : arbre AABB igl::AABB sur le maillage uv, igl::in_element pour chaque sommet du motif ; si aucun triangle ne contient le point, triangle au plus petit carré de distance ; (d) relèvement : coordonnées barycentriques du point 2D dans le triangle uv puis barycentricToPoint sur les sommets 3D du chart ; barycentriques hors triangle ramenées sur l'arête la plus proche, somme tolérée 1 plus ou moins 1e-4, sinon 1/3 chacune, puis bornées à [0, 1].
+5. Après le relèvement les sommets sont DÉJÀ sur la surface (intrinsèque). La reprojection au plus proche point ne sert plus qu'à recoller les sommets partagés ; ensuite LaplacianReproject (damp 0,7). C'est la différence essentielle avec notre moteur (grille de Coons + lissage laplacien 3D + projection extrinsèque).
+6. Garanties : le code n'a PAS de test de non-pli sur la paramétrisation LSCM (un avertissement de triangle dégénéré existe seulement hors NDEBUG) ; le bord étant convexe (polygone régulier), un plongement de Tutte aurait une garantie que LSCM n'a pas. Le fait que le polygone cible soit toujours convexe et régulier est ce qui rend la méthode robuste en pratique.
+
+## 5. Motifs : données exactes (pour coder sans refaire de la lecture de figure)
+
+Fichiers Pattern_N_k.h pour N = 2 (motifs 0, 1), 3 (0, 1, 2, 3), 4 (0 à 4), 5 (0 à 4), 6 (0 à 3) [CODE]. Chaque fichier contient : l'équation Ax = b (matrice de contraintes et second membre en fonction de l), la fonction get_default_parameter (ILP lp_solve, objectif « maximiser la somme des paddings » avec x ou y borné à sa valeur médiane plus ou moins 1 et des contraintes p_i <= q_i), generate_subtopology (quad central ou petit maillage, puis x et y boucles d'arêtes insérées), add_padding. Les équations sont reproduites dans takayama_validation_and_tables_30-October-2026.md. Remarques absentes du papier : (a) les motifs 3-2, 3-3 et 5-4 viennent du travail de Yasseen et al. (Computer-Aided Design 45, 2013, Figure 9) ; (b) le motif 3-3 et 6-x sont inclus dans la bibliothèque ; (c) get_default_parameter utilise les motifs dans l'ordre 0, 1, 2, 3 (4 pour les quads) sans tenir compte du nombre de singularités des motifs 3 et 5-4 ; (d) la sélection par permutation (rotations et miroirs) est explorée par Permutation.h.
+
+## 6. ILP de quantification : termes réellement codés (qr_ilp.cpp) [CODE]
+
+- Poids : isoWeight = alpha, regWeight = 1 - alpha. Avec alpha = 0,005 des fichiers de configuration, la régularité pèse 99,5 % : l'isométrie est presque un simple départage.
+- Variables : un entier par arche, borne inférieure MIN_SUBDIVISION_VALUE = 1 (pas de côté de longueur nulle).
+- Isométrie : pour chaque arche libre, terme (s_i - s^_i) avec s^_i = longueur de l'arche / longueur d'arête cible du chart (divisé par 2 si hardParityConstraint est faux), plancher à 1 ; coût quadratique (méthode LEASTSQUARES) ou absolu (ABS), normalisé par le nombre de termes.
+- Régularité 4 côtés : |somme_j - somme_{j+2}| par côté, divisé par 4 (égalité des côtés opposés).
+- Régularité 3 côtés : contrainte s_j + 1 <= s_{j+1} + s_{j+2} + c avec c entier >= 0 (INÉGALITÉ STRICTE, soit une unité de marge), coût |c|.
+- Régularité 5 côtés : s_j + s_{j+1} + 1 <= s_{j+2} + s_{j+3} + s_{j+4} + c, coût |c|.
+- Régularité 6 côtés : s_j + 1 <= s_{j+2} + s_{j+4} + c ; en plus parité : s_0 + s_2 + s_4 = 2 hexParity - hexFree avec hexParity >= 3 entier et hexFree dans {0, 1} ; coût (c + hexFree) / 2.
+- Poids de la régularité non rectangulaire : 0,9 et division par le nombre de côtés ; alignement des singularités : poids 0,1 ; répété une seconde fois en laissant tomber les termes non respectés (repeatLosingConstraintsIterations).
+- Solveur à flot (qr_flow.cpp) : graphe où chaque côté a un noeud, chaque chart relie des noeuds intérieurs, des noeuds « d'urgence » absorbent la parité (valence 3 : boucles ; valence 4 : boucles plus diagonales ; valence 5 : arêtes entre voisins ; valence 6 : opposés plus voisins) ; coûts séparés dans FlowStats : régularité voisine (v3 à v6), opposée v6, boucles de côté, singularité sur le bord, alignement ; solveur Bi-MDF avec double cover.
+- Sous-systèmes : fixedChartClusters = 300 dans ilp.txt (le papier dit m = 300) mais 0 dans functions.cpp.
+
+## 7. Heuristiques du code absentes ou différentes du papier
+
+1. MaxVal = 5 au lieu de 6 dans trace.cpp (les patchs à 6 côtés sont refusés au tracé alors que le quadrangulateur sait les remplir).
+2. Réparation du nombre de coins d'un patch (patch_tracer.h, vers la ligne 5017) : s'il y a moins de MinVal = 3 coins, on ajoute les sommets de bord de plus petite somme d'angles ; s'il y en a plus de MaxVal, on retire d'abord ceux de plus grande somme d'angles qui ne sont ni TVNarrow, TVConcave ni TVConvex, puis, si nécessaire, n'importe lesquels. Types de sommet de bord : TVNarrow, TVConcave, TVConvex (équivalents de U-turn, virage à gauche et à droite du papier).
+3. CClarkability = 1 : la tolérance géométrique est avgEdge x 1 (une longueur moyenne d'arête), alors que le papier dit la longueur du plus petit côté ; les fonctions OrderedCC de catmull_clarkability.h (commentées) calculent (|L1 - L2| - min) / min.
+4. Premier tour : si aucun emplacement TVNarrow ou TVConcave n'existe, boucles seules ; ensuite SolveSubPatches en trois passes (normal, vérifier les patchs non disque, forcer les patchs non disque), puis retrait final par méta-maillage (BatchRemovalMetaMesh).
+5. Concave_Need = 1 : au moins une émission de chemin par sommet concave.
+6. split_on_removal et away_from_singular : un chemin retiré peut être coupé ; aucun chemin ne passe près d'une singularité.
+7. Lissage final : MultiCostraintSmooth, 30 pas amortis à 0,5 avec projection sur la base des arêtes de feature et des faces (pas de lissage naïf).
+8. La suppression des doublets (valence 2) est active par défaut dans quadrangulate().
+9. Le code traite « patch ouvert sur un bord de maillage » : sommets de bord isOnBorder.
+
+## 8. Ce que ZenRay Lines peut en tirer
+
+1. Reproduire le plongement : (polygone régulier convexe, côtés divisés uniformément en nombre d'arêtes) + paramétrisation du chart + localisation + relèvement barycentrique = remplissage intrinsèque sans pli par construction du relèvement, le seul risque étant un pli de la paramétrisation, qu'un plongement de Tutte à poids de valeur moyenne supprime (voir intrinsic_patch_fill).
+2. Reprendre les constantes : arc de longueur proportionnelle pour répartir une arche sur un segment du polygone ; regularity strict (+1) pour 3, 5 et 6 côtés ; MIN_SUBDIVISION_VALUE = 1.
+3. Les motifs de Takayama sont lus directement dans Pattern_N_k.h : plus besoin de lire les figures.
+4. Les lissages post-relèvement (reprojection + Laplacien contraint, 30 pas amortis à 0,5) sont ce qui rend le résultat net.

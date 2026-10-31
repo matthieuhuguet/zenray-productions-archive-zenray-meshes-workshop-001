@@ -1,0 +1,91 @@
+# Redressement des quads dans les patchs primitifs : cartes isométriques, résolution dans la carte, essai sur cinq maillages (30 October 2026)
+
+Passe 9 de l'agent cloud, demande du fil principal : formules, pseudo code numpy et essai du redressement rigoureux sur biseau, pilier, arche, support et cylindre chanfreiné, avec mesures d'angle et de rectitude. Statuts : [MESURÉ] exécuté dans le bac à sable cloud (code `pass8_tools/zr8_prims.py` et `run_prim_straighten.py`, sortie `primitive_outputs/prim_straighten_30-October-2026.json`) ; [DOC] lu sur la page citée ; [ESTIMÉ] jugement non vérifié. Complète `quad_straightening_30-October-2026.md` (redressement général par la barrière de Winslow) et `hard_edge_junction_repair_30-October-2026.md`. (30 October 2026)
+
+## 0. Réponse en dix lignes (30 October 2026)
+- Sur ces cinq maillages, la détection de primitives sur le layout de QuadWild couvre 486 quads sur 486 (biseau, 30 plans), 734 sur 734 (pilier, 30 plans), 470 sur 470 (support, 10 plans), 434 sur 490 (cylindre chanfreiné : 8 plans, 4 cônes, 2 cylindres) et 222 sur 486 (arche : 4 plans, 2 patchs libres). [MESURÉ] (30 October 2026)
+- Les trois familles sont développables, donc leur carte (plan, cylindre déroulé, cône déroulé) conserve longueurs et angles : une grille carrée dans la carte est une grille carrée sur la surface, et la rectitude d'une ligne de grille dans la carte est exactement sa rectitude géodésique sur la surface. [DOC pour le cadre : surfaces développables, https://dmg.tuwien.ac.at/geom/ig/pottmann/oldpub/2006/lhwyw_conical_06/lhwyw_conical_06.html] (30 October 2026)
+- Méthode essayée : garder la topologie et le bord de chaque patch primitif de QuadWild, repasser dans la carte, résoudre les sommets intérieurs (Tutte sur le graphe de la grille puis barrière de Winslow, aire cible égale), relever par la carte inverse. Les sommets intérieurs tombent exactement sur la primitive. [MESURÉ] (30 October 2026)
+- Effet sur la forme : petit, de signe variable. Sur les quads bruts, la rectitude intrinsèque moyenne baisse de 3,34 à 2,97 degrés (biseau) et de 5,63 à 4,27 degrés (pilier), monte de 3,24 à 3,44 degrés (cylindre chanfreiné), reste à 0,5 degré (support) et à 3,1 degrés (arche). Sur les quads lissés de QuadWild, l'effet va de moins 0,16 degré à plus 0,16 degré. [MESURÉ] (30 October 2026)
+- Fidélité à la primitive : sur le cylindre chanfreiné, les sommets de QuadWild sont à 0,0049 arête de quad au plus de la primitive ajustée (ils sont posés sur le maillage triangulaire) ; après la résolution dans la carte ils sont exacts et la distance moyenne à l'entrée passe de 0 à 4e-5 de la diagonale. [MESURÉ] (30 October 2026)
+- Aucun quad plié ni écrasé avant ou après, sur les cinq maillages, brut et lissé. [MESURÉ] (30 October 2026)
+- Ce que la méthode ne peut pas corriger : le défaut restant (angle moyen 8 degrés sur le pilier brut) vient en grande partie du bord et des comptes fixés par le layout, que la résolution intérieure ne change pas. Cause exacte [ESTIMÉ], non analysée. (30 October 2026)
+- Conséquence pour le produit : sur les surfaces développables, le gain du redressement rigoureux dans la carte est inférieur à l'effet du lissage de QuadWild lui même ; l'intérêt est l'exactitude sur la primitive (modification de dimension, ajustement CAO), pas la rectitude. [ESTIMÉ à partir de 5 maillages] (30 October 2026)
+- Non fait : résolution du bord glissant le long des crêtes dans la carte, sphères et tores (non développables), patchs de raccord entre deux primitives. (30 October 2026)
+- Détection de primitives : les références sont Efficient RANSAC de Schnabel, Wahl et Klein 2007 (https://diglib.eg.org/handle/10.2312/CGF.v26i2pp214-226) et son implémentation CGAL ; la détection essayée ici est plus simple (ajustement par patch du layout, sans RANSAC). [DOC pour les références] (30 October 2026)
+
+## 1. Formules (30 October 2026)
+Un patch dont les sommets sont à moins de `tol` d'une primitive reçoit une carte `chart : R^3 vers R^2` (`fwd`) et son inverse (`inv`). (30 October 2026)
+
+| Primitive | Carte directe (u, v) | Inverse | Date |
+|---|---|---|---|
+| Plan, repère (e1, e2), origine c | u = (x moins c) point e1, v = (x moins c) point e2 | x = c + u e1 + v e2 | 30 October 2026 |
+| Cylindre, axe a, rayon r, angle polaire theta autour de a, hauteur z | u = r theta, v = z | x = c0 + z a + r (cos(u/r) b1 + sin(u/r) b2) | 30 October 2026 |
+| Cône, sommet q, axe a, demi angle beta, rho = distance au sommet, psi = angle polaire, phi = psi sin(beta) | u = rho cos(phi), v = rho sin(phi) | rho = norme de (u, v), psi = atan2(v, u) / sin(beta), x = q + rho (cos(beta) a + sin(beta) (cos(psi) b1 + sin(psi) b2)) | 30 October 2026 |
+
+Isométrie : pour le cylindre, ds au carré = dz au carré + r au carré d(theta) au carré = du au carré + dv au carré ; pour le cône, ds au carré = d(rho) au carré + rho au carré sin au carré (beta) d(psi) au carré = d(rho) au carré + rho au carré d(phi) au carré. Les angles d'un quad dans la carte sont donc ses angles sur la surface, et le virage d'une ligne de grille dans la carte est son virage géodésique. (30 October 2026)
+
+Ajustements (`zr8_prims.py`) : plan par décomposition en valeurs singulières (normale = plus petit vecteur singulier) ; cylindre : l'axe est le plus petit vecteur propre de la matrice N^T N des normales de sommet (elles sont perpendiculaires à l'axe), puis cercle des moindres carrés dans le plan perpendiculaire ; cône : sommet et axe par moindres carrés sur les directions du sommet aux points, refus si demi angle sous 0,05 ou au dessus de pi/2 moins 0,05 radian. Choix du type : plan d'abord, sinon le meilleur de cylindre et cône, dans la tolérance `tol` = 0,02 fois l'arête de quad moyenne. [MESURÉ pour la tolérance choisie] (30 October 2026)
+
+Énergie dans la carte (identique à `quad_straightening_30-October-2026.md`, avec la surface remplacée par le plan de la carte) : E = somme sur les coins de quad de (1 moins theta) tr(J^T J) / chi(d, epsilon) + theta (1 + d au carré) / chi(d, epsilon), avec chi(d, epsilon) = (d + racine(epsilon au carré + d au carré)) / 2 et d le déterminant normalisé du coin. Source de la barrière : Garanzha, Kaporin, Kudryavtseva, Protais, Ray, Sokolov, "Foldover-free maps in 50 lines of code", ACM TOG 40(4), 2021 ; diapositives et code : https://github.com/ssloy/invertible-maps et https://raw.githubusercontent.com/ssloy/invertible-maps/main/slides.pdf [DOC, diapositives lues dans la passe 9, point 1]. Aire cible égale pour tous les quads du patch (`size="patch"`). (30 October 2026)
+
+## 2. Pseudo code numpy (30 October 2026)
+```python
+# 30 October 2026, run_prim_straighten.py : interior re-solve of one primitive patch in its isometric chart.
+chart, kind, resid = classify_patch(layout, patch, tol)          # plane, cylinder or cone, resid = max distance of the layout vertices
+verts, quads = patch_vertices(Q, patch_quads); isb = on_patch_boundary(verts)
+uv = chart.fwd(P[verts])                                         # isometric development, boundary included
+flip = signed_area(uv, quads) < 0                                # keep the quads counter clockwise in the chart
+uv0 = harmonic_uv(uv, quads, fixed=isb)                          # Tutte on the grid graph, ONE sparse solve
+uv1 = winslow_barrier(uv0, quads, kind_fixed=isb, size="patch")  # fold free energy, boundary fixed
+X = chart.inv(uv1)                                               # interior vertices exactly on the primitive
+accept = no_new_fold(X, quads) and min_jacobian_not_lower(X, quads)
+if accept: P[verts[~isb]] = X[~isb]
+```
+
+## 3. Détection sur les cinq maillages (30 October 2026)
+| Maillage | Patchs par type | Quads dans des patchs primitifs | Écart de l'aller retour de la carte (arête de quad, quads lissés) | Date |
+|---|---|---|---|---|
+| biseau | 30 plans | 486 sur 486 | 0 | 30 October 2026 |
+| pilier | 30 plans | 734 sur 734 | 0,000001 | 30 October 2026 |
+| arche | 4 plans, 2 libres | 222 sur 486 | 0 | 30 October 2026 |
+| support | 10 plans | 470 sur 470 | 0 | 30 October 2026 |
+| cylindre chanfreiné | 8 plans, 4 cônes, 2 cylindres | 434 sur 490 | 0,0049 | 30 October 2026 |
+
+Sur le cylindre chanfreiné, 56 quads sur 490 sont dans des patchs libres (ni plan, ni cylindre, ni cône à la tolérance). [MESURÉ] (30 October 2026)
+
+## 4. Résultats (30 October 2026)
+Quads bruts de QuadWild (avant -> après la résolution dans la carte). Écart d'angle : moyenne de |angle moins 90 degrés| sur les quads du maillage entier, puis sur les quads des patchs primitifs. (30 October 2026)
+
+| Maillage | Écart d'angle global ; dans les patchs primitifs (degrés) | Rectitude intrinsèque moyenne (degrés) | 90e centile (degrés) | Jacobien minimal dans les patchs | Pliés ; écrasés (inchangés) | Déplacement intérieur max (arête) | Date |
+|---|---|---|---|---|---|---|---|
+| biseau | 6,32 -> 6,01 ; 6,32 -> 6,01 | 3,34 -> 2,97 | 13,27 -> 11,33 | 0,8081 -> 0,7860 | 0 ; 0 | 0,089 | 30 October 2026 |
+| pilier | 9,27 -> 8,12 ; 9,27 -> 8,12 | 5,63 -> 4,27 | 19,14 -> 15,58 | 0,5174 -> 0,5273 | 0 ; 0 | 0,531 | 30 October 2026 |
+| arche | 5,47 -> 5,49 ; 11,97 -> 12,01 | 3,13 -> 3,14 | 8,19 -> 8,17 | 0,8678 -> 0,8690 | 0 ; 0 | 0,021 | 30 October 2026 |
+| support | 1,70 -> 1,70 ; 1,70 -> 1,70 | 0,49 -> 0,51 | 1,07 -> 1,11 | 0,9811 -> 0,9819 | 0 ; 0 | 0,008 | 30 October 2026 |
+| cylindre chanfreiné | 4,07 -> 4,30 ; 3,50 -> 3,77 | 3,24 -> 3,44 | 10,97 -> 11,17 | 0,7116 -> 0,7827 | 0 ; 0 | 0,173 | 30 October 2026 |
+
+Quads lissés de QuadWild : (30 October 2026)
+
+| Maillage | Écart d'angle global ; dans les patchs primitifs (degrés) | Rectitude intrinsèque moyenne (degrés) | 90e centile (degrés) | Jacobien minimal dans les patchs | Pliés ; écrasés (inchangés) | Déplacement intérieur max (arête) | Date |
+|---|---|---|---|---|---|---|---|
+| biseau | 4,34 -> 4,48 ; 4,34 -> 4,48 | 2,08 -> 2,24 | 8,04 -> 9,11 | 0,8165 -> 0,8165 | 0 ; 0 | 0,045 | 30 October 2026 |
+| pilier | 6,18 -> 6,35 ; 6,18 -> 6,35 | 3,34 -> 3,33 | 13,72 -> 13,23 | 0,4954 -> 0,5676 | 0 ; 0 | 0,166 | 30 October 2026 |
+| arche | 5,59 -> 5,56 ; 12,10 -> 12,04 | 3,34 -> 3,18 | 8,18 -> 8,16 | 0,8652 -> 0,8691 | 0 ; 0 | 0,098 | 30 October 2026 |
+| support | 1,54 -> 1,51 ; 1,54 -> 1,51 | 0,40 -> 0,39 | 1,06 -> 0,77 | 0,9795 -> 0,9732 | 0 ; 0 | 0,051 | 30 October 2026 |
+| cylindre chanfreiné | 3,50 -> 3,41 ; 3,37 -> 3,27 | 2,80 -> 2,64 | 10,36 -> 10,54 | 0,7725 -> 0,8000 | 0 ; 0 | 0,065 | 30 October 2026 |
+
+Distance moyenne à l'entrée (fraction de la diagonale) : 0 avant et après sur les quatre maillages à patchs plans ; 0 -> 4e-5 (brut) et 0 -> 4,1e-5 (lissé) sur le cylindre chanfreiné. Patchs rejetés ou écartés par le garde fou (pas de pli créé, Jacobien minimal non dégradé) : 0 dans tous les essais. [MESURÉ] (30 October 2026)
+
+Lectures : (30 October 2026)
+1. Gain net sur les quads bruts de QuadWild pour le biseau (rectitude moins 0,37 degré) et le pilier (moins 1,36 degré, 90e centile de 19,1 à 15,6 degrés) ; perte pour le cylindre chanfreiné (plus 0,20 degré). Sur les quads lissés l'effet reste sous 0,2 degré dans les deux sens, et les écarts d'angle montent légèrement (biseau 4,34 à 4,48, pilier 6,18 à 6,35). (30 October 2026)
+2. La résolution à aire égale est moins bonne que le lissage de QuadWild quand les quads de QuadWild ont déjà des tailles variables adaptées au bord : le choix `size="patch"` impose l'aire moyenne partout. Cette explication est [ESTIMÉ] ; la mesure est la perte sur le biseau et le pilier lissés. (30 October 2026)
+3. La rectitude intrinsèque est calculée sur le maillage entier, y compris les lignes qui traversent les patchs voisins : elle ne bouge donc que par les lignes touchées. L'écart d'angle des quads des patchs primitifs est donné séparément pour cette raison. (30 October 2026)
+4. Le Jacobien minimal monte de 0,7116 à 0,7827 sur le cylindre chanfreiné brut et de 0,4954 à 0,5676 sur le pilier lissé : la méthode améliore le pire quad dans ces deux cas. [MESURÉ] (30 October 2026)
+
+## 5. Ce qui n'est pas fait (30 October 2026)
+1. Le bord des patchs reste celui de QuadWild : le coin de chaque patch, les comptes d'arêtes et la position des sommets de bord ne changent pas. Une résolution qui laisse glisser les sommets de bord le long des crêtes dans la carte (comme la barrière de la passe 9, point 1) n'est pas essayée ici. (30 October 2026)
+2. Les surfaces non développables (sphère, tore, ellipsoïde) n'ont pas de carte isométrique : seule une carte conforme ou une projection est possible, avec distorsion. (30 October 2026)
+3. Les patchs de raccord (congé, chanfrein de forme libre) ne sont pas des primitives à la tolérance de 0,02 arête : 56 quads du cylindre chanfreiné. (30 October 2026)
+4. Le seuil de tolérance de la détection n'a pas été balayé. (30 October 2026)
+5. Comparaison avec une détection RANSAC (références en section 0) : non faite. (30 October 2026)

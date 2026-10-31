@@ -1,0 +1,224 @@
+# Remplissage intrinsèque d'un patch sur une région courbe sans pli (30 October 2026)
+
+Problème posé par le thread principal : notre moteur remplit un patch par une grille de Coons, un lissage laplacien 3D puis une projection au plus proche point ; il plie dès que la région est courbe (25 % de quads pliés sur l'arche). Statuts : [DOC] = source lue ou résumée de recherche ; [CODE] = lu dans quadwild-bimdf ; [MESURÉ] = exécuté ici par mon propre script numpy/scipy (lecture seule du reste, aucun code externe) ; [ESTIMÉ] = déduction.
+
+## 0. Résultat mesuré sur un cas courbe contrôlé [MESURÉ]
+
+Banc : bande de sphère (maillage lat-lon de 14 400 triangles, 7 381 sommets), patch à 4 côtés de 8 arêtes, grille 8 x 8 = 64 quads, pli = un coin de quad dont le Jacobien signé contre la normale de la sphère est négatif. Deux méthodes : (a) extrinsèque (Coons 3D + lissage laplacien de 30 passes + projection au plus proche point de la sphère) ; (b) intrinsèque (plongement de Tutte à poids de valeur moyenne de la région sur un carré, grille régulière dans le carré, relèvement barycentrique).
+
+| Étendue du patch (longitude x latitude) | Extrinsèque : quads pliés / écrasés (Jacobien < 0,3) | Intrinsèque : pliés / écrasés | Triangles retournés dans le plongement |
+|---|---|---|---|
+| 120 x 80 degrés | 0 / 0 | 0 / 0 | 0 |
+| 200 x 90 degrés | 4 / 8 | 0 / 0 | 0 |
+| 260 x 100 degrés | 24 / 28 | 0 / 0 | 0 |
+| 320 x 110 degrés | 36 / 44 | 0 / 0 | 0 |
+Le diagnostic de la cause est confirmé : le plis du moteur extrinsèque croît avec la courbure de la région ; la méthode intrinsèque donne 0 pli sur les quatre cas, résout 7 381 inconnues en 0,2 s (spsolve par LU creuse). Le script se trouve en section 7. Limite : banc sphérique avec patch à 4 côtés (grille régulière) ; les patchs à N côtés demandent la topologie des motifs de Takayama (voir takayama_validation_and_tables) pour le placement des sommets dans le polygone.
+
+## 1. Principe : paramétriser d'abord, placer ensuite dans le plan, relever par barycentriques
+
+1. Extraire la région du maillage de référence (triangles du patch) : un disque topologique avec UNE boucle de bord, dont N sommets sont les coins.
+2. Choisir le polygone cible convexe à N côtés (section 3) et y poser le bord (section 4).
+3. Résoudre un plongement de Tutte à poids positifs : l'intérieur de la région tombe dans le polygone SANS retournement garanti (section 2).
+4. Générer le motif de quads du patch (Takayama, Tarini ou grille) dans le polygone : coordonnées 2D des sommets du motif.
+5. Pour chaque sommet 2D du motif, trouver le triangle de la paramétrisation qui le contient et relever par coordonnées barycentriques : le point est ALORS sur la surface de référence par construction (c'est ce qui manque à notre moteur extrinsèque).
+6. Option : lissage tangentiel contraint à la surface (QuadWild fait 30 pas amortis à 0,5, voir quadwild_source_notes).
+C'est exactement la chaîne de QuadWild [CODE] (qr_mapping.cpp : valeurs de bord par rapport de longueur d'arc, igl::lscm avec tout le bord fixé, localisation igl::in_element + arbre AABB, relèvement barycentrique, repli au triangle le plus proche) ; la seule différence que je recommande est de remplacer LSCM par un plongement de Tutte à valeur moyenne, qui a une garantie de non-pli.
+
+## 2. Méthodes de paramétrisation et garanties
+
+| Méthode | Principe | Garantie de non-pli | Échecs | Source |
+|---|---|---|---|---|
+| Tutte avec poids positifs (Tutte 1963, Floater 2003) | chaque sommet intérieur est une combinaison convexe de ses voisins ; bord fixé sur un polygone convexe | OUI : application bijective si le bord est envoyé homéomorphiquement sur un polygone convexe (théorème de Floater 2003, discrétisation du théorème de Radó-Kneser-Choquet) | triangles dégénérés si trois sommets d'un triangle sont sur le même côté (côté « plat ») : voir bulge section 4 ; bord non simple ; région non disque | [DOC] https://www.ams.org/journals/mcom/2003-72-242/S0025-5718-02-01466-7 ; Gortler, Gotsman, Thurston, CAGD 2006 (https://www.cin.ufpe.br/~sbm/CGartigos/gortler_et_al.pdf : poids positifs normalisés, matrice diagonalement dominante, solution unique) |
+| Poids de valeur moyenne (Floater 2003) | w_ij = (tan(a_{j-1}/2) + tan(a_j/2)) / r_j, a angles de l'éventail autour de i (re-normalisés à 2 pi sur une surface), r_j = distance | positifs pour un éventail de triangles (angles < pi) donc la garantie de Tutte s'applique ; préserve mieux la forme que les poids uniformes | angle d'éventail normalisé supérieur à pi en cas d'angle total très petit : borner à pi - 1e-6 | [DOC via recherche] formule rapportée par Hormann-Floater et Ju-Schaefer-Warren (https://people.engr.tamu.edu/schaefer/research/meanvalue.pdf) |
+| Poids uniformes | 1/valence | garantie de Tutte | forte distorsion | [DOC] idem Tutte |
+| Poids cotangentes (harmonique) | cot a + cot b | pas de garantie : poids négatifs si un angle est obtus, donc retournements possibles | triangles obtus | [ESTIMÉ] standard, non relu ici |
+| LSCM (Lévy, Petitjean, Ray, Maillot 2002) | énergie conforme, bord libre ou fixé | PAS de garantie contre le pliage, y compris avec un bord fixé (ABF++ note le même problème de retournement) | retournements sur régions très courbes | [DOC] https://web.engr.oregonstate.edu/~grimmc/content/research/Levy2002.html ; https://www.cs.ubc.ca/~sheffa/papers/abf_plus_plus.pdf |
+| ABF++ (Sheffer et al. 2005) | angles, minimisation non linéaire | angles valides, pas de garantie de bijection ici : non confirmé dans mes sources | lent | [DOC partiel] https://www.cs.ubc.ca/~sheffa/papers/abf_plus_plus.pdf |
+| Boundary First Flattening (Sawhney, Crane 2017) | paramétrisation conforme linéaire avec contrôle de la longueur ou de l'angle du bord, aplatissement directement sur une forme cible | pas de garantie de bijection dans l'extrait lu | un facteur conforme de bord à régler ; pas prévu pour un polygone entier imposé | [DOC] https://arxiv.org/pdf/1704.06873 |
+| Polygone convexe fixe + Tutte | combinaison des deux premières lignes | OUI (section 2 ligne 1) | voir échecs | recommandé |
+Ce que font les autres : Takayama 2014 place les sommets du motif par une résolution laplacienne uniforme avec bord sur un polygone régulier [CODE : determine_geometry.cpp] puis laisse à l'application le relèvement sur la surface ; QuadWild fait LSCM + relèvement [CODE] ; Instant Meshes n'embarque pas de patch : il arrondit un champ de position (non lu ici) ; Rhino QuadRemesh, Alias : non trouvé.
+
+## 3. Polygone cible et répartition du bord
+
+Deux choix, tous deux strictement convexes :
+- Polygone régulier à N côtés (Takayama et QuadWild) : coins sur le cercle unité, coin 0 en bas à gauche ; chaque côté divisé en l_i segments égaux ; simple mais distord si les l_i sont très inégaux (côté de 15 arêtes et côtés de 5, 6 : arêtes de 15 fois plus petites sur le grand côté dans le polygone).
+- Polygone cyclique dont les côtés sont proportionnels aux nombres d'arêtes l_i (ce que je recommande dès qu'il existe) : existe si et seulement si max(l_i) < somme des autres l_i, c'est l'inégalité de Tarini pour N = 3 (triangle exact), et la condition de rayon unique pour N >= 4 (le polygone inscrit dans un cercle de rayon R tel que somme 2 asin(l_i / 2R) = 2 pi, ou, si le centre est hors du polygone, asin(l_max / 2R) = somme des asin des autres). Pour N = 4 avec l_0 = l_2 et l_1 = l_3 c'est le rectangle l_0 x l_1 (grille exacte). Mesuré : (4, 5, 6, 8, 3) donne des côtés exactement proportionnels ; (4, 13, 3, 4, 4) aussi (centre hors du polygone) ; (15, 6, 5) et (10, 4, 1, 1) : pas de polygone, repli sur le régulier [MESURÉ].
+Répartition du bord : le sommet de bord k de la région reçoit la position correspondant à la fraction de LONGUEUR D'ARC s_k / L_i le long du côté i de la région (même règle que QuadWild [CODE]), puis les points du motif sur ce côté sont ceux de la partition uniforme en l_i segments (positions t = j / l_i) : en 3D le sommet j du motif sur le côté est le point à la fraction j / l_i de la longueur d'arc de l'arche. Les deux patchs qui partagent une arche doivent calculer ces sommets UNE SEULE FOIS (QuadWild les crée par arche), sinon les coutures ne se soudent pas.
+Pôle et rayons de Tarini [DOC pour les formules, ESTIMÉ pour le tracé] : les entiers s_i (patch_conditions_tarini_30-October-2026.md) donnent la position du pôle : chaque côté i est coupé en deux sous-côtés de s_{i-1} et s_{i+1} arêtes, et un flux d'arêtes (séparatrice) part du pôle vers chacun de ces N points ; entre deux séparatrices consécutives s'étend une grille régulière rectangulaire. N = 3 : s_i = (e_{i-1} - e_i + e_{i+1}) / 2 ; N = 5 : s_i = (e_{i-1} + e_i + e_{i+1} - e_{i-2} - e_{i+2}) / 2 ; N = 6 : s_i = (e_{i-1} + e_{i+1} - e_{i+3}) / 2 ; N = 7 : s_i = (e_{i-2} + e_{i-1} + e_{i+1} + e_{i+2} - e_i - e_{i+3} - e_{i-3}) / 2 ; N = 8 : deux paramètres libres k. Dans le polygone régulier, le pôle est le point intérieur dont les distances (en arêtes) aux N côtés correspondent aux s_i ; en pratique on laisse la résolution laplacienne du motif (Takayama) le placer, puis on corrige par relaxation.
+
+## 4. Conditions de non-pli et leurs pièges
+
+1. Bord strictement convexe : avec les sommets du motif alignés sur des côtés droits, des triangles dégénérés (trois sommets de la région sur le même côté) donnent des aires nulles ou un retournement de 1e-17. MESURÉ : sur une région à 4 800 triangles, 1 à 2 triangles retournés avec bulge = 0, 0 avec bulge = 1e-3 pour N = 3 et 5. Remède : courber chaque côté en arc de sagitta epsilon (epsilon = 1e-3 fois la longueur du côté), la polygonale reste convexe. Le code de section 7 implémente la bosse parabolique.
+2. Région disque : une seule boucle de bord, sans pincement. Si la région a un trou ou une poignée : couper le long du chemin le plus court vers le bord ou remplir le trou (soit fermer par triangulation d'oreilles, soit ajouter le trou comme contrainte) ; une région fermée (pas de bord) n'est pas un patch ; plusieurs boucles de bord = refus (ValueError dans le code).
+3. Coins : N sommets de bord distincts de la boucle, dans l'ordre de la boucle ; si deux coins consécutifs sont adjacents le côté vaut une arête, c'est permis mais l_i >= 1.
+4. Bord non convexe de la région : sans effet, c'est le polygone cible qui est convexe, pas la région ; la distorsion est absorbée par la paramétrisation. Un patch avec des bords fortement concaves (U-turn, virage à gauche) donne des triangles très écrasés dans le plan (aire minimale 1e-8 à 1e-7 mesurée) : fusionner, ou couper avec un chemin (conditions de validité de QuadWild).
+5. Triangles de la région d'aire presque nulle ou éventails à angle supérieur à pi : borner les angles à pi - 1e-6 (fait dans le code).
+6. Pli résiduel dans le relevé : le plongement est sans pli dans le PLAN ; en 3D un quad dont les quatre sommets se relèvent dans des triangles éloignés peut rester non planaire ou écrasé sans être retourné. Remède : lissage tangentiel contraint à la surface (QuadWild : 30 pas, amortissement 0,5, projection sur la base de la surface), puis juge ZrlTopoJudge.
+
+## 5. Ordre de grandeur de coût [MESURÉ]
+
+Région de 14 400 triangles : assemblage des poids (boucle Python sur les sommets) plus factorisation LU creuse en environ 0,2 s ; localisation des 81 sommets : négligeable (KD-tree sur les centres de triangles, 24 candidats). Pour 10^6 triangles il faut vectoriser les poids ; le solveur creux passe à l'échelle (scipy.sparse.linalg.splu ou cholmod).
+
+## 6. Plan d'intégration pour ZenRay Lines [ESTIMÉ]
+
+1. Remplacer le remplissage Coons + lissage 3D par : extraire la région, polygone cyclique (ou régulier en repli), Tutte à valeur moyenne, motif de Takayama dans le polygone, relèvement barycentrique, lissage tangentiel.
+2. Garder le lissage final et le juge existant ; mesurer sur l'arche (2 124 triangles) et le lys le pourcentage de plis avant et après.
+3. Pour les patchs à 7 et 8 côtés, absents du code de Takayama (N <= 6) : utiliser les conditions de Tarini (section 3) et le motif en rayons ; non implémentés dans QuadWild [CODE : refus hors de 2 à 6].
+
+## 7. Code complet (numpy/scipy), testé le 30 October 2026
+
+Chargement : python -I, venv /Users/zenray/.venvs/zenray-meshes/bin/python ; dépendances : numpy, scipy. Il contient les fonctions boundary_loop, polygon_regular, polygon_cyclic, boundary_uv, mean_value_system, tutte_mv, uv_check, lift, grid_quads, quad_fold_stats. Banc de la section 0 : bande de sphère lat-lon, 120 x 60 cellules.
+
+```python
+"""30 October 2026 : intrinsic patch fill (mean value Tutte embedding of a surface region onto a convex polygon, barycentric lift). Self-contained numpy/scipy. python -I intrinsic_fill.py (runs a self-test)."""
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+
+# ---------------------------------------------------------------- 1. boundary loop and sides
+def boundary_loop(F):
+    """ordered boundary vertex loop of a disk-like triangle set F (n,3) (one loop expected)."""
+    E = {}
+    for a, b, c in F:
+        for u, v in ((a, b), (b, c), (c, a)):
+            E[(u, v)] = E.get((u, v), 0) + 1
+    nxt = {u: v for (u, v), n in E.items() if (v, u) not in E}
+    if not nxt: raise ValueError("no boundary: region is closed")
+    start = next(iter(nxt)); loop = [start]
+    while nxt[loop[-1]] != start:
+        loop.append(nxt[loop[-1]])
+        if len(loop) > len(nxt): raise ValueError("boundary is not a single simple loop")
+    if len(loop) != len(nxt): raise ValueError("several boundary loops: region is not a disk")
+    return loop
+
+# ---------------------------------------------------------------- 2. target polygon
+def polygon_regular(N):
+    th = 2 * np.pi * np.arange(N) / N - np.pi / 2 - np.pi / N
+    return np.c_[np.cos(th), np.sin(th)]
+
+def polygon_cyclic(l):
+    """strictly convex polygon inscribed in a circle, side i has length proportional to l[i]; None if max(l) >= sum(others).
+    Two cases: circle centre inside the polygon (sum of central angles = 2 pi) or outside (longest side subtends the sum of the others)."""
+    l = np.asarray(l, float); N = len(l); im = int(np.argmax(l))
+    if N < 3 or l[im] >= l.sum() - l[im]: return None
+    others = np.delete(l, im); lo0 = l[im] / 2 * (1 + 1e-12)
+    f_in = lambda R: np.sum(2 * np.arcsin(np.clip(l / (2 * R), 0, 1))) - 2 * np.pi
+    h_out = lambda R: np.arcsin(np.clip(l[im] / (2 * R), 0, 1)) - np.sum(np.arcsin(np.clip(others / (2 * R), 0, 1)))
+    def bis(g, lo, hi):
+        if g(lo) * g(hi) > 0: return None
+        for _ in range(200):
+            m = 0.5 * (lo + hi)
+            lo, hi = (m, hi) if g(lo) * g(m) > 0 else (lo, m)
+        return 0.5 * (lo + hi)
+    R = bis(f_in, lo0, 1e6 * l.sum())
+    if R is not None: ang = 2 * np.arcsin(np.clip(l / (2 * R), 0, 1))
+    else:
+        R = bis(h_out, lo0, 1e6 * l.sum()); ang = 2 * np.arcsin(np.clip(l / (2 * R), 0, 1)); ang[im] = -(ang.sum() - ang[im])
+    th = np.concatenate([[0], np.cumsum(ang)[:-1]]); th -= th.mean()
+    return R * np.c_[np.cos(th), np.sin(th)]
+
+def boundary_uv(X, loop, corners, l, poly, bulge=1e-3):
+    """UV of boundary vertices: arc-length fraction along each side mapped on the polygon side; a small bulge makes the polygon strictly convex.
+    corners: indices IN loop (increasing) of the N corners; l: edge counts; poly: (N,2) corners."""
+    N = len(corners); uv = np.zeros((len(loop), 2)); P = X[loop]
+    seg = np.r_[np.linalg.norm(np.diff(P, axis=0), axis=1), np.linalg.norm(P[0] - P[-1])]
+    for i in range(N):
+        a, b = corners[i], corners[(i + 1) % N]
+        idx = list(range(a, b + 1)) if b > a else list(range(a, len(loop))) + list(range(0, b + 1))
+        s = np.r_[0, np.cumsum([seg[k % len(loop)] for k in idx[:-1]])]; t = s / s[-1]
+        p0, p1 = poly[i], poly[(i + 1) % N]; d = p1 - p0; nrm = np.array([d[1], -d[0]])  # outward for ccw polygon
+        for j, k in enumerate(idx[:-1] if True else idx):
+            uv[k] = p0 + t[j] * d + bulge * np.linalg.norm(d) * 4 * t[j] * (1 - t[j]) * nrm / (np.linalg.norm(nrm) + 1e-30)
+    return uv
+
+# ---------------------------------------------------------------- 3. mean value weights and solve
+def mean_value_system(X, F, loop):
+    n = len(X); nb = set(loop)
+    # neighbours in cyclic order per interior vertex via the triangle fan
+    fan = {}
+    for a, b, c in F:
+        for u, v, w in ((a, b, c), (b, c, a), (c, a, b)):
+            fan.setdefault(u, {})[v] = w  # in triangle (u,v,w) ccw: next neighbour after v is w
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        if i in nb: continue
+        nbr = fan[i]; v0 = next(iter(nbr)); order = [v0]
+        while nbr[order[-1]] != v0:
+            order.append(nbr[order[-1]])
+            if len(order) > len(nbr): break
+        p = X[order] - X[i]; r = np.linalg.norm(p, axis=1)
+        q = np.roll(p, -1, axis=0); cosang = np.einsum('ij,ij->i', p, q) / (r * np.roll(r, -1))
+        al = np.arccos(np.clip(cosang, -1, 1)); al *= 2 * np.pi / al.sum()           # angles rescaled to 2 pi (shape preserving)
+        t = np.tan(np.minimum(al, np.pi - 1e-6) / 2)                                  # tan(alpha_j/2), alpha_j between neighbour j and j+1
+        w = (np.roll(t, 1) + t) / r                                                  # (tan(alpha_{j-1}/2)+tan(alpha_j/2))/r_j
+        w /= w.sum()
+        rows += [i] * len(order); cols += order; vals += (-w).tolist(); rows.append(i); cols.append(i); vals.append(1.0)
+    A = sp.csr_matrix((vals, (rows, cols)), shape=(n, n))
+    return A
+
+def tutte_mv(X, F, loop, uv_b):
+    n = len(X); A = mean_value_system(X, F, loop); isb = np.zeros(n, bool); isb[loop] = True
+    # boundary rows: identity
+    A = A.tolil()
+    for k in loop: A[k, :] = 0; A[k, k] = 1.0
+    A = A.tocsc(); rhs = np.zeros((n, 2)); rhs[loop] = uv_b
+    lu = spla.splu(A); return np.c_[lu.solve(rhs[:, 0]), lu.solve(rhs[:, 1])]
+
+def uv_check(uv, F):
+    a, b, c = uv[F[:, 0]], uv[F[:, 1]], uv[F[:, 2]]
+    area = 0.5 * ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))
+    return area  # all > 0 for a valid embedding (ccw faces)
+
+# ---------------------------------------------------------------- 4. locate and lift
+def lift(points_uv, uv, F, X):
+    """barycentric lift of 2D points into 3D through the triangles of the uv map (uniform grid for point location)."""
+    from scipy.spatial import cKDTree
+    cen = uv[F].mean(axis=1); tree = cKDTree(cen); out = np.zeros((len(points_uv), 3)); miss = 0
+    a, b, c = uv[F[:, 0]], uv[F[:, 1]], uv[F[:, 2]]
+    det = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    for k, p in enumerate(points_uv):
+        _, cand = tree.query(p, k=min(24, len(F)))
+        best, bb = -1e9, None
+        for f in np.atleast_1d(cand):
+            l1 = ((b[f, 0] - p[0]) * (c[f, 1] - p[1]) - (b[f, 1] - p[1]) * (c[f, 0] - p[0])) / det[f]
+            l2 = ((c[f, 0] - p[0]) * (a[f, 1] - p[1]) - (c[f, 1] - p[1]) * (a[f, 0] - p[0])) / det[f]
+            l3 = 1 - l1 - l2; m = min(l1, l2, l3)
+            if m > best: best, bb = m, (f, l1, l2, l3)
+            if m >= -1e-12: break
+        if best < -1e-9: miss += 1
+        f, l1, l2, l3 = bb; l = np.clip([l1, l2, l3], 0, None); l /= l.sum()
+        out[k] = l[0] * X[F[f, 0]] + l[1] * X[F[f, 1]] + l[2] * X[F[f, 2]]
+    return out, miss
+
+# ---------------------------------------------------------------- 5. pattern grid (N = 4 regular grid) and the quality judge
+def grid_quads(nx, ny):
+    idx = lambda i, j: j * (nx + 1) + i
+    return [[idx(i, j), idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)] for j in range(ny) for i in range(nx)]
+
+def quad_fold_stats(Pq, Q, normals_at):
+    """signed Jacobian per quad corner against the surface normal (corner folds: any negative)."""
+    bad = 0; sq = 0
+    for q in Q:
+        pts = Pq[q]; nrm = normals_at(pts.mean(axis=0)); js = []
+        for k in range(4):
+            e1 = pts[(k + 1) % 4] - pts[k]; e2 = pts[(k - 1) % 4] - pts[k]
+            js.append(np.dot(np.cross(e1, e2), nrm) / (np.linalg.norm(e1) * np.linalg.norm(e2) + 1e-30))
+        if min(js) <= 0: bad += 1
+        if min(js) < 0.3: sq += 1
+    return bad, sq
+```
+
+Appel type (région d'un patch à N côtés ; F = triangles (n,3) numpy entiers orientés de manière cohérente, X = sommets 3D) :
+
+```python
+loop = boundary_loop(F)                              # une boucle, sinon ValueError
+corners = [index in loop of the N corner vertices, increasing]
+l = [edge counts of the N sides]                     # from the MILP, sum even
+poly = polygon_cyclic(l)
+if poly is None: poly = polygon_regular(len(l))      # fallback when max(l) >= sum of others
+uvb = boundary_uv(X, loop, corners, l, poly, bulge=1e-3)
+uv = tutte_mv(X, F, loop, uvb)                       # mean value Tutte embedding, no flip
+assert (uv_check(uv, F) * np.sign(uv_check(uv, F).sum()) > 0).all()
+# pattern_uv = 2D coordinates of the pattern vertices (Takayama topology relaxed by a Laplace solve with the polygon boundary)
+P3, miss = lift(pattern_uv, uv, F, X)                # points on the reference surface
+```

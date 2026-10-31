@@ -1,0 +1,116 @@
+"""Pass 9 : statistics of the REAL arch layout and of its folded quads, plus constraint and iteration variants of the barrier. Written 30 October 2026.
+Usage : python3 -I real_arch_stats.py arch=DIR out=stats.json    (same DIR as run_real_arch.py : DIR/rerun/part_rem_p0.* and the dump).
+Everything printed or written here is MEASURED by this script on the rerun of QuadWild; nothing is copied from the hand off.
+FR : statistiques du layout reel de l'arche, diagnostic des quads pliés, variantes de la barrière."""
+import sys, json, time, collections
+sys.path.insert(0, ".")
+import numpy as np
+from scipy.spatial import cKDTree
+import run_real_arch as RA
+import zr8_judge as J, zr8_localrepair as LR
+
+lay, arcs, sides, dump, P0, Q0, Ps, h, ref = RA.lay, RA.arcs, RA.sides, RA.dump, RA.P0, RA.Q0, RA.Ps, RA.h, RA.ref
+qpart, qcorners = dump["qpart"], dump["qcorners"]
+out = {"h": h}
+
+
+def pct(x, q):
+    return float(np.percentile(np.asarray(x, float), q))
+
+
+# ================================================================ layout (triangle layer)
+rep = lay.report()
+out["layout"] = {"patches": rep["patches"], "triangles": rep["triangles"], "vertices": rep["vertices"], "corner_histogram": rep["corner_histogram"],
+                 "loops_per_patch": rep["loops_per_patch"], "euler_histogram": rep["euler_histogram"], "t_junction_incidences": rep["t_junction_incidences"],
+                 "mesh_border_edges": rep["mesh_border_edges"]}
+nodes_tri = {c for cs in lay.corners for c in cs}
+out["layout"]["nodes"] = len(nodes_tri)
+fe = {(min(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3])), max(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3]))) for f, e in lay.features}
+out["layout"]["feature_edges_triangle_layer"] = len(fe)
+cyc = 0
+for p in range(lay.npatch):
+    lp = lay.loops[p][0] if len(lay.loops[p]) == 1 else None
+    if lp is None: continue
+    pos = [lp.index(c) for c in lay.corners[p] if c in lp]
+    cyc += int(pos != sorted(pos))
+out["layout"]["patches_with_corners_not_in_cyclic_order"] = cyc
+
+# ================================================================ quads per patch
+sz = np.array([len(q) for q in qpart])
+out["quads_per_patch"] = {"patches": int(len(sz)), "mean": round(float(sz.mean()), 2), "median": float(np.median(sz)), "le4": int((sz <= 4).sum()), "le8": int((sz <= 8).sum()), "le16": int((sz <= 16).sum())}
+patch_of = np.full(len(Q0), -1)
+for p, qf in enumerate(qpart):
+    patch_of[list(qf)] = p
+out["quads_per_patch"]["quads_without_patch"] = int((patch_of < 0).sum())
+
+# ================================================================ patch corner angles (quad angle at each patch corner)
+cnt = collections.Counter()
+for p, qf in enumerate(qpart):
+    for c in qcorners[p]:
+        a = LR.corner_quad_angle(P0, Q0, qf, c)
+        if a is None: cnt["none"] += 1; continue
+        cnt["total"] += 1
+        if a < 58: cnt["lt58"] += 1
+        elif a <= 122: cnt["58_122"] += 1
+        else: cnt["gt122"] += 1
+        if a > 180: cnt["gt180"] += 1
+out["patch_corner_quad_angles_raw"] = dict(cnt)
+
+# ================================================================ folded and squashed quads, raw and smooth
+feat_samples = RA.crease_pts
+ft = cKDTree(feat_samples)
+all_nodes = {int(c) for cs in qcorners for c in cs}
+
+
+def fold_diag(P, label):
+    Jc = J.corner_jacobians(P, Q0); Jm = Jc.min(axis=1)
+    fol = np.where(Jm < 0)[0]; squ = np.where(Jm < 0.3)[0]
+    d = collections.Counter(); angles = []; sums = []; nq_at = []
+    for f in fol:
+        k = int(np.argmin(Jc[f])); v = int(Q0[f][k]); p = int(patch_of[f])
+        own = v in set(qcorners[p]) if p >= 0 else False
+        node = v in all_nodes
+        onfeat = bool(ft.query(P[v])[0] < 0.1 * h)
+        d["corner_of_own_patch" if own else ("foreign_node" if node else "non_node")] += 1
+        d["on_feature" if onfeat else "off_feature"] += 1
+        if node and not own: d["foreign_node_on_feature" if onfeat else "foreign_node_off_feature"] += 1
+        if (not node) and not own: d["non_node_on_feature" if onfeat else "non_node_off_feature"] += 1
+        qs = [g for g in qpart[p] if v in Q0[g]] if p >= 0 else [f]
+        a = LR.corner_quad_angle(P, Q0, [f], v); angles.append(a)
+        sums.append(sum(LR.corner_quad_angle(P, Q0, [g], v) for g in qs)); nq_at.append(len(qs))
+        d["same_patch_quads_at_vertex_%d" % len(qs)] += 1
+    psz = np.array([sz[patch_of[f]] if patch_of[f] >= 0 else -1 for f in fol]); psq = np.array([sz[patch_of[f]] for f in squ if patch_of[f] >= 0])
+    r = {"folded": int(len(fol)), "squashed_lt03": int(len(squ)), "classes": dict(d),
+         "folded_angle_deg": {"median": round(pct(angles, 50), 1), "p10": round(pct(angles, 10), 1), "p90": round(pct(angles, 90), 1), "min": round(min(angles), 1), "max": round(max(angles), 1)},
+         "angle_sum_same_patch_at_vertex_median_deg": round(pct(sums, 50), 1),
+         "folded_in_patch_size": {"le4": int((psz <= 4).sum()), "le8": int((psz <= 8).sum()), "le16": int((psz <= 16).sum())},
+         "squashed_in_patch_size": {"le4": int((psq <= 4).sum()), "le8": int((psq <= 8).sum()), "le16": int((psq <= 16).sum())},
+         "folded_quad_is_a_patch_corner_quad": int(sum(1 for f in fol if patch_of[f] >= 0 and any(int(Q0[f][k]) in set(qcorners[patch_of[f]]) for k in range(4))))}
+    print(label, json.dumps(r), flush=True)
+    return r
+
+
+out["fold_diag_raw"] = fold_diag(P0, "raw")
+out["fold_diag_smooth"] = fold_diag(Ps, "smooth")
+
+# ================================================================ barrier variants on the raw quads
+kind0, arc_of0, arcset = RA.classify(P0, Q0)
+kfree = kind0.copy(); kfree[kind0 == 1] = 0                      # crease vertices free
+nfree = kind0.copy(); nfree[kind0 == 2] = 0                      # layout nodes free (they stay free on the surface)
+variants = {"retained_8x60": (kind0, 8, 60), "iter_20x100": (kind0, 20, 100), "iter_40x150": (kind0, 40, 150),
+            "crease_vertices_free_8x60": (kfree, 8, 60), "nodes_free_8x60": (nfree, 8, 60)}
+out["barrier_variants_raw"] = {}
+for name, (kd, outer, inner) in variants.items():
+    t = time.time()
+    X, hist = RA.S.barrier(P0, Q0, ref, outer=outer, inner=inner, theta=1.0 / 8, size="keep", kind=kd, arc_of=arc_of0, arcs=arcset)
+    r = RA.report(X, Q0); r["seconds"] = round(time.time() - t, 1)
+    out["barrier_variants_raw"][name] = {k: r[k] for k in ("folded", "squashed_lt03", "jac_mean", "crease_dev_max_over_h", "crease_dev_mean_over_h", "seconds")}
+    print(name, out["barrier_variants_raw"][name], flush=True)
+    if name == "retained_8x60":
+        Jc = J.corner_jacobians(X, Q0); fol = np.where(Jc.min(axis=1) < 0)[0]
+        ty = collections.Counter()
+        for f in fol:
+            ty["free_slide_fixed=%d_%d_%d" % tuple(int(x) for x in np.bincount(kd[Q0[f]], minlength=3))] += 1
+        out["remaining_folded_after_barrier_raw_by_vertex_kinds"] = dict(ty)
+json.dump(out, open(dict(kv.split("=", 1) for kv in sys.argv[1:])["out"], "w"), indent=1)
+print("done")

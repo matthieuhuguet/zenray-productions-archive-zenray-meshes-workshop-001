@@ -1,0 +1,98 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH, step 2 : STRAIGHT CREASES. Every crease chain (edges whose two quads differ by more than --crease-deg) is cut at its corners, each piece is fitted by a straight line, else by a circular arc, and its vertices are put on the fit ; those vertices are then pinned and the facet vertex update runs again so the panels around them follow. Only vertices move ; a leash keeps every vertex near where it started ; symmetric by the mirror mates.
+    python -I CarCreaseStraighten.py in.obj out.obj [--crease-deg 35] [--line-rms-mm 2.5] [--arc-rms-mm 2.0] [--max-move-mm 12] [--vertex-iters 30] [--corner-deg 25]
+FR : plis droits : chaque chaine de plis est coupee aux coins, chaque morceau ajuste par une droite sinon un arc de cercle, les sommets sont poses sur l'ajustement puis epingles, les panneaux voisins suivent."""
+import argparse, collections, os, sys, time
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "lines"))
+import CarFacetFilter as CF
+import ZrlQuadStraighten as QS
+
+
+def crease_chains(V, Q, deg):
+    n, A, C = CF.quad_geom(V, Q); ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ef[(min(a, b), max(a, b))].append(qi)
+    cosf = np.cos(np.radians(deg)); adj = collections.defaultdict(list)
+    for (a, b), f in ef.items():
+        if len(f) == 2 and float(n[f[0]] @ n[f[1]]) < cosf: adj[a].append(b); adj[b].append(a)
+    seen = set(); chains = []
+    def walk(a, b):
+        ch = [a, b]; seen.add((min(a, b), max(a, b))); prev, cur = a, b
+        while len(adj[cur]) == 2:
+            cand = [x for x in adj[cur] if x != prev]
+            if not cand: break
+            nx = cand[0]; k = (min(cur, nx), max(cur, nx))
+            if k in seen: break
+            seen.add(k); ch.append(nx); prev, cur = cur, nx
+        return ch
+    for v0 in list(adj):
+        if len(adj[v0]) != 2:
+            for n0 in adj[v0]:
+                if (min(v0, n0), max(v0, n0)) not in seen: chains.append(walk(v0, n0))
+    for v0 in list(adj):
+        for n0 in adj[v0]:
+            if (min(v0, n0), max(v0, n0)) not in seen: chains.append(walk(v0, n0))
+    return chains
+
+
+def fit_line(P):
+    c = P.mean(0); u, s, vt = np.linalg.svd(P - c, full_matrices=False); d = vt[0]; t = (P - c) @ d; F = c + np.outer(t, d); return F, np.linalg.norm(P - F, axis=1)
+
+
+def fit_arc(P):
+    c = P.mean(0); u, s, vt = np.linalg.svd(P - c, full_matrices=False); e1, e2 = vt[0], vt[1]; X = np.c_[(P - c) @ e1, (P - c) @ e2]
+    M = np.c_[2 * X, np.ones(len(X))]; sol, *_ = np.linalg.lstsq(M, (X ** 2).sum(1), rcond=None); ctr = sol[:2]; r = np.sqrt(max(sol[2] + (ctr ** 2).sum(), 1e-12))
+    if r > 50.0: return None, None
+    dv = X - ctr; L = np.linalg.norm(dv, axis=1); Y = ctr + dv / np.maximum(L, 1e-12)[:, None] * r; F = c + np.outer(Y[:, 0], e1) + np.outer(Y[:, 1], e2)
+    return F, np.linalg.norm(P - F, axis=1)
+
+
+def fit_piece(P, line_rms, arc_rms, depth=0):
+    """returns the fitted points of the chain piece : a line, else an arc, else split at the farthest point from the chord and recurse ; None parts stay unmoved."""
+    n = len(P)
+    if n < 5: return P.copy(), "keep"
+    F, d = fit_line(P)
+    if np.sqrt((d ** 2).mean()) <= line_rms and d.max() <= 2.5 * line_rms: return F, "line"
+    F, d = fit_arc(P)
+    if F is not None and np.sqrt((d ** 2).mean()) <= arc_rms and d.max() <= 2.5 * arc_rms: return F, "arc"
+    if depth >= 8 or n < 10: return P.copy(), "keep"
+    chord = P[-1] - P[0]; cl = np.linalg.norm(chord); dist = np.linalg.norm(np.cross(P - P[0], chord / max(cl, 1e-12)), axis=1); k = int(np.argmax(dist[2:-2])) + 2
+    A, ka = fit_piece(P[:k + 1], line_rms, arc_rms, depth + 1); B, kb = fit_piece(P[k:], line_rms, arc_rms, depth + 1); out = np.vstack([A[:-1], B]); return out, "split"
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--crease-deg", type=float, default=35.0); ap.add_argument("--line-rms-mm", type=float, default=2.5); ap.add_argument("--arc-rms-mm", type=float, default=2.0)
+    ap.add_argument("--max-move-mm", type=float, default=12.0); ap.add_argument("--vertex-iters", type=int, default=30); ap.add_argument("--min-len-m", type=float, default=0.08); ap.add_argument("--no-symmetry", action="store_true"); ap.add_argument("--freeze", default=CF.FREEZE_DEFAULT); a = ap.parse_args(); t0 = time.time()
+    lines = open(a.inp).read().split("\n"); V, F = CF.load_obj(a.inp); Q = np.array([f for f in F if len(f) == 4], np.int64); adj, fixed0 = CF.face_adjacency(Q); fixed0 = np.concatenate([fixed0, np.zeros(len(V) - len(fixed0), bool)]); fixed0 = fixed0 | CF.frozen_vertices(a.inp, a.freeze, len(V))
+    chains = crease_chains(V, Q, a.crease_deg); P = V.copy(); pinned = np.zeros(len(V), bool); kinds = collections.Counter(); leash = a.max_move_mm / 1000.0
+    for ch in chains:
+        ch = np.array(ch); L = np.linalg.norm(np.diff(V[ch], axis=0), axis=1).sum()
+        if len(ch) < 6 or L < a.min_len_m: continue
+        Pf, kind = fit_piece(V[ch], a.line_rms_mm / 1000.0, a.arc_rms_mm / 1000.0)
+        if len(Pf) != len(ch): continue
+        off = np.linalg.norm(Pf - V[ch], axis=1); ok = off <= leash
+        if kind != "keep":
+            P[ch[ok]] = Pf[ok]; pinned[ch[ok]] = True
+        kinds[kind] += 1
+    pinned[fixed0] = False; used = np.zeros(len(V), bool); used[Q.ravel()] = True; mate, cx = CF.mirror_mates(V, used); sym = not a.no_symmetry
+    if sym: P = CF.symmetrize(P, mate, cx); pm = pinned & (mate >= 0); pinned = pinned & ((mate >= 0) | ~sym)
+    el = np.linalg.norm(V[Q[:, 0]] - V[Q[:, 1]], axis=1).mean(); n = CF.filter_normals(P, Q, adj, 2 * np.sin(np.radians(8.0) / 2), 6 * el, 8, 30)
+    free = ~pinned; step_fixed = fixed0 | pinned; P2 = CF.update_vertices(P, Q, n, step_fixed, a.vertex_iters, 1e9)
+    off = np.linalg.norm(P2 - V, axis=1); far = off > 2 * leash; P2[far] = V[far]
+    if sym: P2 = CF.symmetrize(P2, mate, cx)
+    j0 = QS.quad_jmin(V, Q); moved_back = 0
+    for _ in range(12):
+        jn = QS.quad_jmin(P2, Q); bad = np.flatnonzero(jn < np.minimum(j0, 0.3) - 1e-9)
+        if not len(bad): break
+        for q in Q[bad]:
+            P2[q] = V[q]; moved_back += 1
+            if sym: mm = mate[q][mate[q] >= 0]; P2[mm] = V[mm]
+    it = iter(P2); out = []
+    for l in lines:
+        if l.startswith("v "): out.append("v %.6f %.6f %.6f" % tuple(next(it)))
+        else: out.append(l)
+    open(a.out, "w").write("\n".join(out)); d = np.linalg.norm(P2 - V, axis=1) * 1000
+    print("chains %d  %s  pinned %d  moved mean %.2f max %.1f mm  reverted quads %d  %.0f s" % (len(chains), dict(kinds), int(pinned.sum()), d.mean(), d.max(), moved_back, time.time() - t0))
+
+
+if __name__ == "__main__": main()

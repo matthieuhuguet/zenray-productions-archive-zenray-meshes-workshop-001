@@ -1,0 +1,31 @@
+"""30 October 2026 : ZenRay Meshes, per component report of a multi-part OBJ (the car) : quads, connected components, open edges and non manifold edges INSIDE the part, bounding box. A part that is closed by itself separates like a Lego brick.
+    python -I CarPartsReport.py car.obj [--json out.json]
+FR : rapport par composant : quads, composantes, aretes ouvertes et non manifold dans la piece, boite englobante."""
+import collections, json, sys
+import numpy as np
+
+
+def main():
+    path = sys.argv[1]; V = []; groups = collections.OrderedDict(); cur = None
+    for l in open(path):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("g "): cur = l[2:].strip(); groups.setdefault(cur, [])
+        elif l.startswith("f ") and cur is not None: groups[cur].append([int(x.split("/")[0]) - 1 for x in l.split()[1:]])
+    V = np.array(V); rows = []
+    for g, F in groups.items():
+        if not F: continue
+        ec = collections.Counter(); par = {}
+        def find(x):
+            while par.setdefault(x, x) != x: par[x] = par[par[x]]; x = par[x]
+            return x
+        for f in F:
+            for k in range(len(f)): a, b = f[k], f[(k + 1) % len(f)]; ec[(min(a, b), max(a, b))] += 1; par[find(a)] = find(b)
+        vs = sorted({v for f in F for v in f}); comps = len({find(v) for v in vs}); P = V[vs]
+        rows.append({"part": g, "faces": len(F), "components": comps, "open_edges": sum(1 for c in ec.values() if c == 1), "non_manifold_edges": sum(1 for c in ec.values() if c > 2), "bbox_mm": [int(round(x * 1000)) for x in (P.max(0) - P.min(0))]})
+    bad = [r for r in rows if r["open_edges"] or r["non_manifold_edges"]]
+    print("parts %d ; closed by themselves %d ; with open edges %d" % (len(rows), len(rows) - len(bad), len(bad)))
+    for r in bad: print("  %-34s faces %5d components %d open %4d non-manifold %d bbox %s" % (r["part"], r["faces"], r["components"], r["open_edges"], r["non_manifold_edges"], r["bbox_mm"]))
+    if "--json" in sys.argv: json.dump(rows, open(sys.argv[sys.argv.index("--json") + 1], "w"), indent=1)
+
+
+if __name__ == "__main__": main()

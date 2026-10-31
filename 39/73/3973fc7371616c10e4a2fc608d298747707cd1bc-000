@@ -1,0 +1,96 @@
+"""Q9, mesure 2 : planéité multi-échelle et ondulation des panneaux principaux de v752.
+Pour chaque panneau : RMS à un plan unique, RMS à une quadrique globale (la 'bombe' voulue), ondulation résiduelle,
+écart d'angle des normales, nombre de plans RANSAC pour couvrir 90 % de l'aire à 2 mm. 30 October 2026."""
+import sys, json, re
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load('out/v752_exterior.npz'); VIS = ext['vis']; SGN = ext['sign']
+N = N * SGN[:, None]          # normales d'enroulement orientées vers l'extérieur
+
+PANELS = ["CAR_body_hood_C", "CAR_body_roof_C", "CAR_body_door_L", "CAR_body_glass_windshield_C", "CAR_body_glass_rear_C",
+          "CAR_body_rear_C", "CAR_body_fender_front_L", "CAR_body_quarter_L", "CAR_body_shoulder_L", "CAR_body_rocker_L",
+          "CAR_body_sill_L", "CAR_body_decklid_C", "CAR_body_bumper_front_C", "CAR_body_fascia_panel_C", "CAR_body_glass_door_L",
+          "CAR_body_shoulder_rear_L", "CAR_arch_front_L", "CAR_light_headlight_L"]
+
+def panel_pts(nm):
+    gi = names.index(nm)
+    m = (Gq == gi) & VIS
+    vs = np.unique(Q[m].ravel())
+    return V[vs], m
+
+def pca_frame(P0):
+    c = P0.mean(0)
+    u, s, vt = np.linalg.svd(P0 - c, full_matrices=False)
+    return c, vt, s
+
+def ransac_planes(P, w, tol, min_frac=0.03, iters=300, rng=np.random.default_rng(1)):
+    """Multi-plan glouton : retire le plan le plus peuplé, répète tant qu'il couvre > min_frac. Renvoie la couverture cumulée."""
+    idx = np.arange(len(P)); tot = w.sum(); cov = []; rem = idx.copy()
+    for _ in range(12):
+        if len(rem) < 20: break
+        best = None
+        for _ in range(iters):
+            s = rng.choice(rem, 3, replace=False)
+            n = np.cross(P[s[1]] - P[s[0]], P[s[2]] - P[s[0]]); nn = np.linalg.norm(n)
+            if nn < 1e-9: continue
+            n /= nn
+            d = np.abs((P[rem] - P[s[0]]) @ n)
+            inl = rem[d < tol]
+            sc = w[inl].sum()
+            if best is None or sc > best[0]: best = (sc, inl, n, P[s[0]])
+        if best is None or best[0] / tot < min_frac: break
+        # raffinement par moindres carrés
+        inl = best[1]
+        c, vt, s_ = pca_frame(P[inl]); n = vt[2]
+        d = np.abs((P[rem] - c) @ n); inl = rem[d < tol]
+        cov.append(float(w[inl].sum() / tot))
+        rem = np.setdiff1d(rem, inl)
+    return cov
+
+res = []
+for nm in PANELS:
+    if nm not in names: continue
+    P0, m = panel_pts(nm)
+    gi = names.index(nm)
+    # sommets avec poids = aire d'un quart de quad
+    vs, inv = np.unique(Q[m].ravel(), return_inverse=True)
+    w = np.zeros(len(vs)); np.add.at(w, inv, np.repeat(A[m] / 4.0, 4))
+    # on écarte une bande de bord de 3 cm (là où se logent les congés et les raccords)
+    bdry = set()
+    ed = edge_table(Q[m])
+    for (u, v), fl in ed.items():
+        if len(fl) == 1: bdry.add(Q[m][fl[0]][0]) if False else None
+    c, vt, s = pca_frame(P0)
+    # plan unique
+    h = (P0 - c) @ vt[2]
+    tree = cKDTree(P0)
+    # bord : sommets du groupe qui ont un voisin d'un autre groupe ou arête ouverte -> approximé par l'enveloppe 2D
+    uv = (P0 - c) @ vt[:2].T
+    ext = uv.max(0) - uv.min(0)
+    inner = (uv[:, 0] > uv[:, 0].min() + .03) & (uv[:, 0] < uv[:, 0].max() - .03) & (uv[:, 1] > uv[:, 1].min() + .03) & (uv[:, 1] < uv[:, 1].max() - .03)
+    X1 = np.c_[uv, np.ones(len(uv))]
+    cf, *_ = np.linalg.lstsq(X1[inner], h[inner], rcond=None); r1 = h[inner] - X1[inner] @ cf
+    X2 = np.c_[uv[:, 0] ** 2, uv[:, 0] * uv[:, 1], uv[:, 1] ** 2, uv, np.ones(len(uv))]
+    c2, *_ = np.linalg.lstsq(X2[inner], h[inner], rcond=None); r2 = h[inner] - X2[inner] @ c2
+    X3 = np.c_[uv[:, 0] ** 3, uv[:, 0] ** 2 * uv[:, 1], uv[:, 0] * uv[:, 1] ** 2, uv[:, 1] ** 3, X2]
+    c3, *_ = np.linalg.lstsq(X3[inner], h[inner], rcond=None); r3 = h[inner] - X3[inner] @ c3
+    # écart d'angle des normales à la normale moyenne
+    nm_mean = (N[m] * A[m][:, None]).sum(0); nm_mean /= np.linalg.norm(nm_mean)
+    ang = np.degrees(np.arccos(np.clip(N[m] @ nm_mean, -1, 1)))
+    cov2 = ransac_planes(P0[inner], w[inner], 0.002)
+    cov05 = ransac_planes(P0[inner], w[inner], 0.0005)
+    d = {"name": nm, "area_m2": float(A[m].sum()), "extent_m": [float(ext[0]), float(ext[1])],
+         "rms_plane_mm": float(np.sqrt((r1 ** 2).mean()) * 1000), "max_plane_mm": float(np.abs(r1).max() * 1000),
+         "rms_quadric_mm": float(np.sqrt((r2 ** 2).mean()) * 1000), "max_quadric_mm": float(np.abs(r2).max() * 1000),
+         "rms_cubic_mm": float(np.sqrt((r3 ** 2).mean()) * 1000),
+         "normal_spread_deg_std": float(ang.std()), "normal_spread_deg_p95": float(np.percentile(ang, 95)),
+         "ransac_planes_2mm_cum_cover": cov2[:6], "ransac_planes_0.5mm_cum_cover": cov05[:6]}
+    res.append(d)
+    print(f"{nm:30s} {d['area_m2']:5.2f} m2  plan {d['rms_plane_mm']:6.2f} (max {d['max_plane_mm']:6.1f})  quad {d['rms_quadric_mm']:5.2f} (max {d['max_quadric_mm']:5.1f}) cub {d['rms_cubic_mm']:5.2f}  normales std {d['normal_spread_deg_std']:5.2f} deg p95 {d['normal_spread_deg_p95']:5.2f}  RANSAC2mm {['%.2f'%x for x in cov2[:3]]}")
+json.dump(res, open("out/q9_panel_flatness.json", "w"), indent=1)

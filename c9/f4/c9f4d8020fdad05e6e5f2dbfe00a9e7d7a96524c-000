@@ -1,0 +1,273 @@
+# ZenRay Retopology (ex ZenRay Lines) : inventaire de l'algorithme, préparation de la fusion avec QuadWild
+
+État au 30 October 2026. Lecture seule : aucun fichier existant modifié, aucun script exécuté. Tout ce qui suit vient de la lecture des sources citées.
+
+## 0. Périmètre, sources, conventions
+
+Sources, chemins absolus :
+
+- MEM = /Users/zenray/.claude/Memory1/Projects/zenray-meshes/ZenRayMeshes1.md, sections 16 à 27 lues en entier.
+- SKL = /Users/zenray/.claude/skills/zenray-meshes/SKILL.md, sections 237 à 302 lues en entier. Sections 1 à 236 cherchées par mots-clés (Zrl, Lines, MILP, Tarini, QuadWild, Quad Remesh, Manny) : seules des mentions de tournois Quad Remesh sur capot et aile apparaissent (SKL 215, ligne 2285 ; SKL 227, ligne 2411), hors Lines.
+- SCR = /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines/ : 82 fichiers Zrl*.py. En-têtes lus pour ZrlTutteFill, ZrlCarMesh, ZrlCounts, ZrlNetMesh, ZrlAutoPatch, ZrlCorners, ZrlTubeNet, ZrlJunction, ZrlBodyNet, ZrlAny, ZrlTopoJudge ; une ligne d'objet pour les autres. Blocs PARAMS lus dans le code de NetMesh, TutteFill, AutoPatch, TubeNet, Straighten, Trunk, Junction, Tubes, BodyNet, Counts, Corners, QuadStats.
+- SCRR = /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/retopo/ : non inventorié (voir 0.1).
+- RAS = /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/Raster.py : rendu de profondeur GPU appelé par ZrlCreases (code).
+
+Conventions : « MEM 22 » = section 22 de MEM ; « SKL 263 » = section 263 de SKL ; « code » = fichier de SCR avec sa fonction ou son bloc PARAMS.
+
+Normale du juge : les chiffres de MEM 16 et des sections SKL antérieures à SKL 297 utilisent l'ancienne normale, celle du coin 0. MEM 23 indique que la normale des diagonales est adoptée vers 14 h 30 le 30 October 2026 ; ses plis sont alors des bornes hautes. Les chiffres marqués « ancienne normale » ci-dessous sont des bornes hautes. Voir 6.2.
+
+### 0.1 Deux familles sous le même nom
+
+- Famille SCR (Zrl*) : moteur de réseau de courbes vers quads, éditeur 3D, voiture par panneaux, juges. C'est l'objet de cet inventaire. Nom affiché : ZenRay Retopology, module de ZenRay Meshes (MEM 26 ; SKL 302). Les noms de fichiers gardent le préfixe Zrl tant qu'une migration n'est pas faite (MEM 26).
+- Famille SCRR (Zrr*) : module de finition du 29 October 2026 (SKL 237, 238) : partition d'une coque, champ de hauteur, tournoi ZrrBest à 8 variantes. Même mot, code distinct. Hors inventaire, à trancher avant la fusion.
+- Copies de recherche de la passe 7, dans SCR : ZrlTutte0.py, ZrlTutte7.py, ZrlAnnulus7.py, ZrlWeld7.py. Leurs résultats ne sont pas portés dans ZrlTutteFill.py (MEM 27 ; vérification par recherche de mots dans ZrlTutteFill.py : aucune règle de bande, aucun traitement d'anneau partagé).
+
+## 1. La chaîne d'étapes
+
+Quatre chaînes coexistent. La chaîne A est le cœur (réseau de courbes vers quads). Les chaînes B à F sont des voies d'entrée ou de sortie qui finissent en chaîne A ou en moteur de patch.
+
+### 1.1 Chaîne A : réseau de courbes vers maillage de quads (ZrlNetMesh)
+
+Entrée : document `lines_edit.json` (format zenray-lines, schéma 2) : nœuds, arcs en matrices de points de contrôle n x 3 (B-spline cubique uniforme serrée), miroir en transformation 4 x 4, graines de composant, `component_options`, `mesh_params` (SCR ZrlServe.py, `save_edit`, SKL 248). Sortie : maillage de quads en OBJ, JSON (P, Q, quad_jac, face_of_quad, faces, issues, stats, arc_counts). Toutes les tolérances sont des mètres, multipliées par `unit` (0,1 pour les doigts ; SKL 263 et code ZrlNetMesh). Entrée de chaque étape : la sortie de l'étape précédente ; seules A0 et A1 lisent des fichiers extérieurs.
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| A0 | Surface de visée | ZrlNetMesh `load_ref`, `read_obj_cached`, classe `Ref` (`closest`, `normals_at`, `node_normal`) ; ZrlRefMesh pour le binaire du navigateur | Surface sur laquelle les courbes sont posées | `ref` = "v752" ; cache .npy au-delà de 50 000 triangles (SKL 257) ; `node_normal` ignore les triangles à plus de 120 degrés du plus proche (SKL 260) | Triangles, normales |
+| A1 | Document | ZrlServe `save_edit` | Refuse NaN, id répété, courbe sans matrice finie ; écrit en atomique puis relit (SHA-256) | aucun | `lines_edit.json` |
+| A2 | Docteur | ZrlNetMesh `_doctor`, `doctor` | Recolle les bouts proches d'un nœud, supprime doublons et arcs nuls | `weld_tol_m` 0,02 ; `dup_mid_tol_m` 0,02 ; `dup_mean_dist_m` 0,01 ; `min_arc_len_m` 0,001 | `issues` |
+| A3 | Projection | ZrlNetMesh `project_doc` | Nœuds et arcs posés sur la surface avant les faces (SKL 242) | `project_arcs` True | Document projeté |
+| A4 | Graphe | `Net.__init__`, `_tjunctions`, `_crossings`, `_prepare_graph` | Jonctions en T, croisements signalés | `tjunction_tol_m` 0,03 ; `cross_tol_m` 0,006 ; `cross_split` False (code ZrlNetMesh : les croisements sont signalés, pas coupés) | Graphe d'arcs |
+| A5 | Faces | `Net.trace` (système de rotation autour de la normale), `_geometry` | Boucles fermées d'arcs = faces | `tangent_dist_m` 0,02 ; `node_normal_band_m` 0,01 ; `max_face_sides` 8 ; `max_face_area_m2` 3,0 | Faces `he` |
+| A6 | Composants | `Net.assign_components`, `_face_opts` | Une graine nommée tombe dans une face : la face prend le nom et l'échelle du composant | `seed_plane_tol_m` 0,5 ; `inherit_component` False (True pour le corps, SKL 269) | Nom et `edge_scale` par face |
+| A7 | Coins et côtés | `Net.corners`, `_symmetric_corners`, `_soft_corners`, `_add_corners`, `_split_arc`, `_sides` | Coin = virage au-dessus du seuil ; côtés entre coins | `corner_deg` 35 ; `corners_force` par nœud ; `soft_window_m` 0,04 ; `soft_corner_deg` 45 ; `corner_min_deg` 10 ; `corner_min_gap_frac` 0,05 ; `max_virtual_corners` 2 ; `symmetric_corners` False | Côtés par face ; raisons d'exclusion : complement, sliver (`min_compactness` 0,08), wraps_around (`wrap_min_normal` 0,3), too_many_sides, annulus, round_face, overlaps (`overlap_plane_m` 0,05) |
+| A8 | Comptes entiers | ZrlNetMesh `Net.counts` puis ZrlCounts `solve` (scipy milp, HiGHS) et `tarini_s` | Un entier par arc partagé ; côtés opposés égaux ; patch à N côtés avec un pôle : e_i = s_(i-1) + s_(i+1), s_i entier au moins 1 (MEM 18) ; arcs miroirs égaux | `edge_m` 0,02 (NetMesh) ; `min_spoke` 2 ; `min_loop_count` 3 ; `min_arc_count` 1 ; `arc_min_counts` ; `time_limit_s` 90 (SKL 263, ancienne valeur 20) ; `mip_rel_gap` 0,03 ; `merge_mirror` False, activé par `counts_params` ; SIDES = 3 à 8 ; élastique : `slack_patch` 1000, `slack_mirror` 30 | `counts_by_arc`, spokes ; échec : « counts cannot close » (SKL 261) |
+| A9 | Échantillonnage | ZrlNetMesh `Net.fill` (début) | Chaque arc est échantillonné une seule fois en `c` pas : les voisins partagent les mêmes points, donc sont soudés par construction (en-tête ZrlNetMesh) | nombre d'arêtes de A8 | `arc_vs` |
+| A10 | Remplissage | `Net.fill`, fonction interne `patch` (grille de Coons discrète) ; motif de Tarini pour N côtés | 4 côtés : grille de Coons. N côtés (3, 5 à 8) : centre = moyenne des coins, rayons de longueur s_i, N sous-patches. Côtés opposés différents : erreur | `auto_fallback` True : un 5 ou 6 côtés qui échoue au juge est refait en 4 côtés si cela plie moins (`_build_one`) | Grille de quads, `face_of_quad` |
+| A11 | Conformité | `Net.conform` | Solution harmonique (Tutte, bord fixe) puis projection sur la référence puis relaxation | `harmonic` True ; `relax_iters` 30 ; `project_every` 3 ; `project_k` 8 ; `tangential` False | Sommets sur la surface |
+| A12 | Dépliage | `Net.untangle` (Winslow dans le plan de la face) | Ne touche que les faces qui plient, gardé seulement si cela plie moins (SKL 242) | `untangle_iters` 400 | `untangled` |
+| A13 | Symétrie | `Net.symmetrize` | Chaque sommet moyenné avec son jumeau miroir, sommets d'axe sur x = 0 | `symmetry_x` False (à réserver aux réseaux construits symétriques : sur un réseau non symétrique, les plis passent de 165 à 181, SKL 245) | Sommets symétriques |
+| A14 | Jugement | `Net.judge` avec ZrlQuadStats (normale des diagonales, MEM 23) | Plis, écrasés, coins aigus | `jac_min` 0,5 ; `sharp_deg` 30 ; `sharp_factor` 0,9 ; `drop_failed` False | `quad_jac`, `stats`, OBJ dans `work/lines/mesh` (`mesh_<date>.obj`, `latest.obj`) |
+
+Compléments : `_split_units` et `_merge_results` (code ZrlNetMesh) traitent un document à plusieurs échelles de composant (SKL 257). ZrlLod (Catmull-Clark vectorisé, niveaux 0 à 3, SKL 257) lisse le résultat après coup.
+
+### 1.2 Chaîne B : corps et personnage depuis le maillage seul (ZrlBodyNet)
+
+Entrée : `python -I ZrlBodyNet.py model.obj out.json [--param clé=valeur]` (code ZrlBodyNet, SKL 263). Tout le réseau d'un personnage en 8 à 40 secondes (SKL 263). Entrée de chaque étape : la sortie de la précédente ; la seule entrée externe est le fichier OBJ. Le chef d'orchestre appelle les étapes ci-dessous puis la chaîne A.
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| B1 | Distance et branches | ZrlTubes (méthode de la chaleur, arbre de fusion) | Branches du corps depuis une racine (SKL 253 : 13 branches sur Manny, racine au bassin) | `heat_len_m` 0,05 ; `persistence_m` 0,015 ; `band_m` 0,015 ; `root` None (sommet le plus proche du centre de masse) | Branches |
+| B2 | Tubes depuis les pointes | ZrlTubeNet `network(kind="fingers")`, `limbs_from_tips`, `arm_fingers` | Chaque membre mesuré depuis sa pointe, circonférence par niveau de 4 mm ; le tube finit au premier saut durable (SKL 255) | `neck_widen` 1,25 ; `neck_jump` 1,4 ; `jump_window` 1,0 ; `jump_before_tol` 0,4 ; `bump_keep` 0,85 ; `segments` head 1, leg 1, arm 2 ; `min_ring_gap` 0,5 | Anneaux et coutures par tube |
+| B3 | Anneaux | ZrlTubeNet `ring_levels`, `profile`, `build_tube` ; ZrlJunction `trim_pinched` | Anneaux serrés à chaque articulation (pile d'anneaux) ; anneau de base pincé retiré | `joint_gap_m` 0,02 ; `joint_zone_m` 0,04 ; `planar_arms` 1 ; `ring_step_m` 0,012 (doigt) et 0,03 (bras) ; `seams` 4 par défaut, 8 bras, 8 tête (SKL 265) ; `pinch_ratio` 0,55 (ZrlJunction) | Tubes de quads |
+| B4 | Bouts | ZrlTubeNet `build_tube` (`cap_mode` quad) | Bout de tube = patch à quatre coins égaux (SKL 263) | `cap_m` 0,009 ; `crown_min_radius_m` 0,04 (SKL 268) | Calottes |
+| B5 | Redressement | ZrlStraighten `straighten_doc` | Coins des anneaux glissés pour que les coutures soient droites | `iters` 30 ; `lam` 0,5 ; `max_shift` 0,15 ; `max_gap_deg` 125 ; `min_gap` 0,14 | Coutures droites |
+| B6 | Fusion | ZrlMerge (`--unit`) ; ZrlJunction `weld_coincident` | Un document, échelles par composant ; nœuds coïncidents soudés | `mesh_unit` 0,1 pour les doigts ; `mesh_feature_unit` 1 (SKL 260) ; tolérance de soudure 0,004 (`weld_m`) | Document unique |
+| B7 | Tronc | ZrlTrunk `build_trunk` | Tronc en tube d'anneaux horizontaux (SKL 262) | `step_m` 0,04 ; `seams` 12 ; `bottom_offset_m` 0,10 ; `top_offset_m` 0,12 ; `waist_zone_m` 0,035 ; `edge_scale` 0,6 (voir 6.2) | Anneaux du tronc |
+| B8 | Jonctions | ZrlJunction `body_junctions`, `torso_junction`, `symmetric_star`, `star_junction`, `join_rings`, classe Router (chemin le plus court sur la surface, lissage, miroir, centrage, symétrie) | Ponts en patron de vêtement : ligne centrale dans le plan de symétrie, pôles, coutures | `pole_upper` 0,88 ; `pole_lower` 0,12 ; `chest_pole_frac` 0,5 ; `pelvis_pole_frac` 0,5 ; `lead_m` 0,015 ; `smooth_iters` 140 ; `smooth_lambda` 0,5 ; `project_every` 4 ; `centre_tol_m` 0,004 ; `mirror_tol_m` 0,012 ; `chest_ladder` 0 (écarté, SKL 270) ; `trunk` 1 | Faces de jonction (main : 6 trous et 18 ponts, SKL 271) |
+| B9 | Maillage | Chaîne A (ZrlNetMesh `build`) | Quads du corps | `mesh_params` du document, dont `counts_params`, `arc_min_counts`, `corner_deg` 55 (SKL 265) | Maillage |
+| B10 | Contrôle | ZrlClosedCheck, ZrlTubeCheck, ZrlUnmeshed, ZrlJunctionContacts, ZrlJunctionDiag | Sphère fermée (V - E + F = 2), composant par composant, faces non maillées | voir section 4 | Rapports |
+
+Paramètres de corps (code ZrlBodyNet, `BODY_PARAMS`) : `arm_edge_scale` 0,6 ; `head_edge_scale` 0,8 ; `trunk_min_count` 4 (SKL 268 : sans cela les colonnes du dos recevaient 1 ou 3 arêtes).
+
+### 1.3 Chaîne C : voiture par panneaux (ZrlCarPatches, ZrlCarMesh, ZrlCarSymmetrize)
+
+Principe : chaque panneau de carrosserie est un patch indépendant, maillé seul. Un flux ne traverse jamais un joint de panneau (MEM 16 ; SKL 277). Entrée : graines `lines/data/seeds_v752.json` (C0) ; sortie : OBJ de 35 groupes.
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| C0 | Graines | `lines/data/seeds_v752.json` | Une graine par panneau, 35 graines (SKL 277) | aucun | Graines |
+| C1 | Patch par panneau | ZrlCarPatches appelle ZrlAutoPatch `patch` | Un patch à quatre coins par graine ; reprise avec d'autres angles de zone si un coin tourne de moins de 20 degrés | `zone_deg` 25 ; `max_corners` 4 ; `corner_deg` 35 ; `ring_cuts` 4 | `car_patches.json` ; copie `lines/data/lines_car_patches.json` |
+| C2 | Maillage seul | ZrlCarMesh `sub_docs`, `repair_folded`, `VARIANTS` (36 combinaisons) | Chaque patch maillé comme un sous-document d'une face, jugé, réparé | `--edge` 0,04 utilisé partout (code : 0,03) ; `--shapes` (coupe au coude le plus vif, `sharpest_bend` 25 degrés sur 2 cm, SKL 281) ; `--reflex` (coupe des coins rentrants, `reflex_split`, SKL 289) ; bande fine à quatre coins aux bouts (`thin_strip`, SKL 289) ; `--tune` (harmonic, tangential, relax 0/30/80, untangle 0/400/1500, SKL 278) ; `--sweep` (bord x 0,92 / 0,96 / 1,04 / 1,08 et seuil de coin 35/45/70/85, SKL 290 et 291) ; `--repair` (`repair_folded` avec `border_ok`, SKL 291) ; `--auto-edge N` (une arête par panneau pour environ N quads, SKL 279) | Quads par panneau, `component_edge_m`, `component_shape`, `component_mesh_params` dans le document |
+| C3 | Symétrie | ZrlCarSymmetrize | Pour chaque paire _L et _R, le meilleur panneau (moins de plis, puis moins d'écrasés) est reflété sur l'autre (SKL 278) | `--edge` 0,04 | Symétrie exacte |
+| C4 | Assemblage | ZrlCarMesh `--save-doc` ; sortie `lines/data/car_panels_mesh.obj` | 35 groupes `g CAR_...` ; projet `car-panels` de l'éditeur (SKL 283, 284) | aucun | OBJ et projet |
+| C5 | Voiture hybride | ZrlHybridCar (`--ours`, `--doc`, `--out`, `--edge` 0,04) ; ZrlPartTournament ; HouQuadParts ; HouQuadVariants (13 réglages) | Pièces avec patch ZenRay gardées, les autres au Quad Remesh pièce par pièce, tournoi de réglages par pièce (MEM 17) | score = plié + 0,3 écrasé + 0,0005 pôles pour 1 000 quads (MEM 17) ; `--min-fold` 0,005 (code ZrlPartTournament) | 137 pièces, 59 017 quads, 1,06 % de plis (SKL 293) |
+
+### 1.4 Chaîne D : patch au clic, zones et accroche (ZrlAutoPatch, ZrlAny)
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| D1 | Zone | ZrlAutoPatch `patch` (POST /auto_patch, op patch) | La zone grandit depuis le triangle cliqué tant que la pièce est la même et que la normale tourne de moins de `zone_deg` ; contour chaîné | `zone_deg` 25 ; `max_radius_m` 1,0 ; `max_triangles` 60 000 ; `step_m` 0,004 | Zone et contour |
+| D2 | Coins et côtés | ZrlAutoPatch `corners`, côtés en B-splines | Les virages les plus francs sont les coins (un coin par virage) ; côtés ajustés en B-splines | `corner_deg` 35 ; `turn_window_m` 0,02 ; `corner_gap_frac` 0,12 ; `max_corners` 4 (5 à 8 pour ZrlAny) ; `ctrl_step_m` 0,04 ; `spike_deg` 150 | Quatre côtés |
+| D3 | Anneau | ZrlAutoPatch `ring_cuts` | Une zone à second contour long (pneu) est coupée en quarts d'anneau | `ring_frac` 0,35 ; `ring_cuts` 4 (0 refuse les anneaux) | Quarts |
+| D4 | Accroche | ZrlAutoPatch `snap` (op snap) | Un point posé se règle sur le contour le plus proche | `feature_deg` 25 ; `snap_radius_m` 0,02 ; `snap_sample_m` 0,002 | Point accroché |
+| D5 | Régions | ZrlAny `segment` | Composantes lisses par union-find sur la normale, puis fusion des petites régions | `zone_deg` 25 ; `merge_deg` 70 ; `min_tris` ; `MAXC` 8 (3 à 8 coins) | Régions sans recouvrement |
+| D6 | Patch par région | ZrlAny, puis moteur de patch | Un patch par région à 3 à 8 coins, maillé seul | `--target-quads` 2 500 ; `--min-area-frac` 0,002 | Patchs |
+
+Mesure : sur l'arche, la découpe en régions donne 3 000 à 3 500 quads pliés sur 11 000 à 14 000 (MEM 19). Voir section 3.
+
+### 1.5 Chaîne E : remplissage intrinsèque (ZrlTutteFill, ZrlCorners, ZrlCounts)
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| E1 | Région en disque | ZrlTutteFill `main` | Une région de triangles est traitée comme un disque | `--edge` 0,05 ; `--zone-deg` 25 ; `--min-area-frac` 0,002 ; `--merge-deg` 35 ; `--corners` "robust" | Zones |
+| E2 | Vrais coins | ZrlCorners `detect` | Douglas-Peucker à quatre tolérances, persistance des virages, coins convexes admis, fentes concaves rejetées | `eps_frac` (0,004 ; 0,008 ; 0,016 ; 0,032) ; `t_fine` 28 ; `t_coarse` 35 ; `ratio` 0,55 ; `spike_concave` 150 ; `max_corners` 8 ; nombre de coins exact à 94,4 % sur l'arche (MEM 23) | Indices des coins |
+| E3 | Patch à N côtés | ZrlTutteFill `fillN` | Coins accrochés aux sommets de bord ; comptes par ZrlCounts `solve` sur un patch seul ; polygone cyclique à côtés proportionnels aux comptes ; grille de Coons 2D ; motif de Tarini pour 3 et 5 à 8 côtés | `cyclic_polygon`, `coons`, `mvc_weights` (valeur moyenne, Floater 2003), `relax` 150 itérations | Grille de quads |
+| E4 | Relèvement | ZrlTutteFill (coordonnées barycentriques) | La grille du plan est relevée en 3D sur la région | orientation alignée sur la surface ; lissage à 0 par défaut (MEM 22) | Quads relevés |
+| E5 | Refus | ZrlTutteFill | Zones refusées avec leur raison : deux coins (lentilles, bandes), anneaux à deux boucles | MEM 22 et 24 | Liste des zones refusées, `fail_area_frac` |
+| E6 | Passe 7, non portée | ZrlTutte7, ZrlAnnulus7, ZrlWeld7 (copies de recherche) | Plongement, règles de capuchon, anneaux, comptes partagés par MILP global | MEM 27 | Résultats de recherche |
+
+### 1.6 Chaîne F : plis, sorties Houdini, éditeur
+
+| # | Étape | Fonction (code) | Rôle | Paramètres, défaut | Sortie |
+|---|---|---|---|---|---|
+| F1 | Plis | ZrlCreases `crease_map` (profondeur GPU, RAS) | Plis concaves du modèle vus par la caméra | lissage 2,5 mm ; seuil 25 par mètre ; morceau de plus de 14 mm (SKL 246) | Carte de plis |
+| F2 | Chemin de pli | ZrlCreases `crease_path` | Plus court chemin le long du creux | coût 1 / (0,15 + courbure / 80) ; `snap_mm` 6,0 ; garde-fou : refus si le chemin dépasse 1,35 fois le trait (`lockLenRatio`, SKL 252) | Points de contrôle |
+| F3 | Tous les plis | ZrlCreaseNet | Plis de 18 directions, chaînés, fusionnés, raccordés, ajustés en B-splines, miroirs reliés | Manny : 216 courbes en 8 s (SKL 253) | Réseau de plis |
+| F4 | Chaîne Houdini | ZrlChain (`chain_latest.json`) ; ZrlHoudiniLink (`/obj/ZRL_Retopo`, `keep_<nom>`, `COMP_<nom>`, 200 au plus) ; ZrlHda (`zrm_component`, cuisson par ZrlBuildOne) | Recopie sans interprétation des courbes et du maillage | matrices de points de contrôle ; écart mesuré 0,0001 mm (SKL 248) | Scène Houdini |
+| F5 | Serveur et éditeur | ZrlServe (port 8766), ZrlProjects, ZrlServeRestart.sh | Éditeur 3D, projets, sauvegarde automatique 1,5 s, contrôle de version (SKL 242, 249, 251) | venv `/Users/zenray/.venvs/zenray-meshes/bin/python -I` obligatoire (numpy, scipy) | Éditeur |
+
+Routes du serveur citées : POST /faces, /mesh, /project, /auto_patch, /crease_path, /creases, /crease_align, /crease_net, /openings, /chain, /lod, /model, /export ; GET /api/lines/version (SKL 242 à 257).
+
+## 2. Points forts mesurés
+
+Les chiffres marqués « ancienne normale » sont des bornes hautes pour les plis (voir 0 et 6.2).
+
+| # | Résultat mesuré | Source |
+|---|---|---|
+| P1 | Un seul juge chiffré pour toute méthode : part de quads, plis, écrasés, valence 4, pôles pour 1 000 quads, écart à la référence dans les deux sens, régularité des arêtes | MEM 16 ; code ZrlTopoJudge |
+| P2 | Voiture en 35 panneaux : 35 sur 35 maillés, 7 177 quads, 0 plié, 48 écrasés (0,67 %), valence 4 à 99,9 %, 1,1 pôle pour 1 000 quads, écart 0,30 % de la diagonale | MEM 16 ; SKL 291 (ancienne normale ; MEM 23 indique 50 écrasés après changement, voir 6.2) |
+| P3 | Même carrosserie en Quad Remesh entier : 4,5 % de plis, 10,0 % d'écrasés, 104 pôles pour 1 000 quads (ancienne normale) | MEM 16 |
+| P4 | Symétrie gauche droite exacte par paires miroir sur la voiture : 6 paires reflétées, 8 799 quads, 125 plis contre 157 avant la symétrie | SKL 278 |
+| P5 | Symétrie des sommets de Manny à 3 mm : 98,7 % (poitrine 99,3, bras 100, bassin 99,4) après `merge_mirror` | SKL 271 |
+| P6 | Torse de Manny, version v3 : 304 quads, 0 plié, Jacobien minimum 0,644, symétrie exacte 0,0 mm, bords à moins de 0,9 mm de la peau (jugé avec le juge de ZrlMannyChest) | SKL 245 |
+| P7 | Manny entier fermé : une pièce, V - E + F = 2, 0 arête de bord, faces maillées sur faces (949 sur 949 au 29 October 2026, ancienne normale ; 1 079 sur 1 079 en mk13) | SKL 265 ; SKL 271 (mk13) |
+| P8 | Patch à 7 et 8 côtés : heptagone régulier 137 quads, octogone régulier 128, 0 plié ; irréguliers 121 et 105 quads, 0 plié ; octogone large 360 quads, 0 plié | MEM 18 ; SKL 294 |
+| P9 | Patch à quatre côtés isolé, parfait : porte 720 quads, Jacobien minimum 0,998 à 1,000, rapport d'arêtes 1,04 ; patch miroir 720 quads, Jacobien 1,0 | SKL 242, 243 |
+| P10 | Porte auto-construite de l'éditeur : 2 668 quads, 0 plié, Jacobien minimum 0,46 | SKL 250 |
+| P11 | Vitesse : Manny, 11 672 quads convertis en 37,5 s dans l'app ; personnage en 8 à 40 s en une commande ; 1,95 million de triangles : NetMesh.build 12,5 s, chargement de référence 5,3 s au lieu de 11,6 s | SKL 265 ; SKL 263 ; SKL 257 |
+| P12 | Auto-construction de l'éditeur : 134 pièces sur 137 en 2,7 s côté serveur (écart médian au contour 2,9 mm) | SKL 251 |
+| P13 | Tutte à valeur moyenne : 0 pli sur une bande de sphère, dans les quatre cas de l'essai | MEM 21 |
+| P14 | Remplissage intrinsèque avec vrais coins : arche 0,94 % de plis et 1,51 % d'écrasés, contre 1,26 % et 3,35 % sans les vrais coins ; lys 2,5 % de plis, 32,9 % d'écrasés (lys aggravé) | MEM 23 (bloc ZrlCorners, ancienne normale : comparaison relative seulement) |
+| P15 | Passe 7 (copie de recherche, normale des diagonales) : couverture de surface 0,997 sur l'arche, plis 0,06 %, écrasés 0,87 % ; lys couverture 0,994, plis 0,25 %, écrasés 1,17 % | MEM 27 (non porté dans ZrlTutteFill.py) |
+| P16 | Plis portés : Manny v4 porte 0,68 de ses plis sur une arête, contre 0,35 pour la v3 (environ 0,3 au hasard) | SKL 246 |
+| P17 | Sauvegarde : sept mauvais documents refusés avant écriture, fichier précédent intact octet pour octet ; document bon écrit, relu, empreinte identique | SKL 248 (ZrlSaveTest) |
+| P18 | Densité : ZrlTuneBody et ZrlQuadStats.regions égalisent l'arête moyenne par région (tête 19,5 vers 14,4 mm ; poitrine 18 vers 18,7 mm, la plus grossière) | SKL 269 |
+| P19 | Tests de moteur : a à f verts après chaque changement ; ZrlCounts selftest vert sur un bon cas, rouge sur un cas cassé | SKL 242 ; SKL 240 |
+
+## 3. Échecs et limites connus
+
+Les plis marqués « ancienne normale » sont des bornes hautes.
+
+| # | Échec ou limite | Chiffre | Source |
+|---|---|---|---|
+| L1 | Décomposition automatique en régions sans patch conforme (arche) | 3 712 plis sur 17 474 quads par ZrlAny ; 3 000 à 3 500 pliés sur 11 000 à 14 000 avec 40 à 117 régions ; régions fusionnées à quatre coins : 2 776 plis sur 11 135 quads | MEM 16 (lecture 3) ; MEM 19 ; MEM 17 (essais écartés) |
+| L2 | Remplissage intrinsèque sur la voiture entière | 88 zones sur 285 remplies, 43 714 quads, 16,0 % pliés, 45,7 % écrasés ; zones refusées : 112 à 2 coins, 60 anneaux à 2 boucles | MEM 22 |
+| L3 | Réseau de courbes tiré des lignes 2D de la voiture | 16 faces maillées sur 98, 165 quads retournés ; le convertisseur n'est pas en cause, le réseau l'est | SKL 247 |
+| L4 | Auto-construction sans réseau propre | 316 problèmes après réparations (119 boucles extérieures en trop, 41 anneaux, 44 faces à mauvais quads), 74 faces sur 265 maillées, 1 818 pliés, 3 818 écrasés | SKL 251 |
+| L5 | Réseau de la voiture (MBO ou dessiné) | 15 faces maillées sur 96 (dessiné) ; 23 sur 89 (MBO) ; le patch seul par panneau marche (35 sur 35) | SKL 273 ; SKL 277 |
+| L6 | Membres mesurés depuis la racine | Branche du bras gauche emporte le torse (anneaux de 1,15 à 2,24 m) ; corrigé par mesure depuis la pointe | SKL 254 ; SKL 255 |
+| L7 | Bras et jambes après mesure depuis la pointe | Bras supérieurs : 14 faces maillées sur 20, dont 2 bonnes ; jambes : 74 et 75 maillées sur 100, 25 faces ignorées par recouvrement | SKL 255 |
+| L8 | Poitrine (jonction du torse) | 114 quads repliés dans les jonctions, surtout la poitrine (SKL 265) ; 95 au total à mk13 (SKL 271) ; 29 repliés sur 74 dans la jonction de poitrine à mk6 | SKL 265 ; SKL 270 ; SKL 271 |
+| L9 | Pont en échelle (chest_ladder) | 61 à 96 pliés, 277 à 379 écrasés, 12 829 quads au lieu de 10 917 : écarté | SKL 270 |
+| L10 | Coude incliné (tilt_deg) | Maillage non fermé : Euler -1, 196 arêtes de bord | SKL 272 |
+| L11 | Coupe de la cheville (split_ankle) | Non fermé : Euler -2, 84 arêtes de bord | SKL 286 |
+| L12 | Coins d'anneau à angles polaires égaux, et anneaux plans | Jambes 44 bonnes sur 98, doigts 148 sur 165 : pire que les longueurs d'arc ; anneaux plans : continuité cassée (156 faces au lieu de 316) | SKL 258 |
+| L13 | Solveur de comptes sous limite de temps | Limite 20 s : 512 faces sur 518 en 70 s ; 150 s : 516 sur 518 mais 465 s ; la limite est passée à 90 s | SKL 260 ; SKL 263 |
+| L14 | Faces non maillées à cause de la parité | 6 faces de Manny à 20 mm (pentagones du bas-ventre et du dos, calottes des pieds, deux quads du bras) : « counts cannot close, slack 1 » | SKL 261 |
+| L15 | Comparaison QuadWild et Quad Remesh à densité égale | QuadWild ne gagne nettement que sur l'eucalyptus ; sur l'arche et Manny, Quad Remesh est meilleur ou égal ; le tableau de la section 23 comparait 29 477 quads à 4 886 | MEM 25 (correction de MEM 23) |
+| L16 | QuadWild sur la voiture entière | Plus de 11 minutes et 5,7 Go de mémoire ; à traiter pièce par pièce | MEM 22 ; MEM 23 |
+| L17 | Lys (pièces fines) | À densité égale, QuadWild organic 6,2 % d'écrasés contre 1,1 % pour Quad Remesh ; Tutte 23,3 % d'écrasés avant la passe 7 | MEM 25 ; MEM 24 |
+| L18 | Joints de panneaux avec patchs indépendants | Fissures 31 % (arche) et 29 % (lys) ; soudure à tolérance 10,7 % et 5,7 % d'écrasés ; MILP global 0,9 % de plis mais +35 % de quads sur l'arche | MEM 27 |
+| L19 | Patchs en lentille (N = 2) et bandes étroites en une rangée | Non traités | MEM 23 ; MEM 27 ; SKL 294 |
+| L20 | Visage | Aucun modèle de visage testé ; les boucles d'yeux et de bouche ne sont pas tracées | SKL 256 |
+| L21 | Juge de flux | Le juge ne mesure ni le flux sémantique (anneaux d'articulation, doigts en phalanges), ni les boucles | MEM 16 (lecture 2) |
+| L22 | Panneaux qui plient : l'arête fine multiplie les plis | Aile avant : 26 ou 43 plis selon l'arête ; arrière : 17 ; l'arête de base de 40 mm est gardée pour ces panneaux ; essai d'arête de 0,02 à 0,08 sans gain en absolu | SKL 279 ; SKL 284 |
+| L23 | Réparation locale insuffisante | ZrlRepairAll baisse les plis de 1 391 à 1 171 seulement | MEM 17 |
+
+## 4. Outils de mesure et de rendu
+
+Interpréteur : `/Users/zenray/.venvs/zenray-meshes/bin/python -I` (numpy, scipy). Dossier de travail : `/Users/zenray/.claude/tmp/tmp-zenray-meshes/`. Hython, pour les comparaisons Houdini : `/Users/zenray/Create/Build/Houdini22/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/bin/hython` (MEM 16).
+
+| Outil | Rôle | Commande, forme |
+|---|---|---|
+| ZrlTopoJudge | Juge commun : quads, plis, écrasés, valence 4, pôles, écart aux deux sens, régularité des arêtes | `python -I ZrlTopoJudge.py quads.obj ref.obj [--json]` (MEM 16) |
+| ZrlQuadStats | Plis (Jacobien négatif), écrasés (sous 0,3), aspect et arête par tranche de hauteur ; normale des diagonales ; fonctions `stats`, `regions`, `symmetry` | `python -I ZrlQuadStats.py mesh.obj [--band 0.1] [--json]` |
+| ZrlFoldView | Une vue : plis en rouge, écrasés en orange | code ZrlFoldView (SKL 289) |
+| ZrlBoard3D | Planche comparative 3D, même caméra, plis en rouge, écrasés en orange, chiffres sous chaque vignette | `python -I ZrlBoard3D.py out.png --title ... --cell "Nom=chemin.obj"` ; options `--cols 2`, `--zoom x0,y0,x1,y1`, `Nom=chemin.obj@solid::note` (MEM 24 ; SKL 301) |
+| ZrlStatusSheets | Quatre feuilles d'état (architecture, densité égale, couverture Tutte, feuille de route) | `ZrlStatusSheets.py out_dir` (SKL 300) |
+| ZrlClosedCheck | Maille un document et prouve une sphère fermée (V - E + F = 2, aucune arête de bord, une pièce) ; envoie exactement ce que l'éditeur envoie | `python -I ZrlClosedCheck.py doc.json --ref ref.obj [--edge 0.02] [--time-limit s]` (SKL 259) |
+| ZrlTubeCheck | Par composant : faces maillées, faces bonnes, quads sous 0,5 | `python -I ZrlTubeCheck.py doc.json --ref ref.obj --unit 0.1 --edge 0.005` (SKL 254) |
+| ZrlUnmeshed | Faces non maillées avec composant, taille, position, anneaux, coins | `ZrlUnmeshed.py` (SKL 263) |
+| ZrlFaceReport | Statut de maillage par composant et raisons | code (SKL 277) |
+| ZrlCountsDiag | Entier de chaque arc d'un tube (anneaux par colonnes) | code (SKL 268) |
+| ZrlJunctionContacts, ZrlJunctionDiag, ZrlJunctionView | Ponts qui se touchent ; faces non simples ; image orthographique du réseau | code (SKL 259) |
+| ZrlFair | Bruit des normales (99e centile, seuil 1 degré) | code (SKL 240) |
+| ZrlSaveTest | Test de sauvegarde dans les deux sens | `python -I ZrlSaveTest.py` (SKL 248) |
+| ZrlNetMeshTest | Tests a à f du moteur | code (SKL 242) |
+| ZrlCounts selftest | Solveur de comptes : vert sur bon cas, rouge sur cas cassé | `python ZrlCounts.py selftest` (code) |
+| ZrlTuneBody, ZrlTuneJunction, ZrlTune, ZrlPartTournament | Balayages de paramètres en parallèle, classés par plis puis écrasés | SKL 263, 271 ; MEM 17 |
+| HouQuadBench, HouQuadParts, HouQuadVariants | Quad Remesh de Houdini 22 par hython, entier ou pièce par pièce, 13 réglages | MEM 16 ; MEM 17 |
+| QwBench | QuadWild Bi-MDF compilé (sans Gurobi) | `QwBench.py mesh.obj out_dir [organic|mechanical|basic]` (MEM 23) |
+| QwParts, QwDensity | QuadWild pièce par pièce, ou maillage entier à densité visée (scaleFact dans le fichier de flux principal) | MEM 25 (arguments non lus) |
+| ZrlServeRestart.sh | Relance le serveur avec le venv, vérifie par POST /faces | SKL 242 |
+
+Compilation de QuadWild : `cmake . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSATSUMA_ENABLE_BLOSSOM5=0 -DQUADRETOPOLOGY_WITH_GUROBI=0` puis `cmake --build build -j10`, dans `/Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf` (MEM 23).
+
+Commande de la voiture complète (SKL 289) : `ZrlCarMesh.py lines/data/lines_car_patches.json --ref versions/ZenRayCar_v752.obj --out <obj> --edge 0.04 --reflex --tune --shapes --repair --save-doc <json>`, environ 70 s.
+
+## 5. Règles et leçons à garder dans la fusion
+
+Ces règles viennent de corrections de Matthieu ou de pièges payés. Elles doivent survivre à la fusion, avec un test qui échoue si elles sont violées.
+
+| # | Règle | Source |
+|---|---|---|
+| R1 | Symétrie exacte par paires miroir : un arc miroir porte le même nombre d'arêtes ; un panneau miroir est une copie du meilleur des deux | MEM 20 (enseignement 6) ; SKL 271 ; SKL 278 |
+| R2 | Symétrie ne se force jamais sur un réseau non symétrique : `symmetry_x` fait passer les plis de 165 à 181 | SKL 245 |
+| R3 | Patchs de 3 à 8 côtés selon la condition de Tarini : e_i = s_(i-1) + s_(i+1), s_i entiers au moins 1 | MEM 18 ; SKL 294 |
+| R4 | Un patch par panneau de carrosserie ; aucun flux ne traverse un joint de panneau | MEM 16 (lecture 1) ; SKL 277 |
+| R5 | Bande fine : quatre coins aux deux bouts, `corners_force` pour que le moteur n'invente pas de coins au milieu d'un bord long | SKL 289 |
+| R6 | Coupe aux coins rentrants et aux coudes du contour (`reflex_split`, `sharpest_bend`), jamais un coin caché au milieu d'un côté | SKL 280 ; SKL 289 |
+| R7 | Seuls les vrais coins comptent : un coin faux tenu à la place d'une zone plate crée des écrasés | MEM 22 |
+| R8 | Densité égale avant toute comparaison : ne jamais comparer deux méthodes sans égaliser le nombre de quads ; des quads six fois plus petits plient moins | MEM 25 ; SKL 299 ; SKL 279 |
+| R9 | Visuel 3D à chaque étape : une planche comparative envoyée à Matthieu avant de proposer une correction, objet 3D dessus ; un schéma sans l'objet ne suffit pas | MEM 24 ; SKL 298 ; SKL 301 |
+| R10 | Un seul juge pour toutes les méthodes, testé dans les deux sens : vert sur un bon cas, rouge sur un cas cassé | MEM 16 ; SKL 248 ; SKL 259 |
+| R11 | Un vérificateur envoie exactement ce que l'éditeur envoie (`component_options` compris), sinon le diagnostic est faux | SKL 259 |
+| R12 | Normale du juge : celle des diagonales, jamais celle du coin 0 (qui compte de faux plis) | MEM 23 |
+| R13 | Limite de temps du solveur de comptes à 90 s : sous la charge, le même réseau maille 502 ou 516 faces | SKL 260 ; SKL 263 |
+| R14 | Le défaut est presque toujours le réseau, pas le convertisseur : un réseau de pièce naît de ses composants (contours fermés, bords partagés), jamais de lignes 2D relevées | SKL 247 |
+| R15 | Les plis du modèle guident les boucles ; un tube se mesure depuis sa pointe, jamais depuis une racine unique | SKL 246 ; SKL 254 ; SKL 255 |
+| R16 | Un composant parfait à la fois ; l'infrastructure (juge, sauvegarde, assemblage) avant le réseau | SKL 239 ; SKL 237 |
+| R17 | Un réglage automatique mesure après chaque étape et annule ce qui n'améliore pas : « jamais pire par construction » | SKL 244 |
+| R18 | Une palette unique (`lines/palette.json`) lue par l'éditeur et par les rendus ; changer une couleur = changer une valeur | SKL 269 ; SKL 282 |
+| R19 | Un serveur qui importe un module garde l'ancien code : redémarrer après chaque modification, puis vérifier par POST /faces | SKL 242 |
+| R20 | Dans les essais, couper la sauvegarde automatique (`ZRL3D.S.noAutosave = true`), sinon l'essai écrase `lines_edit.json` | SKL 251 ; SKL 252 |
+| R21 | Projeter les nœuds et les arcs sur la surface avant les faces (une courbe hors de la coque plie la première rangée) | SKL 242 |
+| R22 | Un commentaire `//` ajouté en fin de ligne JS avale la suite de l'instruction, et `node --check` ne le voit pas : vérifier chaque remplacement dans le navigateur | SKL 242 ; SKL 244 |
+| R23 | Pour un personnage : tous les arcs symétriques reliés (`link_mirrors`), coins forcés sur tous les nœuds, et pas de coin virtuel au milieu d'un arc | SKL 263 ; SKL 265 |
+| R24 | Chaque famille de composants d'un personnage a sa couleur pâle : jambes vert pâle, torse bleu, bras rouge pâle, tête violet pâle, articulation éclaircie de 55 % | SKL 269 |
+
+## 6. Inconnues et incohérences
+
+### 6.1 Non trouvé
+
+- Topologie d'origine de Manny : non trouvée. L'export de la scène ne contient que des triangles (benchmark/gt/manny_character.obj, 30 418 triangles) ; trois recherches d'images n'ont donné aucun fil de fer. Piste : capture du fil de fer dans Unreal, à comparer à la planche (SKL 271).
+- Convention chiffrée de boucles pour un visage de personnage : aucune norme publiée trouvée (MEM 20, enseignement 4 ; SKL 256).
+- Test de flexion (coude et genou à 90 degrés) sur le maillage : non réalisé (SKL 266, à faire (e)).
+- Fenêtre de `~/Applications/ZenRay Meshes.app` : non vérifiée par l'agent (SKL 249, 251).
+- Thème sombre et écran étroit de l'éditeur : non vérifiés (SKL 251).
+- Port de la passe 7 dans ZrlTutteFill.py : non fait (MEM 27).
+- Cas N = 2 (lentille) et choix du pôle loin des articulations par les s_i : non traités (SKL 294).
+- Densité variable par région pour QuadWild : correctif de 3 lignes dans main.cpp proposé, non appliqué (MEM 25).
+- Coins robustes sur bord bruité et recollage des patchs voisins : non résolus (MEM 22 ; MEM 27).
+- Juge de flux sémantique : absent (MEM 16).
+- Fichiers de recherche `research/retopology-dataset/` (passes 1 à 7, dont summary_30-October-2026_pass7.md) : non ouverts par moi ; leurs conclusions sont celles qui sont citées dans MEM 20 à 27.
+- Arguments exacts de QwParts, QwDensity, HouQuadVariants et ZrlUnmeshed : non lus (seules leurs fonctions sont décrites).
+- Comportement de QuadWild compilé sur les pièces de la voiture au-delà des mesures citées : non mesuré dans cette passe.
+
+### 6.2 Incohérences à trancher avant la fusion
+
+1. Année de la source de Tarini : 2021 (MEM 18, arXiv 2101.11569) dans la mémoire, 2022 dans l'en-tête de ZrlCounts et dans SKL 239. À vérifier sur la source.
+2. Toutes les mesures de Manny (SKL 245 à 288) et de la voiture (SKL 277 à 291) sont antérieures au changement de normale du juge (vers 14 h 30 le 30 October 2026) : ce sont des bornes hautes des plis. Pour Manny mk24, MEM 23 donne 64 plis (0,47 %) après changement, contre 106 (0,78 %) avant ; MEM 16 garde 0,78 %.
+3. Voiture : SKL 291 (12 h 35, ancienne normale) indique 48 écrasés ; MEM 23 (après changement de normale) indique 50 écrasés et écrit « inchangé ». Même version, deux comptes.
+4. `trunk_edge_scale` : 0,6 dans ZrlTrunk.PARAMS (`edge_scale`) et 0,75 dans ZrlJunction.PARAMS (valeur retenue par SKL 269). Quelle valeur sert en production n'est pas établi par la lecture.
+5. Jonction de main : l'en-tête de ZrlJunction dit 0,4, le PARAMS donne 0,3 (valeur retenue par SKL 271).
+6. Arête par défaut de ZrlCarMesh : 0,03 dans le code, 0,04 dans toutes les commandes citées (SKL 289 à 291).
+7. Seuil de fusion des régions : 35 degrés par défaut dans ZrlTutteFill, 70 dans ZrlAny. Les deux existent ; le choix est à documenter.
+8. Noms : ZrlTutte0.py garde l'en-tête « ZenRay Lines TUTTE FILL » ; le code affiche désormais « ZenRay Retopology » (MEM 26). Deux familles, Zrr et Zrl, portent le nom « ZenRay Retopology » (0.1).
+9. Les tableaux de MEM 16 et 17 et les lignes QuadWild de MEM 23 utilisent l'ancienne normale (MEM 23 le dit). MEM 19 et 22 utilisent la normale du coin 0 (MEM 22 le précise).
+
+### 6.3 Ce que cet inventaire n'a pas vérifié
+
+- Aucun script n'a été exécuté ; les chiffres sont ceux des sources, non recalculés.
+- Les paramètres lus dans le code l'ont été sur les blocs PARAMS au 30 October 2026 ; une modification ultérieure des fichiers n'est pas couverte.
+- Les doubles tirets apparaissent seulement dans les options de commande (par exemple `--edge`) et dans les séparateurs de tableau, jamais comme ponctuation.

@@ -1,0 +1,173 @@
+"""Pass 9 : junction repair experiments on planar rectilinear faces (L, T, thin arm, stepped profile). Written 30 October 2026.
+A planar face is a polygon whose boundary is hard edges (creases). Every boundary vertex is fixed or slides along its side. The experiments compare
+S0 (one patch, every polygon vertex a corner, including reflex ones), S1 (local re-layout : reflex corners split by cuts, rectangle patches),
+and the barrier smoothing applied to S0 with fixed corners and sliding sides.
+FR : experiences de reparation des jonctions sur des faces planes rectilignes."""
+import sys, json, collections
+sys.path.insert(0, ".")
+import numpy as np
+from shapely.geometry import Polygon, box
+import zr8_layout as L, zr8_counts as C, zr8_fill as Fm, zr8_judge as J, zr8_prims as PR, zr8_straighten as S
+
+
+def grid_mesh(poly, delta):
+    """Right triangle mesh of a rectilinear polygon whose coordinates are multiples of delta. Returns V (n,3), F (m,3) counter clockwise and a
+    dict from integer grid coordinates to vertex ids."""
+    minx, miny, maxx, maxy = poly.bounds
+    nx = int(round((maxx - minx) / delta)); ny = int(round((maxy - miny) / delta)); vid = {}; V = []; F = []
+    def get(i, j):
+        if (i, j) not in vid:
+            vid[(i, j)] = len(V); V.append([minx + i * delta, miny + j * delta, 0.0])
+        return vid[(i, j)]
+    for i in range(nx):
+        for j in range(ny):
+            cx = minx + (i + 0.5) * delta; cy = miny + (j + 0.5) * delta
+            if poly.contains(Polygon([(cx - 1e-9, cy - 1e-9), (cx + 1e-9, cy - 1e-9), (cx, cy + 1e-9)])):
+                a, b, c, d = get(i, j), get(i + 1, j), get(i + 1, j + 1), get(i, j + 1)
+                F += [[a, b, c], [a, c, d]]
+    return np.array(V), np.array(F), vid, (minx, miny)
+
+
+def make_layout(poly, delta, rects):
+    """rects : list of shapely boxes whose union is the polygon (empty list = single patch). Corners : the polygon vertices (single patch)
+    or the rectangle corners (several patches)."""
+    V, F, vid, (minx, miny) = grid_mesh(poly, delta)
+    def vkey(x, y):
+        return vid[(int(round((x - minx) / delta)), int(round((y - miny) / delta)))]
+    if not rects:
+        pid = np.zeros(len(F), int); corners = [[vkey(x, y) for x, y in list(poly.exterior.coords)[:-1]]]
+    else:
+        cen = V[F].mean(axis=1); pid = np.zeros(len(F), int)
+        for t, c in enumerate(cen):
+            for k, r in enumerate(rects):
+                if r.buffer(1e-9).contains(Polygon([(c[0] - 1e-7, c[1] - 1e-7), (c[0] + 1e-7, c[1] - 1e-7), (c[0], c[1] + 1e-7)])):
+                    pid[t] = k; break
+        corners = [[vkey(x, y) for x, y in list(r.exterior.coords)[:-1]] for r in rects]
+    return L.Layout.from_arrays(V, F, pid, corners)
+
+
+def mesh_with(lay, h, strategy):
+    arcs, sides = lay.arcs()
+    sol = C.solve_counts(arcs, sides, edge=h)
+    if not sol.get("ok"):
+        return None, sol, arcs, sides
+    chart = PR.PlaneChart(np.zeros(3), np.array([0, 0, 1.0]))
+    parts = []
+    for p in range(lay.npatch):
+        chart = PR.PlaneChart(np.zeros(3), np.array([0, 0, 1.0]))
+        parts.append(Fm.fill_patch_analytic(lay, p, sides[p], sol["counts"], sol["s"][p], chart))
+    P, Q, keys = Fm.weld(parts)
+    return (P, Q, keys, parts), sol, arcs, sides
+
+
+def barrier_sliding(lay, P, Q, keys, arcs, theta=1.0 / 8):
+    """Smoothing with fixed polygon corners, boundary vertices sliding along their straight side, free interior (case S3)."""
+    akeys = list(arcs.keys()); aid = {k: i for i, k in enumerate(akeys)}
+    nodes = {c for cs in lay.corners for c in cs}
+    kind = np.zeros(len(P), int); arc_of = np.full(len(P), -1)
+    boundary_arc = {k for k, v in arcs.items() if len(v["patches"]) == 1}
+    for i, k in enumerate(keys):
+        if k[0] == "node" and k[1] in nodes: kind[i] = 2
+        elif k[0] == "arc" and k[1] in boundary_arc: kind[i] = 1; arc_of[i] = aid[k[1]]
+    arcset = S.ArcSet([lay.V[list(k)] for k in akeys])
+    X, h = S.barrier(P, Q, Fm.PlaneSurface(), outer=8, inner=80, theta=theta, size="patch", groups=np.zeros(len(Q), int), kind=kind, arc_of=arc_of, arcs=arcset)
+    return X, kind
+
+
+def forced_corner_report(P, Q, crease_edges, fixed):
+    """Quad corners whose vertex is fixed AND whose two quad edges both lie on creases : the corner angle is set by the crease geometry, no vertex
+    move can change it. Returns a list of (quad index, corner index, angle in degrees measured inside the quad, orientation of the quad normal)."""
+    out = []
+    for qi, q in enumerate(Q):
+        for k in range(4):
+            v, a, b = int(q[k]), int(q[(k + 1) % 4]), int(q[(k - 1) % 4])
+            if fixed[v] and (min(v, a), max(v, a)) in crease_edges and (min(v, b), max(v, b)) in crease_edges:
+                x = P[a] - P[v]; y = P[b] - P[v]
+                ang = np.degrees(np.arctan2(np.cross(x, y)[2], x @ y)) % 360.0                # planar case, counter clockwise quad
+                out.append((qi, k, round(float(ang), 1)))
+    return out
+
+
+def crease_deviation(P, Q, poly, h):
+    """Max distance from points sampled every 0.2 h along the polygon boundary (the creases) to the nearest boundary edge of the quad mesh."""
+    from scipy.spatial import cKDTree
+    cnt = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(a, b), max(a, b))] += 1
+    segs = [(P[a], P[b]) for (a, b), c in cnt.items() if c == 1]
+    pts = np.array([poly.boundary.interpolate(t).coords[0] for t in np.arange(0, poly.boundary.length, 0.2 * h)])
+    best = np.full(len(pts), np.inf)
+    for a, b in segs:
+        ab = (b - a)[:2]; L2 = max(ab @ ab, 1e-30)
+        t = np.clip(((pts - a[:2]) @ ab) / L2, 0, 1); c = a[:2] + t[:, None] * ab
+        best = np.minimum(best, np.linalg.norm(pts - c, axis=1))
+    return float(best.max())
+
+
+def report(name, label, P, Q, lay=None, kind=None):
+    j = J.judge_plus(P, Q)
+    Jm = J.corner_jacobians(P, Q).min(axis=1)
+    out = {"case": name, "strategy": label, "quads": int(j["quads"]), "folded": int((Jm < 0).sum()), "squashed": int((Jm < 0.3).sum()),
+           "jac_mean": round(j["jac_mean"], 4), "angle_dev_mean": round(j["angle_dev_mean_deg"], 2), "angle_dev_p99": round(j["angle_dev_p99_deg"], 1),
+           "turn_iso_mean": round(j["loop_turn_iso_mean_deg"], 2), "turn_iso_p90": round(j["loop_turn_iso_p90_deg"], 2),
+           "poles_per_1000": round(j["poles_per_1000_quads"], 1), "boundary_edges": j["boundary_edges"], "euler": j["euler"]}
+    if kind is not None:
+        out["quads_all_vertices_on_creases"] = int((kind[Q] > 0).all(axis=1).sum())
+        cr = set()
+        cnt = collections.Counter()
+        for q in Q:
+            for k in range(4):
+                a, b = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(a, b), max(a, b))] += 1
+        cr = {e for e, c in cnt.items() if c == 1}                                              # boundary edges of a planar face are crease edges
+        fr = J.corner_jacobians(P, Q)
+        forced = forced_corner_report(P, Q, cr, kind == 2)
+        out["forced_corners_over_180"] = int(sum(1 for _, _, a in forced if a > 180.0))
+    return out
+
+
+def run_case(name, poly, rects, delta, h):
+    rows = []
+    # S0 : one patch, every polygon vertex is a corner (reflex corners included)
+    lay0 = make_layout(poly, delta, [])
+    K = len(lay0.corners[0])
+    res0, sol0, arcs0, sides0 = mesh_with(lay0, h, "S0") if K <= 8 else (None, None, None, None)
+    if res0 is None or K > 8:
+        rows.append({"case": name, "strategy": "S0 single patch K=%d" % K, "note": "not meshable (K above 8 or counts infeasible)"})
+    else:
+        P, Q, keys, parts = res0
+        nodes = {c for cs in lay0.corners for c in cs}
+        kind = np.array([2 if (k[0] == "node") else (1 if k[0] == "arc" else 0) for k in keys])
+        rows.append(dict(report(name, "S0 single patch K=%d (reflex corner is a corner)" % K, P, Q, kind=kind), counts_violations=len(sol0["violations"]), crease_dev_over_h=round(crease_deviation(P, Q, poly, h) / h, 4)))
+        X, kind2 = barrier_sliding(lay0, P, Q, keys, arcs0)
+        rows.append(dict(report(name, "S3 = S0 then barrier, corners fixed, sides sliding", X, Q, kind=kind2), crease_dev_over_h=round(crease_deviation(X, Q, poly, h) / h, 4),
+                         min_corner_jacobian=round(float(J.corner_jacobians(X, Q).min()), 4)))
+    # S1 : local re-layout, reflex corners split into rectangle patches
+    lay1 = make_layout(poly, delta, rects)
+    res1, sol1, arcs1, sides1 = mesh_with(lay1, h, "S1")
+    if res1 is None:
+        rows.append({"case": name, "strategy": "S1 rectangles", "note": "counts infeasible"})
+    else:
+        P, Q, keys, parts = res1
+        kind = np.array([2 if (k[0] == "node") else (1 if k[0] == "arc" else 0) for k in keys])
+        rows.append(dict(report(name, "S1 re-layout, %d rectangles (valence 3 at the reflex corner)" % lay1.npatch, P, Q, kind=kind), counts_violations=len(sol1["violations"]), crease_dev_over_h=round(crease_deviation(P, Q, poly, h) / h, 4),
+                         min_corner_jacobian=round(float(J.corner_jacobians(P, Q).min()), 4)))
+    return rows
+
+
+if __name__ == "__main__":
+    d = 0.025; h = 0.05
+    cases = {
+        "L (arms 1.0 x 0.5)": (Polygon([(0, 0), (1, 0), (1, .5), (.5, .5), (.5, 1), (0, 1)]), [box(0, 0, .5, 1), box(.5, 0, 1, .5)]),
+        "L thin arm (0.1)": (Polygon([(0, 0), (1, 0), (1, .1), (.1, .1), (.1, 1), (0, 1)]), [box(0, 0, .1, 1), box(.1, 0, 1, .1)]),
+        "T (stem 0.35)": (Polygon([(0, 0), (1, 0), (1, .35), (.675, .35), (.675, 1.05), (.325, 1.05), (.325, .35), (0, .35)]),
+                          [box(0, 0, 1, .35), box(.325, .35, .675, 1.05)]),
+        "stairs 4 steps": (Polygon([(0, 0), (1.6, 0), (1.6, .3), (1.2, .3), (1.2, .6), (.8, .6), (.8, .9), (.4, .9), (.4, 1.2), (0, 1.2)]),
+                           [box(0, 0, .4, 1.2), box(.4, 0, .8, .9), box(.8, 0, 1.2, .6), box(1.2, 0, 1.6, .3)]),
+    }
+    allrows = []
+    for n, (poly, rects) in cases.items():
+        allrows += run_case(n, poly, rects, d, h)
+    json.dump(allrows, open(sys.argv[1] if len(sys.argv) > 1 else "/tmp/planar_rows.json", "w"), indent=1)
+    for r in allrows:
+        print(json.dumps(r))

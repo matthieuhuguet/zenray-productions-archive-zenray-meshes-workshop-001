@@ -1,0 +1,77 @@
+"""E2b'' : comme E2b' mais avec une lumière PONCTUELLE par vue (position estimée) : I = a + h n_y + g max(0, n.(L - x)/|L - x|), x = centroïde 3D de la région
+lu dans le tampon de profondeur. Même segmentation parfaite supposée. 30 October 2026."""
+import sys, json
+import numpy as np
+from scipy.optimize import least_squares
+sys.path.insert(0, ".")
+from e2_common import *
+from e2b_bound import normals_of, solve_normal
+
+def region_stats3(case, imgs, min_px=250):
+    st = {}
+    for nm in VIEWS6:
+        v = case["views"][nm]; fid = v["fid"]; I = imgs[nm]
+        a, b, d, x0, y1, px = v["frame"]; H, W = v["mask"].shape
+        rr, cc = np.mgrid[0:H, 0:W]
+        for f in np.unique(fid[fid >= 0]):
+            m = fid == f
+            if m.sum() < min_px: continue
+            u = x0 + (cc[m] + 0.5) * px; vv = y1 - (rr[m] + 0.5) * px; z = v["depth"][m]
+            X = u[:, None] * a + vv[:, None] * b + z[:, None] * d
+            st[(f, nm)] = (float(np.median(I[m])), int(m.sum()), X.mean(0))
+    return st
+
+def fit_point_light(known, st, N, nm):
+    rows = [(N[f], st[(f, nm)][0], st[(f, nm)][1], st[(f, nm)][2]) for f in known if (f, nm) in st]
+    if len(rows) < 6: return None
+    Nn = np.array([r[0] for r in rows]); y = np.array([r[1] for r in rows]); w = np.sqrt([r[2] for r in rows]); w = w / w.max(); Xc = np.array([r[3] for r in rows])
+    def f(th):
+        a, h, g = th[:3]; L = th[3:6]
+        l = L[None, :] - Xc; l /= np.linalg.norm(l, axis=1, keepdims=True)
+        return w * (a + h * Nn[:, 1] + g * np.clip((Nn * l).sum(1), 0, None) - y)
+    best = None
+    for dist in (3.0, 6.0, 12.0, 40.0):
+        for dirn in ((-0.5, 0.8, 0.6), (0.5, 0.8, 0.6), (-0.5, -0.8, 0.6), (0, 0, 1.0), (0, 1.0, 0)):
+            L0 = np.array(dirn) / np.linalg.norm(dirn) * dist
+            # L0 est exprimé dans le repère de la caméra : on ne le connaît pas, on teste des directions mondiales
+            sol = least_squares(f, np.r_[0.4, 0.1, 0.5, L0], max_nfev=120)
+            if best is None or sol.cost < best.cost: best = sol
+    return best.x
+
+def run(noise, K, dist, trials=3, seed=0):
+    errs = []; solved = 0; total = 0
+    for t in range(trials):
+        case = make_case(seed=seed + t)
+        imgs = clay_from_views(case["views"], light_dist=dist, noise=noise, rng=np.random.default_rng(seed + 10 * t))
+        st = region_stats3(case, imgs); N = normals_of(case)
+        facets = sorted({f for (f, nm) in st})
+        area = {f: sum(st[(f, nm)][1] for nm in VIEWS6 if (f, nm) in st) for f in facets}
+        big = sorted(facets, key=lambda f: -area[f])[:max(K, 8)]
+        rng = np.random.default_rng(100 + t)
+        known = list(rng.choice(big, size=min(K, len(big)), replace=False))
+        lights = {nm: fit_point_light(known, st, N, nm) for nm in VIEWS6}
+        for f in facets:
+            if f in known: continue
+            total += 1
+            eqs = []; dirs = []
+            for nm in VIEWS6:
+                if (f, nm) not in st or lights[nm] is None: continue
+                a, h, g = lights[nm][:3]; L = lights[nm][3:6]
+                I, _, xc = st[(f, nm)]
+                if I - a < 0.03 + abs(h): continue
+                l = L - xc; l /= np.linalg.norm(l)
+                eqs.append((g * l + h * np.array([0, 1.0, 0]), I - a)); dirs.append(case["views"][nm]["frame"][2])
+            if len(eqs) < 2: continue
+            n = solve_normal(eqs, dirs)
+            if n is None: continue
+            solved += 1; errs.append(float(np.degrees(np.arccos(np.clip(n @ N[f], -1, 1)))))
+    return {"noise": noise, "K": K, "light_dist_m": dist, "facets_total": total, "facets_solved": solved, "err_median_deg": float(np.median(errs)) if errs else None,
+            "err_p90_deg": float(np.percentile(errs, 90)) if errs else None, "share_under_3deg": float(np.mean(np.array(errs) < 3)) if errs else None}
+
+if __name__ == "__main__":
+    out = []
+    for K in (14, 20):
+        for noise in (0.0, 0.01, 0.02):
+            r = run(noise, K, 6.0); out.append(r)
+            print({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()}, flush=True)
+    json.dump(out, open("out/e2b_bound2.json", "w"), indent=1)

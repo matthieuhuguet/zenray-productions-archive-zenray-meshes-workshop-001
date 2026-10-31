@@ -1,0 +1,92 @@
+import sys, json, os, hashlib, warnings
+sys.path.append("/tmp/claude-0/-home-user-Memory/993a92cd-e483-55a9-9dfe-6c59fcf91767/scratchpad/agentB/work/pylibs")
+import numpy as np, trimesh
+warnings.filterwarnings("ignore")
+B="/tmp/claude-0/-home-user-Memory/993a92cd-e483-55a9-9dfe-6c59fcf91767/scratchpad/agentB"
+
+def load_parts(path):
+    obj = trimesh.load(path, force=None, process=False)
+    if isinstance(obj, trimesh.Scene):
+        parts = obj.dump(concatenate=False)
+    elif isinstance(obj, trimesh.Trimesh):
+        parts = [obj]
+    else:
+        parts = []
+    return [p for p in parts if isinstance(p, trimesh.Trimesh) and len(p.faces)>0]
+
+def analyze(path):
+    parts = load_parts(path)
+    rec = {"file": path, "sha256": hashlib.sha256(open(path,"rb").read()).hexdigest(), "bytes": os.path.getsize(path),
+           "trimesh_version": trimesh.__version__, "n_geometries": len(parts)}
+    if not parts:
+        rec["error"]="no triangle geometry loaded"; return rec
+    V = np.vstack([p.vertices for p in parts]); 
+    off=0; F=[]
+    for p in parts:
+        F.append(p.faces+off); off+=len(p.vertices)
+    F=np.vstack(F)
+    rec["vertices_loaded"]=int(len(V)); rec["faces_loaded"]=int(len(F))
+    m = trimesh.Trimesh(vertices=V, faces=F, process=False)
+    # remove exactly degenerate faces (zero area) for angle stats, but report count
+    area_all = m.area_faces
+    nzero = int((area_all<=1e-18).sum())
+    m.merge_vertices()  # position-only merge, default tolerance
+    rec["vertices_merged"]=int(len(m.vertices)); rec["faces_after_merge"]=int(len(m.faces))
+    rec["is_watertight_before_dedupe"]=bool(m.is_watertight)
+    fs=np.sort(m.faces,axis=1); _,idx=np.unique(fs,axis=0,return_index=True)
+    rec["duplicate_faces_removed"]=int(len(m.faces)-len(idx))
+    if len(idx)<len(m.faces):
+        m=trimesh.Trimesh(vertices=m.vertices, faces=m.faces[np.sort(idx)], process=False)
+    rec["faces_unique"]=int(len(m.faces))
+    rec["vertices_referenced_after_merge"]=int(len(np.unique(m.faces)))
+    rec["zero_area_faces"]=nzero
+    b = m.bounds; ext = b[1]-b[0]
+    rec["bounds_min"]=[float(x) for x in b[0]]; rec["bounds_max"]=[float(x) for x in b[1]]
+    rec["extents"]=[float(x) for x in ext]; rec["bbox_diagonal"]=float(np.linalg.norm(ext))
+    rec["area"]=float(m.area)
+    rec["is_watertight"]=bool(m.is_watertight); rec["is_winding_consistent"]=bool(m.is_winding_consistent)
+    rec["euler_number"]=int(m.euler_number)
+    # edge counts
+    e = np.sort(m.edges, axis=1)
+    u, c = np.unique(e, axis=0, return_counts=True)
+    rec["edges_unique"]=int(len(u)); rec["boundary_edges"]=int((c==1).sum()); rec["nonmanifold_edges"]=int((c>2).sum())
+    if m.is_watertight:
+        rec["volume"]=float(m.volume)
+    # components
+    comps = m.split(only_watertight=False)
+    rec["components"]=int(len(comps))
+    rec["components_watertight"]=int(sum(1 for c_ in comps if c_.is_watertight))
+    big = sorted([len(c_.faces) for c_ in comps], reverse=True)[:5]
+    rec["largest_component_faces"]=big
+    # dihedral angles
+    adj = m.face_adjacency; ang = np.degrees(np.nan_to_num(m.face_adjacency_angles))
+    rec["adjacent_pairs"]=int(len(adj))
+    if len(adj):
+        rec["edge_angle_hist_share"]={
+            "lt_1deg": float((ang<1).mean()), "1_5deg": float(((ang>=1)&(ang<5)).mean()),
+            "5_20deg": float(((ang>=5)&(ang<20)).mean()), "20_60deg": float(((ang>=20)&(ang<60)).mean()),
+            "ge_60deg": float((ang>=60).mean())}
+        s = np.zeros(len(m.faces)); n = np.zeros(len(m.faces)); mx=np.zeros(len(m.faces))
+        for k in (0,1):
+            np.add.at(s, adj[:,k], ang); np.add.at(n, adj[:,k], 1); np.maximum.at(mx, adj[:,k], ang)
+        a = m.area_faces; ok = n>0
+        mean = np.where(ok, s/np.maximum(n,1), np.nan)
+        tot = a[ok].sum()
+        rec["flat_area_share_mean_lt_1deg"]=float(a[ok & (mean<1.0)].sum()/tot)
+        rec["flat_area_share_max_lt_1deg"]=float(a[ok & (mx<1.0)].sum()/tot)
+        rec["area_share_in_faces_with_adjacency"]=float(tot/a.sum())
+        rec["median_edge_angle_deg"]=float(np.median(ang)); rec["p95_edge_angle_deg"]=float(np.percentile(ang,95))
+    return rec
+
+if __name__=="__main__":
+    out=[]
+    for ln in open(B+"/work/dl_log.txt"):
+        code,d,p,sha,path,h,sz = ln.strip().split("|")
+        try:
+            r = analyze(path)
+        except Exception as ex:
+            r = {"file":path,"error":repr(ex)}
+        r["repo_dir"]=d; r["repo_path"]=p; r["commit"]=sha
+        out.append(r)
+        print(os.path.basename(path), {k:r.get(k) for k in ("n_geometries","vertices_loaded","faces_loaded","vertices_merged","is_watertight","components","flat_area_share_mean_lt_1deg","error")}, flush=True)
+    json.dump(out, open(B+"/work/mesh_stats.json","w"), indent=1)

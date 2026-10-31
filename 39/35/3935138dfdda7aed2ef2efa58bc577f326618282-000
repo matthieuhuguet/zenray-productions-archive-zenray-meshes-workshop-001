@@ -1,0 +1,26 @@
+"""Les vérificateurs sur deux cas naturels : v752 (peau extérieure) et l'arche hard surface réelle du banc. 30 October 2026."""
+import sys, json, time
+import numpy as np
+sys.path.insert(0, ".")
+from zrcar_common import *
+from verifiers import *
+import trimesh
+out = {}
+# v752 : peau extérieure en triangles
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P); Q, keep = quads_to_array(F); Gq = G[keep]
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]
+import re
+skin = re.compile(r"^CAR_(body_(?!under_floor)|arch_|fascia_|bumper_|grille_|light_|pillar_|splitter_|rocker_line|vent_|closer_)")
+sk = np.array([bool(skin.match(n)) for n in names])[Gq] & vis
+Qs = Q[sk]; T = np.concatenate([Qs[:, [0, 1, 2]], Qs[:, [0, 2, 3]]])
+used = np.unique(T.ravel()); remap = -np.ones(len(V), int); remap[used] = np.arange(len(used)); Vs = V[used]; Ts = remap[T]
+t = time.time(); r = run_all(Vs, Ts); out["v752_skin_exterior"] = r
+print("v752 peau extérieure", {k: {a: b for a, b in v.items() if a in ("planar_area_fraction", "planar_fraction", "segments_per_m", "undulation_length_fraction", "mirror_p99_mm", "pass", "open_edges")} for k, v in r.items()}, round(time.time() - t, 1), "s")
+# arche réelle
+A = trimesh.load("/home/user/Memory/Projects/zenray-meshes/handoff/arch-real-30-October-2026/files/tmp/tmp-zenray-meshes/benchmark/gt/arch_hard.obj", force="mesh", process=False)
+Va, Ta = np.array(A.vertices), np.array(A.faces)
+print("arche", Va.shape, Ta.shape, "bbox", Va.min(0).round(3), Va.max(0).round(3), "étanche", A.is_watertight)
+t = time.time(); r = run_all(Va, Ta); out["arch_hard_gt"] = r
+print("arche", {k: {a: b for a, b in v.items() if a in ("planar_area_fraction", "planar_fraction", "segments_per_m", "undulation_length_fraction", "mirror_p99_mm", "pass", "open_edges")} for k, v in r.items()}, round(time.time() - t, 1), "s")
+json.dump(out, open("out/verifier_natural.json", "w"), indent=1)

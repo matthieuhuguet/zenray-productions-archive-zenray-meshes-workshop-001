@@ -1,0 +1,32 @@
+"""Maillage fermé exact de la voiture facettée (union booléenne manifold3d de polytopes convexes), subdivisé à une longueur d'arête donnée.
+Chaque triangle porte l'identifiant global du plan qui le contient (vérité de facette). 30 October 2026."""
+import numpy as np, trimesh
+from scipy.spatial import ConvexHull
+def polytope_mesh(P):
+    h = ConvexHull(P.verts)
+    m = trimesh.Trimesh(vertices=P.verts, faces=h.simplices, process=True)
+    m.fix_normals()
+    return m
+def closed_mesh(car, max_edge=0.06):
+    ms = [polytope_mesh(P) for P in car.pieces]
+    # arbre union simple : tous les polytopes sont unis (la différence n'est pas utilisée dans cette version)
+    U = trimesh.boolean.union(ms, engine="manifold")
+    if max_edge:
+        V, F = trimesh.remesh.subdivide_to_size(U.vertices, U.faces, max_edge=max_edge)
+        U = trimesh.Trimesh(vertices=V, faces=F, process=False)
+    # étiquette de plan : le plan dont n.x - c est le plus proche de 0 pour les 3 sommets et dont la normale colle
+    N = U.face_normals; C = U.triangles_center
+    labels = np.full(len(U.faces), -1)
+    best = np.full(len(U.faces), 1e9)
+    off = 0
+    for P in car.pieces:
+        dist = np.abs(C @ P.n.T - P.c[None, :])                      # (m, nplans)
+        ang = N @ P.n.T
+        score = dist + 1e-3 * (1 - ang)
+        score[ang < 0.999] = 1e9
+        j = score.argmin(1); s = score.min(1)
+        better = s < best
+        labels[better] = off + j[better]; best[better] = s[better]
+        off += len(P.n)
+    labels[best > 1e-6] = -1
+    return U, labels

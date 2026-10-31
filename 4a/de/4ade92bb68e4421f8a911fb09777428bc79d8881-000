@@ -1,0 +1,35 @@
+import sys, json, os, itertools, concurrent.futures as cf
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import qw6
+MESH = ["arch_hard", "lily_plant", "eucalyptus_tree", "manny_character"]
+PREP = {"basic": {}, "organic": dict(sharp_feature_thr=-1), "thr20": dict(sharp_feature_thr=20), "thr50": dict(sharp_feature_thr=50), "thr70": dict(sharp_feature_thr=70), "noremesh": dict(do_remesh=0), "noremesh_org": dict(do_remesh=0, sharp_feature_thr=-1)}
+FLOWS = {"flow": "flow", "flow_noalign": "flow_noalign", "mst": "flow_noalign_approx_mst", "r2even": "flow_noalign_approx_round2even", "symmdc": "flow_noalign_approx_symmdc", "edgethru": "flow_noalign_edgethru", "nodethru": "flow_noalign_nodethru", "vhalf": "flow_virtual_half", "ilp": "ilp_noalign"}
+OUT = qw6.HERE + "/results1.jsonl"
+done = set()
+if os.path.exists(OUT):
+    for l in open(OUT): d = json.loads(l); done.add((d["mesh"], d["prep"], d["tag"]))
+def s12(a):
+    m, p = a; return (m, p, qw6.stage12(f"{qw6.GT}/{m}.obj", p, PREP[p]))
+jobs12 = [(m, p) for m in MESH for p in PREP]
+with cf.ThreadPoolExecutor(12) as ex: S = {(m, p): s for m, p, s in ex.map(s12, jobs12)}
+for k, v in S.items(): print("stage12", k, v["rc"], v["seconds"], v["input_faces"], v["remesh_faces"], flush=True)
+# stage 3 variants
+V = []  # (mesh, prep, tag, flow_kw, flow_base)
+for m in MESH:
+    for p in PREP: V.append((m, p, "base", {}, "flow_noalign_lemon"))
+    for p in ("basic", "organic"):
+        for sf in (0.5, 0.7, 1.5, 2, 3): V.append((m, p, f"scale{sf}", dict(scaleFact=sf), "flow_noalign_lemon"))
+        for a in (0.001, 0.02, 0.05, 0.1, 0.3, 1.0): V.append((m, p, f"alpha{a}", dict(alpha=a), "flow_noalign_lemon"))
+        for fk, fb in FLOWS.items(): V.append((m, p, f"cfg_{fk}", {}, fb))
+        V.append((m, p, "reg_quads0", dict(regularityQuadrilaterals=0), "flow_noalign_lemon")); V.append((m, p, "reg_nonq0", dict(regularityNonQuadrilaterals=0), "flow_noalign_lemon"))
+        V.append((m, p, "iso0", dict(isometry=0), "flow_noalign_lemon")); V.append((m, p, "parity0", dict(hardParityConstraint=0), "flow_noalign_lemon")); V.append((m, p, "align1", dict(alignSingularities=1), "flow_noalign_lemon"))
+V = [v for v in V if (v[0], v[1], v[2]) not in done]
+print(len(V), "stage3 jobs", flush=True)
+def j3(a):
+    i, (m, p, tag, kw, fb) = a; s = S[(m, p)]
+    if not s["rem"]: return dict(mesh=m, prep=p, tag=tag, no_stage12=True, tail=s["tail"])
+    try: r = qw6.stage3(s, f"{p}_{tag}", kw, f"{qw6.GT}/{m}.obj", 100 + i, flow_base=fb)
+    except Exception as e: r = dict(tag=f"{p}_{tag}", error=repr(e))
+    r.update(mesh=m, prep=p, tag=tag, flow=fb, kw=kw); return r
+with cf.ThreadPoolExecutor(12) as ex, open(OUT, "a") as f:
+    for r in ex.map(j3, list(enumerate(V))): f.write(json.dumps(r) + "\n"); f.flush()
+print("done")

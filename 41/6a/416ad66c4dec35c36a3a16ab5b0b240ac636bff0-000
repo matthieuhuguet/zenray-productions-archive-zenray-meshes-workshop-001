@@ -1,0 +1,30 @@
+import sys, os, json, numpy as np, subprocess, shutil
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import qw6, carx, q3
+from scipy.spatial import cKDTree
+OUT = {}
+def seg_samples(V, quads, per=8):
+    S = []
+    for q in quads:
+        for k in range(4):
+            a, b = V[q[k]], V[q[(k + 1) % 4]]
+            S.append(a[None] + (b - a)[None] * np.linspace(0, 1, per, endpoint=False)[:, None])
+    return np.concatenate(S)
+def run_case(tag, objpath, prep_kw, extra=None, ref=None, num=7, flow_kw=None):
+    """stage 1-2 (with optional .sharp) then stage 3, judge vs ref (default: the input)"""
+    d = f"{qw6.WORK}/q3_{tag}"; os.makedirs(d, exist_ok=True); name = os.path.splitext(os.path.basename(objpath))[0]
+    dst = f"{d}/{name}.obj"; shutil.copy(objpath, dst); cfgp = f"{d}/prep.txt"; qw6.write_prep(cfgp, **prep_kw)
+    cmd = [f"{qw6.QW}/build/Build/bin/quadwild", dst, "2", cfgp] + ([extra] if extra else [])
+    rc, out, err, sec = qw6.run(cmd, 1500); open(f"{d}/stage12.log", "w").write(out + err)
+    rem = f"{d}/{name}_rem_p0.obj"; res = dict(tag=tag, stage12_s=sec, rc12=rc)
+    if not os.path.exists(rem): res["fail12"] = (out + err)[-300:]; return res, None
+    s12 = dict(dir=d, name=name, rem=rem); r = qw6.stage3(s12, "run", flow_kw or {}, ref or objpath, num); res.update(r)
+    return res, f"{d}/{name}_rem_p0_{num}_quadrangulation_smooth.obj"
+if __name__ == "__main__":
+    which = sys.argv[1]; V0, G0 = carx.load(); res = []
+    if which == "roof":
+        for p, kw in [("basic", {}), ("organic", dict(sharp_feature_thr=-1)), ("noremesh", dict(do_remesh=0))]:
+            r, out = run_case(f"roof_{p}", "car/CAR_body_roof_C.obj", kw); res.append(r)
+    if which == "doors":
+        for g in ("CAR_body_door_L", "CAR_body_door_R"):
+            r, out = run_case(g, f"car/{g}.obj", {}); r["out"] = out; res.append(r)
+    print(json.dumps(res, indent=1))

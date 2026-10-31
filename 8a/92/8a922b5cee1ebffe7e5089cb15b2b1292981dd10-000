@@ -1,0 +1,170 @@
+"""30 October 2026 : read-only diagnosis harness for ZrlTutteFill.fill4 (instrumented copy, options). Imports the project modules without modifying them.
+python -I diag.py <obj> <edge> [--opts key=value ...]"""
+import sys, os, json, math, collections
+SD = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines'; sys.path.insert(0, SD)
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'; sys.dont_write_bytecode = True
+import numpy as np, scipy.sparse as sps
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
+import ZrlAutoPatch as AP, ZrlAny as ANY, ZrlQuadStats as QS, ZrlNetMesh as NM
+
+def weights(P, F, vid, kind):
+    rows=[];cols=[];vals=[]
+    for t in F:
+        for k in range(3):
+            i,j,l=t[k],t[(k+1)%3],t[(k+2)%3]
+            a=P[j]-P[i]; b=P[l]-P[i]; na=max(np.linalg.norm(a),1e-20); nb=max(np.linalg.norm(b),1e-20)
+            ang=np.arccos(np.clip(a@b/(na*nb),-1,1))
+            if kind=='mvc': tn=np.tan(ang/2); wj=tn/na; wl=tn/nb
+            elif kind=='cot':   # cotangent weights, each edge ij gets cot of the angle OPPOSITE (at l) /2 : standard (cot a + cot b)/2 ; here per triangle contribution cot(angle at l)/2, clamped positive
+                aj=P[i]-P[l]; bj=P[j]-P[l]; ca=np.clip(aj@bj/(max(np.linalg.norm(aj)*np.linalg.norm(bj),1e-20)),-1,1); cotl=ca/max(np.sqrt(1-ca*ca),1e-6)
+                wj=max(cotl,0)*0.5; wl=0.0   # contribution to edge (i,j) from the angle at l ; the edge (i,l) gets its own from vertex j's triangle iteration
+            elif kind=='uniform': wj=1.0; wl=0.0
+            rows+= [vid[i]]*2; cols+=[vid[j],vid[l]]; vals+=[wj,wl]
+            if kind=='cot':   # symmetric: also (j,i)
+                rows+=[vid[j]]; cols+=[vid[i]]; vals+=[wj]
+    n=len(vid); W=sps.coo_matrix((vals,(rows,cols)),shape=(n,n)).tocsr()
+    if kind=='uniform':
+        W=(W>0).astype(float)
+    return W
+
+def cyc_quad(l):
+    l=np.asarray(l,float); N=4; im=int(np.argmax(l))
+    if l[im]>=l.sum()-l[im]: return None
+    others=np.delete(l,im); lo0=l[im]/2*(1+1e-12)
+    f=lambda R: np.sum(2*np.arcsin(np.clip(l/(2*R),0,1)))-2*np.pi
+    h=lambda R: np.arcsin(np.clip(l[im]/(2*R),0,1))-np.sum(np.arcsin(np.clip(others/(2*R),0,1)))
+    def bis(g,lo,hi):
+        if g(lo)*g(hi)>0: return None
+        for _ in range(200):
+            m=.5*(lo+hi); lo,hi=(m,hi) if g(lo)*g(m)>0 else (lo,m)
+        return .5*(lo+hi)
+    R=bis(f,lo0,1e6*l.sum())
+    if R is not None: ang=2*np.arcsin(np.clip(l/(2*R),0,1))
+    else:
+        R=bis(h,lo0,1e6*l.sum()); ang=2*np.arcsin(np.clip(l/(2*R),0,1)); ang[im]=-(ang.sum()-ang[im])
+    th=np.concatenate([[0],np.cumsum(ang)[:-1]]); th-=th.mean(); return R*np.c_[np.cos(th),np.sin(th)]
+
+def corner_quad(poly, n0, n1):
+    """bilinear map of the integer rectangle [0,n0]x[0,n1] onto the polygon (4 corners ccw)."""
+    def f(u,v):
+        s,t=u/n0,v/n1; return (1-s)*(1-t)*poly[0]+s*(1-t)*poly[1]+s*t*poly[2]+(1-s)*t*poly[3]
+    return f
+
+def relax(P,Q,n0,n1,tri,iters):
+    n=len(P); E=np.concatenate([Q[:,[0,1]],Q[:,[1,2]],Q[:,[2,3]],Q[:,[3,0]]]); E=np.unique(np.sort(E,axis=1),axis=0)
+    W=sps.coo_matrix((np.ones(2*len(E)),(np.r_[E[:,0],E[:,1]],np.r_[E[:,1],E[:,0]])),shape=(n,n)).tocsr(); deg=np.maximum(np.asarray(W.sum(1)).ravel(),1); W=sps.diags(1.0/deg)@W
+    gi,gj=np.meshgrid(np.arange(n0+1),np.arange(n1+1),indexing='ij'); inner=((gi>0)&(gi<n0)&(gj>0)&(gj<n1)).ravel(); free=np.flatnonzero(inner)
+    iters=int(iters)
+    if not len(free) or iters<=0: return P
+    ref=NM.Ref(tri); P=P.copy()
+    for it in range(iters):
+        Pn=W@P; P[free]=0.5*P[free]+0.5*Pn[free]
+        if (it+1)%5==0 or it==iters-1: P[free]=ref.closest(P[free])[0]
+    return P
+
+def fill4(m,Z,edge,o,prm=AP.PARAMS):
+    Ls,ln=AP.loops(m,Z)
+    if len(Ls)!=1: return None,'loops %d'%len(Ls)
+    B=np.asarray(Ls[0],np.int64); Pb=m['P'][B]; X,total=AP.resample_closed(Pb,prm['step_m']); normal=m['N'][Z].mean(0); normal/=max(np.linalg.norm(normal),1e-9)
+    prm4=dict(prm,max_corners=4); C,turn=AP.corners(X,total,normal,prm4)
+    if len(C)!=4: return None,'corners %d'%len(C)
+    cum=np.r_[0,np.cumsum(np.linalg.norm(np.diff(np.vstack([Pb,Pb[:1]]),axis=0),axis=1))]; Ltot=cum[-1]; sC=[C[k]/len(X)*Ltot for k in range(4)]
+    if o.get('snap','0')=='1': sC=[float(cum[int(np.argmin(np.abs(cum[:-1]-s0)))]) for s0 in sC]
+    side_len=[((sC[(k+1)%4]-sC[k])%Ltot) for k in range(4)]
+    turns=[float(turn[c]) for c in C]
+    n0=max(1,int(round(0.5*(side_len[0]+side_len[2])/edge))); n1=max(1,int(round(0.5*(side_len[1]+side_len[3])/edge)))
+    poly=np.array([[0,0],[n0,0],[n0,n1],[0,n1]],float); polyname=o.get('poly','rect')
+    dimsjac=(o.get('dims','sides')=='jac')
+    if dimsjac: poly=np.array([[0,0],[1,0],[1,1],[0,1]],float)
+    if polyname=='cyc':
+        sl=[side_len[0]/edge,side_len[1]/edge,side_len[2]/edge,side_len[3]/edge]; cq=cyc_quad(sl)
+        if cq is not None: poly=cq
+    sag=o.get('sag',0.0)
+    uv={}; seg_of={}
+    for bi,v in enumerate(B):
+        s=cum[bi]; k=0
+        for q in range(4):
+            d=(s-sC[q])%Ltot
+            if d<=side_len[q]+1e-9: k=q; break
+        t=np.clip(((s-sC[k])%Ltot)/max(side_len[k],1e-12),0,1); p0=poly[k]; p1=poly[(k+1)%4]; d=p1-p0; nrm=np.array([d[1],-d[0]]); nrm/= (np.linalg.norm(nrm)+1e-30)
+        uv[int(v)]=tuple(p0+t*d+sag*np.linalg.norm(d)*4*t*(1-t)*nrm)
+    F=m['F'][Z]; used=np.unique(F); vid={int(v):i for i,v in enumerate(used)}; Pm=m['P']; inner=[int(v) for v in used if int(v) not in uv]
+    W=weights(Pm,F,vid,o.get('w','mvc')); n=len(used); U=np.zeros((n,2))
+    for v,p in uv.items(): U[vid[v]]=p
+    if inner:
+        ii=np.array([vid[v] for v in inner]); bi_=np.array([vid[v] for v in uv]); Dg=np.asarray(W.sum(1)).ravel(); Lap=(sps.diags(Dg)-W).tocsr()
+        A=Lap[ii][:,ii].tocsc(); rhs=-(Lap[ii][:,bi_]@U[bi_]); U[ii]=spsolve(A,rhs).reshape(len(ii),2)
+    T2=np.array([[vid[int(a)] for a in t] for t in F])
+    if dimsjac:
+        a_,b_,c_=U[T2[:,0]],U[T2[:,1]],U[T2[:,2]]; d1=b_-a_; d2=c_-a_; det=d1[:,0]*d2[:,1]-d1[:,1]*d2[:,0]; ok=np.abs(det)>1e-18
+        e1=Pm[used[T2[:,1]]]-Pm[used[T2[:,0]]]; e2=Pm[used[T2[:,2]]]-Pm[used[T2[:,0]]]
+        Xu=(e1*d2[:,1:2]-e2*d1[:,1:2])/np.where(ok,det,1)[:,None]; Xv=(-e1*d2[:,0:1]+e2*d1[:,0:1])/np.where(ok,det,1)[:,None]; wA=np.abs(det)*ok
+        mu=float((np.linalg.norm(Xu,axis=1)*wA).sum()/max(wA.sum(),1e-30)); mv=float((np.linalg.norm(Xv,axis=1)*wA).sum()/max(wA.sum(),1e-30))
+        n0=max(1,int(round(mu/edge))); n1=max(1,int(round(mv/edge))); U=U*np.array([n0,n1],float); poly=poly*np.array([n0,n1],float)
+    a_,b_,c_=U[T2[:,0]],U[T2[:,1]],U[T2[:,2]]
+    area=0.5*((b_[:,0]-a_[:,0])*(c_[:,1]-a_[:,1])-(b_[:,1]-a_[:,1])*(c_[:,0]-a_[:,0]))
+    # orientation reference : the polygon is ccw in (u,v) ; the region triangles winding vs the boundary loop direction
+    sgn=np.sign(np.median(area)) if len(area) else 1; flipped=int((area*sgn<=0).sum()); degen=int((np.abs(area)<1e-12*max(1,np.abs(area).max())).sum())
+    cen=U[T2].mean(1); tree=cKDTree(cen)
+    gi,gj=np.meshgrid(np.arange(n0+1),np.arange(n1+1),indexing='ij'); G2=np.stack([gi.ravel(),gj.ravel()],1).astype(float)
+    mapf=corner_quad(poly,n0,n1) if polyname=='cyc' and cyc_quad is not None else None
+    Q2=np.array([mapf(u,v) for u,v in G2]) if mapf is not None else G2
+    P3=np.zeros((len(Q2),3)); tri_of=np.zeros(len(Q2),int); bad=0
+    _,cand=tree.query(Q2,k=min(int(o.get('k',24)),len(T2)))
+    for qi,q in enumerate(Q2):
+        found=False
+        for t in np.atleast_1d(cand[qi]):
+            a,b,c=U[T2[t]]; M=np.array([[b[0]-a[0],c[0]-a[0]],[b[1]-a[1],c[1]-a[1]]]); det=np.linalg.det(M)
+            if abs(det)<1e-18: continue
+            l1,l2=np.linalg.solve(M,q-a)
+            if l1>=-1e-6 and l2>=-1e-6 and l1+l2<=1+1e-6:
+                P3[qi]=(1-l1-l2)*Pm[used[T2[t,0]]]+l1*Pm[used[T2[t,1]]]+l2*Pm[used[T2[t,2]]]; tri_of[qi]=t; found=True; break
+        if not found: t=int(cand[qi][0]); P3[qi]=Pm[used[T2[t]]].mean(0); tri_of[qi]=t; bad+=1
+    idx=lambda i,j: i*(n1+1)+j; Qd=np.array([[idx(i,j),idx(i+1,j),idx(i+1,j+1),idx(i,j+1)] for i in range(n0) for j in range(n1)],np.int64)
+    Nz=m['N'][Z]; tri_normals=Nz  # per located triangle (index into F order = Z order)
+    info=dict(turns=turns,n0=n0,n1=n1,tris=len(F),flipped=flipped,degen=degen,bad=bad,side_ratio=max(side_len)/max(min(side_len),1e-9),sides=side_len,
+              opp_ratio=max(side_len[0]/max(side_len[2],1e-9),side_len[2]/max(side_len[0],1e-9),side_len[1]/max(side_len[3],1e-9),side_len[3]/max(side_len[1],1e-9)))
+    P3r=relax(P3,Qd,n0,n1,m['P'][F],o.get('relax',150))
+    return dict(P3=P3,P3r=P3r,Q=Qd,tri_of=tri_of,Nz=tri_normals,info=info,F=F),None
+
+def quad_metrics(P,Q,vnorm,sharp_deg=25.0):
+    """judge style jacobian (corner-0 normal), surface-normal jacobian, normal spread."""
+    edge,aspect,jmin,_=QS.stats(P,Q)
+    Pq=P[Q]; Ns=vnorm[Q]            # (q,4,3) surface normals at the corners
+    ns=Ns.mean(1); ns/=np.maximum(np.linalg.norm(ns,axis=1,keepdims=True),1e-12)
+    jac=np.empty((len(Q),4))
+    for k in range(4):
+        u=Pq[:,(k+1)%4]-Pq[:,k]; v=Pq[:,(k-1)%4]-Pq[:,k]; jac[:,k]=np.einsum('ij,ij->i',np.cross(u,v),ns)/np.maximum(np.linalg.norm(u,axis=1)*np.linalg.norm(v,axis=1),1e-12)
+    js=jac.min(1)
+    spread=np.degrees(np.arccos(np.clip(np.min([np.einsum('ij,ij->i',Ns[:,a],Ns[:,b]) for a in range(4) for b in range(a+1,4)],axis=0),-1,1)))
+    # planarity : distance of the 4th vertex to the plane of the first three over the mean edge
+    n0=np.cross(Pq[:,1]-Pq[:,0],Pq[:,2]-Pq[:,0]); n0/=np.maximum(np.linalg.norm(n0,axis=1,keepdims=True),1e-12); plan=np.abs(np.einsum('ij,ij->i',Pq[:,3]-Pq[:,0],n0))/np.maximum(edge,1e-12)
+    return dict(jmin=jmin,js=js,spread=spread,edge=edge,aspect=aspect,plan=plan)
+
+def run(obj,edge,o,zone_deg=25.0,merge_deg=35.0,min_area_frac=0.002,collect=None):
+    m=AP.mesh(os.path.abspath(obj)); zones=ANY.segment(m,zone_deg,max(4,int(min_area_frac*len(m['F']))),merge_deg=merge_deg,log=lambda s:None)
+    agg=collections.Counter(); allM=[]; fails=collections.Counter(); perzone=[]
+    for k,(Z,seed) in enumerate(zones):
+        try: r,err=fill4(m,Z,edge,o)
+        except Exception as ex: r,err=None,'error %s'%str(ex)[:60]
+        if r is None: fails[err]+=1; continue
+        info=r['info']; Nz=r['Nz']
+        for key in ('flipped','degen','bad','tris'): agg[key]+=info[key]
+        agg['zones_ok']+=1
+        for tag,P in (('pre',r['P3']),('post',r['P3r'])):
+            vn=Nz[r['tri_of']]
+            qm=quad_metrics(P,r['Q'],vn)
+            agg[tag+'_quads']+=len(r['Q']); agg[tag+'_fold_judge']+=int((qm['jmin']<0).sum()); agg[tag+'_sq_judge']+=int((qm['jmin']<0.3).sum())
+            agg[tag+'_fold_surf']+=int((qm['js']<0).sum()); agg[tag+'_sq_surf']+=int((qm['js']<0.3).sum())
+            fj=qm['jmin']<0; agg[tag+'_fold_judge_sharp']+=int((fj&(qm['spread']>25)).sum()); agg[tag+'_fold_judge_smooth']+=int((fj&(qm['spread']<=25)).sum())
+            agg[tag+'_fold_judge_but_surf_ok']+=int((fj&(qm['js']>=0)).sum()); agg[tag+'_sq_judge_but_surf_ok']+=int(((qm['jmin']<0.3)&(qm['js']>=0.3)).sum())
+            agg[tag+'_nonplanar_gt0.1']+=int((qm['plan']>0.1).sum()); agg[tag+'_aspect_gt3']+=int((qm['aspect']>3).sum())
+        perzone.append((k,info['tris'],info['n0'],info['n1'],round(info['opp_ratio'],2),info['flipped'],info['bad'],int((quad_metrics(r['P3r'],r['Q'],Nz[r['tri_of']])['jmin']<0).sum()),len(r['Q'])))
+    return dict(agg),dict(fails),perzone,len(zones)
+
+if __name__=='__main__':
+    obj=sys.argv[1]; edge=float(sys.argv[2]); o={}
+    for kv in sys.argv[3:]:
+        k,v=kv.split('='); o[k]=float(v) if k in('sag','relax','k') else v
+    agg,fails,pz,nz=run(obj,edge,o); print(json.dumps(dict(opts=o,zones=nz,**agg,fails=fails)))

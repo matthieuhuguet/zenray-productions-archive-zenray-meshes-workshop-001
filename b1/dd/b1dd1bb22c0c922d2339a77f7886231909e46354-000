@@ -1,0 +1,42 @@
+"""Q9, mesure 9 : (a) symétrie miroir de v752 ; (b) silhouettes de v752 contre les masques de la planche, recalage par boîte englobante
+(échelle uniforme, translation), IoU et résidu d'échelle. 30 October 2026."""
+import sys, json
+import numpy as np, cv2
+from scipy.spatial import cKDTree
+sys.path.insert(0, ".")
+from zrcar_common import *
+from clay_render import *
+from board_masks import panels, mask_of
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F)
+used = np.unique(Q.ravel()); U = V[used]
+# (a) symétrie : x -> -x
+tr = cKDTree(U); d, _ = tr.query(U * np.array([-1, 1, 1]))
+print("symétrie miroir x : distance au plus proche sommet miroir, médiane %.4f mm, p99 %.3f mm, max %.3f mm" % (np.median(d) * 1000, np.percentile(d, 99) * 1000, d.max() * 1000))
+tris = quads_to_tris(Q)
+B = panels()
+res = {"symmetry_mm": {"median": float(np.median(d) * 1000), "p99": float(np.percentile(d, 99) * 1000), "max": float(d.max() * 1000)}}
+for name in ("front", "back", "left", "right", "top", "bottom"):
+    img, org = B[name]
+    m, _ = mask_of(img)
+    # on retire du masque les roues ? non. On rend la voiture entière.
+    R = render(V, tris, name, px=0.004, margin=0)
+    sil = (R["id"] >= 0).astype(np.uint8)
+    ys, xs = np.where(sil); sb = (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
+    ys2, xs2 = np.where(m); mb = (xs2.min(), ys2.min(), xs2.max() + 1, ys2.max() + 1)
+    sw, sh = sb[2] - sb[0], sb[3] - sb[1]; mw, mh = mb[2] - mb[0], mb[3] - mb[1]
+    s_w, s_h = mw / sw, mh / sh
+    s = np.sqrt(s_w * s_h)
+    crop = sil[sb[1]:sb[3], sb[0]:sb[2]]
+    rs = cv2.resize(crop, (int(round(sw * s)), int(round(sh * s))), interpolation=cv2.INTER_NEAREST)
+    canvas = np.zeros_like(m); x0 = int(round(mb[0] + (mw - rs.shape[1]) / 2)); y0 = int(round(mb[1] + (mh - rs.shape[0]) / 2))
+    hh, ww = rs.shape
+    canvas[max(y0, 0):y0 + hh, max(x0, 0):x0 + ww] = rs[max(-y0, 0):, max(-x0, 0):][:canvas.shape[0] - max(y0, 0), :canvas.shape[1] - max(x0, 0)]
+    inter = (canvas & m).sum(); uni = (canvas | m).sum()
+    iou = inter / uni
+    print(f"{name:7s} IoU {iou:.3f}  échelle w {s_w:.3f} h {s_h:.3f} (écart {abs(s_w/s_h-1)*100:.1f} %)  v752 {sw}x{sh} px a 4 mm, masque {mw}x{mh}  => {1000*0.004/s:.2f} mm par pixel de planche")
+    res[name] = {"iou": float(iou), "scale_w": float(s_w), "scale_h": float(s_h), "aspect_gap_percent": float(abs(s_w / s_h - 1) * 100), "mm_per_board_px": float(1000 * 0.004 / s)}
+    ov = np.zeros(m.shape + (3,), np.uint8); ov[..., 0] = (m & (1 - canvas)) * 255; ov[..., 2] = (canvas & (1 - m)) * 255; ov[..., 1] = (canvas & m) * 120
+    from PIL import Image; Image.fromarray(ov).save(f"out/board/{name}_v752_vs_board.png")
+json.dump(res, open("out/q9_silhouette_symmetry.json", "w"), indent=1)

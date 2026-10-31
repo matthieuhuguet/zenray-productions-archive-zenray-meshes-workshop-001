@@ -1,0 +1,147 @@
+"""Pass 9 : mirror plane detection (candidate planes from PCA, iterative closest point refinement of the plane, inlier fraction), connected
+component instances (descriptor, rigid ICP over the 24 axis permutations), half mirror quadrangulation. Written 30 October 2026.
+FR : detection du plan miroir, des instances (composantes semblables) et quadrangulation par moitie puis reflet et soudure."""
+import itertools
+import numpy as np
+import trimesh
+from scipy.spatial import cKDTree
+
+
+def sample_surface(V, F, n=6000, seed=0):
+    m = trimesh.Trimesh(V, F, process=False)
+    pts, _ = trimesh.sample.sample_surface_even(m, n, seed=seed) if n < 20000 else trimesh.sample.sample_surface(m, n, seed=seed)
+    return np.asarray(pts)
+
+
+def reflect(X, n, d):
+    return X - 2.0 * ((X @ n) - d)[:, None] * n[None, :]
+
+
+def refine_plane(X, tree, n, d, iters=30, tau=None):
+    """ICP style refinement of a mirror plane: reflect, match to nearest sample, re-estimate the plane from the pairs."""
+    for _ in range(iters):
+        Y = reflect(X, n, d); dist, idx = tree.query(Y)
+        cut = tau if tau is not None else np.median(dist) * 3 + 1e-12
+        ok = dist < cut
+        if ok.sum() < 20: break
+        A = X[ok]; B = X[idx[ok]]                                  # B is the match of the reflection of A, so B ~ reflect(A)
+        diff = A - B; s = np.sign(diff @ n); s[s == 0] = 1
+        nn = (diff * s[:, None]).sum(axis=0)
+        if np.linalg.norm(nn) < 1e-12: break
+        nn /= np.linalg.norm(nn)
+        dd = float((((A + B) / 2.0) @ nn).mean())
+        if np.linalg.norm(nn - n) < 1e-10 and abs(dd - d) < 1e-12: n, d = nn, dd; break
+        n, d = nn, dd
+    return n, d
+
+
+def mirror_score(X, tree, n, d, tol):
+    dist, _ = tree.query(reflect(X, n, d))
+    return float(np.median(dist)), float((dist < tol).mean())
+
+
+def detect_mirror_planes(V, F, edge, n_samples=6000, min_inlier=0.6):
+    """Return a list of (normal, offset, median distance in edges, inlier fraction), best first. Candidates: the three PCA axes of the samples
+    and the three coordinate axes, through the area weighted centroid."""
+    X = sample_surface(V, F, n_samples); c = X.mean(axis=0); tree = cKDTree(X)
+    area = trimesh.Trimesh(V, F, process=False).area
+    spacing = float(np.sqrt(area / len(X)))
+    tol = max(0.5 * edge, 1.0 * spacing)                  # the reflected sample can only be matched to within the sample spacing
+    u, s, vt = np.linalg.svd(X - c, full_matrices=False)
+    cands = [vt[i] for i in range(3)] + [np.eye(3)[i] for i in range(3)]
+    found = []
+    for n0 in cands:
+        n0 = n0 / np.linalg.norm(n0); n, d = refine_plane(X, tree, n0, float(c @ n0))
+        med, inl = mirror_score(X, tree, n, d, tol)
+        if inl < min_inlier: continue
+        if any(abs(n @ f[0]) > 0.999 and abs(d - f[1] * np.sign(n @ f[0])) < tol for f in found):
+            continue
+        found.append((n, d, med / edge, inl))
+    detect_mirror_planes.last_tol = tol
+    found.sort(key=lambda t: (-t[3], t[2]))
+    return found
+
+
+# === instances ==================================================================================================================
+def components(V, F):
+    m = trimesh.Trimesh(V, F, process=False)
+    parts = m.split(only_watertight=False)
+    return parts
+
+
+def descriptor(m):
+    c = m.vertices - m.vertices.mean(axis=0)
+    ev = np.sort(np.linalg.eigvalsh(np.cov(c.T)))[::-1]
+    return np.array([m.area, abs(m.volume) if m.is_watertight else 0.0, *np.sqrt(ev), len(m.faces)])
+
+
+def best_rigid(A, B, tree_B, iters=30):
+    """Rigid transform (R, t) mapping point set A onto B: try the 24 proper axis permutations of the PCA frames as initialisation, then ICP."""
+    ca, cb = A.mean(axis=0), B.mean(axis=0)
+    ua, sa, va = np.linalg.svd(A - ca, full_matrices=False); ub, sb, vb = np.linalg.svd(B - cb, full_matrices=False)
+    best = None
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product([1, -1], repeat=3):
+            M = np.zeros((3, 3))
+            for k in range(3): M[k, perm[k]] = signs[k]
+            if np.linalg.det(M) < 0: continue
+            R = vb.T @ M @ va                                   # maps the PCA frame of A onto the PCA frame of B with the chosen axis permutation
+            if np.linalg.det(R) < 0: continue
+            t = cb - R @ ca
+            for _ in range(iters):
+                Y = A @ R.T + t; dist, idx = tree_B.query(Y)
+                P = A; Qm = B[idx]
+                pa, qb = P.mean(axis=0), Qm.mean(axis=0)
+                H = (P - pa).T @ (Qm - qb); U, S_, Vt = np.linalg.svd(H); Rn = Vt.T @ U.T
+                if np.linalg.det(Rn) < 0: Vt[-1] *= -1; Rn = Vt.T @ U.T
+                R = Rn; t = qb - R @ pa
+            dist, _ = tree_B.query(A @ R.T + t); rms = float(np.sqrt((dist ** 2).mean()))
+            if best is None or rms < best[0]: best = (rms, R.copy(), t.copy())
+    return best
+
+
+def match_instances(parts, edge, n_samples=1500, rel_tol=0.03):
+    """Group components that are copies of each other under a rigid motion. Returns groups [(rep index, [(index, R, t, rms), ...]), ...]."""
+    desc = [descriptor(p) for p in parts]; used = set(); groups = []
+    samples = [sample_surface(p.vertices, p.faces, n_samples) for p in parts]
+    for i in range(len(parts)):
+        if i in used: continue
+        grp = [(i, np.eye(3), np.zeros(3), 0.0)]; used.add(i)
+        for j in range(i + 1, len(parts)):
+            if j in used: continue
+            if np.all(np.abs(desc[i] - desc[j]) <= rel_tol * np.maximum(np.abs(desc[i]), 1e-9) + 1e-9):
+                rms, R, t = best_rigid(samples[i], samples[j], cKDTree(samples[j]))
+                if rms < 0.25 * edge:
+                    grp.append((j, R, t, rms)); used.add(j)
+        groups.append((i, grp))
+    return groups
+
+
+# === half mirror quadrangulation ===================================================================================================
+def cut_half(V, F, n, d):
+    """Keep the part of the mesh on the positive side of the plane n . x = d. The cut boundary lies on the plane."""
+    m = trimesh.Trimesh(V, F, process=False)
+    h = trimesh.intersections.slice_mesh_plane(m, plane_normal=n, plane_origin=n * d, cap=False)
+    return np.asarray(h.vertices), np.asarray(h.faces)
+
+
+def mirror_weld(P, Q, n, d, snap):
+    """P, Q : quad mesh of the half (vertices within `snap` of the plane are put exactly on it). Returns the full mesh : the half plus its
+    reflection, vertices on the plane shared. Orientation of the reflected quads is reversed so that normals stay consistent."""
+    P = P.copy(); dist = P @ n - d
+    on = np.abs(dist) < snap
+    P[on] -= dist[on][:, None] * n[None, :]
+    R = reflect(P, n, d)
+    nP = len(P); idx_r = np.arange(nP) + nP
+    # reflected vertices that lie on the plane are the same vertices
+    idx_r[on] = np.arange(nP)[on]
+    allP = np.vstack([P, R]); Qr = idx_r[Q][:, ::-1]
+    allQ = np.vstack([Q, Qr])
+    used = np.unique(allQ); remap = -np.ones(len(allP), int); remap[used] = np.arange(len(used))
+    return allP[used], remap[allQ]
+
+
+def mirror_residual(P, Q, n, d, edge):
+    """Median and maximum distance, in edges, of the reflected vertices to the nearest vertex (0 = exact symmetry)."""
+    U = P[np.unique(Q)]; tree = cKDTree(U); dist, _ = tree.query(reflect(U, n, d))
+    return float(np.median(dist) / edge), float(dist.max() / edge)

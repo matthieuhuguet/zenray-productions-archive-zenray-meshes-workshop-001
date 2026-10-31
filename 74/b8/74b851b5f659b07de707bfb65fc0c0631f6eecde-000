@@ -1,0 +1,66 @@
+"""30 October 2026 : ZenRay Meshes, FINISH : one command that finishes a welded multi-part quad mesh (a car, an arch, any hard surface) : facet filter passes (flat panels, crisp creases, round parts frozen, joins kept), then the finish verifiers, the quad judge and the join gap check, all in one JSON bilan.
+    python -I ZenRayFinish.py in.obj out.obj [--preset car|hard] [--bilan bilan.json] [--no-verify]
+Presets live in FinishPresets.json (HDA interface). The input is never modified ; the bilan compares input and output.
+FR : une commande qui finit un maillage de quads multi-pieces : passes de filtre de facettes, puis verificateurs de finition, juge de quads et controle des jonctions, un seul bilan JSON."""
+import argparse, json, os, subprocess, sys, tempfile, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "lines"))
+import numpy as np
+
+
+def load_tri(p):
+    V = []; T = []
+    for l in open(p):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f":
+            f = [int(x.split("/")[0]) - 1 for x in t[1:]]
+            for k in range(1, len(f) - 1): T.append([f[0], f[k], f[k + 1]])
+    return np.array(V), np.array(T)
+
+
+def verify(path):
+    import ZrFinishVerifiers as VF
+    V, T = load_tri(path); r = VF.run_all(V, T)
+    return {"open_edges": r["closure"]["open_edges"], "non_manifold_edges": r["closure"]["non_manifold_edges"], "planar_fraction": round(r["planarity"]["planar_fraction"], 3), "facet_rms_mm": round(r["facet_planarity"]["rms_area_weighted_mm"], 2),
+            "crease_segments_per_m": round(r["crease_straightness"].get("segments_per_m", 0.0), 1), "soft_dihedral_share": round(r["undulation"]["undulation_length_fraction"], 3), "mirror_p99_mm": round(r["symmetry"]["mirror_p99_mm"], 2)}
+
+
+def sharp(path):
+    import CarCreaseSharpness as CS
+    m = CS.measure(path); return {"crease_edges": m["edges"], "crisp_length_share": round(m["crisp_length_share"], 3), "median_shoulder_deg": round(m["median_shoulder_deg"], 1)}
+
+
+def judge(path, ref):
+    out = subprocess.run([sys.executable, "-I", os.path.join(HERE, "lines", "ZrlTopoJudge.py"), path, ref, "--json"], capture_output=True, text=True).stdout
+    try: d = json.loads(out[out.index("{"):])
+    except Exception: return {}
+    return {k: d.get(k) for k in ("quads", "folded_share", "squashed_share", "jac_mean", "angle_dev_mean_deg", "straight_iso_mean_deg")}
+
+
+def gaps(a, b):
+    out = subprocess.run([sys.executable, "-I", os.path.join(HERE, "CarContactGaps.py"), a, b], capture_output=True, text=True).stdout.strip().split("\n"); return out
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--preset", default="car"); ap.add_argument("--bilan"); ap.add_argument("--no-verify", action="store_true"); a = ap.parse_args(); t0 = time.time()
+    P = json.load(open(os.path.join(HERE, "FinishPresets.json")))[a.preset]; cur = a.inp; tmp = tempfile.mkdtemp(prefix="zrfinish_"); log = []
+    for i, ps in enumerate(P["passes"]):
+        dst = a.out if i == len(P["passes"]) - 1 else os.path.join(tmp, "pass%d.obj" % i)
+        cmd = [sys.executable, "-I", os.path.join(HERE, "CarFacetFilter.py"), cur, dst, "--freeze", P["freeze"], "--ring", str(ps["ring"]), "--normal-iters", str(ps["normal_iters"]), "--vertex-iters", str(ps["vertex_iters"]), "--sigma-r-deg", str(ps["sigma_r_deg"]), "--sigma-s-edges", str(ps["sigma_s_edges"]), "--max-move-edges", str(ps["max_move_edges"])]
+        if a.preset != "car": cmd.append("--no-symmetry")
+        cmd += ["--thickness-mode", ps.get("thickness_mode", P.get("thickness_mode", "off"))]
+        r = subprocess.run(cmd, capture_output=True, text=True); log.append(r.stdout.strip().split("\n")[-1] if r.stdout else r.stderr[-300:]); cur = dst
+        if r.returncode: print("pass %d failed" % i, r.stderr[-500:]); sys.exit(1)
+    bilan = {"preset": a.preset, "passes": log, "seconds": round(time.time() - t0, 1)}
+    if not a.no_verify:
+        bilan["before"] = {"verifiers": verify(a.inp), "judge": judge(a.inp, a.inp), "crease": sharp(a.inp)}; bilan["after"] = {"verifiers": verify(a.out), "judge": judge(a.out, a.inp), "crease": sharp(a.out)}; bilan["joins"] = gaps(a.inp, a.out)
+        b, f = bilan["before"]["verifiers"], bilan["after"]["verifiers"]                      # do no harm : keep the result only if the soft dihedrals fell by 10 percent, the mirror error grew by at most 2 mm and the crisp share of the creases did not fall by more than 15 percent (a mesh whose edges already follow its creases is smeared by the filter), else give the input back
+        cb, ca = bilan["before"]["crease"]["crisp_length_share"], bilan["after"]["crease"]["crisp_length_share"]; ok = b["soft_dihedral_share"] > 0.05 and f["soft_dihedral_share"] <= 0.9 * b["soft_dihedral_share"] and f["mirror_p99_mm"] - b["mirror_p99_mm"] <= 2.0 and (bilan["before"]["crease"]["median_shoulder_deg"] >= 45.0 or ca >= 0.85 * cb);          # the sharpness gate only speaks when creases have flat shoulders to lose (a stack of thin shells has rims everywhere : median 90 degrees, no information)
+        bilan["accepted"] = bool(ok)
+        if not ok:
+            import shutil; shutil.copyfile(a.inp, a.out); bilan["note"] = "the filter did not improve this mesh (already clean or asymmetric) : output = input"
+    print(json.dumps(bilan, indent=1))
+    if a.bilan: json.dump(bilan, open(a.bilan, "w"), indent=1)
+
+
+if __name__ == "__main__": main()

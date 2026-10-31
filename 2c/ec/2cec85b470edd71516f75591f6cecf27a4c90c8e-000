@@ -1,0 +1,132 @@
+"""Pass 9 : primitive detection on the patches of a layout (plane, cylinder, cone) and isometric charts (development) of each primitive.
+Written 30 October 2026. FR : detection de primitives sur les patchs d'un layout et cartes isometriques (developpement) de chaque primitive.
+A plane, a cylinder and a cone are developable : the chart preserves lengths and angles, so a square grid in the chart is a square grid on the surface."""
+import numpy as np
+
+
+def _unit(v):
+    return v / max(np.linalg.norm(v), 1e-30)
+
+
+def patch_points_normals(lay, p):
+    F = lay.F[lay.faces_of_patch[p]]; V = lay.V
+    n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    vs = np.unique(F.ravel()); loc = {int(v): i for i, v in enumerate(vs)}
+    N = np.zeros((len(vs), 3))
+    for k in range(3):
+        for t in range(len(F)):
+            N[loc[int(F[t, k])]] += n[t]
+    N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-30)
+    A = 0.5 * np.linalg.norm(n, axis=1).sum()
+    return V[vs], N, A
+
+
+class PlaneChart:
+    kind = "plane"
+    def __init__(self, c, nrm):
+        t = np.array([1.0, 0, 0]) if abs(nrm[0]) < 0.9 else np.array([0, 1.0, 0])
+        self.c = c; self.e1 = _unit(np.cross(nrm, t)); self.e2 = np.cross(nrm, self.e1); self.flip = 1.0
+    def fwd(self, X):
+        d = X - self.c; return np.stack([d @ self.e1, self.flip * (d @ self.e2)], axis=1)
+    def inv(self, uv):
+        return self.c + uv[:, [0]] * self.e1 + (self.flip * uv[:, [1]]) * self.e2
+    def dist(self, X):
+        return np.abs((X - self.c) @ np.cross(self.e1, self.e2))
+
+
+class CylinderChart:
+    kind = "cylinder"
+    def __init__(self, c0, axis, r, b1, theta0):
+        self.c0 = c0; self.a = axis; self.r = r; self.b1 = b1; self.b2 = np.cross(axis, b1); self.t0 = theta0; self.flip = 1.0
+    def fwd(self, X):
+        d = X - self.c0; z = d @ self.a
+        th = np.arctan2(d @ self.b2, d @ self.b1)
+        th = (th - self.t0 + np.pi) % (2 * np.pi) - np.pi + self.t0                  # unwrap around the patch mean angle
+        return np.stack([self.r * th, self.flip * z], axis=1)
+    def inv(self, uv):
+        th = uv[:, 0] / self.r; z = self.flip * uv[:, 1]
+        return self.c0 + z[:, None] * self.a + self.r * (np.cos(th)[:, None] * self.b1 + np.sin(th)[:, None] * self.b2)
+    def dist(self, X):
+        d = X - self.c0; d = d - np.outer(d @ self.a, self.a)
+        return np.abs(np.linalg.norm(d, axis=1) - self.r)
+
+
+class ConeChart:
+    kind = "cone"
+    def __init__(self, apex, axis, beta, b1, psi0):
+        self.q = apex; self.a = axis; self.beta = beta; self.b1 = b1; self.b2 = np.cross(axis, b1); self.p0 = psi0; self.s = np.sin(beta); self.flip = 1.0
+    def fwd(self, X):
+        w = X - self.q; rho = np.linalg.norm(w, axis=1)
+        psi = np.arctan2(w @ self.b2, w @ self.b1)
+        psi = (psi - self.p0 + np.pi) % (2 * np.pi) - np.pi + self.p0
+        ang = psi * self.s
+        return np.stack([rho * np.cos(ang), self.flip * rho * np.sin(ang)], axis=1)
+    def inv(self, uv):
+        u, v = uv[:, 0], self.flip * uv[:, 1]
+        rho = np.hypot(u, v); psi = np.arctan2(v, u) / self.s
+        dirv = np.cos(self.beta) * self.a[None, :] + self.s * (np.cos(psi)[:, None] * self.b1 + np.sin(psi)[:, None] * self.b2)
+        return self.q + rho[:, None] * dirv
+    def dist(self, X):
+        w = X - self.q; rho = np.linalg.norm(w, axis=1)
+        ang = np.arccos(np.clip((w @ self.a) / np.maximum(rho, 1e-30), -1, 1))
+        return rho * np.abs(np.sin(ang - self.beta))
+
+
+def fit_plane(P, N):
+    c = P.mean(axis=0); u, s, vt = np.linalg.svd(P - c, full_matrices=False); n = vt[2]
+    ChartP = PlaneChart(c, n)
+    return ChartP, float(ChartP.dist(P).max())
+
+
+def fit_cylinder(P, N):
+    w, v = np.linalg.eigh(N.T @ N); a = v[:, 0]                           # normals are perpendicular to the axis : smallest eigenvector
+    if w[0] / max(w[2], 1e-30) > 0.05: return None, np.inf             # normals are not planar enough
+    t = np.array([1.0, 0, 0]) if abs(a[0]) < 0.9 else np.array([0, 1.0, 0]); b1 = _unit(np.cross(a, t)); b2 = np.cross(a, b1)
+    x = P @ b1; y = P @ b2
+    M = np.c_[2 * x, 2 * y, np.ones_like(x)]; sol, *_ = np.linalg.lstsq(M, x ** 2 + y ** 2, rcond=None)
+    cx, cy = sol[0], sol[1]; r = np.sqrt(max(sol[2] + cx ** 2 + cy ** 2, 1e-30))
+    c0 = cx * b1 + cy * b2 + (P.mean(axis=0) @ a) * a
+    d = P - c0; th = np.arctan2(d @ b2, d @ b1); th0 = np.angle(np.exp(1j * th).mean())
+    ch = CylinderChart(c0, a, r, b1, th0)
+    return ch, float(ch.dist(P).max())
+
+
+def fit_cone(P, N):
+    try:
+        q, *_ = np.linalg.lstsq(N, np.einsum("ij,ij->i", N, P), rcond=1e-3)
+    except np.linalg.LinAlgError:
+        return None, np.inf
+    # refine : the apex is the point whose tangent planes contain it ; take the least squares solution on centred data
+    w = P - q; rho = np.linalg.norm(w, axis=1)
+    if rho.min() < 1e-9: return None, np.inf
+    g = w / rho[:, None]
+    M = np.c_[g, -np.ones(len(g))]; u, s, vt = np.linalg.svd(M, full_matrices=False); sol = vt[-1]
+    a = _unit(sol[:3]); cb = sol[3] / max(np.linalg.norm(sol[:3]), 1e-30)
+    if cb < 0: a = -a; cb = -cb
+    beta = np.arccos(np.clip(cb, -1, 1))
+    if beta < 0.05 or beta > np.pi / 2 - 0.05: return None, np.inf
+    t = np.array([1.0, 0, 0]) if abs(a[0]) < 0.9 else np.array([0, 1.0, 0]); b1 = _unit(np.cross(a, t)); b2 = np.cross(a, b1)
+    psi = np.arctan2(w @ b2, w @ b1); p0 = np.angle(np.exp(1j * psi).mean())
+    ch = ConeChart(q, a, beta, b1, p0)
+    return ch, float(ch.dist(P).max())
+
+
+def classify_patch(lay, p, tol):
+    """Best of plane, cylinder, cone by max distance of the patch vertices to the primitive. tol in model units.
+    Returns (chart or None, kind, residual)."""
+    P, N, A = patch_points_normals(lay, p)
+    ch, r = fit_plane(P, N)
+    if r < tol: return ch, "plane", r
+    best = (None, "free", np.inf)
+    for fit in (fit_cylinder, fit_cone):
+        c2, r2 = fit(P, N)
+        if c2 is not None and r2 < tol and r2 < best[2]: best = (c2, c2.kind, r2)
+    return best
+
+
+def classify_patches(lay, tol):
+    out = {}
+    for p in range(lay.npatch):
+        if len(lay.loops[p]) != 1: out[p] = (None, "free", np.inf); continue
+        out[p] = classify_patch(lay, p, tol)
+    return out

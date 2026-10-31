@@ -1,0 +1,136 @@
+"""Pass 9 : generated part of the topology library (44 entries) with an independent verifier. Written 30 October 2026.
+Usage : python3 -I gen_topology_library.py out=entries.json [objdir=DIR] [verify_only=1]
+Families : box(a,b,c), cylinder from box (square to disc map), torus(n,m), ring of voxels (genus 1), L, T, U, stairs, plus, arch (bent box).
+Every entry is built, checked (closed 2 manifold, only quads, Euler equal to the prediction from the voxel complex, combinatorial Gauss Bonnet
+sum(4 - valence) = 4 chi, quad count equal to a closed form) and fingerprinted. A negative test removes one quad and must turn the checks red.
+FR : bibliotheque generee de topologies de quads, avec verificateur independant testé dans les deux sens."""
+import sys, json, os, collections, itertools
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_io as IO, zr8_fingerprint as FP
+
+DIRS = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+# for each direction : the four corner offsets of the face of the unit cube [0,1]^3, counter clockwise seen from outside
+FACE = {(1, 0, 0): [(1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1)], (-1, 0, 0): [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)],
+        (0, 1, 0): [(0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0)], (0, -1, 0): [(0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1)],
+        (0, 0, 1): [(0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)], (0, 0, -1): [(0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0)]}
+
+
+def voxel_surface(cells):
+    cells = set(cells); vid = {}; V = []; Q = []
+    for c in sorted(cells):
+        for d in DIRS:
+            if (c[0] + d[0], c[1] + d[1], c[2] + d[2]) in cells: continue
+            q = []
+            for o in FACE[d]:
+                p = (c[0] + o[0], c[1] + o[1], c[2] + o[2])
+                if p not in vid: vid[p] = len(V); V.append(p)
+                q.append(vid[p])
+            Q.append(q)
+    return np.array(V, float), np.array(Q, int)
+
+
+def box_cells(a, b, c): return {(i, j, k) for i in range(a) for j in range(b) for k in range(c)}
+
+
+def l_cells(a, b, t, h): return {(i, j, k) for k in range(h) for i in range(a) for j in range(t)} | {(i, j, k) for k in range(h) for i in range(t) for j in range(b)}
+
+
+def t_cells(w, hgt, t, h): return {(i, j, k) for k in range(h) for i in range(w) for j in range(hgt - t, hgt)} | {(i, j, k) for k in range(h) for i in range((w - t) // 2, (w - t) // 2 + t) for j in range(hgt - t)}
+
+
+def u_cells(w, hgt, t, h): return {(i, j, k) for k in range(h) for i in range(w) for j in range(t)} | {(i, j, k) for k in range(h) for i in list(range(t)) + list(range(w - t, w)) for j in range(hgt)}
+
+
+def stairs_cells(n, width): return {(i, j, k) for i in range(n) for j in range(width) for k in range(i + 1)}
+
+
+def plus_cells(n, t): return {(i, j, 0) for i in range(n) for j in range((n - t) // 2, (n - t) // 2 + t)} | {(i, j, 0) for i in range((n - t) // 2, (n - t) // 2 + t) for j in range(n)}
+
+
+def ring_cells(n, t, h): return {(i, j, k) for k in range(h) for i in range(n) for j in range(n) if not (t <= i < n - t and t <= j < n - t)}
+
+
+def euler_of_voxels(cells):
+    """Euler characteristic of the solid (vertices - edges + faces - cubes of the cubical complex) : independent of the surface builder."""
+    V = set(); E = set(); Fc = set()
+    for (i, j, k) in cells:
+        for dx, dy, dz in itertools.product((0, 1), repeat=3): V.add((i + dx, j + dy, k + dz))
+        for dy, dz in itertools.product((0, 1), repeat=2): E.add(("x", i, j + dy, k + dz))
+        for dx, dz in itertools.product((0, 1), repeat=2): E.add(("y", i + dx, j, k + dz))
+        for dx, dy in itertools.product((0, 1), repeat=2): E.add(("z", i + dx, j + dy, k))
+        for d in (0, 1): Fc.add(("x", i + d, j, k)); Fc.add(("y", i, j + d, k)); Fc.add(("z", i, j, k + d))
+    return len(V) - len(E) + len(Fc) - len(cells)
+
+
+def exposed_faces(cells):
+    cells = set(cells); return sum(1 for c in cells for d in DIRS if (c[0] + d[0], c[1] + d[1], c[2] + d[2]) not in cells)
+
+
+def torus_mesh(n, m, R=1.0, r=0.35):
+    V = np.array([[(R + r * np.cos(2 * np.pi * j / m)) * np.cos(2 * np.pi * i / n), (R + r * np.cos(2 * np.pi * j / m)) * np.sin(2 * np.pi * i / n), r * np.sin(2 * np.pi * j / m)] for i in range(n) for j in range(m)])
+    Q = np.array([[i * m + j, ((i + 1) % n) * m + j, ((i + 1) % n) * m + (j + 1) % m, i * m + (j + 1) % m] for i in range(n) for j in range(m)])
+    return V, Q
+
+
+def square_to_disc(V, k, m):
+    """box(k,k,m) vertices (x,y in [0,k], z in [0,m]) -> cylinder : elliptical grid map of the square to the disc."""
+    x = (V[:, 0] / k) * 2 - 1; y = (V[:, 1] / k) * 2 - 1
+    u = x * np.sqrt(np.maximum(1 - y ** 2 / 2, 0)); v = y * np.sqrt(np.maximum(1 - x ** 2 / 2, 0))
+    return np.c_[u, v, V[:, 2] / m * 2]
+
+
+def bend_arch(V, a, b, c):
+    """box(a,b,c) with x along the arc (half annulus), y the thickness, z the depth."""
+    th = np.pi * (V[:, 0] / a); R = 2.0 + V[:, 1] / b * 0.6
+    return np.c_[R * np.cos(th), R * np.sin(th), V[:, 2] / c * 0.8]
+
+
+def check(V, Q, chi_expected=None, quads_expected=None):
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
+    closed_manifold = all(c == 2 for c in ec.values())
+    used = np.unique(Q); chi = len(used) - len(ec) + len(Q)
+    val = np.bincount(Q.ravel(), minlength=len(V)); gb = int((4 - val[used]).sum())
+    r = {"closed_manifold": bool(closed_manifold), "euler": int(chi), "gauss_bonnet_ok": bool(gb == 4 * chi), "only_quads": bool(Q.shape[1] == 4)}
+    if chi_expected is not None: r["euler_matches_prediction"] = bool(chi == chi_expected)
+    if quads_expected is not None: r["quads_match_closed_form"] = bool(len(Q) == quads_expected)
+    r["green"] = all(v for k, v in r.items() if k != "euler")
+    return r
+
+
+def build_all():
+    items = []
+    for (a, b, c) in [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2), (3, 1, 1), (3, 2, 1), (3, 3, 1), (3, 3, 3), (4, 2, 2), (4, 4, 1), (4, 4, 2), (6, 3, 2), (5, 5, 5), (8, 2, 2)]:
+        V, Q = voxel_surface(box_cells(a, b, c)); items.append(("box_%dx%dx%d" % (a, b, c), "box", {"a": a, "b": b, "c": c}, V, Q, 2, 2 * (a * b + b * c + c * a)))
+    for (k, m) in [(2, 1), (2, 2), (2, 3), (3, 2), (3, 4), (4, 2), (4, 4), (5, 3)]:
+        V, Q = voxel_surface(box_cells(k, k, m)); items.append(("cylinder_%d_%d" % (k, m), "cylinder_from_box", {"k": k, "m": m}, square_to_disc(V, k, m), Q, 2, 2 * (k * k + 2 * k * m)))
+    for (n, m) in [(4, 4), (6, 3), (8, 4), (12, 6), (16, 8), (24, 12)]:
+        V, Q = torus_mesh(n, m); items.append(("torus_%dx%d" % (n, m), "torus", {"n": n, "m": m}, V, Q, 0, n * m))
+    for (n, t, h) in [(3, 1, 1), (4, 1, 1), (3, 1, 2), (5, 2, 1)]:
+        cl = ring_cells(n, t, h); V, Q = voxel_surface(cl); items.append(("ring_%d_t%d_h%d" % (n, t, h), "voxel_ring", {"n": n, "t": t, "h": h}, V, Q, 2 * euler_of_voxels(cl), exposed_faces(cl)))
+    for (a, b, t, h) in [(2, 2, 1, 1), (3, 3, 1, 1), (3, 3, 1, 2), (4, 3, 2, 1), (5, 5, 2, 2)]:
+        cl = l_cells(a, b, t, h); V, Q = voxel_surface(cl); items.append(("L_%dx%d_t%d_h%d" % (a, b, t, h), "voxel_L", {"a": a, "b": b, "t": t, "h": h}, V, Q, 2 * euler_of_voxels(cl), exposed_faces(cl)))
+    for name, fam, par, cl in [("T_3x2_t1_h1", "voxel_T", {"w": 3, "hgt": 2, "t": 1, "h": 1}, t_cells(3, 2, 1, 1)), ("U_3x2_t1_h1", "voxel_U", {"w": 3, "hgt": 2, "t": 1, "h": 1}, u_cells(3, 2, 1, 1)),
+                               ("stairs_3_w2", "voxel_stairs", {"n": 3, "width": 2}, stairs_cells(3, 2)), ("stairs_5_w3", "voxel_stairs", {"n": 5, "width": 3}, stairs_cells(5, 3)),
+                               ("plus_5_t1", "voxel_plus", {"n": 5, "t": 1}, plus_cells(5, 1))]:
+        V, Q = voxel_surface(cl); items.append((name, fam, par, V, Q, 2 * euler_of_voxels(cl), exposed_faces(cl)))
+    for (a, b, c) in [(6, 1, 2), (8, 2, 2)]:
+        V, Q = voxel_surface(box_cells(a, b, c)); items.append(("arch_%dx%dx%d" % (a, b, c), "arch_bent_box", {"a": a, "b": b, "c": c}, bend_arch(V, a, b, c), Q, 2, 2 * (a * b + b * c + c * a)))
+    return items
+
+
+if __name__ == "__main__":
+    args = dict(kv.split("=", 1) for kv in sys.argv[1:]); objdir = args.get("objdir", "/tmp"); os.makedirs(objdir, exist_ok=True)
+    out = []; allgreen = True
+    for name, fam, par, V, Q, chi_e, q_e in build_all():
+        r = check(V, Q, chi_e, q_e); allgreen &= r["green"]
+        path = os.path.join(objdir, name + ".obj"); IO.write_obj(path, V, Q); fp = FP.fingerprint(path)
+        out.append({"id": "gen_" + name, "family": "generated_" + fam, "source": "genere par pass8_tools/gen_topology_library.py", "params": par, "check": r, "fingerprint": fp})
+    # negative test : drop one quad, the checks must turn red
+    V, Q = voxel_surface(box_cells(3, 3, 3)); neg = check(V, Q[1:], 2, 2 * 27); neg_ok = not neg["green"]
+    json.dump({"entries": out, "all_green": bool(allgreen), "negative_test_turns_red": bool(neg_ok)}, open(args["out"], "w"), indent=1)
+    print(json.dumps({"entries": len(out), "all_green": bool(allgreen), "negative_test_turns_red": bool(neg_ok)}))
+    sys.exit(0 if allgreen and neg_ok else 1)

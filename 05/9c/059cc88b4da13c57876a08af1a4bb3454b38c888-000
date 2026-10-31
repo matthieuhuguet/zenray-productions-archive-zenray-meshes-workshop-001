@@ -1,0 +1,106 @@
+"""30 October 2026 : COVERAGE FIRST car assembly : no component may vanish. For every part of the reference car, every candidate retopology (current hybrid part, QuadWild mechanical part, every Houdini tournament variant, and the reference part itself as the last resort) is measured against the reference part : RECALL (share of reference surface within --tol of the candidate), PRECISION (share of candidate surface within --tol of the reference), area ratio, quads, folded and squashed share. A candidate PASSES the gate when recall >= --recall and precision >= --precision. Among the passing ones the best is the one with the fewest folded and squashed quads (quads preferred over triangles), the reference part is chosen only when nothing else passes.
+    python -I QwCarCover.py ref.obj hybrid.obj hybrid.obj.parts.json qw_dir tournament_dir out.obj [--tol 0.02 --recall 0.97 --precision 0.95] [--report report.json]
+FR : assemblage voiture par couverture d'abord : aucune piece ne disparait ; chaque candidat est mesure contre la piece de reference (rappel, precision), le meilleur candidat qui passe la porte est pris, la piece de reference elle-meme en dernier recours."""
+import argparse, collections, json, os, sys
+from concurrent.futures import ProcessPoolExecutor
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+from scipy.spatial import cKDTree
+import ZrlQuadStats as QS
+SAMPLES_PER_M2 = 4000
+
+
+def load_all(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+def load_groups(path):
+    V = []; G = collections.OrderedDict(); cur = None
+    for l in open(path):
+        t = l.split()
+        if not t: continue
+        if t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t[0] in ("g", "o"): cur = t[1]; G.setdefault(cur, [])
+        elif t[0] == "f" and cur: G[cur].append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), G
+
+
+def tris_of(V, F):
+    T = [(f[0], f[k], f[k + 1]) for f in F for k in range(1, len(f) - 1)]
+    return np.array(T, np.int64) if T else np.zeros((0, 3), np.int64)
+
+
+def sample(V, F, rng, per_m2=SAMPLES_PER_M2):
+    T = tris_of(V, F)
+    if not len(T): return np.zeros((0, 3)), 0.0
+    a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]; area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1); tot = float(area.sum()); n = int(max(200, min(20000, tot * per_m2)))
+    if tot <= 0: return V[T[:, 0]][:n], 0.0
+    i = rng.choice(len(T), n, p=area / tot); u = rng.random((n, 2)); m = u.sum(1) > 1; u[m] = 1 - u[m]
+    return a[i] + u[:, :1] * (b[i] - a[i]) + u[:, 1:] * (c[i] - a[i]), tot
+
+
+def measure(refV, refF, V, F, tol, rng):
+    P, ra = sample(refV, refF, rng); S, ca = sample(V, F, rng)
+    if not len(S) or not len(P): return None
+    recall = float((cKDTree(S).query(P)[0] <= tol).mean()); precision = float((cKDTree(P).query(S)[0] <= tol).mean()); Q = np.array([f for f in F if len(f) == 4], np.int64); nq = len(Q); nt = sum(1 for f in F if len(f) == 3); r = {"recall": round(recall, 4), "precision": round(precision, 4), "area_ratio": round(ca / max(ra, 1e-12), 3), "quads": nq, "tris": nt}
+    if nq:
+        _, _, j, _ = QS.stats(V, Q); r.update({"folded": int((j < 0).sum()), "squashed": int((j < 0.3).sum())})
+    else: r.update({"folded": 0, "squashed": 0})
+    r["bad"] = round((r["folded"] + r["squashed"]) / max(nq, 1), 4) if nq else 1.0; r["quad_share"] = round(nq / max(nq + nt, 1), 4); return r
+
+
+def work(args):
+    part, refV, refF, cands, tol = args; rng = np.random.default_rng(7); out = {}
+    for name, (V, F) in cands.items():
+        try: out[name] = measure(refV, refF, V, F, tol, rng)
+        except Exception as ex: out[name] = {"error": str(ex)[:80]}
+    return part, out
+
+
+def main():
+    ap = argparse.ArgumentParser(); [ap.add_argument(x) for x in ("ref", "hybrid", "parts", "qw_dir", "tournament_dir", "out")]; ap.add_argument("--tol", type=float, default=0.02); ap.add_argument("--recall", type=float, default=0.97); ap.add_argument("--precision", type=float, default=0.95); ap.add_argument("--report"); ap.add_argument("--workers", type=int, default=14); a = ap.parse_args()
+    RV, RG = load_groups(a.ref); HV, HF = load_all(a.hybrid); names = json.load(open(a.parts)); hyb = collections.defaultdict(list)
+    for f, n in zip(HF, names): hyb[n].append(f)
+    jobs = []
+    for part, rf in RG.items():
+        if not rf: continue
+        c = {}
+        if part in hyb: used = sorted({v for f in hyb[part] for v in f}); m = {v: i for i, v in enumerate(used)}; c["hybrid"] = (HV[used], [[m[v] for v in f] for f in hyb[part]])
+        qp = os.path.join(a.qw_dir, part, "qw_mechanical.obj")
+        if os.path.exists(qp): c["qw_mech"] = load_all(qp)
+        td = os.path.join(a.tournament_dir, part)
+        if os.path.isdir(td):
+            for fn in sorted(os.listdir(td)):
+                if fn.endswith(".obj") and fn != "part.obj": c["tourn:" + fn[:-4]] = load_all(os.path.join(td, fn))
+        used = sorted({v for f in rf for v in f}); m = {v: i for i, v in enumerate(used)}; refPart = (RV[used], [[m[v] for v in f] for f in rf]); c["ref"] = refPart; jobs.append((part, refPart[0], refPart[1], c, a.tol))
+    rep = {}
+    with ProcessPoolExecutor(a.workers) as ex:
+        for part, out in ex.map(work, jobs, chunksize=1): rep[part] = out
+    pick = {}; OV = []; OF = []; OG = []; src = collections.Counter()
+    for part, rf in RG.items():
+        if not rf: continue
+        ok = {k: v for k, v in rep[part].items() if v and "error" not in v and v["recall"] >= a.recall and v["precision"] >= a.precision}
+        pool = {k: v for k, v in ok.items() if k != "ref"}
+        if pool: best = min(pool, key=lambda k: (pool[k]["quad_share"] < 0.98, pool[k]["bad"], abs(pool[k]["area_ratio"] - 1)))
+        else: best = "ref"
+        pick[part] = best; src[best.split(":")[0]] += 1
+    # rebuild geometry of the picked candidates
+    for part, best in pick.items():
+        if best == "hybrid": used = sorted({v for f in hyb[part] for v in f}); m = {v: i for i, v in enumerate(used)}; V = HV[used]; F = [[m[v] for v in f] for f in hyb[part]]
+        elif best == "qw_mech": V, F = load_all(os.path.join(a.qw_dir, part, "qw_mechanical.obj"))
+        elif best.startswith("tourn:"): V, F = load_all(os.path.join(a.tournament_dir, part, best[6:] + ".obj"))
+        else: used = sorted({v for f in RG[part] for v in f}); m = {v: i for i, v in enumerate(used)}; V = RV[used]; F = [[m[v] for v in f] for f in RG[part]]
+        base = len(OV); OV += V.tolist(); OF += [[base + int(i) for i in f] for f in F]; OG += [part] * len(F)
+    with open(a.out, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in OV)); f.write("".join("f " + " ".join(str(i + 1) for i in q) + "\n" for q in OF))
+    json.dump(OG, open(a.out + ".parts.json", "w")); json.dump({"pick": pick, "candidates": rep}, open(a.report or a.out + ".report.json", "w"), indent=1)
+    print("parts %d : picked %s ; faces %d" % (len(pick), dict(src), len(OF)))
+    print("parts where only the reference passes (no candidate covers it) :", [p for p, b in pick.items() if b == "ref"][:30])
+
+
+if __name__ == "__main__": main()

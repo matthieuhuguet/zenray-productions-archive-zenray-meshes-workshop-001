@@ -1,0 +1,25 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode=True
+import diag, numpy as np
+def jac_with(Pq,nm):
+    j=np.empty((len(Pq),4))
+    for k in range(4):
+        u=Pq[:,(k+1)%4]-Pq[:,k]; v=Pq[:,(k-1)%4]-Pq[:,k]; j[:,k]=np.einsum('ij,ij->i',np.cross(u,v),nm)/np.maximum(np.linalg.norm(u,axis=1)*np.linalg.norm(v,axis=1),1e-12)
+    return j.min(1)
+def run(obj,edge,o):
+    m=diag.AP.mesh(os.path.abspath(obj)); zones=diag.ANY.segment(m,25.0,max(4,int(0.002*len(m['F']))),merge_deg=35.0,log=lambda s:None); acc=np.zeros((3,2),int); tot=0
+    for k,(Z,seed) in enumerate(zones):
+        try: r,err=diag.fill4(m,Z,edge,o)
+        except Exception: continue
+        if r is None: continue
+        P=r['P3r']; Q=r['Q']; Pq=P[Q]; tot+=len(Q)
+        n0=np.cross(Pq[:,1]-Pq[:,0],Pq[:,3]-Pq[:,0]); n0/=np.maximum(np.linalg.norm(n0,axis=1,keepdims=True),1e-12)
+        nd=np.cross(Pq[:,2]-Pq[:,0],Pq[:,3]-Pq[:,1]); nd/=np.maximum(np.linalg.norm(nd,axis=1,keepdims=True),1e-12)
+        vn=r['Nz'][r['tri_of']][Q].mean(1); vn/=np.maximum(np.linalg.norm(vn,axis=1,keepdims=True),1e-12)
+        for i,nm in enumerate((n0,nd,vn)):
+            jm=jac_with(Pq,nm); acc[i]+= [int((jm<0).sum()),int((jm<0.3).sum())]
+    return tot,acc
+S='/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt'
+for name,path,edge in (('arch',S+'/arch_hard.obj',0.07),('lily',S+'/lily_plant.obj',0.0066)):
+    for tag,o in (('as shipped (relax150)',dict(k=24,relax=150.0)),('snap+sag, relax 0',dict(k=300,relax=0.0,snap='1',sag=0.001))):
+        tot,acc=run(path,edge,o); print(name,tag,'quads',tot,'| corner-0 normal: fold',acc[0][0],'sq',acc[0][1],'| diagonal normal: fold',acc[1][0],'sq',acc[1][1],'| surface normal: fold',acc[2][0],'sq',acc[2][1])

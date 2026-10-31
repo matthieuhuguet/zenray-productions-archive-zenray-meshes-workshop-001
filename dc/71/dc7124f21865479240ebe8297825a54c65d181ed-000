@@ -1,0 +1,48 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH : verifier V9, crease sharpness. For every crease edge (dihedral above --crease-deg between its two quads) the two edges parallel to it, one row away on each side, are looked at : a crisp crease has flat shoulders (their dihedral under --shoulder-deg), a rounded or smeared one has a shoulder that already bends. Reported by edge count and by edge length : share of crisp creases, median shoulder angle.
+    python -I CarCreaseSharpness.py car.obj [--crease-deg 35] [--shoulder-deg 5]
+FR : verificateur V9, nettete des plis : les epaules d'un pli net sont plates."""
+import argparse, collections
+import numpy as np
+
+
+def measure(path, crease_deg=35.0, shoulder_deg=5.0):
+    class a: pass
+    a.inp = path; a.crease_deg = crease_deg; a.shoulder_deg = shoulder_deg
+    V = []; Q = []
+    for l in open(a.inp):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("f "):
+            f = [int(x.split("/")[0]) - 1 for x in l.split()[1:]]
+            if len(f) == 4: Q.append(f)
+    V = np.array(V); Q = np.array(Q); n = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30)
+    ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): u, w = int(q[k]), int(q[(k + 1) % 4]); ef[(min(u, w), max(u, w))].append((qi, k))
+    def dih(e):
+        f = ef.get(e)
+        if not f or len(f) != 2: return None
+        return float(np.degrees(np.arccos(np.clip(n[f[0][0]] @ n[f[1][0]], -1, 1))))
+    def opposite(qi, k):
+        q = Q[qi]; u, w = int(q[(k + 2) % 4]), int(q[(k + 3) % 4]); return (min(u, w), max(u, w))
+    cnt = 0; crisp = 0; L = 0.0; Lc = 0.0; sh = []
+    for e, f in ef.items():
+        if len(f) != 2: continue
+        d = dih(e)
+        if d is None or d < a.crease_deg or d > 175: continue
+        s = []
+        for (qi, k) in f:
+            o = dih(opposite(qi, k))
+            if o is not None: s.append(o)
+        if len(s) < 2: continue
+        length = float(np.linalg.norm(V[e[0]] - V[e[1]])); cnt += 1; L += length; m = max(s); sh.append(m)
+        if m < a.shoulder_deg: crisp += 1; Lc += length
+    sh = np.array(sh) if len(sh) else np.array([0.0])
+    return {"edges": cnt, "length_m": L, "crisp_edge_share": crisp / max(cnt, 1), "crisp_length_share": Lc / max(L, 1e-9), "median_shoulder_deg": float(np.median(sh)), "p90_shoulder_deg": float(np.percentile(sh, 90))}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("--crease-deg", type=float, default=35.0); ap.add_argument("--shoulder-deg", type=float, default=5.0); a = ap.parse_args(); m = measure(a.inp, a.crease_deg, a.shoulder_deg)
+    print("crease edges %d  length %.1f m  crisp (shoulders under %.0f deg) : %.1f %% of edges, %.1f %% of length ; median shoulder %.1f deg  p90 %.1f deg" % (m["edges"], m["length_m"], a.shoulder_deg, 100 * m["crisp_edge_share"], 100 * m["crisp_length_share"], m["median_shoulder_deg"], m["p90_shoulder_deg"]))
+
+
+if __name__ == "__main__": main()

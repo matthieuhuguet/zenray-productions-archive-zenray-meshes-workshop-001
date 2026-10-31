@@ -1,0 +1,135 @@
+"""Q9, mesure 1 : classes de surface de v752 (plane, développable, libre) par ajustement local, pour la peau visible.
+Sortie JSON dans out/q9_surface_classes.json. 30 October 2026."""
+import sys, json, re, time
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, ".")
+from zrcar_common import *
+
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F)
+Gq = G[keep]
+N, A, C = face_geom(V, Q)
+
+SKIN = re.compile(r"^CAR_(body_(?!under_floor)|arch_|fascia_|bumper_|grille_|light_|pillar_|splitter_|rocker_line|vent_|closer_)")
+def is_skin(nm): return bool(SKIN.match(nm))
+skin_gid = np.array([is_skin(n) for n in names])
+ext = np.load('out/v752_exterior.npz')
+fm = skin_gid[Gq] & ext['vis']
+print("peau extérieure (visible, de face) : quads", fm.sum(), "aire m2", A[fm].sum())
+
+# normales et aires par sommet (peau)
+vn = np.zeros_like(V); va = np.zeros(len(V))
+for k in range(4):
+    np.add.at(vn, Q[fm][:, k], N[fm] * A[fm][:, None])
+    np.add.at(va, Q[fm][:, k], A[fm] / 4.0)
+used = va > 0
+vn[used] /= np.linalg.norm(vn[used], axis=1)[:, None]
+ids = np.where(used)[0]
+tree = cKDTree(V[ids])
+# nom du groupe du sommet (premier quad vu)
+vgrp = -np.ones(len(V), int)
+for k in range(4):
+    vgrp[Q[fm][:, k]] = Gq[fm]
+
+def fit(i, r, ndot=0.8):
+    c = V[i]
+    nb = tree.query_ball_point(c, r)
+    pts = V[ids[nb]]
+    nrm = vn[ids[nb]]
+    ok = nrm @ vn[i] > ndot
+    pts = pts[ok]
+    if len(pts) < 12:
+        return None
+    w = vn[i]
+    # repère local
+    t = np.cross(w, [1, 0, 0]);
+    if np.linalg.norm(t) < 0.1: t = np.cross(w, [0, 1, 0])
+    t /= np.linalg.norm(t); b = np.cross(w, t)
+    d = pts - c
+    u, v, h = d @ t, d @ b, d @ w
+    # plan : RMS des hauteurs après retrait du plan moyen (PCA)
+    X = np.c_[u, v, np.ones_like(u)]
+    coef, *_ = np.linalg.lstsq(X, h, rcond=None)
+    rp = h - X @ coef
+    plane_rms = np.sqrt((rp ** 2).mean())
+    # quadrique
+    X2 = np.c_[u * u, u * v, v * v, u, v, np.ones_like(u)]
+    c2, *_ = np.linalg.lstsq(X2, h, rcond=None)
+    rq = h - X2 @ c2
+    quad_rms = np.sqrt((rq ** 2).mean())
+    # courbures au centre (pente locale petite car repère sur la normale)
+    a, bb, cc, dd, ee = c2[:5]
+    H = np.array([[2 * a, bb], [bb, 2 * cc]])
+    k = np.linalg.eigvalsh(H)
+    # extension : spread du nuage dans le plan (éviter les bandes minces)
+    ext = np.sqrt(np.linalg.eigvalsh(np.cov(np.c_[u, v].T))).min() if len(u) > 3 else 0
+    return plane_rms, quad_rms, k[0], k[1], len(pts), ext
+
+res = {}
+t0 = time.time()
+for r in (0.04, 0.10):
+    out = np.full((len(ids), 6), np.nan)
+    for j, i in enumerate(ids):
+        o = fit(i, r)
+        if o is not None:
+            out[j] = o
+    res[r] = out
+    print("rayon", r, "fait en", round(time.time() - t0, 1), "s ; valides", np.isfinite(out[:, 0]).mean())
+
+w = va[ids]
+def frac(mask, wt):
+    return float((wt * mask).sum() / wt.sum())
+report = {"date": "30 October 2026", "skin_area_m2": float(A[fm].sum()), "skin_vertices": int(len(ids))}
+for r, out in res.items():
+    ok = np.isfinite(out[:, 0]) & (out[:, 5] > 0.35 * r)  # voisinage 2D épais
+    ww = np.where(ok, w, 0.0)
+    pr = out[:, 0] * 1000.0     # mm
+    qr = out[:, 1] * 1000.0
+    k1, k2 = out[:, 2], out[:, 3]
+    kmax = np.maximum(np.abs(k1), np.abs(k2)); kmin = np.minimum(np.abs(k1), np.abs(k2))
+    rep = {"valid_area_fraction": float(ww.sum() / w.sum())}
+    for tol in (0.25, 0.5, 1.0, 2.0, 5.0):
+        rep[f"plane_rms_below_{tol}mm"] = frac(pr < tol, ww)
+    # classes (rayon 0.10) avec tolérance plan 1 mm : plane / développable / libre
+    planar = pr < 1.0
+    dev = (~planar) & (kmin < 0.5) & (kmax >= 0.5)       # rayon de courbure > 2 m dans une direction
+    free = (~planar) & (~dev)
+    rep["class_planar_1mm"] = frac(planar, ww)
+    rep["class_developable"] = frac(dev, ww)
+    rep["class_free"] = frac(free, ww)
+    planar2 = pr < 3.0
+    dev2 = (~planar2) & (kmin < 0.5) & (kmax >= 0.5)
+    rep["class_planar_3mm"] = frac(planar2, ww)
+    rep["class_developable_when_3mm"] = frac(dev2, ww)
+    rep["class_free_when_3mm"] = frac((~planar2) & (~dev2), ww)
+    rep["quadric_residual_mm_median"] = float(np.nanmedian(qr[ok]))
+    rep["quadric_residual_mm_p90"] = float(np.nanpercentile(qr[ok], 90))
+    rep["plane_rms_mm_median"] = float(np.nanmedian(pr[ok]))
+    rep["plane_rms_mm_p90"] = float(np.nanpercentile(pr[ok], 90))
+    report[f"r_{r}"] = rep
+# par composant
+per = []
+out = res[0.10]
+ok = np.isfinite(out[:, 0]) & (out[:, 5] > 0.035)
+for gi, nm in enumerate(names):
+    if not skin_gid[gi]: continue
+    sel = ok & (vgrp[ids] == gi)
+    if sel.sum() < 30: continue
+    pr = out[sel, 0] * 1000; qr = out[sel, 1] * 1000
+    k1, k2 = out[sel, 2], out[sel, 3]
+    kmax = np.maximum(np.abs(k1), np.abs(k2)); kmin = np.minimum(np.abs(k1), np.abs(k2))
+    ww = w[sel]
+    per.append({"name": nm, "area_m2": float(A[Gq == gi].sum()), "plane_rms_mm_median": float(np.median(pr)),
+                "quadric_rms_mm_median": float(np.median(qr)),
+                "planar_1mm": frac(pr < 1, ww), "developable": frac((pr >= 1) & (kmin < .5) & (kmax >= .5), ww),
+                "free": frac((pr >= 1) & ~((kmin < .5) & (kmax >= .5)), ww)})
+per.sort(key=lambda d: -d["area_m2"])
+report["per_component"] = per
+import os
+os.makedirs("out", exist_ok=True)
+json.dump(report, open("out/q9_surface_classes.json", "w"), indent=1)
+print(json.dumps({k: v for k, v in report.items() if k != "per_component"}, indent=1))
+for d in per[:25]:
+    print(f"{d['name']:32s} {d['area_m2']:6.3f} m2  planRMS {d['plane_rms_mm_median']:5.2f}  quadRMS {d['quadric_rms_mm_median']:5.2f}  plan {d['planar_1mm']:.2f} dev {d['developable']:.2f} libre {d['free']:.2f}")

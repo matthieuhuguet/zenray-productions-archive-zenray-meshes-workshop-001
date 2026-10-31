@@ -1,0 +1,342 @@
+# Inventaire QuadWild et méthodes de retopologie, pour la fusion avec ZenRay Meshes (30 October 2026)
+
+Lecture seule. Aucun fichier existant n'a été modifié. Ce document résume le dossier `/Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/` et les sections 16 à 27 de `/Users/zenray/.claude/Memory1/Projects/zenray-meshes/ZenRayMeshes1.md` (abrégé ZMS).
+
+Statuts : [MESURÉ] exécuté dans le projet ; [CODE] lu dans le dépôt quadwild-bimdf ; [DOC] lu dans une source publiée ou un résumé de recherche ; [ESTIMÉ] jugement non vérifié ; « non trouvé » quand la source manque.
+
+Les sous-dossiers d'outils (`pass5_tools`, `pass6_tools`, `pass7_tools`, `pass7_boards`, `tutte_diag_tools`) ne sont pas relus : seuls les résultats écrits dans les fichiers `.md` sont utilisés.
+
+## 0. Codes de sources
+
+| Code | Fichier |
+|---|---|
+| QWS | `quadwild_source_notes_30-October-2026.md` (dossier retopology-dataset) |
+| QPS | `quadwild_parameter_study_30-October-2026.md` |
+| APD | `autopatch_decomposition_30-October-2026.md` |
+| IPF | `intrinsic_patch_fill_30-October-2026.md` |
+| TDG | `tutte_fill_diagnosis_30-October-2026.md` |
+| TP7 | `tutte_fill_pass7_30-October-2026.md` |
+| TCA | `true_corners_annuli_normals_30-October-2026.md` |
+| RSG | `region_segmentation_30-October-2026.md` |
+| PCT | `patch_conditions_tarini_30-October-2026.md` |
+| TPT | `takayama_patch_templates_30-October-2026.md` |
+| TVT | `takayama_validation_and_tables_30-October-2026.md` |
+| GAP | `gaps.md` (identique à `gaps_30-October-2026.md`, vérifié par cmp) |
+| LIC | `licenses_and_tools_30-October-2026.md` |
+| SRC | `sources_completed_30-October-2026.md` |
+| MAN | `manny_topology_stats_30-October-2026.md` |
+| ORG | `rules_organic.md` |
+| HSU | `rules_hardsurface.md` |
+| DAT | `datasets_available.md` |
+| TTP | `template_transfer_and_primitives_30-October-2026.md` |
+| SUM n | `summary_30-October-2026.md` (n = 1), `summary_30-October-2026_pass2.md` à `pass7.md` (n = 2 à 7) |
+| MJ | `methods.json` (entrées 1 à 28) et `methods_pass3_30-October-2026.json` (entrées 29 à 38) |
+| CODE | racine `/Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf/` (chemins relatifs à cette racine) |
+| ZMS §n | `/Users/zenray/.claude/Memory1/Projects/zenray-meshes/ZenRayMeshes1.md`, section n |
+
+Numérotation des méthodes : position dans MJ, de 1 à 38 (les 28 entrées de `methods.json`, puis les 10 de `methods_pass3`).
+
+---
+
+## 1. La chaîne QuadWild Bi-MDF
+
+### 1.1 Étapes, entrées et sorties
+
+| Étape | Exécutant | Entrée | Sortie | Source |
+|---|---|---|---|---|
+| 0. Lecture du réglage | `quadwild` avec le fichier `prep.txt` et l'argument d'arrêt 2 (lanceur `QwBench.py`) | OBJ ou PLY triangulaire, fichier de 4 clés : `do_remesh`, `sharp_feature_thr`, `alpha`, `scaleFact` | Maillage remaillé `*_rem_p0.obj` | QWS §1 et §2 ; QPS §1.1 |
+| 1. Remaillage isotrope | intégré à `quadwild` | 15 itérations, aspect 0,35, delta 10 000 | Maillage remaillé | QWS §2 |
+| 2. Champ de directions | intégré, mode choisi automatiquement | Arêtes vives. NPoly si la longueur des arêtes vives divisée par la racine de l'aire dépasse 6, sinon Comiso (MIQ, alpha_curv 0,3) | Champ | QPS §1.2 ; QWS §2 |
+| 3. Tracé des chemins et découpe en patchs | intégré | Champ, arêtes vives, contraintes de patch (disque, 3 à 5 coins, pas de virage à gauche ni de demi-tour) | `_p0.patch`, `_p0.corners`, `_p0.feature`, `_p0.c_feature` | QWS §3, §7 ; APD §1.1 |
+| 4. Quantification (flot Bi-MDF) | `quad_from_patches num flow.txt stats.json` (`useFlowSolver 1`, `qr_flow.cpp`) | Patchs, longueurs de bord | Un entier par arche, régularité et parité traitées comme des poids du flot, sans Gurobi | QWS §6 ; QPS §1.3 |
+| 5. Remplissage de chaque patch | `quadrangulate` et `computePattern` (motifs de Takayama, N de 2 à 6) | Comptes d'arêtes entiers | Quads du patch ; bord réparti par longueur d'arc sur un polygone régulier ; paramétrisation LSCM à bord fixé ; localisation AABB ; relèvement barycentrique | QWS §4 |
+| 6. Lissage final | `MultiCostraintSmooth` avec damp 0,5, échelle = arête moyenne, 30 pas, 1 reprojection | Maillage de quads | `*_rem_p0_123_quadrangulation_smooth.obj` | [CODE] `quadwild/functions.cpp` l. 201 ; QWS §7 point 7 ; ZMS §23 |
+
+Précisions. L'étape 0 ne lit que `do_remesh` et `sharp_feature_thr` ; `alpha` et `scaleFact` du fichier de préparation ne servent que dans un appel que le lanceur ne fait pas (QPS §1.1). La densité se règle dans le fichier de flux (QPS §1.3). Le lanceur est `QwBench.py mesh.obj out_dir [organic|mechanical|basic]` (ZMS §23). Une étape de quadrangulation de chaque patch exige un patch homéomorphe à un disque, de 3 à 6 coins : une lentille à 2 coins et un patch à 7 ou 8 côtés sont refusés (QWS §4 ; APD §1.1).
+
+### 1.2 Paramètres : défauts et ceux qui comptent
+
+| Paramètre | Défaut | Compte-t-il ? (mesuré) | Source |
+|---|---|---|---|
+| `sharp_feature_thr` | 35° (basic et mechanical), -1 (organic : désactive les arêtes vives) | Oui, levier principal de la topologie | QWS §2 ; QPS §1.7, §2 |
+| `do_remesh` | 1 | Oui : à 0, l'arche monte à 8,8 % d'écrasés (16,1 % en organic, trous de 77 ‰) | QPS §2, §3 |
+| `scaleFact` dans le fichier de flux | 1 | Oui : c'est le réglage de densité (EdgeSize = arête moyenne de `_rem_p0.obj` × scaleFact) | QPS §1.3, §4.1 ; CODE `components/quad_from_patches/main.cpp` l. 204-206 |
+| `scaleFact` dans le fichier de préparation | 1 | Non (sans effet) | QPS §1.3 ; SUM 6 point 2 |
+| `alpha` dans le fichier de préparation | 0,01 (basic), 0,02 (organic) | Non (sans effet) | QPS §1.1 |
+| `alpha` du flux | 0,005 (`flow_noalign_lemon`) | Oui en hard surface : 0,1 à 0,3 ramène l'écrasé de 0,84 % à 0,43 % sur l'arche, pour +4 % de quads ; 1,0 échoue | QPS §2, §6 |
+| Fichier de flux | `flow_noalign_lemon` | Oui : `approx_mst` est le meilleur sur l'arche (plié 0,08 %, écrasé 0,60 %) ; `edgethru` dépasse 900 s dans trois cas | QPS §2, §6 |
+| `isometry`, `regularityQuadrilaterals`, `regularityNonQuadrilaterals`, `hardParityConstraint` | 1 | Non : sortie identique sur 8 combinaisons, le flot les ignore | QPS §1.3 |
+| `alignSingularities` | 0 dans lemon (1 dans le fichier flow.txt), poids 0,1 | Faible : `align1` change 0 à 1 % des quads | QWS §2 ; QPS §3 |
+| Solveur ILP Gurobi (`cfg ilp`) | non compilé | Échec systématique (« built without Gurobi ») | QPS §6 |
+| Seuil NPoly ou Comiso | `SharpFactor` 6 | Imposé en dur | QWS §2 ; QPS §1.2 |
+| Remaillage | 15 itérations, aspect 0,35, delta 10 000 | En dur | QWS §2 |
+| Autres constantes en dur | `feature_erode_dilate` 4, `MinVal` 3, `MaxVal` 5 (le papier dit 6), `Drift` 100, `sample_ratio` 0,01, `CClarkability` 1 (tolérance = une arête moyenne), `Concave_Need` 1 | En dur | QWS §2, §7 |
+| Lissage des patchs (chart, fixe, non fixe) | 0, 0, 0 (`functions.cpp` l. 163-165) | En dur : aucun lissage intermédiaire | [CODE] ; QWS §2 |
+| Lissage final | damp 0,5 ; 30 pas ; 1 reprojection | En dur : c'est le seul lissage qui tourne | [CODE] `functions.cpp` l. 201 |
+| Champ | `alpha_curv` 0,3 ; `curv_thr` 0,8 | En dur | QWS §2 |
+
+Le fichier de flux pilote aussi `timeLimit`, `gapLimit`, `minimumGap` et les paliers de temps : ces clés servent le chemin ILP Gurobi, pas le flot (QWS §2 ; QPS §1.3).
+
+### 1.3 Coût en temps mesuré
+
+Mesures propres, séquentielles, sur les quatre maillages du banc (QPS §1.5, machine à charge 12 signalée par l'étude) :
+
+| Maillage | Quads basic / organic | Basic : étapes 1-2 + étape 3 | Organic : étapes 1-2 + étape 3 |
+|---|---|---|---|
+| Arche | 29 477 / 27 323 | 13,9 s + 14,6 s | 14,6 s + 6,1 s |
+| Lys | 17 068 / 6 504 | 7,3 s + 18,5 s | 8,1 s + 4,8 s |
+| Eucalyptus | 5 736 / 9 244 | 4,5 s + 1,3 s | 4,3 s + 1,8 s |
+| Manny | 27 268 / 8 008 | 10,8 s + 20,2 s | 6,7 s + 2,2 s |
+
+Autres mesures : 31 s, 7 s, 9 s et 14 s pour l'arche mechanical, l'eucalyptus organic, Manny organic et le lys organic (ZMS §23), conditions de charge non précisées. Chiffre de l'article [DOC, APD §1.5] : 308 modèles en environ 5 heures sur un portable de 2018 (une minute par maillage), monothread, réparti entre 2 h 30 de remaillage, 50 min de layout et 2 h de quadrangulation. Version Bi-MDF : 0,49 % du temps de QuadWild avec 11 % d'énergie en moins (MJ entrée 2, résumé de recherche, 17,06 s contre 3 491 s sur 300 modèles).
+
+### 1.4 Mémoire mesurée
+
+- Voiture v752 entière (299 000 triangles, bord 0,04) : l'étape 1 dépasse 11 minutes et 5,7 Go de mémoire (ZMS §23). Pour cette raison, la voiture est traitée pièce par pièce (ZMS §23, §25).
+- Autres maillages : non trouvé.
+
+---
+
+## 2. Réglages : densité, symétrie, arêtes vives, composants
+
+### 2.1 Densité
+
+- Loi [QPS §4.1] : EdgeSize = arête moyenne de `_rem_p0.obj` × scaleFact. Le nombre de quads vaut environ A / EdgeSize² × k, avec k entre 1,0 et 1,3 (arche : 0,99 à 1,25 selon l'échelle).
+- Taille d'arête cible L, en unités de l'OBJ : scaleFact = L / e0, où e0 est l'arête moyenne de `_rem_p0.obj` de la préparation utilisée (QPS §4.1).
+- Nombre de quads cible N : scaleFact = racine(1,1 × A / N) / e0, puis une seconde passe scaleFact × racine(quads / N) (QPS §4.1).
+
+Précision du contrôle [MESURÉ, QPS §4.1, 12 cas : quatre maillages, trois cibles] :
+
+| Contrôle | Résultat |
+|---|---|
+| Une passe | Erreur de 5,8 % à 59 % (médiane 10 %) |
+| Deux passes | Erreur sous 8 % dans 11 cas sur 12 ; le cas faible est l'arche visée à 3 000 quads (+28 %, plancher de 620 patchs) |
+| Coût d'une passe | 2 à 20 s (étape 3 seule, étapes 1-2 faites une fois) |
+
+- Plancher : environ 5 à 10 quads par patch. Manny en basic ne descend pas sous 17 574 quads (1 894 patchs) (QPS §4.1 ; SUM 6 point 7).
+- Densité variable par région : impossible par configuration (QPS §4.2). L'API accepte déjà une taille par patch (`quad_from_patches.cpp` l. 45, 277, 304 ; `qr_flow.cpp` l. 457-466). Un correctif de trois lignes pour `main.cpp` l. 206 est proposé (carte de poids par triangle, moyenne par patch), non appliqué, non testé (QPS §4.2 ; SUM 6 point 8).
+- Pièces fines : le toit de la voiture (16 688 triangles, coque fine) remaille à 168 802 faces et sort 71 436 quads par défaut. À scaleFact 3,3, le toit donne 6 681 quads, 0 % pliés, 0 % écrasés, 3,3 pôles pour 1 000 (QPS §5.2).
+
+### 2.2 Symétrie
+
+Aucune symétrie dans le code : grep sans occurrence de symétrie ou de miroir dans `quadwild`, `field_computation`, `quadretopology` et `xfield_tracer` (QPS §5.1 [CODE]). Mesures de symétrie de la sortie (part des sommets qui ont un jumeau miroir) [MESURÉ, QPS §5.1] :
+
+| Cas | À un quart d'arête | À une demi-arête |
+|---|---|---|
+| Arche basic, axe x | 77,8 % | 92,7 % |
+| Arche organic, meilleur axe | 22,6 % | 70,2 % |
+| Manny organic | 43,6 % | 83,5 % |
+| Manny basic | 40,4 % | 68,8 % |
+
+- Deux portes gauche et droite lancées séparément : 39 152 et 39 330 quads, même layout, mais seulement 49 % des sommets à un quart d'arête du miroir (grille déphasée).
+- Les deux portes dans un même OBJ, en deux coques disjointes : 57 136 quads, dont 28 568 par coque, et la coque droite est le miroir exact de la gauche (écart maximal de 0,012 arête). Recette pour les pièces L et R : les fusionner dans un seul OBJ (QPS §5.1).
+- Recette pour un corps symétrique d'un seul tenant (Manny) [MESURÉ, QPS §5.1] : couper à x = 0, quadrangulariser la moitié (5 741 quads), refléter et souder les sommets à |x| < 0,05 arête. Résultat : 11 482 quads, écrasé 0,24 %, plié 0,03 %, écart 1,44 ‰, 17,2 pôles pour 1 000, symétrie exacte, 12 arêtes non variétés à nettoyer sur la couture.
+- Une symétrie exacte par construction n'est publiée dans aucune des méthodes lues (GAP, trou transversal).
+
+### 2.3 Arêtes vives
+
+- Réglage : `sharp_feature_thr`. Valeurs testées : 20, 35 (défaut), 50, 70, et -1 (organic) [QPS §1.7].
+- Fidélité des arêtes vives de l'arche, part des échantillons à moins de 0,1 puis 0,25 longueur d'arête d'une arête de quad [MESURÉ, QPS §1.7] :
+
+| Préparation | Quads | À 0,1 arête | À 0,25 arête |
+|---|---|---|---|
+| basic (35) | 29 477 | 98,7 % | 99,9 % |
+| thr20 | 30 312 | 99,7 % | 100 % |
+| thr50 | 27 050 | 57,6 % | 74,5 % |
+| thr70 | 28 185 | 46,0 % | 66,2 % |
+| organic (-1) | 27 323 | 4,5 % | 31,0 % |
+| Hasard | | environ 20 % | environ 50 % |
+
+- Hard surface : seuil de 35° ou moins. Organic : seuil -1 sur Manny divise l'écrasé par environ 33 (13,75 % à 0,41 %) et réduit les patchs de 1 894 à 213 (QPS §2, §6).
+- Fichier `.sharp` : une ligne `n`, puis une ligne `type,face,arête,` par arête, type 0 pour concave et 1 pour convexe, indices sur le maillage triangulé. Il remplace la détection automatique, donc il doit contenir aussi les arêtes à garder (QPS §5.3 [CODE]).
+- Test forcé sur Manny (175 arêtes imposées à 0,1 et 0,3 arête) : 40,8 % et 90,2 %, contre 32,7 % et 76,8 % avec sharp 35 automatique et 17,3 % et 69,6 % en organic (QPS §5.3).
+- Groupes OBJ (`g`, `usemtl`) : ignorés par l'importeur (QPS §5.3 [CODE]).
+
+### 2.4 Composants
+
+- Un patch est un composant de la découpe. Les bords ouverts du maillage sont gardés comme bords de patch. Chaque coque connexe est quadrangulée séparément (QPS §5.3).
+- Il n'existe pas de « composant imposé » exact. La conformité entre composants voisins n'est pas garantie : les coques de la voiture n'ont aucune arête commune après soudure, donc 534 à 736 sommets de bord ne se raccordent pas (QPS §5.3, §6).
+- Pièces fines : fixer scaleFact par pièce, ne jamais se fier au défaut (QPS §5.2, §7).
+- Règles par partie du corps et de la carrosserie : ORG §1 à §11 et HSU §1 à §8. Ce sont des règles de praticiens, souvent tirées de forums, à confirmer par mesure (SUM 1, point 5 ; ORG §11 : « à CONFIRMER »).
+
+---
+
+## 3. Points forts et échecs mesurés
+
+### 3.1 Forces, à densité égale
+
+Juge commun : plié (Jacobien < 0), écrasé (Jacobien < 0,3), pôles pour 1 000 quads. Tableau ZMS §25, après correction de la normale du Jacobien (voir §3.3 et ZMS §23) :
+
+| Maillage | Quad Remesh (Houdini) : quads, plié, écrasé, pôles | QuadWild organic | QuadWild mechanical |
+|---|---|---|---|
+| Arche | 4 886 ; 0,68 % ; 0,9 % ; 59 | 7 484 ; 0,15 % ; 1,1 % ; 69 | 5 408 ; 1,04 % ; 3,2 % ; 88 |
+| Manny | 5 930 ; 0,37 % ; 0,7 % ; 21 | 6 121 ; 0,21 % ; 0,7 % ; 31 | non donné |
+| Lys | 16 689 ; 0,55 % ; 1,1 % ; 2 | 15 177 ; 0,86 % ; 6,2 % ; 12 | non donné |
+| Eucalyptus | 3 024 ; 0,03 % ; 2,5 % ; 18 | non donné | 2 696 ; 0 % ; 0 % ; 18 |
+
+Lecture (ZMS §25) : à densité égale, Quad Remesh est meilleur ou égal sur l'arche, Manny et le lys. QuadWild ne gagne nettement que sur l'eucalyptus (0 plié, 0 écrasé en mechanical), et en organic sur le taux de plis de l'arche (0,15 %).
+
+Autres forces mesurées :
+- Manny organic : 213 patchs au lieu de 1 894, 5 s au lieu de 30 s (QPS §2, §6).
+- Densité 10 000 quads [MESURÉ, QPS §1.6] : arche organic 0,06 % pliés, 0,54 % écrasés, 45 pôles pour 1 000 ; eucalyptus basic 0 %, 0 %, 4,9 pôles ; Manny organic 0,06 %, 0,37 %, 18,9 pôles.
+- Tournoi par pièce à densité égale sur la voiture [MESURÉ, ZMS §25] : QuadWild gagne 17 pièces sur 24. Total 65 327 quads (+11 %) avec QuadWild contre 59 017 avec Quad Remesh seul ; plié 0,54 % contre 0,64 %, écrasé 2,18 % contre 2,48 %. Gain modeste.
+- Revendication de l'auteur (MJ entrée 1) : moins de 0,5 % d'échecs sur Thingi10K. Non vérifié.
+
+Attention : les tableaux de ZMS §23 comparaient des densités différentes (29 477 quads contre 4 886) et utilisaient l'ancienne normale. Ils sont corrigés en ZMS §25.
+
+### 3.2 Échecs mesurés
+
+| Cas | Symptôme mesuré | Cause (journal) | Source |
+|---|---|---|---|
+| Lys, organic, à 10 000 quads | 8,8 % d'écrasés (6,2 % à densité équivalente selon ZMS §25), trous de surface à partir de scaleFact 1,5 | Lames fines, arêtes vives perdues | QPS §1.6, §6 ; ZMS §25 |
+| Lys, scaleFact ≥ 2 | Trous de 59 ‰ de diagonale au 99e centile | Lames plus étroites que EdgeSize | QPS §3, §6 |
+| Manny, basic (35°) | 1 894 patchs, 13,75 % d'écrasés, 83 pôles | Le seuil crée des arêtes vives dans le modelé du corps | QPS §6 ; 20,65 % à 10 000 quads (QPS §1.6) |
+| Manny, thr20 | 141 s, 4 856 patchs, 17,8 % d'écrasés | Trop d'arêtes vives | QPS §6 |
+| Arche, do_remesh 0 | 8,8 % d'écrasés ; organic : 16,1 % et trous de 77 ‰ | Champ calculé sur le maillage brut | QPS §2, §3 |
+| Coques fines (toit, portes) | 40 000 à 76 000 quads, remaillage à 170 000 faces | `ExpectedEdgeL` pour sphéricité faible | QPS §5.2, §6 |
+| Pièces à bords ouverts | Bords non raccordés entre pièces | Chaque coque quadrangulée seule | QPS §5.3, §6 |
+| Voiture v752 entière | Étape 1 supérieure à 11 min et 5,7 Go | Taille du maillage | ZMS §23 |
+| `alpha` = 1,0 | Échec sur tous les cas (« approximation result infeasible ») | Régularité de poids nul | QPS §6 |
+| `ilp` | Échec (« built without Gurobi ») | Solveur absent | QPS §6 |
+| `edgethru` | Plus de 900 s sur lys et Manny (839 s en organic) | Raffinement sans convergence | QPS §6 |
+
+Aucun plantage ni sortie vide dans les 228 essais du banc. Le risque réel est le temps (QPS §6).
+
+### 3.3 Redressement des quads (straighten)
+
+Ce que dit le dossier :
+- Le lissage final est `MultiCostraintSmooth` : 30 pas, amortissement 0,5, une reprojection, projection sur la base des arêtes de feature et des faces (QWS §7 point 7 ; [CODE] `functions.cpp` l. 201 ; `smooth_mesh.h` l. 309 pour `SmoothPCA`, appelé dans le même lissage).
+- Les lissages de patchs sont mis à zéro (`functions.cpp` l. 163-165). Le pipeline ne lisse donc qu'une seule fois, 30 pas contraints. Attention : QWS §4 point 5 décrit deux lissages Laplaciens à 0,7 ; c'est sans effet, car leurs compteurs valent zéro (voir §7).
+- Le code n'a aucun test de non-pli sur la paramétrisation LSCM, et le dossier ne mentionne aucun test après le lissage (QWS §4 point 6).
+- `straighten_seams` existe dans les dépendances libigl, mais c'est un outil de coutures UV. Aucun appel hors de libigl dans le pipeline [CODE, grep].
+- Le dossier ne définit ni ne mesure une « rectitude » des quads. Le juge ne mesure que plié, écrasé, valence, pôles et écart à la surface (ZMS §16 ; ZMS §23).
+- Diagnostic de Matthieu (ZMS §26, non mesuré) : QuadWild est « très prometteur mais pas assez parfait, notamment dans le redressement des quads (straighten) ».
+
+Ce qui manque, par déduction [ESTIMÉ] :
+1. Une métrique de rectitude mesurée : écart des isolignes à la ligne droite ou au champ, angle entre quads voisins. Non trouvée dans le dossier.
+2. Une garantie après relèvement 3D. Tutte garantit la bijection dans le plan (Floater 2003, IPF §2), mais le relèvement barycentrique ne garantit ni le non-pli ni la rectitude en 3D (IPF §1 point 6 et §4 point 6).
+3. Un critère d'arrêt. Les 30 pas sont fixes, et le dossier ne justifie pas ce nombre : non trouvé.
+4. Un contrôle du non-pli à chaque pas de lissage, et non seulement en fin de pipeline.
+5. Une piste mesurée : lisser dans le plan de la paramétrisation, bord fixe, puis relever. Sur le lys, cette méthode fait passer l'écrasé de 23,5 % à 5,0 % (TP7 §2.3 point c). La rectitude 3D après relèvement n'a pas été mesurée.
+
+---
+
+## 4. Catalogue : les 12 méthodes les plus utiles pour la fusion
+
+Les 38 méthodes (MJ) sont réparties en modèles génératifs non publiés, outils commerciaux interactifs, outils de cloth et méthodes générales. Les 26 non retenues n'ont pas de lien direct avec le pipeline (pour exemple : QuadGPT, Q-MAGIC, Meshtron, Tripo, Marvelous Designer, Alias, Mudbox). Liste des 12 retenues :
+
+| Rang | Méthode (n° MJ) | Famille | Licence | Utilité pour la fusion |
+|---|---|---|---|---|
+| 1 | QuadWild (1) | Champ aligné sur les arêtes, tracé de chemins, quantification entière | GPL-3.0 (documenté) | Chaîne de référence : ses conditions de patch et son tracé de chemins sont la base de la décomposition à reprendre. |
+| 2 | QuadWild Bi-MDF (2) | Quantification par flot sur graphe bi-orienté | GPL-3.0 | Solveur entier sans Gurobi, compilé et mesuré ici ; candidat à greffer sur nos comptes d'arêtes. |
+| 3 | Pattern-Based Quadrangulation for N-Sided Patches, Takayama 2014 (17) | Motifs pour patchs à N côtés, petits ILP | Non trouvée (code C++ embarqué dans quadwild-bimdf) | Table de motifs et sélection validées sur la figure 11 (TVT §4) ; couvre N de 2 à 6. |
+| 4 | Sketch-Based Generation and Editing of Quad Meshes, Takayama 2013 (29) | Réseau de courbes, patchs, subdivisions imposées | Code de 36,2 Mo, licence non lue | Le système le plus proche du nôtre ; son rapport technique sur le remplissage est introuvable en ligne (SRC). |
+| 5 | Quad Layouts via Constrained T-Mesh Quantization, Lyon 2021 (20) | ILP entier sur T-maillage avec borne angulaire | Non trouvée | Donne la borne angulaire pour éviter les quads trop obliques dans notre MILP. |
+| 6 | Mixed-Integer Quadrangulation, Bommes 2009 (6) | Champ croisé, paramétrisation entière | MPL 2.0 pour libigl, mais dépend de CoMISo (GPL 3) | Socle mathématique des comptes entiers ; repli pour pièces libres (LIC). |
+| 7 | Quad Layout Embedding via Aligned Parameterization, Campen et Kobbelt 2014 (19) | Plongement optimisé d'un layout cible | Non trouvée | Méthode pour ancrer un réseau fourni par nous de façon optimale. |
+| 8 | Houdini Quad Remesh SOP (10) | Champ guidé, arêtes vives, symétrie X | Commerciale (SideFX) | Concurrent du tournoi par pièce, déjà disponible là où tourne ZMS (ZMS §16, §17, §25). |
+| 9 | QuadriFlow (5) | Champ d'Instant Meshes et flot entier | MIT (eigen en partie LGPL) | Référence peu coûteuse pour composants organiques ; les flips ne sont pas retirés par défaut. |
+| 10 | Extraction of the Quad Layout Guided by the Curve Skeleton, Usai 2015 (31) | Tubes le long du squelette, boîtes aux jonctions | Non trouvée | Modèle direct des tubes et jonctions du mannequin et des branches (GAP famille 3). |
+| 11 | R3DS Wrap et BWrap, transfert de topologie (16) | Recalage non rigide d'un gabarit | Commerciales | Hérite la topologie d'artiste de Manny. Première piste organique de GAP famille 1 (ESTIMÉ). |
+| 12 | Learning Direction Fields for Quad Mesh Generation, Dielen et al. 2021 (34) | Champ de directions appris sur gabarit enregistré | Aucun code ni jeu trouvé | Générer le réseau de courbes initial d'un corps (GAP famille 1, piste 3). |
+
+Hors catalogue mais central : Tarini 2021, conditions fermées pour un patch à un seul pôle, N de 3 à 8 (PCT). Les inégalités sont linéaires en e_i (N = 3, 5, 6) ; la position du pôle est donnée par les s_i. Le solveur ZMS §18 les encode déjà pour N de 3 à 8.
+
+---
+
+## 5. Passe 7 : remplissage intrinsèque (Tutte, cap étroit, comptes, anneaux, comptes partagés)
+
+### 5.0 Contexte
+
+Avant la passe 7, l'écrasé venait des rectangles imposés à des zones qui n'ont pas quatre vrais coins. Zones à 0 coin faux : 0 % d'écrasés sur l'arche. Zones à 2 coins faux : 88 % (TDG §1). Le relâchement final doublait les plis (1 314 à 2 905 sur l'arche) (TDG §2). Le plongement de Tutte est sain (TDG §3 point a) : la garantie de bijection tient (Floater 2003, IPF §2).
+
+Banc sphère [MESURÉ, IPF §0] : extrinsèque, 4 à 36 quads pliés sur 64 quand l'étendue passe de 200° à 320° ; Tutte à valeur moyenne, 0 pli dans les quatre cas.
+
+### 5.1 Avant et après
+
+| Maillage | État | Couverture | Quads | Plié | Écrasé | Source |
+|---|---|---|---|---|---|---|
+| Arche | Avant (moteur actuel) | 0,781 | 4 248 | 0,35 % | 5,2 % | TP7 §1 ; ZMS §24 |
+| Arche | Après, sans anneaux | 0,914 | 4 636 | 0 | 0,09 % | TP7 §1 |
+| Arche | Après, avec anneaux | 0,997 | 5 279 | 0,06 % | 0,87 % | TP7 §1 ; ZMS §27 |
+| Lys | Avant | 0,849 | 15 632 | 1,71 % | 23,46 % | TP7 §1 (ZMS §24 : 15 329 quads, 23,3 %) |
+| Lys | Après | 0,994 | 13 407 | 0,25 % | 1,17 % | TP7 §1 |
+
+### 5.2 Règles retenues et mesurées
+
+1. Cisaillement des bandes. Cause : les coins du cap étaient accrochés à deux sommets distants de 0,26 m pour une largeur de 4 cm. Un cap étroit (deux sommets de bord face à face, moindre corde plus demi-bord) avec un compte du cap donné par la corde, et non par la longueur curviligne, ramène les bandes de l'arche de 243 quads écrasés (14 %) à 0 sur 832 quads (TP7 §2.2, §2.3 points a et b). Sans compte par la corde, les quads sont multipliés par 1,7 à 3 (TP7 §7).
+2. Lissage Laplacien dans le plan UV, bord fixe. Le bord reste intact, donc soudable. Lys : écrasé 23,46 % à 5,00 %, plié 1,71 % à 0,17 % (100 itérations ; 20 itérations : 8,44 %) (TP7 §2.3 point c).
+3. Zones à deux coins (bandes et lentilles). Une zone qui n'a que deux vrais coins devient un patch à quatre coins, avec deux coins de part et d'autre de chaque pointe à demi-bord. Couverture de l'arche : 66 % avec toutes les zones gardées, 74 % avec cette règle (ZMS §24, correctifs 1 et 2).
+4. Coins superposés. L'écart entre les deux coins du cap (0,035 m) est inférieur au pas des sommets (0,2 m). Repli sur les sommets voisins de la pointe : couverture 0,781 à 0,915 (TP7 §4.2).
+5. Zones rondes ou à un coin. La règle du diamètre (les deux points les plus éloignés comme pointes de bande) ramène le lys à une couverture de 1,0 (TP7 §4.3).
+6. Triangles minuscules. Lys : 264 zones de quatre triangles ou moins, 0,6 % de la surface, font passer l'écrasé de 5,14 % à 1,28 % quand on les ignore. Arche : 22 zones, 0,3 %, écrasé de 2,2 % à 1,0 %. Ne pas généraliser aux zones de quatre côtés (l'arche en a 451, ce sont de vraies faces) (TP7 §2.3 point f).
+7. Écrasé du lys. Les 3 668 quads écrasés viennent des patchs à trois côtés (pétales, trompettes) et des triangles minuscules, non des bandes (0 % d'écrasés) (TP7 §2.1).
+
+### 5.3 Anneaux (zones à deux boucles, 25 sur l'arche, 8,3 % de la surface)
+
+| Méthode | Anneaux faits | Quads | Plié | Écrasé |
+|---|---|---|---|---|
+| belt : un coin par sommet, c barreaux, si les deux boucles ont le même petit nombre de sommets | 16 / 25 | 334 | 0 | 0 |
+| cut : plus court chemin entre les boucles, puis couture | 25 / 25 | 616 | 34 | 66 (10,7 %) |
+| ring : n sommets équidistants sur chaque boucle | 25 / 25 | 662 | 43 | 155 (23,4 %) |
+| Meilleur des trois par zone | 25 / 25 | 643 | 3 | 42 |
+
+Recommandation : belt quand les boucles ont le même nombre de sommets (zéro défaut), sinon cut ; ring seul écarté (TP7 §3). Les cônes (boucle intérieure quatre fois plus courte) restent mauvais (TP7 §3).
+
+### 5.4 Recollage des patchs voisins
+
+Métrique : fissure = longueur des arêtes de bord sur les arcs communs, rapportée à la longueur de ces arcs (0 : tout fermé ; 1 : tout ouvert) (TP7 §5).
+
+| Maillage | Variante | Fissure | Défauts | Quads |
+|---|---|---|---|---|
+| Arche | A : patchs indépendants (actuel) | 0,313 | Écrasé 0,09 % | 4 636 |
+| Arche | B : soudure par tolérance (0,35 arête) | 0,107 | 348 dégénérés, 16 non variétés | 4 288 |
+| Arche | C : un MILP global de comptes partagés | 0,009 | 0 non variété, écrasé 1,31 % | 6 269 (+35 %) |
+| Lys | A | 0,290 | Écrasé 1,17 % | 13 407 |
+| Lys | B | 0,057 | 273 dégénérés, 30 non variétés, écrasé 3,79 % | 13 134 |
+| Lys | C | 0,009 | 0 non variété, écrasé 3,84 % | 13 891 (+3,6 %) |
+
+La soudure par tolérance (B) n'est pas fiable : fusionner des sommets de comptes différents crée des quads dégénérés et des arêtes non variétés. La variante C est la seule à fermer, au prix d'un gonflement de quads. Les 49 et 80 arêtes encore fissurées viennent des patchs refusés et des anneaux, non intégrés dans la couche globale (TP7 §5).
+
+### 5.5 Échecs listés
+
+LSCM avec Coons (écrasé pire, plis). Cotangente positive (identique à la valeur moyenne). Coins « vertex » systématiques (écrasé 13,6 % sur l'arche, 51,7 % sur le lys). Cap étroit sans compte par la corde. Pôle optimisé sans lissage UV. Soudure par tolérance. Ring seul (23 %). Quatre coins équidistants sur les disques (97 % d'écrasés). Neumann et distance géodésique : meilleurs en écrasé (1 % et 2 %) mais non soudables (TP7 §2.2, §7).
+
+### 5.6 Ce qui n'est pas fait
+
+- Rien n'est porté dans `Scripts/lines/ZrlTutteFill.py` ; `TF7.py` est une copie de recherche (TP7 §7 ; ZMS §27).
+- Anneaux hors de la couche de comptes partagés ; écrasé après soudure (1,31 % et 3,84 %) ; fusion des triangles minuscules dans leur voisin ; zones de cinq côtés et plus ; grandes zones de quatre côtés non bandes ; Manny et eucalyptus non testés ; fidélité aux arêtes vives du Tutte soudé non mesurée (TP7 §7).
+- Pistes ouvertes : usage hybride, Tutte où QuadWild échoue, avec les comptes des patchs de QuadWild comme arcs partagés (TP7 §7 ; SUM 7).
+
+---
+
+## 6. Inconnues (non trouvé)
+
+1. Une mesure de rectitude des quads, ou d'un critère de redressement mathématique : non trouvé dans le dossier.
+2. Le choix de 30 pas de lissage : aucune justification publiée ni mesurée. Un critère d'arrêt n'a pas été trouvé dans le code.
+3. La part de sommets à valence 4 que QuadWild atteint : non publiée (MJ entrée 1, champ `output_quality`).
+4. La mémoire pour les maillages autres que la voiture v752 : non trouvé.
+5. Le rapport technique de Takayama 2013 sur le remplissage de régions triangulaires et rectangulaires : introuvable (SRC).
+6. La licence du code de Takayama 2014 et de Usai 2015 : non trouvée (MJ, LIC).
+7. La licence de Dielen 2021 (code et jeu) : non trouvée (MJ entrée 34).
+8. La décomposition par Dual Loops Meshing (Campen, Bommes, Kobbelt 2012) : non trouvée en détail (APD §2).
+9. Les motifs à sept et huit côtés dans la littérature publiée : non trouvés. QuadWild et Takayama refusent N hors de 2 à 6 (QWS §4 ; TPT §1). Notre solveur va jusqu'à 8 (ZMS §18).
+10. Le banc de Tutte à zéro pli est sphérique et à quatre côtés (IPF §0 ; SUM 3, limite). Les patchs à N côtés sur maillages réels ne sont mesurés que sur l'arche et le lys (ZMS §22 à §27), et les patchs à sept et huit côtés n'ont pas de banc publié.
+11. Les règles d'articulation organique : aucun seuil chiffré publié, « à CONFIRMER » par mesure de Manny et MakeHuman (ORG §11 ; SUM 1).
+12. Les jeux de données (Mixamo, CC4, ShapeNet, Deep Fashion, ABC) : licences non trouvées ou non lues (DAT §1).
+13. Animaux, arbres, tissu, architecture : aucune source solide (GAP familles 2, 3, 6, 7).
+14. Les méthodes commerciales Modo Auto Retopo et Alias : partiellement lues (LIC ; SRC).
+15. La normale du Jacobien utilisée dans la passe 6 de l'étude de paramètres (QPS) : non précisée. Les plis de la passe 6 pourraient être des bornes hautes, comme ceux de ZMS §23 (voir §7 point 5).
+
+---
+
+## 7. Incohérences relevées entre sources
+
+1. Profondeur des patchs : le papier autorise 6 côtés, le code plafonne `MaxVal` à 5 (QWS §7 point 1).
+2. Seuil d'arêtes vives : le papier dit 45°, le fichier basic_setup dit 35° (QWS §2).
+3. Tolérance géométrique : le papier dit la plus petite arête, le code prend une arête moyenne (`CClarkability` 1 ; QWS §7 point 3).
+4. Lissage : QWS §4 point 5 décrit deux lissages Laplaciens à 0,7, mais QWS §2 et `functions.cpp` l. 163-165 les mettent à zéro. Seul le lissage final de 30 pas s'exécute (vérifié dans le code).
+5. Normale du Jacobien : les plis de ZMS §16, §22 et §23 utilisent la normale du coin 0, qui surestime les plis (1 249 contre 862 sur l'arche). ZMS §23 les déclare bornes hautes ; ZMS §25 corrige. La passe 6 (QPS) ne précise pas quelle normale a servi.
+6. Lys de la passe 7 : ZMS §24 annonce 15 329 quads et 23,3 % d'écrasés ; TP7 §1 reproduit 15 632 quads et 23,46 % (réglage d'arête différent, 0,0066 contre 0,0065). Les écarts sont faibles, mais la référence doit être choisie.
+7. `gaps.md` et `gaps_30-October-2026.md` sont identiques (49 lignes, vérifié par cmp).
+8. Le tournoi de ZMS §23 (quads de QuadWild contre Quad Remesh à 4 cm) comparait des densités différentes. Corrigé en ZMS §25 (déjà dit).

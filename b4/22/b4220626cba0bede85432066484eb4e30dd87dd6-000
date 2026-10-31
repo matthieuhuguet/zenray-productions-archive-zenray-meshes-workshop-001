@@ -1,0 +1,26 @@
+import sys, os, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode=True
+import numpy as np, corners5 as C5, annulus as AN
+AP,ANY=C5.AP,C5.ANY
+for name in ('arch_hard','lily_plant'):
+    m=AP.mesh('/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/%s.obj'%name); zones=ANY.segment(m,25.0,max(4,int(0.002*len(m['F']))),merge_deg=35.0,log=lambda s:None)
+    tried=ok=0; corners=collections.Counter(); widths=[]; aspect=[]
+    for r,(Z,seed) in enumerate(zones):
+        Ls,ln=AP.loops(m,Z)
+        if len(Ls)!=1: continue
+        B=np.asarray(Ls[0]); Nl=C5.vertex_normals_on_loop(m,Z,B); idx,tn,X,per=C5.detect(m['P'][B],Nl)
+        if len(idx)!=2: continue
+        tried+=1; Pb=m['P'][B]; cum=np.r_[0,np.cumsum(np.linalg.norm(np.diff(np.vstack([Pb,Pb[:1]]),axis=0),axis=1))]; Lt=cum[-1]
+        s=[i/len(X)*Lt for i in idx]; arcA=((s[0]+((s[1]-s[0])%Lt)/2)%Lt); arcB=((s[1]+((s[0]-s[1])%Lt)/2)%Lt)
+        vA=int(B[int(np.argmin(np.abs(cum[:-1]-arcA)))]); vB=int(B[int(np.argmin(np.abs(cum[:-1]-arcB)))])
+        F=m['F'][Z]; adj=AN.vertex_graph(m['P'],F); path=AN.dijkstra(adj,[vA],[vB])
+        if path is None or len(path)<2: continue
+        cut={tuple(sorted((path[i],path[i+1]))) for i in range(len(path)-1)}; F2,old=AN.cut_open(F,cut); comps=AN.components(F2)
+        if len(comps)!=2: continue
+        good=True; cc=[]
+        for cidx in comps:
+            Fi=F2[cidx]; chi,lp=AN.euler_and_loops(Fi); 
+            if chi!=1 or lp!=1: good=False
+        if good: ok+=1
+        aspect.append(Lt/ max(2*np.linalg.norm(m['P'][path[0]]-m['P'][path[-1]]),1e-9))
+    print(name,'zones with 2 detected corners:',tried,'| cut across the middle gives two disks:',ok,'| perimeter/(2*cut length) median:',round(float(np.median(aspect)),1) if aspect else None)

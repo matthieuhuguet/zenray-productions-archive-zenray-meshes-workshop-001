@@ -1,0 +1,60 @@
+import sys, os, collections
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode=True
+import numpy as np, corners5 as C5, annulus as AN
+AP,ANY=C5.AP,C5.ANY
+m=AP.mesh('/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/arch_hard.obj'); zones=ANY.segment(m,25.0,max(4,int(0.002*len(m['F']))),merge_deg=35.0,log=lambda s:None); lab=C5.zone_labels(m,zones)
+rows=[]
+for r,(Z,seed) in enumerate(zones):
+    Ls,ln=AP.loops(m,Z)
+    if len(Ls)!=2: continue
+    inz=np.zeros(len(m['F']),bool); inz[Z]=True; info={}
+    for li,L in enumerate(Ls):
+        Ls_set={(int(L[i]),int(L[(i+1)%len(L)])) for i in range(len(L))}; nl=collections.Counter()
+        for t in Z:
+            for k in range(3):
+                u=m['nb'][t,k]; e=(int(m['F'][t,k]),int(m['F'][t,(k+1)%3]))
+                if e in Ls_set: nl[-2 if u<0 else int(lab[u])]+=1
+        info[li]=dict(nl)
+    rows.append((r,len(Z),len(Ls[0]),len(Ls[1]),info[0],info[1]))
+print('annuli',len(rows)); 
+tris=[x[1] for x in rows]; print('tris per annulus min/median/max',min(tris),int(np.median(tris)),max(tris))
+single=0; merged_disk=0; bothsingle=0; nbmesh=0
+for r,t,lo,li,n0,n1 in rows:
+    s_in=(len(n1)==1 and -2 not in n1); s_out=(len(n0)==1 and -2 not in n0); single+=s_in; bothsingle+=(s_in and s_out); nbmesh+= (-2 in n1) or (-2 in n0)
+    if s_in:
+        nz=list(n1)[0]
+        if nz>=0:
+            Zn=zones[nz][0]; Lsn,_=AP.loops(m,Zn)
+            if len(Lsn)==1: merged_disk+=1
+print('inner loop bordered by exactly one other zone :',single,'/',len(rows),'| and that zone is a disk (merge gives a disk):',merged_disk,'| outer loop also a single neighbour:',bothsingle,'| touches the open border of the mesh:',nbmesh)
+print('sample',rows[:4])
+
+# unzoned components (label -1) : which zones do they touch ?
+T=len(m['F']); comp=-np.ones(T,int); cid=0
+for t in range(T):
+    if lab[t]!=-1 or comp[t]>=0: continue
+    st=[t]; comp[t]=cid
+    while st:
+        x=st.pop()
+        for u in m['nb'][x]:
+            if u>=0 and lab[u]==-1 and comp[u]<0: comp[u]=cid; st.append(u)
+    cid+=1
+touch=collections.defaultdict(set); size=collections.Counter(comp[comp>=0].tolist())
+for t in range(T):
+    if lab[t]!=-1: continue
+    for u in m['nb'][t]:
+        if u>=0 and lab[u]>=0: touch[comp[t]].add(int(lab[u]))
+        elif u<0: touch[comp[t]].add(-2)
+print('unzoned triangle components:',cid,'sizes (median, max):',int(np.median(list(size.values()))),max(size.values()))
+fill=0; fillsz=[]
+for r,t,lo,li,n0,n1 in rows:
+    comps={int(comp[tt]) for tt in range(T) if False}
+    # components touching this annulus through the inner loop
+    Z=zones[r][0]; Ls,ln=AP.loops(m,Z); inz=set(Z.tolist()); cs=set()
+    inner={(int(Ls[1][i]),int(Ls[1][(i+1)%len(Ls[1])])) for i in range(len(Ls[1]))}
+    for tt in Z:
+        for k in range(3):
+            u=m['nb'][tt,k]; e=(int(m['F'][tt,k]),int(m['F'][tt,(k+1)%3]))
+            if e in inner and u>=0 and lab[u]==-1: cs.add(int(comp[u]))
+    if cs and all(touch[c]=={r} for c in cs): fill+=1; fillsz.append(sum(size[c] for c in cs))
+print('annuli whose inner hole is an unzoned component touching only this annulus (fill = disk):',fill,'/',len(rows),'sizes',sorted(fillsz)[:10],'...')

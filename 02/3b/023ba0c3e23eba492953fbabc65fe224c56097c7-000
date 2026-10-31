@@ -1,0 +1,159 @@
+"""E3 (M04) : réseau de plis 3D par LSD sur les six images argile, appariement par intersection des plans de rétroprojection de deux segments, validation dans les autres vues
+(carte de distance aux segments détectés, visibilité par la profondeur de l'enveloppe). Mesure : rappel et précision des arêtes 3D contre la vérité ; plans retrouvés. 30 October 2026."""
+import sys, json, time
+import numpy as np, cv2
+sys.path.insert(0, ".")
+from e2_common import *
+from e2b_shading import hull_buffers
+
+def detect(case, min_len=14):
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV)
+    out = {}
+    for nm in VIEWS6:
+        img = (np.clip(case["imgs"][nm], 0, 1) * 255).astype(np.uint8)
+        segs = lsd.detect(img)[0]
+        segs = segs.reshape(-1, 4) if segs is not None else np.zeros((0, 4))
+        L = np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1])
+        segs = segs[L >= min_len]
+        # on écarte les segments qui longent la silhouette (à moins de 3 pixels du bord du masque)
+        m = case["masks"][nm].astype(np.uint8); dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+        mid = ((segs[:, :2] + segs[:, 2:]) / 2).round().astype(int)
+        mid[:, 0] = np.clip(mid[:, 0], 0, m.shape[1] - 1); mid[:, 1] = np.clip(mid[:, 1], 0, m.shape[0] - 1)
+        segs = segs[dist[mid[:, 1], mid[:, 0]] > 3]
+        out[nm] = segs
+    return out
+
+def support_maps(case, segs):
+    maps = {}
+    for nm in VIEWS6:
+        H, W = case["masks"][nm].shape
+        im = np.zeros((H, W), np.uint8)
+        for x1, y1, x2, y2 in segs[nm]: cv2.line(im, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), 255, 1)
+        maps[nm] = cv2.distanceTransform(255 - im, cv2.DIST_L2, 3)
+    return maps
+
+def to_world(case, nm, pts):
+    a, b, d, x0, y1, px, H, W = view_frame(case["views"][nm])
+    u = x0 + (pts[:, 0] + 0.5) * px; v = y1 - (pts[:, 1] + 0.5) * px
+    return u, v, a, b, d
+
+def backproject_plane(case, nm, seg):
+    """Plan contenant la direction de vue et le segment : (n, c) avec n.x = c."""
+    P = np.array([[seg[0], seg[1]], [seg[2], seg[3]]])
+    u, v, a, b, d = to_world(case, nm, P)
+    p1 = u[0] * a + v[0] * b; p2 = u[1] * a + v[1] * b
+    n = np.cross(p2 - p1, d); nn = np.linalg.norm(n)
+    if nn < 1e-9: return None
+    n /= nn
+    return n, float(n @ p1), p1, p2, a, b, d
+
+def run(case, hull, verbose=True, support_px=1.6, min_overlap=0.04, score_min=0.85):
+    segs = detect(case); maps = support_maps(case, segs); hb = hull_buffers(hull, case)
+    planes = {nm: [backproject_plane(case, nm, s) for s in segs[nm]] for nm in VIEWS6}
+    frames = {nm: view_frame(case["views"][nm]) for nm in VIEWS6}
+    cands = []
+    t0 = time.time()
+    for i, A in enumerate(VIEWS6):
+        for B in VIEWS6[i + 1:]:
+            if np.abs(frames[A][2] @ frames[B][2]) > 0.99: continue          # vues opposées : plans parallèles
+            for ia, pa in enumerate(planes[A]):
+                if pa is None: continue
+                for ib, pb in enumerate(planes[B]):
+                    if pb is None: continue
+                    dirL = np.cross(pa[0], pb[0]); nL = np.linalg.norm(dirL)
+                    if nL < 0.2: continue                                   # plans presque parallèles : droite mal définie
+                    dirL /= nL
+                    # point de la droite : résolution du système n_a.x = c_a, n_b.x = c_b, dirL.x = 0
+                    M = np.array([pa[0], pb[0], dirL]); x = np.linalg.solve(M, [pa[1], pb[1], 0.0])
+                    # étendue de chaque segment le long de la droite
+                    ts = []
+                    for (p, nm) in ((pa, A), (pb, B)):
+                        p1, p2, a, b, d = p[2], p[3], p[4], p[5], p[6]
+                        # paramètres t tels que x + t dirL projette sur les extrémités du segment dans la vue : projection orthographique -> t = dirL.(p - x)/|dirL_proj|^2 le long du segment
+                        w = dirL - (dirL @ d) * d
+                        if np.linalg.norm(w) < 1e-6: ts = None; break
+                        tt = [((q - (x - (x @ d) * d)) @ w) / (w @ w) for q in (p1 - (p1 @ d) * d, p2 - (p2 @ d) * d)]
+                        ts.append((min(tt), max(tt)))
+                    if ts is None: continue
+                    lo = max(ts[0][0], ts[1][0]); hi = min(ts[0][1], ts[1][1])
+                    if hi - lo < min_overlap: continue
+                    cands.append((A, B, ia, ib, x, dirL, lo, hi))
+    if verbose: print("candidats", len(cands), "en", round(time.time() - t0, 1), "s", flush=True)
+    # validation vectorisée
+    keep = []
+    K = 14
+    for (A, B, ia, ib, x, dirL, lo, hi) in cands:
+        ts = np.linspace(lo, hi, K); X = x[None, :] + ts[:, None] * dirL[None, :]
+        best = 0.0; nvis = 0
+        for C in VIEWS6:
+            if C in (A, B): continue
+            a, b, d, x0, y1, px, H, W = frames[C]
+            c = np.floor((X @ a - x0) / px).astype(int); r = np.floor((y1 - X @ b) / px).astype(int)
+            ok = (c >= 0) & (c < W) & (r >= 0) & (r < H)
+            if ok.sum() < K: continue
+            zc = X @ d
+            visible = hb[C]["mask"][r, c] & (np.abs(hb[C]["z"][r, c] - zc) < 0.03)
+            if visible.sum() < 0.7 * K: continue
+            sup = (maps[C][r, c] <= support_px)
+            nvis += 1; best = max(best, float(sup[visible].mean()))
+        if nvis >= 1 and best >= score_min: keep.append((A, B, x, dirL, lo, hi, best))
+    if verbose: print("validés", len(keep), flush=True)
+    return keep, segs
+
+def dedupe(keep, ang_tol=2.0, dist_tol=0.006):
+    lines = []
+    for (A, B, x, dl, lo, hi, s) in keep:
+        p0 = x + lo * dl; p1 = x + hi * dl
+        placed = False
+        for ln in lines:
+            if abs(ln["d"] @ dl) < np.cos(np.radians(ang_tol)): continue
+            if np.linalg.norm(np.cross(p0 - ln["p"], ln["d"])) > dist_tol: continue
+            # fusion : étendue en union le long de la direction commune
+            t = [(q - ln["p"]) @ ln["d"] for q in (p0, p1)]
+            ln["t0"] = min(ln["t0"], min(t)); ln["t1"] = max(ln["t1"], max(t)); ln["n"] += 1; placed = True; break
+        if not placed:
+            d = dl if dl[np.argmax(np.abs(dl))] > 0 else -dl
+            t = sorted([(q - p0) @ d for q in (p0, p1)])
+            lines.append({"p": p0, "d": d, "t0": t[0], "t1": t[1], "n": 1})
+    return lines
+
+def truth_edges(case, step=0.01):
+    """Arêtes vraies : bords des polygones de chaque polytope situés sur la frontière de l'union (échantillonnés tous les step mètres)."""
+    pts = []; tags = []
+    car = case["car"]
+    for k, P in enumerate(car.pieces):
+        other = car.pieces[1 - k]
+        for i, poly in P.polys.items():
+            for j in range(len(poly)):
+                p, q = poly[j], poly[(j + 1) % len(poly)]
+                Ln = np.linalg.norm(q - p); n = max(2, int(Ln / step))
+                X = p[None, :] + np.linspace(0, 1, n)[:, None] * (q - p)[None, :]
+                inside_other = other.contains(X, tol=-1e-4)
+                pts.append(X[~inside_other]); tags += [(k, i)] * int((~inside_other).sum())
+    return np.concatenate(pts)
+
+def score(lines, case, tol=0.005):
+    TE = truth_edges(case)
+    # points échantillonnés sur les droites détectées
+    DP = []
+    for ln in lines:
+        n = max(2, int((ln["t1"] - ln["t0"]) / 0.01)); t = np.linspace(ln["t0"], ln["t1"], n)
+        DP.append(ln["p"][None, :] + t[:, None] * ln["d"][None, :])
+    DP = np.concatenate(DP) if DP else np.zeros((0, 3))
+    from scipy.spatial import cKDTree
+    if len(DP) == 0: return {"recall": 0.0, "precision": 0.0, "truth_edge_samples": len(TE)}
+    rec = (cKDTree(DP).query(TE)[0] <= tol).mean(); prec = (cKDTree(TE).query(DP)[0] <= tol).mean()
+    return {"recall_5mm": float(rec), "precision_5mm": float(prec), "truth_edge_length_m": float(len(TE) * 0.01), "detected_length_m": float(len(DP) * 0.01), "lines": len(lines)}
+
+if __name__ == "__main__":
+    res = {}
+    for name, kw in (("propre", dict()),):
+        case = make_case(**kw)
+        hull = visual_hull(case, 1.5)
+        t = time.time()
+        keep, segs = run(case, hull)
+        lines = dedupe(keep)
+        sc = score(lines, case)
+        print(name, {nm: len(segs[nm]) for nm in VIEWS6}, "lignes dédupliquées", len(lines), sc, round(time.time() - t, 1), "s", flush=True)
+        res[name] = {"segments": {nm: int(len(segs[nm])) for nm in VIEWS6}, "validated": len(keep), "lines": len(lines), "score": sc}
+    json.dump(res, open("out/e3_lines.json", "w"), indent=1)

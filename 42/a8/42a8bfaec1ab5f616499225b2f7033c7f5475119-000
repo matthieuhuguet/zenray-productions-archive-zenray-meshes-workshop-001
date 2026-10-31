@@ -1,0 +1,41 @@
+#!/bin/bash
+# Pass 8, 30 October 2026 : recipe used to build cgg-bern/quadwild-bimdf (commit e722c7e961982cf61db7c10812329dd0fc7d60df) in the cloud sandbox.
+# This file is a record of what was run (the shell options of git need double hyphens, so the shell script is outside the text rules check).
+# FR : recette exacte du build dans le bac a sable cloud, avec les miroirs de sous-modules.
+set -e
+ROOT=/home/user/cgg-bern/quadwild-bimdf
+# 1. system packages (the gmm tarball URL of the CMake file is not reachable from the sandbox, Debian packages replace it)
+apt-get install -y libgmm++-dev libopenblas-dev liblapack-dev libboost-dev libboost-filesystem-dev libboost-system-dev libboost-regex-dev
+# 2. shallow clone of the main repository (git LFS objects skipped)
+GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/cgg-bern/quadwild-bimdf $ROOT
+# 3. pinned submodule commits, fetched one by one (git ls-tree HEAD libs/ cmake-library gives the SHAs)
+fetchsub() { d=$ROOT/$1; mkdir -p $d; cd $d; [ -d .git ] || git init -q; git remote remove origin 2>/dev/null || true; git remote add origin $2
+             git fetch -q --depth 1 origin $3 && git checkout -q FETCH_HEAD; }
+fetchsub cmake-library   https://github.com/cgg-bern/cmake-library          12377901769280afe687eb3e98e0a02850fabc52
+fetchsub libs/satsuma    https://github.com/cgg-bern/libsatsuma             4e96979ecb11bbfe8d9c05e8f8be1ecb992ca5fd
+fetchsub libs/lemon      https://github.com/cgg-bern/lemon                  3c6aa54c62a9b524bb9502872fa172776c1f8244
+fetchsub libs/timekeeper https://github.com/cgg-bern/libTimekeeper          f4f486648faac7c740535678b45b387078e26918
+fetchsub libs/json       https://github.com/nlohmann/json.git               55f93686c01528224f448c19128836e7df245f72
+fetchsub libs/vcglib     https://github.com/cnr-isti-vclab/vcglib.git       5cae2abc2f9056785b0537dcbe156c40da2aea20
+fetchsub libs/xfield_tracer https://github.com/cgg-bern/xfield_tracer_fork  2913b67607a2515bdc8019c582939fb32affbaa0
+fetchsub libs/eigen      https://gitlab.com/libeigen/eigen.git              bc3b39870ecb690a623a3f49149a358b95c5781d
+fetchsub libs/libigl     https://github.com/libigl/libigl.git               f68e055b7dfb281489aa4b921fba65686ff4d456
+# 4. two submodules live on a GitLab server (port 9000) that the sandbox cannot reach : GitHub mirrors, DEFAULT BRANCH HEAD, not the pinned commits
+#    OpenMesh : https://github.com/Lawrencemm/OpenMesh at 4e2e481 (2019-03-10, VERSION 8.0) ; pinned upstream commit 8d527cd was not found on the mirror
+#    CoMISo   : https://github.com/libigl/CoMISo at 562efe3 (2023-04-06) ; pinned upstream commit e018965 was not found on the mirror
+for spec in "libs/OpenMesh https://github.com/Lawrencemm/OpenMesh" "libs/CoMISo https://github.com/libigl/CoMISo"; do
+  set -- $spec; mkdir -p $ROOT/$1; cd $ROOT/$1; [ -d .git ] || git init -q; git remote add origin $2 2>/dev/null || true
+  git fetch -q --depth 1 origin HEAD && git checkout -q FETCH_HEAD
+done
+# 5. two edits of the TOP LEVEL CMakeLists.txt of the sandbox copy (needed by the mirror versions, not by the pinned ones)
+#    after add_subdirectory("libs/CoMISo")  : if(NOT TARGET CoMISo::CoMISo) add_library(CoMISo::CoMISo ALIAS CoMISo) endif()
+#    before add_subdirectory("libs/lpsolve") : target_include_directories(OpenMeshCoreStatic PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/libs/OpenMesh/src ${CMAKE_CURRENT_BINARY_DIR}/libs/OpenMesh/src)
+# 6. sandbox patch of components/quad_from_patches/main.cpp : dump ilpResult, quadmeshPartitions and quadmeshCorners to <mesh>_<num>_dump.txt
+#    (about 20 lines inserted before the line  //COLOR AND SAVE QUADRANGULATION ; see the design document for the exact format)
+# 7. configure and build, no Gurobi, no Blossom V
+cd $ROOT
+cmake . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSATSUMA_ENABLE_BLOSSOM5=0 -DQUADRETOPOLOGY_WITH_GUROBI=0
+ninja -C build -j4          # binaries : build/Build/bin/quadwild, quad_from_patches, cli_trace, viz_mesh_results
+# 8. run (from the repository root, the configs use relative paths)
+#    build/Build/bin/quadwild MESH.obj 2 config/prep_config/basic_setup_Organic.txt        (steps 1 and 2 : remesh, field, tracing)
+#    build/Build/bin/quad_from_patches MESH_rem_p0.obj 123 FLOW.txt STATS.json              (step 3 : quantization, patterns, smoothing)

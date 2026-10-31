@@ -1,0 +1,22 @@
+import sys, json, numpy as np, time
+sys.path.insert(0, '.'); import TF7 as T
+GT="/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/"
+def run(mesh, edge, mf, variants, cap="dd", sel=("strip",)):
+    m = T.AP.mesh(GT+mesh+".obj"); zones = T.ANY.segment(m, 25.0, max(1,int(mf*len(m["F"]))), merge_deg=35.0, log=lambda s: None); tri=m["P"][m["F"]]; area=0.5*np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)
+    res = {v: dict(q=0, fold=0, sq=0, bad=0, zones=0, fail=0, area=0.0, t=0.0) for v in variants}
+    for k,(Z,seed) in enumerate(zones):
+        pr = T.prep(m, Z, edge, dict(T.OPTS, cap=cap))
+        if "fail" in pr: continue
+        cls = "strip" if pr["strip"] else ("k4" if pr["K"]==4 else "kn")
+        if cls not in sel: continue
+        for v in variants:
+            t0=time.time()
+            try: P3,Q,rep = T.fill(m, Z, edge, dict(T.OPTS, embed=v, cap=cap), pr=pr)
+            except Exception as ex: res[v]["fail"]+=1; continue
+            if P3 is None: res[v]["fail"]+=1; continue
+            _,_,j,_ = T.QS.stats(P3, Q); r=res[v]; r["q"]+=len(Q); r["fold"]+=int((j<0).sum()); r["sq"]+=int((j<0.3).sum()); r["bad"]+=rep["unlocated"]; r["zones"]+=1; r["area"]+=float(area[Z].sum()); r["t"]+=time.time()-t0
+    return res
+if __name__=="__main__":
+    mesh, edge, mf = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]); sel = tuple(sys.argv[4].split(",")); variants = sys.argv[5].split(",") ; cap = sys.argv[6] if len(sys.argv)>6 else "dd"
+    r = run(mesh, edge, mf, variants, cap, sel)
+    for v,x in r.items(): print(mesh, sel, v, "zones",x["zones"],"fail",x["fail"],"quads",x["q"],"folded %.2f%%"%(100*x["fold"]/max(x["q"],1)),"squashed %.2f%%"%(100*x["sq"]/max(x["q"],1)),"unlocated",x["bad"],"s %.1f"%x["t"])

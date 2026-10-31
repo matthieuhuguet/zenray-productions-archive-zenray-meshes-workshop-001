@@ -1,0 +1,300 @@
+"""Pass 9 : LOCAL topological repair of the quad mesh produced by QuadWild. Written 30 October 2026.
+For every patch that carries a corner whose quad angle is outside [58, 122] degrees on the obtuse or reflex side, the patch is cut by a path leaving the corner
+so that the corner carries n quads (n = smallest integer with angle / n in [58, 122]); the sub patches are refilled with the closed form patterns of Tarini
+(grid or corner regions), harmonic grid then Winslow barrier in a local chart, lifted and projected on the reference surface. All boundary vertices of the
+patch keep their ids and positions, so the weld with the neighbours is exact by construction; vertices of the cut are the only new boundary vertices.
+FR : reparation topologique LOCALE du maillage de quads de QuadWild : seul le patch fautif est redecoupe, les sommets de bord sont conserves."""
+import collections
+import numpy as np
+from shapely.geometry import Polygon, LineString
+import zr8_counts as C, zr8_fill as Fm, zr8_straighten as S
+import zr8_repair as R
+
+LO, HI = R.LO, R.HI
+
+
+def patch_loop(Q, qf):
+    """Ordered boundary loop (vertex ids, counter clockwise as the quads) of the quads qf. None if the boundary is not one simple loop."""
+    cnt = collections.Counter(); he = {}
+    for f in qf:
+        q = Q[f]
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(a, b), max(a, b))] += 1; he[(a, b)] = 1
+    nxt = collections.defaultdict(list)
+    for (a, b) in he:
+        if cnt[(min(a, b), max(a, b))] == 1: nxt[a].append(b)
+    if not nxt or any(len(v) != 1 for v in nxt.values()): return None
+    start = next(iter(nxt)); loop = [start]; cur = nxt[start][0]
+    while cur != start:
+        loop.append(cur); cur = nxt[cur][0]
+        if len(loop) > len(nxt) + 1: return None
+    return loop if len(loop) == len(nxt) else None
+
+
+def corner_quad_angle(P, Q, qf, v):
+    """Interior angle in degrees (0 to 360, counter clockwise about the quad normal) of the quad of qf that has v as vertex."""
+    for f in qf:
+        q = list(Q[f])
+        if v in q:
+            k = q.index(v); a = P[q[(k + 1) % 4]] - P[v]; b = P[q[(k - 1) % 4]] - P[v]
+            n = np.cross(P[q[2]] - P[q[0]], P[q[3]] - P[q[1]]); n /= max(np.linalg.norm(n), 1e-30)
+            return float(np.degrees(np.arctan2(n @ np.cross(a, b), a @ b)) % 360.0)
+    return None
+
+
+def local_chart(Pb):
+    c = Pb.mean(axis=0); u, s, vt = np.linalg.svd(Pb - c, full_matrices=False)
+    e1, e2 = vt[0], vt[1]; n = np.cross(e1, e2)
+    return c, e1, e2, n
+
+
+def to_uv(chart, X):
+    c, e1, e2, n = chart; d = X - c
+    return np.stack([d @ e1, d @ e2], axis=1)
+
+
+def from_uv(chart, uv):
+    c, e1, e2, n = chart
+    return c + uv[:, [0]] * e1 + uv[:, [1]] * e2
+
+
+def cut_candidates(loop_uv, iv, theta_uv, n, poly, k=6, min_sep=3):
+    """Indices (in the loop) of boundary vertices that can end the cut from corner iv : visible from v, at least min_sep steps away on both sides,
+    sorted by the deviation of the ray angle from theta / n (angle measured from the direction of the next boundary vertex)."""
+    L = len(loop_uv); v = loop_uv[iv]; d0 = loop_uv[(iv + 1) % L] - v
+    out = []
+    for j in range(L):
+        sep = min((j - iv) % L, (iv - j) % L)
+        if sep < min_sep: continue
+        w = loop_uv[j]
+        if not poly.buffer(1e-9).contains(LineString([v, w])): continue
+        ang = np.degrees(np.arctan2(d0[0] * (w - v)[1] - d0[1] * (w - v)[0], d0 @ (w - v))) % 360.0
+        out.append((abs(ang - theta_uv / n), j))
+    out.sort()
+    return [j for _, j in out[:k]]
+
+
+def make_side_lists(rot, corner_set, i0, i1):
+    """Break rot[i0..i1] (inclusive, list of vertex ids) into sides between consecutive corners. Returns a list of vertex id lists."""
+    idx = [t for t in range(i0, i1 + 1) if rot[t] in corner_set or t in (i0, i1)]
+    return [rot[a:b + 1] for a, b in zip(idx[:-1], idx[1:])]
+
+
+def fill_explicit(P, side_pts, cut_free, s, chart, ref, theta=1.0 / 8):
+    """Grid of a patch with K sides whose vertices (3D positions) are all given. side_pts[i] : (e_i + 1, 3) positions from corner i to corner i+1.
+    Returns (uv-lifted positions for the grid keys, quads, keys) where boundary keys carry the given positions."""
+    K = len(side_pts); e = [len(sp) - 1 for sp in side_pts]
+    Cpoly = Fm.polygon_corners(e)
+    keys, guv, quads = Fm.build_grid(e, s, Cpoly)
+    pos = np.zeros((len(guv), 3)); isb = np.zeros(len(guv), bool)
+    for k, i in keys.items():
+        if k[0] == "corner": pos[i] = side_pts[k[1]][0]; isb[i] = True
+        elif k[0] == "side": pos[i] = side_pts[k[1]][k[2]]; isb[i] = True
+    uv = guv.copy(); uvb = to_uv(chart, pos[isb])
+    uv[isb] = uvb
+    # orientation : counter clockwise boundary in the chart
+    loop_ids = []
+    for i in range(K):
+        for idx in range(e[i]):
+            loop_ids.append(keys[("corner", i) if idx == 0 else ("side", i, idx)])
+    Lp = uv[loop_ids]; area = 0.5 * np.sum(Lp[:, 0] * np.roll(Lp[:, 1], -1) - np.roll(Lp[:, 0], -1) * Lp[:, 1])
+    flip = area < 0
+    if flip:
+        uv[:, 1] *= -1; uvb = uv[isb]
+    fixed = set(np.where(isb)[0].tolist())
+    uv = Fm.harmonic_uv(uv, quads, fixed)
+    P2 = np.c_[uv, np.zeros(len(uv))]; kind = np.zeros(len(uv), int); kind[isb] = 2
+    P2, _ = S.barrier(P2, quads, Fm.PlaneSurface(), kind=kind, outer=5, inner=60, theta=theta, size="patch", groups=np.zeros(len(quads), int))
+    uv = P2[:, :2].copy()
+    if flip: uv[:, 1] *= -1
+    X = from_uv(chart, uv)
+    X = ref.project(X)
+    X[isb] = pos[isb]
+    return X, quads, keys, isb
+
+
+def corner_j_all(P, Q):
+    """Minimal corner Jacobian of every quad."""
+    if len(Q) == 0: return np.zeros(0)
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]); n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30)
+    j = []
+    for k in range(4):
+        a = P[Q[:, (k + 1) % 4]] - P[Q[:, k]]; b = P[Q[:, (k - 1) % 4]] - P[Q[:, k]]
+        j.append(np.einsum("ij,ij->i", np.cross(a, b), n) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-30))
+    return np.min(j, axis=0)
+
+
+def min_corner_j(P, Q):
+    if len(Q) == 0: return 1.0
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]); n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30)
+    j = []
+    for k in range(4):
+        a = P[Q[:, (k + 1) % 4]] - P[Q[:, k]]; b = P[Q[:, (k - 1) % 4]] - P[Q[:, k]]
+        j.append(np.einsum("ij,ij->i", np.cross(a, b), n) / np.maximum(np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1), 1e-30))
+    return float(np.min(j))
+
+
+DIAG = collections.Counter()
+
+
+def try_split(P, Q, qf, loop, corner_set, v, theta_q, n, ref, h):
+    """Best split of the patch at corner v into two sub patches. Returns dict with new vertex positions, new quads (as lists of ('old', id) or ('new', i)) or None."""
+    L = len(loop); iv = loop.index(v)
+    rot = loop[iv:] + loop[:iv]
+    Pb = P[rot]; chart = local_chart(Pb); uvb = to_uv(chart, Pb)
+    if Polygon(uvb).area < 0: return None
+    # make the polygon counter clockwise in the chart
+    ccw = 0.5 * np.sum(uvb[:, 0] * np.roll(uvb[:, 1], -1) - np.roll(uvb[:, 0], -1) * uvb[:, 1]) > 0
+    if not ccw:
+        c, e1, e2, nn = chart; chart = (c, e1, -e2, -nn); uvb = to_uv(chart, Pb)
+    poly = Polygon(uvb)
+    if not poly.is_valid: poly = poly.buffer(0)
+    if poly.is_empty or poly.geom_type != "Polygon": return None
+    d0 = uvb[1] - uvb[0]; d1 = uvb[-1] - uvb[0]
+    theta_uv = float(np.degrees(np.arctan2(d0[0] * d1[1] - d0[1] * d1[0], d0 @ d1)) % 360.0)
+    old_min = min_corner_j(P, Q[qf])
+    best = None
+    cands = cut_candidates(uvb, 0, theta_uv, n, poly)
+    DIAG["splits_tried"] += 1; DIAG["no_visible_candidate"] += int(len(cands) == 0)
+    for iw in cands:
+        # sub polygons in rot order : A = rot[0..iw] then the cut back to v, B = rot[iw..end] + v then the cut v -> w
+        sidesA = make_side_lists(rot, corner_set | {rot[0], rot[iw]}, 0, iw)
+        sidesB = make_side_lists(rot + [rot[0]], corner_set | {rot[0], rot[iw]}, iw, len(rot))
+        chord = np.linalg.norm(P[rot[iw]] - P[rot[0]])
+        arcs = {}; sides = {}
+        for tag, sl in (("A", sidesA), ("B", sidesB)):
+            sd = []
+            for i, vs in enumerate(sl):
+                key = (tag, i); arcs[key] = {"len": float(np.linalg.norm(np.diff(P[vs], axis=0), axis=1).sum())}; sd.append([(key, True)])
+            sides[tag] = sd
+        arcs["cut"] = {"len": float(chord)}
+        sides["A"].append([("cut", True)])                     # A closes with w -> v
+        sides["B"].append([("cut", True)])                     # B closes with v -> w (same arc, opposite direction)
+        fixed = {(t, i): len(vs) - 1 for t, sl in (("A", sidesA), ("B", sidesB)) for i, vs in enumerate(sl)}
+        if any(len(sd) < 3 or len(sd) > 8 for sd in sides.values()):
+            DIAG["K_out_of_range"] += 1; continue
+        # distinct keys A/B for the boundary arcs are not shared, only "cut" is : solve the counts with fixed boundary counts
+        sol = C.solve_counts(arcs, sides, edge=h, fixed_counts=fixed)
+        if not sol.get("ok") or sol["violations"]:
+            DIAG["counts_infeasible"] += 1; continue
+        x = sol["counts"]["cut"]
+        if x < 1: continue
+        DIAG["counts_feasible"] += 1
+        cutpts_uv = [uvb[0] + (uvb[iw] - uvb[0]) * t / x for t in range(x + 1)]               # v -> w in the chart
+        cutpts = ref.project(from_uv(chart, np.array(cutpts_uv)))
+        cutpts[0] = P[rot[0]]; cutpts[-1] = P[rot[iw]]
+        new_pos = []; new_quads = []; ok = True; allP = {}
+        id_new = {}; quad_tag = []; corner_names = {"A": [], "B": []}
+        # local numbering : ('old', id) for existing vertices, ('cut', t) for interior cut points, ('int', tag, i) for interior grid vertices
+        for tag, sl in (("A", sidesA), ("B", sidesB)):
+            side_pts = [P[vs] for vs in sl]
+            side_ids = [[("old", int(u)) for u in vs] for vs in sl]
+            if tag == "A":
+                cut_pts = cutpts[::-1]; cut_ids = [("old", rot[iw])] + [("cut", t) for t in range(x - 1, 0, -1)] + [("old", rot[0])]
+            else:
+                cut_pts = cutpts; cut_ids = [("old", rot[0])] + [("cut", t) for t in range(1, x)] + [("old", rot[iw])]
+            side_pts.append(cut_pts); side_ids.append(cut_ids)
+            K = len(side_pts); e = [len(sp) - 1 for sp in side_pts]
+            ssol = sol["s"][tag] if K != 4 else [1] * K
+            try:
+                Xg, quads, keys, isb = fill_explicit(P, side_pts, None, ssol, chart, ref)
+            except Exception as ex:
+                DIAG["fill_error"] += 1; ok = False; break
+            # ids of grid vertices
+            gid = [None] * len(Xg)
+            for k, i in keys.items():
+                if k[0] == "corner": gid[i] = side_ids[k[1]][0]
+                elif k[0] == "side": gid[i] = side_ids[k[1]][k[2]]
+            for i in range(len(Xg)):
+                if gid[i] is None: gid[i] = ("int", tag, i)
+                allP[gid[i]] = Xg[i] if gid[i][0] != "old" else P[gid[i][1]]
+            new_quads += [[gid[a] for a in q] for q in quads]
+            quad_tag += [tag] * len(quads)
+            corner_names[tag] = [side_ids[i][0] for i in range(len(side_ids))]
+        if not ok: continue
+        # evaluate on a local numbering
+        names = list(allP.keys()); nm = {k: i for i, k in enumerate(names)}
+        Pl = np.array([allP[k] for k in names]); Ql = np.array([[nm[k] for k in q] for q in new_quads])
+        mj = min_corner_j(Pl, Ql)
+        if best is None or mj > best["min_j"]:
+            best = {"min_j": mj, "names": names, "pos": Pl, "quads": Ql, "x": x, "iw": iw, "K": {t: len(sides[t]) for t in sides},
+                    "quad_tags": {"A": [i for i, t in enumerate(quad_tag) if t == "A"], "B": [i for i, t in enumerate(quad_tag) if t == "B"]},
+                    "corners_idx": {t: [nm[cn] for cn in corner_names[t]] for t in ("A", "B")}}
+    if best is None: return None
+    best["old_min_j"] = old_min
+    return best
+
+
+# ================================================================================================================================
+# mesh level driver
+# ================================================================================================================================
+def bad_boundary_vertex(P, Q, qf, loop, hi_margin=5.0):
+    """Boundary vertex of the patch whose quads of the patch have the largest corner angle above HI. Returns (v, angles list, theta total) or None."""
+    inc = collections.defaultdict(list)
+    for f in qf:
+        for k in range(4): inc[int(Q[f][k])].append((f, k))
+    best = None
+    for v in loop:
+        angs = []
+        for f, k in inc[v]:
+            q = Q[f]; a = P[q[(k + 1) % 4]] - P[v]; b = P[q[(k - 1) % 4]] - P[v]
+            n = np.cross(P[q[2]] - P[q[0]], P[q[3]] - P[q[1]]); n /= max(np.linalg.norm(n), 1e-30)
+            angs.append(float(np.degrees(np.arctan2(n @ np.cross(a, b), a @ b)) % 360.0))
+        if not angs: continue
+        m = max(angs)
+        if m > HI + hi_margin and (best is None or m > best[3]): best = (v, angs, sum(angs), m)
+    return best
+
+
+def repair_mesh(P, Q, qpart, qcorners, ref, h, max_splits=2000, min_gain=0.02, verbose=False):
+    """Local repair of every patch that has a boundary vertex whose quad angle exceeds HI. P (n,3), Q (m,4) arrays, qpart per patch quad ids, qcorners per patch
+    corner vertex ids. Returns (P2, Q2, log) with unused vertices and dead quads removed."""
+    P = np.array(P, float); Q = np.array(Q, int)
+    alive = np.ones(len(Q), bool)
+    patches = [{"qf": list(qf), "corners": set(int(c) for c in qcorners[i])} for i, qf in enumerate(qpart)]
+    queue = list(range(len(patches))); log = []; tried = set(); splits = 0
+    while queue and splits < max_splits:
+        pi = queue.pop(0); rec = patches[pi]
+        loop = patch_loop(Q, rec["qf"])
+        if loop is None: log.append(("noloop", pi)); continue
+        bv = bad_boundary_vertex(P, Q, rec["qf"], loop)
+        while bv is not None and (pi, bv[0]) in tried:
+            # look for the next worst vertex
+            loop2 = [x for x in loop if (pi, x) not in tried]
+            if not loop2: bv = None; break
+            bv = bad_boundary_vertex(P, Q, rec["qf"], loop2)
+            if bv is not None and (pi, bv[0]) in tried: bv = None
+        if bv is None: continue
+        v, angs, theta, mx = bv
+        n = R.quads_needed(theta)
+        if n is None or n < 2:
+            tried.add((pi, v)); log.append(("skip_angle", pi, v, round(theta, 1))); queue.append(pi); continue
+        corner_set = set(rec["corners"]) | {v}
+        res = try_split(P, Q, rec["qf"], loop, corner_set, v, theta, n, ref, h)
+        if res is not None:
+            jo = corner_j_all(P, Q[rec["qf"]]); jn = corner_j_all(res["pos"], res["quads"])
+            res["old_stats"] = (int((jo < 0).sum()), int((jo < 0.3).sum()), float(jo.mean())); res["new_stats"] = (int((jn < 0).sum()), int((jn < 0.3).sum()), float(jn.mean()))
+            better = (res["new_stats"][0], res["new_stats"][1], -res["new_stats"][2]) < (res["old_stats"][0], res["old_stats"][1], -res["old_stats"][2])
+            res["better"] = better
+        if res is None or not res["better"] or res["new_stats"][0] > res["old_stats"][0]:
+            tried.add((pi, v)); log.append(("rejected", pi, v, round(theta, 1), n, None if res is None else (res["old_stats"], res["new_stats"]))); queue.append(pi); continue
+        # apply
+        names = res["names"]; gid = {}; newP = []
+        for k, nm in enumerate(names):
+            if nm[0] == "old": gid[k] = nm[1]
+            else:
+                gid[k] = len(P) + len(newP); newP.append(res["pos"][k])
+        P = np.vstack([P, np.array(newP)]) if newP else P
+        newQ = np.array([[gid[i] for i in q] for q in res["quads"]])
+        for f in rec["qf"]: alive[f] = False
+        base = len(Q); Q = np.vstack([Q, newQ]); alive = np.concatenate([alive, np.ones(len(newQ), bool)])
+        # split the new quads into the two sub patches by their tag : names ('int', tag, i) and quads touching them ; use the per tag lists stored in res
+        tagA = set(res["quad_tags"]["A"]); 
+        qa = [base + i for i in range(len(newQ)) if i in tagA]; qb = [base + i for i in range(len(newQ)) if i not in tagA]
+        cornersA = set(gid[nm_i] for nm_i in res["corners_idx"]["A"]); cornersB = set(gid[nm_i] for nm_i in res["corners_idx"]["B"])
+        patches.append({"qf": qa, "corners": cornersA}); patches.append({"qf": qb, "corners": cornersB})
+        queue += [len(patches) - 2, len(patches) - 1]
+        splits += 1; log.append(("split", pi, v, round(theta, 1), n, res["old_stats"], res["new_stats"], res["x"]))
+    # compact
+    keep = np.where(alive)[0]; Qk = Q[keep]; used = np.unique(Qk); remap = -np.ones(len(P), int); remap[used] = np.arange(len(used))
+    return P[used], remap[Qk], log

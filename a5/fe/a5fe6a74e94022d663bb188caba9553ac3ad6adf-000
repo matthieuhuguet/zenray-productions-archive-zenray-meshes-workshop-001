@@ -1,0 +1,30 @@
+"""30 October 2026 : ZenRay Meshes, FROM A TRIANGLE MESH TO A FINISHED QUAD MESH IN ONE COMMAND : ZenRay Retopology (QuadWild as layout engine, symmetry by construction, gates) then ZenRay Finish (flat panels, crisp creases, do-no-harm gate). Writes out_dir/retopo/, out_dir/finish/ and pipeline.json.
+    python -I ZenRayMeshesPipeline.py tri.obj out_dir --target 40000 [--preset hard|car] [--retopo-set regime=hard]
+FR : d'un maillage de triangles a un maillage de quads fini en une commande : retopologie puis finition."""
+import argparse, json, os, subprocess, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); PY = [sys.executable, "-I"]
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out_dir"); ap.add_argument("--target", type=int, required=True); ap.add_argument("--preset", default="hard"); ap.add_argument("--retopo-set", action="append", default=[]); ap.add_argument("--creases", action="store_true", help="second round : the creases of the finished mesh are given to QuadWild (.sharp), then finish again"); a = ap.parse_args(); t0 = time.time()
+    r_dir = os.path.join(a.out_dir, "retopo"); f_dir = os.path.join(a.out_dir, "finish"); os.makedirs(a.out_dir, exist_ok=True)
+    cmd = PY + [os.path.join(HERE, "lines", "ZenRayRetopology.py"), "run", a.inp, "--target", str(a.target), "--out", r_dir, "--no-board"]
+    for s in a.retopo_set: cmd += ["--set", s]
+    r = subprocess.run(cmd, capture_output=True, text=True); print(r.stdout[-1500:])
+    res = os.path.join(r_dir, "result.obj")
+    if r.returncode or not os.path.exists(res): print("retopology failed", r.stderr[-500:]); sys.exit(1)
+    f = subprocess.run(PY + [os.path.join(HERE, "ZenRayFinishAll.py"), res, f_dir, "--preset", a.preset, "--caps", "none", "--small", "none"], capture_output=True, text=True); print(f.stdout[-800:])
+    if f.returncode: print("finish failed", f.stderr[-500:]); sys.exit(1)
+    final = os.path.join(f_dir, "finished.obj")
+    if a.creases:
+        tri = os.path.join(a.out_dir, "finished_tri.obj"); out_lines = []
+        for l in open(final):
+            if l.startswith("f ") and len(l.split()) == 5: t = l.split(); out_lines += ["f %s %s %s" % (t[1], t[2], t[3]), "f %s %s %s" % (t[1], t[3], t[4])]
+            else: out_lines.append(l.rstrip())
+        open(tri, "w").write("\n".join(out_lines) + "\n"); c_dir = os.path.join(a.out_dir, "creases"); c = subprocess.run(PY + [os.path.join(HERE, "QwCreases.py"), tri, c_dir, str(a.target)], capture_output=True, text=True); print(c.stdout[-300:])
+        if c.returncode: print("creases round failed", c.stderr[-400:]); sys.exit(1)
+        final = os.path.join(c_dir, "quads.obj")
+    out = {"input": os.path.abspath(a.inp), "retopo": res, "finished": final, "seconds": round(time.time() - t0, 1)}; json.dump(out, open(os.path.join(a.out_dir, "pipeline.json"), "w"), indent=1); print(json.dumps(out, indent=1))
+
+
+if __name__ == "__main__": main()

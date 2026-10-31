@@ -1,0 +1,123 @@
+"""30 October 2026 : cut an annular zone (two boundary loops) along shortest paths between the loops : one cut gives a disk, two cuts give two disks with four sides each. numpy/scipy only, read-only use of the project modules."""
+import sys, os, collections, heapq
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode = True
+import numpy as np
+import corners5 as C5
+AP, ANY = C5.AP, C5.ANY
+
+def vertex_graph(P, F):
+    adj = collections.defaultdict(dict)
+    for a, b, c in F:
+        for u, v in ((a, b), (b, c), (c, a)):
+            w = float(np.linalg.norm(P[u] - P[v])); adj[int(u)][int(v)] = w; adj[int(v)][int(u)] = w
+    return adj
+
+def dijkstra(adj, sources, targets, banned=frozenset()):
+    """shortest path from any source to any target avoiding the banned vertices (except the endpoints themselves) ; returns the vertex list."""
+    dist = {s: 0.0 for s in sources}; prev = {}; pq = [(0.0, s) for s in sources]; heapq.heapify(pq); tset = set(targets)
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist.get(u, 1e18): continue
+        if u in tset: 
+            path = [u]
+            while path[-1] in prev: path.append(prev[path[-1]])
+            return path[::-1]
+        for v, w in adj[u].items():
+            if v in banned and v not in tset: continue
+            nd = d + w
+            if nd < dist.get(v, 1e18): dist[v] = nd; prev[v] = u; heapq.heappush(pq, (nd, v))
+    return None
+
+def cut_open(F, cut_edges):
+    """duplicate vertices so that the triangles on the two sides of every cut edge no longer share it. returns new triangle array (vertex ids are tuples mapped to ints) and the map new -> old vertex."""
+    F = np.asarray(F); T = len(F); parent = {}
+    def find(x):
+        while parent.setdefault(x, x) != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    edge_tris = collections.defaultdict(list)
+    for t, f in enumerate(F):
+        for k in range(3): edge_tris[tuple(sorted((int(f[k]), int(f[(k + 1) % 3]))))].append(t)
+    for (u, v), ts in edge_tris.items():
+        if len(ts) == 2 and (u, v) not in cut_edges:                       # triangles glued along an uncut edge : their corners at u and at v are the same vertex
+            for w in (u, v):
+                a, b = ts; parent[find((a, w))] = find((b, w))
+    ids = {}; new = np.zeros_like(F); old = []
+    for t, f in enumerate(F):
+        for k in range(3):
+            r = find((t, int(f[k])))
+            if r not in ids: ids[r] = len(ids); old.append(int(f[k]))
+            new[t, k] = ids[r]
+    return new, np.array(old)
+
+def euler_and_loops(F):
+    E = {}
+    for a, b, c in F:
+        for u, v in ((a, b), (b, c), (c, a)): E[(int(u), int(v))] = 1
+    V = set(F.ravel().tolist()); und = {tuple(sorted(e)) for e in E}; chi = len(V) - len(und) + len(F)
+    nxt = {u: v for (u, v) in E if (v, u) not in E}; seen = set(); loops = 0
+    for s in nxt:
+        if s in seen: continue
+        loops += 1; x = s
+        while x not in seen: seen.add(x); x = nxt.get(x, s)
+    return chi, loops
+
+def components(F):
+    parent = {}
+    def find(x):
+        while parent.setdefault(x, x) != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for f in F: parent[find(int(f[0]))] = find(int(f[1])); parent[find(int(f[1]))] = find(int(f[2]))
+    comp = collections.defaultdict(list)
+    for i, f in enumerate(F): comp[find(int(f[0]))].append(i)
+    return list(comp.values())
+
+def process(m, Z):
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 2: return None
+    outer, inner = Ls[0], Ls[1]; F = m["F"][Z]; P = m["P"]; adj = vertex_graph(P, F)
+    p1 = dijkstra(adj, outer, inner)
+    if p1 is None: return dict(ok=False, why="no path")
+    cut1 = {tuple(sorted((p1[i], p1[i + 1]))) for i in range(len(p1) - 1)}
+    F1, old1 = cut_open(F, cut1); chi1, loops1 = euler_and_loops(F1); res = dict(ok=True, tris=len(Z), outer=len(outer), inner=len(inner), path1=len(p1), chi1=chi1, loops1=loops1)
+    # second cut : starts on the outer loop at the vertex farthest along the arc from the first path's outer end, avoids the first path
+    k0 = outer.index(p1[0]); far = [outer[(k0 + len(outer) // 2 + d) % len(outer)] for d in range(-len(outer) // 8, len(outer) // 8 + 1)]
+    p2 = dijkstra(adj, far, inner, banned=frozenset(p1))
+    if p2 is None: res.update(ok2=False); return res
+    cut2 = cut1 | {tuple(sorted((p2[i], p2[i + 1]))) for i in range(len(p2) - 1)}
+    F2, old2 = cut_open(F, cut2); comps = components(F2); pieces = []
+    for cidx in comps:
+        Fi = F2[cidx]; chi, lp = euler_and_loops(Fi)
+        # detect corners of the piece
+        Ln = AP.__dict__  # noqa
+        pieces.append((len(cidx), chi, lp))
+    res.update(ok2=True, path2=len(p2), pieces=pieces)
+    # corners of each piece with the new detector on its boundary loop (positions from the old vertex ids)
+    cnt = []
+    for cidx in comps:
+        Fi = F2[cidx]; E = {}
+        for a, b, c in Fi:
+            for u, v in ((a, b), (b, c), (c, a)): E[(int(u), int(v))] = 1
+        nxt = {u: v for (u, v) in E if (v, u) not in E}
+        if not nxt: continue
+        s0 = next(iter(nxt)); L = [s0]
+        while nxt.get(L[-1]) is not None and nxt[L[-1]] != s0 and len(L) < len(nxt): L.append(nxt[L[-1]])
+        Bo = old2[np.array(L)]; Pc = P[Bo]
+        An = np.zeros((len(L), 3))
+        for i, v in enumerate(L):
+            ts = [t for t in cidx if v in F2[t]]; nn = m["N"][Z[ts]].mean(0) if ts else np.array([0, 0, 1.0]); An[i] = nn / max(np.linalg.norm(nn), 1e-12)
+        idx, tn, X, per = C5.detect(Pc, An); cnt.append(len(idx))
+    res["piece_corners"] = cnt; return res
+
+if __name__ == "__main__":
+    S = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/arch_hard.obj'
+    m = AP.mesh(S); zones = ANY.segment(m, 25.0, max(4, int(0.002 * len(m["F"]))), merge_deg=35.0, log=lambda s: None); rows = []
+    for r, (Z, seed) in enumerate(zones):
+        res = process(m, Z)
+        if res is not None: res["zone"] = r; rows.append(res)
+    print("annuli", len(rows))
+    ok1 = sum(1 for r in rows if r.get("ok") and r["chi1"] == 1 and r["loops1"] == 1); print("one cut -> disk (chi 1, one loop):", ok1, "/", len(rows))
+    ok2 = [r for r in rows if r.get("ok2") and len(r["pieces"]) == 2 and all(p[1] == 1 and p[2] == 1 for p in r["pieces"])]; print("two cuts -> two disks:", len(ok2), "/", len(rows))
+    c4 = sum(1 for r in ok2 if r["piece_corners"] and all(c == 4 for c in r["piece_corners"])); print("two disks both with 4 detected corners:", c4, "/", len(ok2))
+    print("corner count histogram of the pieces:", dict(collections.Counter(c for r in ok2 for c in r["piece_corners"])))
+    print("tris per annulus: median", int(np.median([r["tris"] for r in rows if "tris" in r])), "loop lengths (vertices) median outer/inner", int(np.median([r["outer"] for r in rows if "outer" in r])), int(np.median([r["inner"] for r in rows if "inner" in r])))
+    for r in rows[:5]: print(r)

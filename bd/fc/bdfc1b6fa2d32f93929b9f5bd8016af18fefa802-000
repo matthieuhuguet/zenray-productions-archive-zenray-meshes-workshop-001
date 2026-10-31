@@ -1,0 +1,103 @@
+"""Pass 9 : half mirror quadrangulation, second version. Written 30 October 2026.
+Usage : python3 -I run_symmetry_v2.py base=WORK cases=arch,sphere,torus,tube out=res.json
+Fixes the two defects of run_symmetry.py : (1) the density of the half is matched to the quad edge of the whole mesh run (scaleFact = h_whole / mean edge of
+the half's remeshed layer, from a first run at scale 1), (2) only the BOUNDARY vertices of the half quadrangulation are snapped to the plane, within half a quad edge.
+FR : quadrangulation par moitie, version 2 : densite calee sur le maillage entier, soudure limitee aux sommets de bord de la moitie."""
+import sys, json, os, time, re, collections
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_io as IO, zr8_judge as J, zr8_symmetry as SY, qw_run as QR
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:]); base = a["base"]; cap = a.get("cap", "0") == "1"
+ROOT = "/home/user/cgg-bern/quadwild-bimdf"
+
+
+def mean_edge_tri(V, F):
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]); return float(np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1).mean())
+
+
+def mean_edge_quad(P, Q):
+    return float(np.mean([np.linalg.norm(P[Q[:, k]] - P[Q[:, (k + 1) % 4]], axis=1).mean() for k in range(4)]))
+
+
+def boundary_vertices(Q):
+    cnt = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            x, y = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(x, y), max(x, y))] += 1
+    return sorted({v for e, c in cnt.items() if c == 1 for v in e})
+
+
+def mirror_weld2(P, Q, n, d, snap):
+    """Half quad mesh -> full mesh. Boundary vertices within `snap` of the plane are put on it and shared with their reflection."""
+    P = P.copy(); bv = np.array(boundary_vertices(Q), int); dist = P @ n - d
+    near = bv[np.abs(dist[bv]) < snap]; far = bv[np.abs(dist[bv]) >= snap]
+    P[near] -= dist[near][:, None] * n[None, :]
+    on = np.zeros(len(P), bool); on[near] = True
+    R = SY.reflect(P, n, d); nP = len(P); idx_r = np.arange(nP) + nP; idx_r[on] = np.arange(nP)[on]
+    allP = np.vstack([P, R]); allQ = np.vstack([Q, idx_r[Q][:, ::-1]])
+    used = np.unique(allQ); remap = -np.ones(len(allP), int); remap[used] = np.arange(len(used))
+    return allP[used], remap[allQ], {"boundary_vertices": int(len(bv)), "snapped": int(len(near)), "not_snapped": int(len(far))}
+
+
+def mode_and_scale(name):
+    prep = open("%s/qw/%s_prep.txt" % (base, name)).read(); flow = open("%s/qw/%s_flow.txt" % (base, name)).read()
+    mode = None
+    for m, f in (("organic", "basic_setup_Organic.txt"), ("mechanical", "basic_setup_Mechanical.txt"), ("basic", "basic_setup.txt")):
+        if open("%s/config/prep_config/%s" % (ROOT, f)).read().strip() == prep.strip(): mode = m
+    return mode, re.search(r"scaleFact\s+(\S+)", flow).group(1)
+
+
+def metrics(P, Q, V, F, n, d, edge):
+    j = J.judge_plus(P, Q, ref_tris=(V, F)); med, mx = SY.mirror_residual(P, Q, n, d, edge)
+    return {"quads": int(len(Q)), "folded_pct": round(100 * j["folded_frac"], 3), "squashed_pct": round(100 * j["squashed_frac"], 3), "jac_mean": round(j["jac_mean"], 4),
+            "angle_dev": round(j["angle_dev_mean_deg"], 2), "turn_iso": round(j["loop_turn_iso_mean_deg"], 2), "poles_per_1000": round(j["poles_per_1000_quads"], 1),
+            "euler": j["euler"], "boundary_edges": j["boundary_edges"], "nonmanifold": j["nonmanifold_edges"], "dist_to_input_frac_diag": round(j["dist_mean_frac_diag"], 6),
+            "mirror_residual_median_edges": round(med, 4), "mirror_residual_max_edges": round(mx, 4)}
+
+
+out = []
+os.makedirs(base + "/sym2", exist_ok=True)
+for name in a["cases"].split(","):
+    V, F = IO.read_obj_tri_or_quad("%s/meshes/%s.obj" % (base, name)); V = np.array(V); F = np.array(F); edge = mean_edge_tri(V, F)
+    planes = SY.detect_mirror_planes(V, F, edge)
+    if not planes:
+        out.append({"name": name, "planes": 0}); print(name, "no mirror plane"); continue
+    n, d, med, inl = planes[0]
+    if name == "torus": n, d = np.array([1.0, 0, 0]), 0.0
+    if name == "sphere": n, d = np.array([0, 0, 1.0]), 0.0
+    mode, scale = mode_and_scale(name)
+    Pw, Qw = IO.read_obj_tri_or_quad("%s/qw/%s_rem_p0_123_quadrangulation_smooth.obj" % (base, name)); Pw = np.array(Pw); Qw = np.array(Qw); hq = mean_edge_quad(Pw, Qw)
+    res = {"name": name, "mode": mode, "scaleFact_whole": scale, "planes_found": len(planes), "plane_normal": np.round(n, 3).tolist(), "plane_offset": round(float(d), 4),
+           "detect_median_edges": round(med, 3), "detect_inliers": round(inl, 3), "h_whole": round(hq, 5), "whole": metrics(Pw, Qw, V, F, n, d, edge)}
+    if cap:
+        import trimesh
+        h_ = trimesh.intersections.slice_mesh_plane(trimesh.Trimesh(V, F, process=False), plane_normal=n, plane_origin=n * d, cap=True)
+        Vh, Fh = np.asarray(h_.vertices), np.asarray(h_.faces)
+    else:
+        Vh, Fh = SY.cut_half(V, F, n, d)
+    hp = "%s/sym2/%s_half%s.obj" % (base, name, "_cap" if cap else ""); IO.write_obj(hp, Vh, Fh)
+    t = time.time(); r1 = QR.run({"mesh": hp, "workdir": base + "/sym2", "mode": mode, "scale": "1.0"})
+    if not r1["ok"]:
+        res["half_run"] = "failed at scale 1"; out.append(res); print(name, res["half_run"]); continue
+    Vr, Fr = IO.read_obj_tri_or_quad(r1["rem"]); e_rem = mean_edge_tri(np.array(Vr), np.array(Fr)); s = hq / e_rem
+    r2 = QR.run({"mesh": hp, "workdir": base + "/sym2", "mode": mode, "scale": "%.5f" % s})
+    for _round in range(2):                                       # secant correction on the MEASURED quad edge of the half (cap quads included)
+        if not r2["ok"]: break
+        Pm, Qm = IO.read_obj_tri_or_quad(r2["quad_smooth"]); hm = mean_edge_quad(np.array(Pm), np.array(Qm))
+        if abs(hm / hq - 1.0) < 0.06: break
+        s = s * hq / hm; r2 = QR.run({"mesh": hp, "workdir": base + "/sym2", "mode": mode, "scale": "%.5f" % s})
+    res["half_seconds_two_runs"] = round(time.time() - t, 1); res["scaleFact_half"] = round(s, 4)
+    if not r2["ok"]:
+        res["half_run"] = "failed at matched scale"; out.append(res); print(name, res["half_run"]); continue
+    for label, path in (("half_raw", r2["quad"]), ("half_smooth", r2["quad_smooth"])):
+        P, Q = IO.read_obj_tri_or_quad(path); P = np.array(P); Q = np.array(Q)
+        res[label + "_before_weld"] = {"quads": int(len(Q)), "h": round(mean_edge_quad(P, Q), 5)}
+        info0 = {}
+        if cap:
+            dd = np.abs(P @ n - d); onp = (dd[Q] < 0.5 * hq).all(axis=1); info0 = {"cap_quads_removed": int(onp.sum())}; Q = Q[~onp]
+            used = np.unique(Q); rm = -np.ones(len(P), int); rm[used] = np.arange(len(used)); P = P[used]; Q = rm[Q]
+        P2, Q2, info = mirror_weld2(P, Q, n, d, 0.5 * hq); info.update(info0)
+        res[label] = metrics(P2, Q2, V, F, n, d, edge); res[label]["weld"] = info
+    out.append(res); print(json.dumps(res), flush=True)
+json.dump(out, open(a["out"], "w"), indent=1)

@@ -1,0 +1,43 @@
+"""E3 oracle : quelle part des arêtes vraies visibles est détectable (contraste de part et d'autre) dans les rendus argile synthétiques ? 30 October 2026."""
+import sys, json
+import numpy as np
+sys.path.insert(0, ".")
+from e2_common import *
+from e3_lines import truth_edges
+from scipy.spatial import cKDTree
+case = make_case()
+TE = truth_edges(case, step=0.01)
+# dédoublonnage (chaque arête est partagée par deux polygones)
+tr = cKDTree(TE); keep = np.ones(len(TE), bool)
+for i, nb in enumerate(tr.query_ball_point(TE, 0.003)):
+    if keep[i]:
+        for j in nb:
+            if j > i: keep[j] = False
+TE = TE[keep]
+print("échantillons d'arêtes vraies uniques", len(TE), "longueur m", len(TE) * 0.01)
+res = {}
+vis_count = np.zeros(len(TE), int); best_contrast = np.zeros(len(TE))
+for nm in VIEWS6:
+    v = case["views"][nm]; a, b, d, x0, y1, px = v["frame"]; H, W = v["mask"].shape; img = case["imgs"][nm]
+    c = np.floor((TE @ a - x0) / px).astype(int); r = np.floor((y1 - TE @ b) / px).astype(int)
+    ok = (c >= 3) & (c < W - 3) & (r >= 3) & (r < H - 3)
+    vis = np.zeros(len(TE), bool)
+    vis[ok] = v["mask"][r[ok], c[ok]] & (np.abs(v["depth"][r[ok], c[ok]] - (TE[ok] @ d)) < 0.006)
+    # contraste : écart d'intensité médiane entre deux voisinages à +-3 pixels de part et d'autre dans la direction du gradient local
+    gy, gx = np.gradient(cv2.GaussianBlur(img, (0, 0), 1.0))
+    contrast = np.zeros(len(TE))
+    idx = np.where(vis)[0]
+    for i in idx:
+        rr, cc = r[i], c[i]
+        patch = img[rr - 3:rr + 4, cc - 3:cc + 4]
+        contrast[i] = patch.max() - patch.min()
+    vis_count += vis; best_contrast = np.maximum(best_contrast, np.where(vis, contrast, 0))
+    res[nm] = {"visible_samples": int(vis.sum())}
+for thr in (0.01, 0.02, 0.04):
+    m2 = (vis_count >= 2)
+    res[f"visible_in_2plus_views_contrast_ge_{thr}"] = float(((best_contrast >= thr) & m2).sum() / max(m2.sum(), 1))
+res["visible_in_2plus_views_share_of_truth_edges"] = float((vis_count >= 2).mean())
+res["visible_in_1plus_views_share_of_truth_edges"] = float((vis_count >= 1).mean())
+res["truth_unique_edge_length_m"] = float(len(TE) * 0.01)
+print(json.dumps(res, indent=1))
+json.dump(res, open("out/e3_oracle.json", "w"), indent=1)

@@ -23,12 +23,74 @@ def samples(V, F, n=60000, rng=np.random.default_rng(1)):
     return a[i] + u[:, :1] * (b[i] - a[i]) + u[:, 1:] * (c[i] - a[i])
 
 
+def quad_angles(V, Q):
+    """the four corner angles (degrees) of every quad, shape (n, 4)."""
+    A = np.zeros((len(Q), 4))
+    for k in range(4):
+        u = V[Q[:, (k + 1) % 4]] - V[Q[:, k]]; w = V[Q[:, (k - 1) % 4]] - V[Q[:, k]]
+        A[:, k] = np.degrees(np.arccos(np.clip((u * w).sum(1) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(w, axis=1), 1e-12), -1, 1)))
+    return A
+
+
+def straight_intrinsic(V, Q, bd):
+    """30 October 2026 : INTRINSIC straightness. The extrinsic metric above counts the two edges that continue each other across a hard edge as bent (a 90 degree crease gives 90 degrees of error although the line is straight once the two faces are unfolded). Here, at every interior valence 4 vertex the neighbours are put in cyclic order, the four face angles alpha_i between consecutive edges are measured, and for each pair of continuing edges the deviation is |sum of the two face angles on one side - sum on the other side| / 2 : 0 on a flat grid, 0 across any crease that is a straight line in the unfolded surface. Returns (mean, p90) in degrees."""
+    at = collections.defaultdict(list)
+    for q in Q:
+        for k in range(4): at[int(q[k])].append((int(q[(k - 1) % 4]), int(q[(k + 1) % 4])))
+    devs = []
+    for v, lst in at.items():
+        if v in bd or len(lst) != 4: continue
+        nxt = {p: n for p, n in lst}
+        if len(nxt) != 4: continue
+        ring = [lst[0][0], lst[0][1]]
+        while len(ring) < 4:
+            n = nxt.get(ring[-1])
+            if n is None or n in ring: break
+            ring.append(n)
+        if len(ring) != 4: continue
+        U = V[ring] - V[v]; U = U / np.maximum(np.linalg.norm(U, axis=1, keepdims=True), 1e-12); al = [np.degrees(np.arccos(np.clip(U[i] @ U[(i + 1) % 4], -1, 1))) for i in range(4)]
+        devs.append(abs((al[0] + al[1]) - (al[2] + al[3])) / 2); devs.append(abs((al[1] + al[2]) - (al[3] + al[0])) / 2)
+    d = np.array(devs) if devs else np.zeros(1); return round(float(d.mean()), 2), round(float(np.percentile(d, 90)), 2)
+
+
+def straightness(V, Q, ecnt):
+    """RIGHT ANGLE error : mean and 90th percentile of |corner angle - 90| over all quad corners ; STRAIGHT ISOLINE error : at every interior vertex of valence 4 the two straight-through edge pairs should be collinear : mean and 90th percentile of the deviation from 180 degrees of the angle between the two edges that continue each other ; MIRROR SYMMETRY : for the best of the three axis planes through the bounding box centre, the mean distance from each mirrored vertex to the nearest vertex, in mean edge lengths (0 = perfectly symmetric)."""
+    from scipy.spatial import cKDTree
+    A = quad_angles(V, Q); dev = np.abs(A - 90.0); out = {"angle_dev_mean_deg": round(float(dev.mean()), 2), "angle_dev_p90_deg": round(float(np.percentile(dev, 90)), 2)}
+    nb = collections.defaultdict(list)
+    for q in Q:
+        for k in range(4): nb[int(q[k])].append((int(q[(k + 1) % 4]), int(q[(k - 1) % 4])))
+    bd = {v for (a, b), c in ecnt.items() if c == 1 for v in (a, b)}; devs = []
+    for v, lst in nb.items():
+        if v in bd or len(lst) != 4: continue
+        nbrs = list({x for pair in lst for x in pair})
+        if len(nbrs) != 4: continue
+        P = V[nbrs] - V[v]; P = P / np.maximum(np.linalg.norm(P, axis=1, keepdims=True), 1e-12); best = None                      # the two pairs that are the most opposite
+        for i in range(4):
+            j = min((x for x in range(4) if x != i), key=lambda x: float(P[i] @ P[x])); devs.append(180.0 - np.degrees(np.arccos(np.clip(P[i] @ P[j], -1, 1))))
+    d = np.array(devs) if devs else np.zeros(1); out.update({"straight_dev_mean_deg": round(float(d.mean()), 2), "straight_dev_p90_deg": round(float(np.percentile(d, 90)), 2)})
+    iso = straight_intrinsic(V, Q, bd); out.update({"straight_iso_mean_deg": iso[0], "straight_iso_p90_deg": iso[1]})                    # 30 October 2026 : the same straightness measured ON THE SURFACE (unfolded angles), fair across a hard edge
+    used = np.array(sorted({int(v) for q in Q for v in q})); X = V[used]; c = (X.max(0) + X.min(0)) / 2; tr = cKDTree(X); el = np.linalg.norm(V[Q[:, 0]] - V[Q[:, 1]], axis=1).mean(); best = (1e9, 0)
+    for ax in range(3):
+        M = X.copy(); M[:, ax] = 2 * c[ax] - M[:, ax]; dd = tr.query(M)[0].mean() / max(el, 1e-12)
+        if dd < best[0]: best = (dd, ax)
+    out.update({"symmetry_axis": "xyz"[best[1]], "symmetry_mean_edge": round(float(best[0]), 3)})
+    return out
+
+
 def judge(quads_obj, ref_obj):
     V, F = load(quads_obj); R, RF = load(ref_obj); diag = float(np.linalg.norm(R.max(0) - R.min(0))); Q = np.array([f for f in F if len(f) == 4], np.int64); nq = len(Q); nt = sum(1 for f in F if len(f) == 3)
     out = {"faces": len(F), "quads": nq, "triangles": nt, "other": len(F) - nq - nt, "quad_share": round(nq / max(len(F), 1), 4)}
     if nq:
         _, _, jmin, _ = QS.stats(V, Q); out.update({"folded": int((jmin < 0).sum()), "squashed": int((jmin < 0.3).sum()), "folded_share": round(float((jmin < 0).mean()), 4), "squashed_share": round(float((jmin < 0.3).mean()), 4)})
         ed = np.concatenate([np.linalg.norm(V[Q[:, k]] - V[Q[:, (k + 1) % 4]], axis=1) for k in range(4)]); out["edge_p99_over_mean"] = round(float(np.percentile(ed, 99) / max(ed.mean(), 1e-12)), 2)
+        out.update({"jac_mean": round(float(np.mean(jmin)), 4), "jac_lt05_share": round(float((jmin < 0.5).mean()), 4), "jac_p5": round(float(np.percentile(jmin, 5)), 4)})            # 30 October 2026 : regularity (scaled Jacobian of Verdict and Knupp, minimum over the four corners of every quad)
+        el = np.stack([np.linalg.norm(V[Q[:, k]] - V[Q[:, (k + 1) % 4]], axis=1) for k in range(4)], 1); asp = el.max(1) / np.maximum(el.min(1), 1e-12); out["aspect_p90"] = round(float(np.percentile(asp, 90)), 2); out["edge_std_over_mean"] = round(float(ed.std() / max(ed.mean(), 1e-12)), 3)
+        ecnt = collections.Counter()
+        for q in Q:
+            for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ecnt[(min(a, b), max(a, b))] += 1
+        out.update(straightness(V, Q, ecnt))                                                   # 30 October 2026 : the "straighten" metrics asked by Matthieu (right angles, straight isolines, mirror symmetry)
+        used = {int(v) for q in Q for v in q}; out.update({"boundary_edges": sum(1 for c in ecnt.values() if c == 1), "nonmanifold_edges": sum(1 for c in ecnt.values() if c > 2), "euler": len(used) - len(ecnt) + nq, "vertices_used": len(used)})
         cnt = collections.Counter(); ec = collections.Counter()
         for q in Q:
             for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
@@ -39,9 +101,44 @@ def judge(quads_obj, ref_obj):
         inner = [v for v in nbv if v not in bd]; val = np.array([len(nbv[v]) for v in inner]) if inner else np.array([4])
         out.update({"interior_vertices": len(inner), "valence4_share": round(float((val == 4).mean()), 4), "poles_3": int((val == 3).sum()), "poles_5": int((val == 5).sum()), "poles_other": int(((val != 3) & (val != 4) & (val != 5)).sum()), "poles_per_1000_quads": round(1000.0 * float((val != 4).sum()) / nq, 1), "boundary_vertices": len(bd)})
     S = samples(V, F) if len(F) else V; tr = cKDTree(samples(R, RF)); d1 = tr.query(S)[0]; tq = cKDTree(S); d2 = tq.query(samples(R, RF, 20000))[0]
-    out.update({"dev_mean_frac_diag": round(float(d1.mean() / diag), 5), "dev_p99_frac_diag": round(float(np.percentile(d1, 99) / diag), 5), "holes_p99_frac_diag": round(float(np.percentile(d2, 99) / diag), 5)})
+    out.update({"diag_m": round(diag, 4), "dev_mean_mm": round(float(d1.mean()) * 1000, 3), "dev_p99_mm": round(float(np.percentile(d1, 99)) * 1000, 3), "dev_mean_frac_diag": round(float(d1.mean() / diag), 5), "dev_p99_frac_diag": round(float(np.percentile(d1, 99) / diag), 5), "holes_p99_frac_diag": round(float(np.percentile(d2, 99) / diag), 5)})
     return out
 
 
+def _grid(n):
+    V = [(x / n, y / n, 0.0) for y in range(n + 1) for x in range(n + 1)]; F = [[y * (n + 1) + x, y * (n + 1) + x + 1, (y + 1) * (n + 1) + x + 1, (y + 1) * (n + 1) + x] for y in range(n) for x in range(n)]; return np.array(V), F
+
+
+def _cubesphere(n):
+    key = {}; V = []; F = []
+    def vid(p):
+        k = tuple(np.round(p, 6))
+        if k not in key: key[k] = len(V); V.append(p / np.linalg.norm(p))
+        return key[k]
+    for axis in range(3):
+        for sgn in (-1.0, 1.0):
+            for i in range(n):
+                for j in range(n):
+                    def pt(a, b):
+                        c = [0.0, 0.0, 0.0]; c[axis] = sgn; c[(axis + 1) % 3] = -1 + 2 * a / n; c[(axis + 2) % 3] = -1 + 2 * b / n; return np.array(c)
+                    q = [vid(pt(i, j)), vid(pt(i + 1, j)), vid(pt(i + 1, j + 1)), vid(pt(i, j + 1))]; F.append(q if sgn > 0 else q[::-1])
+    return np.array(V), F
+
+
+def selftest(tmp="/tmp"):
+    """30 October 2026 : the judge is tested in BOTH directions (plan task T03) : a regular grid is green, the same grid with one flipped quad is red, a closed quad sphere has Euler characteristic 2 and no boundary edge."""
+    def write(path, V, F):
+        open(path, "w").write("".join("v %f %f %f\n" % tuple(p) for p in V) + "".join("f " + " ".join(str(i + 1) for i in f) + "\n" for f in F))
+    V, F = _grid(10); write(tmp + "/_j_grid.obj", V, F); ref = tmp + "/_j_grid.obj"; g = judge(ref, ref)
+    ok1 = g["angle_dev_mean_deg"] < 0.01 and g["straight_dev_mean_deg"] < 0.01 and g["straight_iso_mean_deg"] < 0.01 and g["symmetry_mean_edge"] < 0.01 and g["folded"] == 0 and g["squashed"] == 0 and g["boundary_edges"] == 40 and g["euler"] == 1 and g["jac_mean"] > 0.999 and g["nonmanifold_edges"] == 0
+    F2 = [list(f) for f in F]; F2[45] = [F2[45][0], F2[45][2], F2[45][1], F2[45][3]]; write(tmp + "/_j_bow.obj", V, F2); w = judge(tmp + "/_j_bow.obj", ref); ok2a = w["squashed"] >= 1 and w["jac_mean"] < g["jac_mean"]           # a bow tie quad has a zero Jacobian : counted squashed
+    V2 = V.copy(); q = F[45]; c = V[q].mean(0); V2[q[2]] = c - 0.3 * (V[q[2]] - c); write(tmp + "/_j_inv.obj", V2, F); b = judge(tmp + "/_j_inv.obj", ref); ok2 = ok2a and b["folded"] >= 1 and b["jac_mean"] < g["jac_mean"] and b["angle_dev_mean_deg"] > g["angle_dev_mean_deg"] + 0.05       # an inverted corner : counted folded
+    Vs, Fs = _cubesphere(6); write(tmp + "/_j_sphere.obj", Vs, Fs); s_ = judge(tmp + "/_j_sphere.obj", tmp + "/_j_sphere.obj"); ok3 = s_["euler"] == 2 and s_["boundary_edges"] == 0 and s_["folded"] == 0 and s_["nonmanifold_edges"] == 0
+    print("grid green", ok1, "| flipped quad red", ok2, "| closed sphere euler 2", ok3, "| keys", sorted(set(g) & {"jac_mean", "jac_lt05_share", "aspect_p90", "boundary_edges", "euler", "dev_mean_mm"}))
+    return ok1 and ok2 and ok3
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("quads"); ap.add_argument("ref"); a = ap.parse_args(); print(json.dumps(judge(a.quads, a.ref), indent=1))
+    ap = argparse.ArgumentParser(); ap.add_argument("quads", nargs="?"); ap.add_argument("ref", nargs="?"); ap.add_argument("--json", action="store_true"); ap.add_argument("--selftest", action="store_true"); a = ap.parse_args()
+    if a.selftest: sys.exit(0 if selftest() else 1)
+    print(json.dumps(judge(a.quads, a.ref), indent=None if a.json else 1))

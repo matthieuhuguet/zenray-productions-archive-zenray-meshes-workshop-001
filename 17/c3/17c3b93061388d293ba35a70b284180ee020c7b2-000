@@ -1,0 +1,31 @@
+"""Peau extérieure d'un maillage de quads par rasterisation exacte (numba) depuis K directions : une face est extérieure si elle
+apparaît dans le tampon d'identifiants d'au moins une vue (caméras au-dessus de ymin) avec au moins min_px pixels, et son signe
+d'orientation (+1 : la normale d'enroulement pointe vers la caméra) est voté par les vues. 30 October 2026."""
+import numpy as np
+from clay_render import render, quads_to_tris, tri_normals
+
+def fibonacci_dirs(k):
+    i = np.arange(k) + 0.5
+    phi = np.arccos(1 - 2 * i / k); th = np.pi * (1 + 5 ** 0.5) * i
+    return np.c_[np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi), np.cos(phi)]
+
+def exterior_faces(V, Q, k=120, px=0.003, ymin=-0.1, min_px=3):
+    tris = quads_to_tris(Q)
+    nq = len(Q)
+    tn = tri_normals(V, tris)
+    vis = np.zeros(nq, bool); votes = np.zeros(nq)
+    dirs = fibonacci_dirs(k); dirs = dirs[dirs[:, 1] >= ymin]
+    for d in dirs:
+        R = render(V, tris, (tuple(d), (0, 1, 0)), px=px)
+        idb = R["id"]; m = idb >= 0
+        t_ids = idb[m]
+        cnt = np.bincount(t_ids, minlength=len(tris))
+        seen = cnt >= min_px
+        face_seen = seen[:nq] | seen[nq:]
+        nd = tn @ d
+        sg = np.where(seen, np.sign(nd), 0.0)
+        vote_f = sg[:nq] + sg[nq:]
+        vis |= face_seen
+        votes += vote_f
+    sign = np.where(votes >= 0, 1.0, -1.0)
+    return vis, sign, votes

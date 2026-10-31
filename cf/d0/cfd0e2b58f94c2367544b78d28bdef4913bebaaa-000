@@ -1,0 +1,89 @@
+"""Écrit ../verifier_design_30-October-2026.md à partir des auto-tests (out/verifier_*.json). 30 October 2026."""
+import json, re
+D = "30 October 2026"
+st = json.load(open("out/verifier_selftest.json")); nat = json.load(open("out/verifier_natural.json")); rp = json.load(open("out/verifier_reprojection_selftest.json"))
+L = []
+def e(s=""):
+    if s and D not in s and not set(s) <= set("|-: ") and not s.rstrip().endswith("| Date |"): s += f" ({D})"
+    L.append(s)
+def ok(b): return "vert" if b else "ROUGE"
+e("# Vérificateurs de finition hard surface et leurs auto-tests (Q7, passe 1 : sept vérificateurs codés et testés dans les deux sens)")
+e()
+e("## 0. Principe")
+e()
+e("- Règle de la maison (CLAUDE.md, PRIORITÉ 0 du vérifiable) : un vérificateur n'a rien prouvé tant qu'il n'a pas viré au rouge sur un cas cassé ; chaque vérificateur ci-dessous est donc livré avec un cas vert et un ou plusieurs cas rouges construits exprès, et `experiments/selftest_verifiers.py` sort en code 0 seulement si le cas exact est vert partout et si chaque cas cassé est rouge là où il doit l'être.")
+e("- Les vérificateurs lisent un maillage triangulé (sommets en mètres), n'ont besoin que de numpy, scipy et trimesh (MIT), sont déterministes (graines fixes) et renvoient un dictionnaire JSON avec la valeur, le seuil et `pass` : c'est la sortie machine demandée par la mission.")
+e("- Statut de tous les nombres : [MESURÉ] dans le bac à sable cloud, code dans `experiments/verifiers.py`, `selftest_verifiers.py`, `selftest_natural.py`, `selftest_reprojection.py`.")
+e("- Les seuils sont des réglages de départ calibrés sur une seule famille synthétique (`experiments/facetcar.py`) : ils sont à recalibrer sur des maillages de référence validés par Matthieu avant d'en faire des portes de livraison. [ESTIMÉ] jugement.")
+e()
+e("## 1. Les sept vérificateurs codés")
+e()
+e("| Id | Ce qu'il mesure | Définition | Seuil de départ | Date |")
+e("|---|---|---|---|---|")
+rows = [
+ ("V1 closure", "fermeture", "arêtes ouvertes et arêtes non variétés du maillage", "0 et 0"),
+ ("V2 facet_planarity", "planéité des facettes (Q7 : planéité RMS)", "faces voisines à dièdre inférieur à 3 degrés fusionnées (union-find) ; part de l'aire des régions dont le RMS au plan moyen est sous 0,5 mm", "au moins 98 % de l'aire"),
+ ("V3 local_planarity", "planéité locale d'un maillage dense", "pour 6000 faces tirées par aire : voisinage de 10 cm de même orientation ; part de celles dont le RMS au plan est sous 0,5 mm", "au moins 95 %"),
+ ("V4 crease_straightness", "rectitude des plis (Q7 : rectitude et netteté)", "chaînes d'arêtes de dièdre supérieur à 35 degrés, plus de 15 cm ; segments de Douglas-Peucker à 1 mm par mètre de pli", "au plus 3 segments par mètre"),
+ ("V5 undulation", "tôle ondulée (arêtes molles)", "part de la longueur d'arête de dièdre dans [0,3 ; 5) degrés", "moins de 2 %"),
+ ("V6 symmetry", "symétrie (Q7)", "points échantillonnés sur la surface, reflétés en x, distance POINT-SURFACE (insensible à la tessellation) ; p99", "moins de 1 mm"),
+ ("V7 reprojection_iou", "erreur de reprojection dans les six vues (Q7)", "IoU des silhouettes du maillage contre des masques de même cadre, minimum sur six vues", "au moins 0,995"),
+]
+for r in rows: e("| " + " | ".join(r) + f" | {D} |")
+e()
+e("- Piège payé : la première version de V6 mesurait la distance sommet à sommet, donc elle jugeait ASYMÉTRIQUE (p99 20 mm) un polyèdre exact simplement parce que sa tessellation n'est pas symétrique ; la distance point-surface donne 0,000 mm sur le même maillage. [MESURÉ] `selftest_verifiers.py`.")
+e("- Piège payé : V3 seul jugeait 'non plan' (14,8 %) l'arche CAD réelle du banc parce que ses grandes faces triangulées ne laissent pas assez de voisins à 10 cm ; V2 (régions) la juge plane à 100 %. V3 vaut pour les maillages denses (quads de 1 à 2 cm), V2 pour les maillages à grandes facettes. [MESURÉ] `selftest_natural.py`.")
+e()
+e("## 2. Auto-tests dans les deux sens (voiture facettée exacte : union booléenne exacte de polytopes, 86 036 triangles)")
+e()
+e("| Cas | V1 fermeture | V2 facettes | V3 plan local | V4 plis (seg/m) | V5 ondulation | V6 symétrie p99 mm | Date |")
+e("|---|---|---|---|---|---|---|---|")
+for name, r in st.items():
+    e(f"| {name} | {ok(r['closure']['pass'])} | {r['facet_planarity']['planar_area_fraction']:.3f} {ok(r['facet_planarity']['pass'])} | {r['planarity']['planar_fraction']:.3f} {ok(r['planarity']['pass'])} | {r['crease_straightness']['segments_per_m']:.2f} {ok(r['crease_straightness']['pass'])} | {r['undulation']['undulation_length_fraction']:.4f} {ok(r['undulation']['pass'])} | {r['symmetry']['mirror_p99_mm']:.3f} {ok(r['symmetry']['pass'])} | {D} |".replace(".", ","))
+e()
+e("- Cas rouges construits : ondulation basse fréquence de 3 mm (longueur d'onde 0,4 m), bruit blanc de 1 mm, plis ondulés de 2 mm seulement près des arêtes vives, un triangle retiré, un côté décalé de 5 mm.")
+e("- Lecture : l'ondulation de 3 mm est rattrapée par V2, V3, V4, V5 ; le bruit blanc par V2, V3, V4, V5 et V6 ; l'ondulation des plis SEULE (surface plane intacte au sens de V3) est vue par V2, V4, V5 et V6 mais pas par V3, V4 étant celui qui la désigne le plus nettement (6,90 segments par mètre contre 0,96) ; le trou n'est vu que par V1 ; le décalage de 5 mm que par V6 et V3.")
+e("- Résultat du script : le cas exact est vert partout et chaque cas cassé est rouge au(x) vérificateur(s) attendu(s) : code de sortie 0. [MESURÉ] `selftest_verifiers.py`.")
+e()
+e("| Cas de reprojection (V7) | IoU minimum | Verdict | Date |")
+e("|---|---|---|---|")
+for name, r in rp.items(): e(f"| {name} | {r['iou_min']:.4f} | {ok(r['pass'])} | {D} |".replace(".", ","))
+e()
+e("- Résolution : à 8 mm par pixel, V7 détecte un décalage de 15 mm (IoU 0,991 à 0,963) ; il ne dit rien sous 1 cm, la finition au millimètre se juge par V2 à V6. [MESURÉ] `selftest_reprojection.py`.")
+e()
+e("## 3. Cas naturels")
+e()
+e("| Maillage | V2 facettes | V4 plis (seg/m) | V5 ondulation | V1 arêtes ouvertes | Date |")
+e("|---|---|---|---|---|---|")
+for name, r in nat.items():
+    e(f"| {name} | {r['facet_planarity']['planar_area_fraction']:.3f} {ok(r['facet_planarity']['pass'])} | {r['crease_straightness'].get('segments_per_m', float('nan')):.2f} {ok(r['crease_straightness']['pass'])} | {r['undulation']['undulation_length_fraction']:.4f} {ok(r['undulation']['pass'])} | {r['closure']['open_edges']} | {D} |".replace(".", ","))
+e()
+e("- v752 (peau extérieure, 49 631 quads) est rouge à V2, V4, V5 : seulement 26,7 % de son aire est en régions planes à 0,5 mm, 13,7 segments de pli par mètre, 44,9 % de la longueur d'arête dans la bande molle. [MESURÉ] `selftest_natural.py`.")
+e("- L'arche CAD réelle du banc (`handoff/arch-real-30-October-2026/.../arch_hard.obj`, maillage de sortie Houdini) est verte à V2 (100 %) et V5 (0,68 %), rouge à V4 (4,9 segments par mètre) parce que ses plis sont des ARCS : V4 doit recevoir une variante qui ajuste un cercle quand la chaîne est courbe (rayon constant), sinon il condamne un congé parfait. Limite connue, à lever en passe 2. [MESURÉ] `selftest_natural.py`.")
+e("- Limite mesurée de V2 : une sculpture de voxels de 2 cm lissée par Taubin (témoin B0 de l'essai E2a, 132 356 triangles) passe V2 (99,6 % de l'aire en régions planes à 0,5 mm, RMS pondéré 0,17 mm) parce que ses grandes faces de voxel restent planes ; elle est rouge à V4 (4,68 à 7,63 segments par mètre), V5 (7,9 à 15,7 % de la longueur d'arête dans la bande molle) et V6 (symétrie p99 de 11 à 158 mm) : V2 ne doit jamais être le seul vérificateur d'une porte de livraison. [MESURÉ] `e2a_hull.py`.")
+e("- Les arêtes ouvertes de v752 (17 034) sont celles de la peau extraite (faces cachées retirées), non celles de v752 entier (104) ; V1 ne s'applique qu'à un maillage complet. [MESURÉ] `selftest_natural.py`.")
+e()
+e("## 4. Vérificateurs conçus, pas encore codés (passe 2)")
+e()
+e("| Id | Ce qu'il mesure | Définition | Auto-test prévu (vert / rouge) | Date |")
+e("|---|---|---|---|---|")
+todo = [
+ ("V8 parallélisme et orthogonalité", "régularités globales (H4)", "clusters de normales de facettes à 0,5 degré ; part des paires de facettes à moins de 0,5 degré d'être parallèles ou orthogonales, contre le nombre attendu", "polyèdre exact / même polyèdre dont chaque normale est tournée de 0,7 degré au hasard"),
+ ("V9 netteté du pli", "pli net ou congé à rayon constant", "profil de normale en travers du pli : largeur de la transition et rayon équivalent, constant le long de la chaîne", "polyèdre / polyèdre lissé par subdivision (rayon variable)"),
+ ("V10 continuité G1 et G2 entre patchs", "raccord de surface", "écart d'angle de normale et de courbure normale de part et d'autre de la frontière entre deux patchs", "deux patchs raccordés en G2 / les mêmes avec un saut de tangente de 2 degrés"),
+ ("V11 lignes de reflet (zébrures)", "qualité de surface courbe, vue comme le designer", "rendu d'un champ de bandes sur la normale, extraction des bords de bande, comptage des inflexions et de la régularité d'espacement", "cylindre exact / cylindre avec une ondulation de 0,2 mm"),
+ ("V12 régularité des jeux", "jeux de panneaux de 3 à 5 mm", "distance entre deux bords voisins échantillonnée le long du joint : écart-type et minimum", "joint à 4 mm constant / joint dont le jeu varie de 4 à 7 mm"),
+ ("V13 rectitude d'arc", "variante de V4", "ajustement circulaire des chaînes courbes : RMS au cercle et rayon constant", "arche parfaite (CAD) / même arche froissée de 2 mm"),
+]
+for r in todo: e("| " + " | ".join(r) + f" | {D} |")
+e()
+e("- Aucune de ces six lignes n'est dite faite : elles sont le plan de la passe 2. [ESTIMÉ] jugement.")
+e()
+e("## 5. Usage et limites")
+e()
+e("- Ordre d'usage proposé : V1 (la pièce est-elle fermée) puis V2 (facettes) puis V4 et V5 (plis et tôle) puis V6 et V7 (symétrie et reprojection) ; une pièce n'est livrée que si tout est vert, conformément à la règle de la maison pour les systèmes.")
+e("- Limite 1 : calibrés sur une famille synthétique à facettes parfaites ; la planche de Matthieu est générée et incohérente d'une vue à l'autre (plafond 0,96) : V7 ne peut donc pas atteindre 0,995 contre elle, il faut un seuil propre à la planche, mesuré par l'IoU entre la meilleure enveloppe et les masques. [ESTIMÉ] jugement.")
+e("- Limite 2 : V2 à V5 jugent un style (polyèdre) ; une voiture à courbure continue comme la McLaren 750S aurait besoin de V10 et V11 en plus et d'une autre définition de V5. [ESTIMÉ] jugement.")
+e("- Limite 3 : les vérificateurs ne disent rien de la ressemblance à la référence : ils garantissent la finition, pas la fidélité ; la fidélité se juge par V7 et par la vérité 3D des voitures synthétiques. [ESTIMÉ] jugement.")
+open("../verifier_design_30-October-2026.md", "w").write("\n".join(L) + "\n")
+print(len(L))

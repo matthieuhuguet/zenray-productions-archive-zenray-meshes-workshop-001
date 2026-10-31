@@ -1,0 +1,112 @@
+"""Pass 7 : annular zones (two boundary loops) : cut along the shortest path between the loops then fill the disk, or a ring of quads without cut. FR : anneaux."""
+import sys, collections, heapq
+sys.path.insert(0, '.'); import numpy as np, TF7 as T
+import ZrlNetMesh as NM
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/pass5_tools")
+import annulus as A5
+AP = T.AP
+
+def make_mesh(P, F):
+    P = np.asarray(P, float); F = np.asarray(F, np.int64); Tn = len(F); N = np.cross(P[F[:, 1]] - P[F[:, 0]], P[F[:, 2]] - P[F[:, 0]]); A = np.linalg.norm(N, axis=1); N = N / np.maximum(A, 1e-20)[:, None]
+    E = np.stack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], 1).reshape(-1, 2); key = np.minimum(E[:, 0], E[:, 1]) * (len(P) + 1) + np.maximum(E[:, 0], E[:, 1]); order = np.argsort(key, kind="stable"); ks = key[order]; nb = -np.ones(3 * Tn, np.int64)
+    same = np.flatnonzero(ks[1:] == ks[:-1]); a, b = order[same], order[same + 1]; nb[a] = b // 3; nb[b] = a // 3
+    return {"P": P, "F": F, "G": np.zeros(Tn, np.int64), "N": N, "nb": nb.reshape(Tn, 3), "cent": P[F].mean(1)}
+
+def weld(P, Q, tol=1e-7):
+    key = {}; remap = np.zeros(len(P), int); nv = []
+    for i, p in enumerate(P):
+        k = tuple(np.round(p / tol).astype(np.int64))
+        if k not in key: key[k] = len(nv); nv.append(p)
+        remap[i] = key[k]
+    return np.array(nv), remap[np.asarray(Q)]
+
+def cut_fill(m, Z, edge, opts):
+    """one cut along the shortest path between the two loops, then the four sided fill whose corners are the four ends of the cut."""
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 2: return None, None, {"fail": "not an annulus"}
+    outer, inner = Ls[0], Ls[1]; F = m["F"][Z]; adj = A5.vertex_graph(m["P"], F); banned = set(outer) | set(inner)
+    p = A5.dijkstra(adj, outer, inner, banned=frozenset(banned))
+    if p is None or len(p) < 2: return None, None, {"fail": "no cut path"}
+    cut = {tuple(sorted((p[i], p[i + 1]))) for i in range(len(p) - 1)}; Fn, old = A5.cut_open(F, cut); Pn = m["P"][old]; m2 = make_mesh(Pn, Fn); Z2 = np.arange(len(Fn))
+    Ls2, _ = AP.loops(m2, Z2)
+    if len(Ls2) != 1: return None, None, {"fail": "cut left %d loops" % len(Ls2)}
+    B2 = Ls2[0]; ends = [i for i, v in enumerate(B2) if int(old[v]) in (p[0], p[-1])]
+    if len(ends) != 4: return None, None, {"fail": "cut ends %d" % len(ends)}
+    o = dict(T.OPTS, **opts); o["ci_fixed"] = ends; pr = T.prep(m2, Z2, edge, o)
+    if "fail" in pr: return None, None, pr
+    P3, Q, rep = T.fill(m2, Z2, edge, o, pr=pr)
+    if P3 is None: return None, None, rep
+    P3, Q = weld(P3, Q); rep["cut_len"] = len(p); return P3, Q, rep
+
+def ring_fill(m, Z, edge, opts):
+    """a ring of quads between the two loops without cut : n points on each loop (equal arc length), facing each other ; rows = round(width / edge) with the intermediate rows projected on the zone."""
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 2: return None, None, {"fail": "not an annulus"}
+    P = m["P"]; La = P[Ls[0]]; Lb = P[Ls[1]]
+    def per(X): return float(np.linalg.norm(np.diff(np.vstack([X, X[:1]]), axis=0), axis=1).sum())
+    pa, pb = per(La), per(Lb); n = max(3, int(round(0.5 * (pa + pb) / edge))); tri = m["P"][m["F"][Z]]; area = float(0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1).sum()); width = area / max(0.5 * (pa + pb), 1e-12); rows = max(1, int(round(width / edge)))
+    def resample(X, n):
+        Y = np.vstack([X, X[:1]]); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Y, axis=0), axis=1))]; t = np.linspace(0, cum[-1], n, endpoint=False); return np.stack([np.interp(t, cum, Y[:, k]) for k in range(3)], 1)
+    Xa = resample(La, n); Xb0 = resample(Lb, n); best = None
+    for rev in (False, True):
+        Xb = Xb0[::-1] if rev else Xb0
+        for sh in range(n):
+            c = float(np.linalg.norm(Xa - np.roll(Xb, sh, axis=0), axis=1).sum())
+            if best is None or c < best[0]: best = (c, rev, sh)
+    _, rev, sh = best; Xb = np.roll(Xb0[::-1] if rev else Xb0, sh, axis=0); ref = NM.Ref(tri); R = [Xa]
+    for r in range(1, rows): R.append(ref.closest((1 - r / rows) * Xa + (r / rows) * Xb)[0])
+    R.append(Xb); V = np.vstack(R); Q = []
+    for r in range(rows):
+        for i in range(n): j = (i + 1) % n; Q.append([r * n + i, r * n + j, (r + 1) * n + j, (r + 1) * n + i])
+    Q = np.array(Q, np.int64); nn = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]).sum(0); normal = m["N"][Z].mean(0)
+    if nn @ normal < 0: Q = Q[:, ::-1]
+    return V, Q, {"n": n, "rows": rows, "width_edges": round(width / edge, 2), "ring": True}
+
+
+def best_fill(m, Z, edge, opts):
+    """both the cut fill and the ring of quads are built and judged on the spot : the one with the fewest folded (x5) plus squashed quads is kept."""
+    best = None
+    for name, fn in (("belt", belt_fill), ("cut", cut_fill), ("ring", ring_fill)):
+        try: P, Q, rep = fn(m, Z, edge, opts)
+        except Exception as ex: P = None
+        if P is None: continue
+        j = T.QS.stats(P, Q)[2]; sc = 5 * int((j < 0).sum()) + int((j < 0.3).sum())
+        if best is None or sc < best[0]: best = (sc, P, Q, dict(rep, annulus=name))
+    return (best[1], best[2], best[3]) if best else (None, None, {"fail": "annulus"})
+
+
+def belt_fill(m, Z, edge, opts):
+    """an annulus whose two loops are small polygons with the SAME number c of vertices (a prism band) : every vertex of a loop is a corner, matched to a vertex of the other loop (cyclic shift and orientation of least total distance), c rungs (shortest paths between matched corners), c four sided patches."""
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 2: return None, None, {"fail": "not an annulus"}
+    La, Lb = list(Ls[0]), list(Ls[1])
+    if len(La) != len(Lb) or not 3 <= len(La) <= 12: return None, None, {"fail": "loops not matching"}
+    c = len(La); P = m["P"]; best = None
+    for rev in (False, True):
+        Bq = Lb[::-1] if rev else Lb
+        for sh in range(c):
+            Bs = Bq[sh:] + Bq[:sh]; cost = sum(float(np.linalg.norm(P[La[i]] - P[Bs[i]])) for i in range(c))
+            if best is None or cost < best[0]: best = (cost, Bs)
+    Bs = best[1]; F = m["F"][Z]; adj = A5.vertex_graph(P, F); banned = frozenset(set(La) | set(Lb)); cut = set(); rungs = []
+    for i in range(c):
+        p = A5.dijkstra(adj, [La[i]], [Bs[i]], banned=banned)
+        if p is None: return None, None, {"fail": "no rung"}
+        rungs.append(p)
+        for u, v in zip(p[:-1], p[1:]): cut.add(tuple(sorted((u, v))))
+    Fn, old = A5.cut_open(F, cut); comps = A5.components(Fn)
+    if len(comps) != c: return None, None, {"fail": "belt split in %d pieces" % len(comps)}
+    Pn = P[old]; V = []; Q = []; off = 0
+    for comp in comps:
+        Fc = Fn[comp]; used = np.unique(Fc); rm = {int(v): i for i, v in enumerate(used)}; Fl = np.array([[rm[int(a)] for a in t] for t in Fc]); oc = old[used]; m2 = make_mesh(Pn[used], Fl); Z2 = np.arange(len(Fl)); Ls2, _ = AP.loops(m2, Z2)
+        if len(Ls2) != 1: return None, None, {"fail": "piece not a disk"}
+        B2 = Ls2[0]; ends = [i for i, v in enumerate(B2) if int(oc[v]) in {p[0] for p in rungs} | {p[-1] for p in rungs}]
+        if len(ends) != 4:
+            ends_ = [i for i, v in enumerate(B2) if int(oc[v]) in (set(La) | set(Lb))]
+            if len(ends_) < 4: return None, None, {"fail": "piece corners %d" % len(ends)}
+            return None, None, {"fail": "piece corners %d" % len(ends)}
+        o = dict(T.OPTS, **opts); o["ci_fixed"] = ends; pr = T.prep(m2, Z2, edge, o)
+        if "fail" in pr: return None, None, pr
+        P3, Qd, rep = T.fill(m2, Z2, edge, o, pr=pr)
+        if P3 is None: return None, None, rep
+        V.append(P3); Q.append(Qd + off); off += len(P3)
+    V, Q = weld(np.vstack(V), np.vstack(Q)); return V, Q, {"belt": c}

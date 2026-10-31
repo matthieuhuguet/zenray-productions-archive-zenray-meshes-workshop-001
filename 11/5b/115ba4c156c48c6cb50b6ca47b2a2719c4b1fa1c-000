@@ -1,0 +1,61 @@
+"""Pass 9 : assembles topology_library_schema and topology_library_batch064 from the external candidate scan and the generated entries. Written 30 October 2026.
+Usage : python3 -I build_topology_library.py raw=library_raw.jsonl gen=gen_entries.json outdir=DIR
+Only links and fingerprints are stored for external meshes (no mesh file is redistributed). FR : assemble le schema et le lot de 64 entrees de la bibliotheque."""
+import sys, json, re, collections
+a = dict(kv.split("=", 1) for kv in sys.argv[1:]); DATE = "30 October 2026"
+rows = [json.loads(l) for l in open(a["raw"])]; gen = json.load(open(a["gen"]))["entries"]
+
+
+def slug(s): return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")[:48]
+
+
+def compact(fp):
+    keep = ("vertices", "faces", "face_sizes", "edges", "euler", "boundary_edges", "nonmanifold_edges", "boundary_loops", "components", "genus", "valence_hist_interior",
+            "poles_per_1000_faces", "bbox_diagonal", "mean_edge", "quad_stats", "mirror_symmetry_median_edges", "best_mirror_axis")
+    return {k: fp[k] for k in keep if k in fp}
+
+
+def topology_class(f):
+    h = f["valence_hist_interior"]; keys = set(h)
+    if f["euler"] == 2 and f.get("boundary_loops", 0) == 0 and keys <= {"3", "4"} and h.get("3") == 8: return "box_topology"
+    if f["euler"] == 0 and f.get("boundary_loops", 0) == 0 and keys == {"4"}: return "torus_topology"
+    return "other"
+
+
+ext = []; skipped = []
+for r in rows:
+    if r["included"]:
+        f = r["fingerprint"]
+        ext.append({"id": "ext_%s_%s" % (slug(r["keyword"]), slug(r["name"])), "date": DATE, "kind": "external_link", "keyword": r["keyword"], "family": r["family"], "name": r["name"],
+                    "url_raw": r["url_raw"], "repo_url": r["repo_url"], "license_name": r["license_name"], "license_url": r["license_url"], "size_bytes": r["size_bytes"],
+                    "topology_class": topology_class(f), "fingerprint": compact(f), "remarks": r["remarks"]})
+    else:
+        skipped.append({"name": r["name"], "url_raw": r["url_raw"], "license_name": r["license_name"], "exclusion_reason": r["exclusion_reason"]})
+gens = []
+for g in gen:
+    f = g["fingerprint"]
+    gens.append({"id": g["id"], "date": DATE, "kind": "generated", "family": g["family"], "source": g["source"], "params": g["params"], "license_name": "genere par ce depot, aucune licence tierce",
+                 "topology_class": topology_class(f), "verified": g["check"], "fingerprint": compact(f)})
+batch = {"batch": "064", "date": DATE, "count": len(ext) + len(gens), "counts": {"external_link": len(ext), "generated": len(gens)}, "entries": ext + gens, "external_excluded": skipped,
+         "excluded_count": len(skipped)}
+schema = {
+    "schema": "topology_library", "version": 1, "date": DATE,
+    "purpose": "index of small quad meshes with validated topology, by keyword, family and fingerprint; only links and fingerprints, no mesh file redistributed",
+    "entry_fields": {
+        "id": "string, unique, prefix ext_ for external links and gen_ for generated meshes", "date": "string, 30 October 2026", "kind": "external_link or generated",
+        "keyword": "string, search keyword that found the link (external only)", "family": "organic, hard_surface, or generated_<generator>", "name": "string (external only)",
+        "url_raw": "direct download URL of the mesh, https (external only)", "repo_url": "repository page (external only)", "license_name": "licence read in the repository, or the statement that the entry is generated",
+        "license_url": "URL of the licence text (external only)", "size_bytes": "integer (external only)", "source": "generator path (generated only)", "params": "generator parameters (generated only)",
+        "topology_class": "box_topology (8 valence 3 vertices, rest valence 4, Euler 2, closed), torus_topology (all valence 4, Euler 0, closed), other",
+        "verified": "generated only : closed_manifold, euler, gauss_bonnet_ok (sum of 4 minus valence equals 4 chi), euler_matches_prediction (from the voxel complex), quads_match_closed_form, green",
+        "fingerprint": "vertices, faces, face_sizes, edges, euler, boundary_edges, nonmanifold_edges, boundary_loops, components, genus, valence_hist_interior, poles_per_1000_faces, bbox_diagonal, mean_edge, quad_stats (jac_mean, folded_frac, squashed_frac, angle_dev_mean_deg, angle_dev_p99_deg, loop_turn_mean_deg, loop_turn_p90_deg, edge_cv, area_cv), mirror_symmetry_median_edges (x, y, z, in mean edges, 0 = exact), best_mirror_axis",
+        "remarks": "free text in French (external only)"},
+    "inclusion_rules_observed": ["free licence read in the repository (CC0, MIT, Apache 2.0, Tomorrow Open Source 1.0, CC BY 4.0 with attribution) ; entries with an unknown licence (2) or CC BY NC 4.0 (1) were excluded",
+                                 "mostly quads : excluded meshes had at most 89.3 percent of faces with 4 vertices (32 meshes), included ones at least 94.1 percent",
+                                 "size : the scan skipped one file of 3833953 bytes as too big ; the largest included file has 1749303 bytes",
+                                 "no duplicate : a byte identical file (SHA-256) was excluded", "the fingerprint tool must parse the file (3 files excluded because it did not), and a trivial one face mesh was excluded (1)"],
+    "regeneration": {"fingerprint_tool": "pass8_tools/zr8_fingerprint.py path=MESH.obj", "generated_part": "pass8_tools/gen_topology_library.py out=entries.json", "assembly": "pass8_tools/build_topology_library.py"},
+}
+json.dump(schema, open(a["outdir"] + "/topology_library_schema_30-October-2026.json", "w"), indent=1, ensure_ascii=False)
+json.dump(batch, open(a["outdir"] + "/topology_library_batch064_30-October-2026.json", "w"), indent=1, ensure_ascii=False)
+print(json.dumps({"count": batch["count"], "counts": batch["counts"], "excluded": len(skipped), "classes": collections.Counter(e["topology_class"] for e in batch["entries"])}))

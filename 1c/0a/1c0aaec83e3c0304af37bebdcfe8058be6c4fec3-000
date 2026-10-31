@@ -1,0 +1,48 @@
+"""30 October 2026 : ZenRay HYBRID : the LAYOUT of QuadWild (its patches and corners, a layout it finds on any mesh) filled and welded by the mathematics of ZenRay Retopology.
+EN: quadwild writes `<name>_rem_p0.obj` (the remeshed triangles), `.patch` (a patch id per triangle) and `.corners` (the corner vertices of every patch). Every patch is a disk with 3 to 6 corners ; the corners are given to the intrinsic fill (ZrlTutte7, `ci_fixed`), the integer edge counts of ALL patches are solved at once by ONE global MILP over elementary arcs shared by neighbouring patches (ZrlCounts, Tarini conditions, exact parity), every patch is filled by Tutte's embedding (mean value weights, cyclic polygon, Coons grid, Tarini spokes, uv smoothing) and the patches are welded on their shared vertices : straight, regular quads, closed cracks, by construction.
+    python -I ZrlHybrid.py rem_p0.obj reference.obj out.obj --quads 6000 [--tmax 300] [--uvsmooth 80]
+FR : le layout de QuadWild rempli et soude par les mathematiques de ZenRay : comptes d'aretes globaux par un MILP, remplissage de Tutte, soudure sur les sommets communs."""
+import argparse, collections, json, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlAutoPatch as AP, ZrlTutte7 as T, ZrlWeld7 as W, ZrlAnnulus7 as A, ZrlTopoJudge as TJ
+
+
+def qw_layout(rem_obj):
+    """the remeshed mesh, the patch id of every triangle and the corner vertices of every patch (QuadWild file formats)."""
+    base = rem_obj[:-4]; m = AP.mesh(os.path.abspath(rem_obj)); ids = [int(x) for x in open(base + ".patch").read().split()]; n = ids[0]; lab = np.array(ids[1:1 + n])
+    if n != len(m["F"]): raise ValueError("patch file has %d triangles, the mesh %d" % (n, len(m["F"])))
+    tok = open(base + ".corners").read().split(); npat = int(tok[0]); k = 1; corners = []
+    for _ in range(npat): c = int(tok[k]); corners.append([int(x) for x in tok[k + 1:k + 1 + c]]); k += 1 + c
+    return m, lab, corners
+
+
+def make_preps(m, lab, corners, edge):
+    prs = {}; fails = collections.Counter()
+    for z in range(len(corners)):
+        Z = np.flatnonzero(lab == z)
+        if not len(Z): continue
+        Ls, ln = AP.loops(m, Z)
+        if len(Ls) != 1: fails["loops %d" % len(Ls)] += 1; continue
+        B = np.asarray(Ls[0]); pos = {int(v): i for i, v in enumerate(B)}; ci = sorted({pos[c] for c in corners[z] if c in pos})
+        if not 3 <= len(ci) <= 8: fails["corners %d" % len(ci)] += 1; continue
+        pr = T.prep(m, Z, edge, dict(T.OPTS, ci_fixed=ci, corners_only=True))
+        if "fail" in pr: fails[pr["fail"]] += 1; continue
+        prs[z] = pr
+    return prs, fails
+
+
+def run(rem_obj, ref_obj, out, quads, tmax=300, uvsmooth=80, log=print):
+    t0 = time.time(); m, lab, corners = qw_layout(rem_obj); tri = m["P"][m["F"]]; area = float(0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1).sum()); edge = (area / quads) ** 0.5
+    prs, fails = make_preps(m, lab, corners, edge); log("patches %d of %d, refused %s" % (len(prs), len(corners), dict(fails)))
+    lay, side_arcs, poly = W.build_layout(m, prs); log("arcs %d" % len(lay["arcs"])); sol, lay2, dropped, secs = W.solve_global(lay, edge, tmax)
+    if not sol.get("ok"): return {"ok": False, "error": "global counts infeasible", "milp_s": round(secs, 1)}
+    prsC = W.apply_counts(prs, side_arcs, sol, lay2); opts = {"uvsmooth": uvsmooth}; V, Q, parts, f2 = W.fill_all(m, prsC, edge, opts)
+    if V is None: return {"ok": False, "error": "no patch filled", "fills_failed": dict(f2)}
+    V, Q = A.weld(V, Q, 1e-6); W.write_obj(out, V, Q); json.dump([int(p) for p in parts], open(out + ".parts.json", "w")); j = TJ.judge(out, ref_obj); ec = W.edge_counts(Q)
+    j.update({"ok": True, "patches": len(prsC), "patches_total": len(corners), "dropped_by_milp": len(dropped), "milp_s": round(secs, 1), "open_edges": sum(1 for c in ec.values() if c == 1), "nonmanifold": sum(1 for c in ec.values() if c > 2), "seconds": round(time.time() - t0, 1), "edge_m": round(edge, 4)})
+    return j
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("rem"); ap.add_argument("ref"); ap.add_argument("out"); ap.add_argument("--quads", type=int, default=6000); ap.add_argument("--tmax", type=int, default=300); ap.add_argument("--uvsmooth", type=int, default=80); a = ap.parse_args()
+    r = run(a.rem, a.ref, a.out, a.quads, a.tmax, a.uvsmooth); print(json.dumps({k: r[k] for k in r if k in ("ok", "error", "quads", "folded", "squashed", "folded_share", "squashed_share", "valence4_share", "poles_per_1000_quads", "dev_mean_frac_diag", "patches", "patches_total", "dropped_by_milp", "milp_s", "open_edges", "nonmanifold", "seconds", "edge_m")}))

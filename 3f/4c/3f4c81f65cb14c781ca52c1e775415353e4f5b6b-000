@@ -1,0 +1,97 @@
+import sys, os, json, numpy as np, shutil
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import qw6, carx, q3, q3run
+from scipy.spatial import cKDTree
+import ZrlTopoJudge as J
+def surf_samples(V, T, lab, n=200000, seed=1):
+    rng = np.random.default_rng(seed); a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]; ar = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    i = rng.choice(len(T), n, p=ar / ar.sum()); u = rng.random((n, 2)); m = u.sum(1) > 1; u[m] = 1 - u[m]
+    return a[i] + u[:, :1] * (b[i] - a[i]) + u[:, 1:] * (c[i] - a[i]), np.array(lab)[i]
+def weld(V, tris, gof, tol=1e-7):
+    key = {}; remap = np.zeros(len(V), int); nv = []
+    for i, p in enumerate(V):
+        k = tuple(np.round(p / tol).astype(np.int64))
+        if k not in key: key[k] = len(nv); nv.append(p)
+        remap[i] = key[k]
+    T = [[remap[v] for v in t] for t in tris]; keep = [i for i, t in enumerate(T) if len(set(t)) == 3]
+    return np.array(nv), [T[i] for i in keep], [gof[i] for i in keep]
+def write_obj(path, V, T):
+    open(path, "w").write("".join("v %.9g %.9g %.9g\n" % tuple(p) for p in V) + "".join("f " + " ".join(str(int(x) + 1) for x in t) + "\n" for t in T))
+def border_report(Vq, Q, Vin, Tin, gin):
+    """quads straddling the component border and share of the border covered by quad edges"""
+    Tin = np.array(Tin); ed = {}
+    for i, t in enumerate(Tin):
+        for j in range(3): a, b = t[j], t[(j + 1) % 3]; ed.setdefault((min(a, b), max(a, b)), []).append(i)
+    be = [k for k, L in ed.items() if len(L) == 2 and gin[L[0]] != gin[L[1]]]
+    BS = np.concatenate([Vin[a][None] + (Vin[b] - Vin[a])[None] * np.linspace(0, 1, 6)[:, None] for a, b in be]) if be else np.zeros((0, 3))
+    QS = q3run.seg_samples(Vq, Q, 12); el = float(np.mean([np.linalg.norm(Vq[q[k]] - Vq[q[(k + 1) % 4]]) for q in Q for k in range(4)]))
+    d = cKDTree(QS).query(BS)[0] if len(BS) else np.array([0.0]); P, L = surf_samples(Vin, Tin, [g for g in gin])
+    names = sorted(set(gin)); code = {g: i for i, g in enumerate(names)}; Lc = np.array([code[g] for g in L]); tr = cKDTree(P)
+    lab = Lc[tr.query(Vq)[1]]; dB = cKDTree(BS).query(Vq)[0] if len(BS) else np.full(len(Vq), 9.0)
+    mixed = 0
+    for q in Q:
+        ls = {lab[v] for v in q if dB[v] > 0.1 * el}
+        mixed += len(ls) > 1
+    # a quad is "crossing" when its centroid is farther than 0.1 edge from the border but its vertices lie on both sides ; also quads whose edge crosses the border (centre near border)
+    cen = Vq[Q].mean(1); dc = cKDTree(BS).query(cen)[0] if len(BS) else np.full(len(Q), 9.0)
+    return dict(border_edges=len(be), border_covered_01=round(float((d < 0.1 * el).mean()), 4), border_covered_03=round(float((d < 0.3 * el).mean()), 4), quads_with_vertices_on_both_sides=int(mixed), quads_centre_within_0_25_edge_of_border=int((dc < 0.25 * el).sum()), mean_edge=round(el, 5))
+def pair_test():
+    V0, G0 = carx.load(); out = {}
+    sel, vs, lines, gof = carx.extract(V0, G0, ["CAR_body_quarter_L", "CAR_body_shoulder_rear_L"], "car/pairraw.obj")
+    Vw, Tw, gw = weld(np.array(vs), lines, gof); write_obj("car/pair_welded.obj", Vw, Tw)
+    nb = q3.write_sharp("car/pair_welded.sharp", Tw, gw, Vw); out["sharp_edges"] = nb; out["tris"] = len(Tw)
+    for tag, kw, extra in [("pair_auto35", {}, None), ("pair_organic", dict(sharp_feature_thr=-1), None), ("pair_forced", {}, os.path.abspath("car/pair_welded.sharp")), ("pair_forced_org", dict(sharp_feature_thr=-1), os.path.abspath("car/pair_welded.sharp"))]:
+        r, o = q3run.run_case(tag, "car/pair_welded.obj", kw, extra=extra)
+        if o and os.path.exists(o):
+            Vq, F = q3.loadobj(o); Q = np.array([f for f in F if len(f) == 4]); r["border"] = border_report(Vq, Q, Vw, Tw, gw)
+        out[tag] = r
+    return out
+def clip_half(V, F, axis=0):
+    """triangles clipped to the half space x >= 0 (seam exactly on the plane)"""
+    nv = [list(p) for p in V]; T = []
+    def inter(i, j):
+        a, b = V[i], V[j]; t = a[axis] / (a[axis] - b[axis]); p = a + t * (b - a); p[axis] = 0.0; nv.append(list(p)); return len(nv) - 1
+    cache = {}
+    def cut(i, j):
+        k = (min(i, j), max(i, j))
+        if k not in cache: cache[k] = inter(*k)
+        return cache[k]
+    for f in F:
+        t = [f[0], f[1], f[2]]; s = [V[v][axis] >= 0 for v in t]; n = sum(s)
+        if n == 3: T.append(t)
+        elif n == 0: continue
+        else:
+            poly = []
+            for k in range(3):
+                a, b = t[k], t[(k + 1) % 3]; sa, sb = V[a][axis] >= 0, V[b][axis] >= 0
+                if sa: poly.append(a)
+                if sa != sb: poly.append(cut(a, b))
+            for k in range(1, len(poly) - 1): T.append([poly[0], poly[k], poly[k + 1]])
+    return np.array(nv), T
+def half_test():
+    Vm, Fm = q3.loadobj(qw6.GT + "/manny_character.obj"); Vh, Th = clip_half(Vm, Fm); used = sorted({v for t in Th for v in t}); rm = {v: i for i, v in enumerate(used)}
+    Vh = Vh[used]; Th = [[rm[v] for v in t] for t in Th]; write_obj("car/manny_half.obj", Vh, Th)
+    r, o = q3run.run_case("manny_half", "car/manny_half.obj", dict(sharp_feature_thr=-1), ref="car/manny_half.obj")
+    out = dict(half_tris=len(Th), run=r)
+    if o and os.path.exists(o):
+        Vq, F = q3.loadobj(o); Q = [f for f in F if len(f) == 4]; el = float(np.mean([np.linalg.norm(Vq[q[k]] - Vq[q[(k + 1) % 4]]) for q in Q for k in range(4)]))
+        on = np.abs(Vq[:, 0]) < 0.05 * el; out["seam_vertices_within_0_05_edge_of_plane"] = int(on.sum()); out["x_offset_of_seam_vertices_max_over_edge"] = round(float(np.abs(Vq[on, 0]).max() / el), 4) if on.any() else None
+        M = Vq.copy(); M[:, 0] *= -1; V2 = np.concatenate([Vq, M]); F2 = [list(q) for q in Q] + [[len(Vq) + int(v) for v in q[::-1]] for q in Q]
+        sn = Vq[on]; V2s = V2.copy(); V2s[np.concatenate([on, on])[:len(V2)], 0] = 0.0
+        Vw, Fw, _ = weld(V2s, [f for f in F2], [0] * len(F2), tol=1e-6) if False else (None, None, None)
+        # weld by position on the quads
+        key = {}; remap = np.zeros(len(V2s), int); nvv = []
+        for i, p in enumerate(V2s):
+            k = tuple(np.round(p / (0.02 * el)).astype(np.int64)) if abs(p[0]) < 0.05 * el else (i,)
+            if k not in key: key[k] = len(nvv); nvv.append(p)
+            remap[i] = key[k]
+        F3 = [[int(remap[v]) for v in f] for f in F2]; Vf = np.array(nvv); write_obj("car/manny_full_mirrored.obj", Vf, F3)
+        ec = {}
+        for f in F3:
+            for k in range(4): a, b = f[k], f[(k + 1) % 4]; ec[(min(a, b), max(a, b))] = ec.get((min(a, b), max(a, b)), 0) + 1
+        out["mirrored_welded"] = dict(quads=len(F3), vertices=len(Vf), edges_used_once=sum(1 for c in ec.values() if c == 1), edges_used_over_twice=sum(1 for c in ec.values() if c > 2))
+        Rm = qw6.GT + "/manny_character.obj"
+        try: out["mirrored_judge_vs_full"] = J.judge("car/manny_full_mirrored.obj", Rm)
+        except Exception as e: out["judge_error"] = repr(e)
+    return out
+if __name__ == "__main__":
+    t = sys.argv[1]; print(json.dumps(pair_test() if t == "pair" else half_test(), indent=1, default=str))

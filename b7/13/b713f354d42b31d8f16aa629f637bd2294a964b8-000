@@ -1,0 +1,46 @@
+"""30 October 2026 : EQUAL DENSITY BASELINES (plan task T04) : Quad Remesh (Houdini), QuadWild organic and QuadWild mechanical on every test mesh at the SAME number of quads (within 10 percent of the target, corrected by iteration), judged by the extended ZrlTopoJudge.
+    python -I ZrlBaselines.py out.json mesh:target [mesh:target ...]     (mesh = arch_hard, manny_character, lily_plant, eucalyptus_tree ; benchmark/gt)
+FR : les baselines a densite egale : meme nombre de quads (a 10 pour cent pres) pour chaque methode."""
+import json, os, subprocess, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import ZrlTopoJudge as TJ, QwParts as QP
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"; HYTHON = "/Users/zenray/Create/Build/Houdini22/Houdini22.0.368/Frameworks/Houdini.framework/Versions/22.0/Resources/bin/hython"
+KEYS = ("quads", "folded_share", "squashed_share", "jac_mean", "jac_lt05_share", "valence4_share", "poles_per_1000_quads", "boundary_edges", "nonmanifold_edges", "euler", "dev_mean_mm", "edge_std_over_mean")
+
+
+def houdini(mesh, target, out_dir):
+    ref = f"{ROOT}/benchmark/gt/{mesh}.obj"; n = target; res = None
+    for it in range(4):
+        out = f"{out_dir}/hou_{mesh}.obj"; subprocess.run([HYTHON, f"{HERE}/HouQuadBench.py", ref, out, str(max(8, int(n)))], capture_output=True, text=True)
+        if not os.path.exists(out): break
+        j = TJ.judge(out, ref); res = (out, j)
+        if abs(j["quads"] / target - 1) <= 0.10: break
+        n = n * target / max(j["quads"], 1)
+    return res
+
+
+def quadwild(mesh, target, out_dir):
+    ref = f"{ROOT}/benchmark/gt/{mesh}.obj"; d = f"{out_dir}/qw_{mesh}"; os.makedirs(d, exist_ok=True); tri = os.path.join(d, "part.obj"); faces = []; Vl = []
+    for l in open(ref):
+        t = l.split()
+        if t and t[0] == "v": Vl.append(t[1:4])
+        elif t and t[0] == "f": faces.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    QP.write_part(Vl, faces, tri); edge = (QP.area_of(tri) / target) ** 0.5; QP.run(("whole", d, 900, edge)); out = {}
+    for kind in ("organic", "mechanical"):
+        p = os.path.join(d, "qw_%s.obj" % kind)
+        if os.path.exists(p): out[kind] = (p, TJ.judge(p, ref))
+    return out
+
+
+def main():
+    out_json = sys.argv[1]; res = {}; od = f"{ROOT}/work/lines/baselines_30oct"; os.makedirs(od, exist_ok=True)
+    for spec in sys.argv[2:]:
+        mesh, target = spec.split(":"); target = int(target); row = {}
+        h = houdini(mesh, target, od)
+        if h: row["Quad Remesh"] = {k: h[1].get(k) for k in KEYS}; row["Quad Remesh"]["file"] = h[0]
+        for kind, (p, j) in quadwild(mesh, target, od).items(): row["QuadWild " + kind] = {k: j.get(k) for k in KEYS}; row["QuadWild " + kind]["file"] = p
+        for k, v in row.items(): v["quads_vs_target"] = round(v["quads"] / target, 3)
+        res[mesh] = {"target": target, "methods": row}; json.dump(res, open(out_json, "w"), indent=1); print(mesh, {k: (v["quads"], v["quads_vs_target"]) for k, v in row.items()}, flush=True)
+
+
+if __name__ == "__main__": main()

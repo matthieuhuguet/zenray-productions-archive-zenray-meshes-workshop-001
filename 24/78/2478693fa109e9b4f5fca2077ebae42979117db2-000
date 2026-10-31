@@ -1,0 +1,115 @@
+"""Pass 8 : ONE global MILP of shared edge counts on the elementary arcs of a patch layout. Written 30 October 2026.
+Variables : n_a integer >= 1 for each elementary arc a ; for each patch p with K sides (3 <= K <= 8) integer s_(p,i) >= 1 with
+the closed form of Tarini 2021 (arXiv 2101.11569) e_i = s_(i-1) + s_(i+1), e_i = sum of the n_a on side i ; K = 4 : e_0 = e_2 and e_1 = e_3 only ; a continuous
+slack pair on each of these equalities (elastic mode, large weight) ; optional mirror equalities n_a = n_b.
+Objective : sum_a w_a (n_a - g_a)^2 (convex piecewise linear interpolation at the integers, norm l2), or relative (rel2), or l1 ;
++ M sum slack, with g_a = target count of arc a (length / edge by default).
+FR : un MILP global de comptes partages ; les conditions de Tarini sont encodees par les entiers s_i (e_i = s_(i-1) + s_(i+1)),
+ce qui couvre N de 3 a 8 d'un seul bloc de contraintes lineaires, y compris la parite."""
+import numpy as np
+from scipy.optimize import milp, LinearConstraint, Bounds
+from scipy.sparse import lil_matrix, csr_matrix
+
+
+def solve_counts(arcs, sides, edge=None, targets=None, mirror_pairs=(), weights=None, big_m=200.0, time_limit=120.0, kmax=8, elastic=True,
+                 norm="l2", window=4, fixed_counts=None):
+    """arcs : {key: {'len': float, ...}} ; sides : {patch: [[(arc key, fwd), ...] per side]} ; returns a dict.
+    targets : {key: g_a} overrides length / edge. mirror_pairs : iterable of (key_a, key_b)."""
+    keys = list(arcs.keys()); ai = {k: i for i, k in enumerate(keys)}
+    na = len(keys)
+    g = np.array([(targets[k] if targets and k in targets else arcs[k]["len"] / edge) for k in keys], float)
+    w = np.ones(na) if weights is None else np.array([weights.get(k, 1.0) for k in keys], float)
+    patches = [p for p, sd in sides.items() if sd is not None and 3 <= len(sd) <= kmax]
+    skipped = [p for p, sd in sides.items() if sd is None or not (3 <= len(sd) <= kmax)]
+    # variable layout : [n_a (na)] [t_a (na)] [s_(p,i) ...] [slack+ ...] [slack- ...]
+    s_off = {}; cnt = 2 * na
+    for p in patches:
+        s_off[p] = cnt; cnt += len(sides[p])
+    n_sl = sum(len(sides[p]) for p in patches)
+    sl_plus = cnt; cnt += n_sl; sl_minus = cnt; cnt += n_sl
+    nv = cnt
+    c = np.zeros(nv); c[na:2 * na] = w; c[sl_plus:] = big_m if elastic else 0.0
+    lb = np.zeros(nv); ub = np.full(nv, np.inf)
+    lb[:na] = 1; lb[na:2 * na] = 0
+    integrality = np.zeros(nv); integrality[:na] = 1
+    for p in patches:
+        o = s_off[p]; K = len(sides[p]); lb[o:o + K] = 1; integrality[o:o + K] = 1
+    if not elastic:
+        ub[sl_plus:] = 0
+    if fixed_counts:
+        for k_, v_ in fixed_counts.items():
+            lb[ai[k_]] = v_; ub[ai[k_]] = v_
+    rows = []; lo = []; hi = []
+    nrow = (2 * na if norm == "l1" else (2 * window + 1) * na) + n_sl + len(mirror_pairs) + 1
+    A = lil_matrix((nrow, nv)); r = 0
+    if norm == "l1":
+        # t_a >= n_a - g_a and t_a >= g_a - n_a
+        for i in range(na):
+            A[r, na + i] = 1; A[r, i] = -1; lo.append(-g[i]); hi.append(np.inf); r += 1
+            A[r, na + i] = 1; A[r, i] = 1; lo.append(g[i]); hi.append(np.inf); r += 1
+    else:
+        # convex piecewise linear interpolation of (n - g)^2 at the integers : t_a >= (k-g)^2 + (2k+1-2g)(n_a-k) for k near g.
+        # Exact at integer n_a ; the weight 1/max(g,1) makes it a squared RELATIVE error.
+        c[na:2 * na] = w / np.maximum(g, 1.0) if norm == "rel2" else w
+        for i in range(na):
+            k0 = int(np.floor(g[i]))
+            for k in range(max(1, k0 - window) if k0 - window >= 1 else 1, max(1, k0 - window) + 2 * window + 1):
+                slope = 2 * k + 1 - 2 * g[i]
+                A[r, na + i] = 1; A[r, i] = -slope; lo.append((k - g[i]) ** 2 - slope * k); hi.append(np.inf); r += 1
+    # Tarini : e_i - s_(i-1) - s_(i+1) - slack+ + slack- = 0
+    k = 0
+    for p in patches:
+        K = len(sides[p]); o = s_off[p]
+        if K == 4:
+            # no pole : opposite sides equal, and a side may have a single edge (a strip). The s variables of Tarini would force
+            # e_i >= 2, which is wrong for K = 4 (measured : 4 false violations on the QuadWild counts of the potato, strips 1 x 34).
+            for i in (0, 1):
+                for (key, fwd) in sides[p][i]: A[r, ai[key]] += 1
+                for (key, fwd) in sides[p][i + 2]: A[r, ai[key]] -= 1
+                A[r, sl_plus + k + i] = -1; A[r, sl_minus + k + i] = 1
+                lo.append(0); hi.append(0); r += 1
+            k += K
+            continue
+        for i in range(K):
+            for (key, fwd) in sides[p][i]:
+                A[r, ai[key]] += 1
+            A[r, o + (i - 1) % K] -= 1; A[r, o + (i + 1) % K] -= 1
+            A[r, sl_plus + k] = -1; A[r, sl_minus + k] = 1
+            lo.append(0); hi.append(0); r += 1; k += 1
+    for (a, b) in mirror_pairs:
+        A[r, ai[a]] = 1; A[r, ai[b]] = -1; lo.append(0); hi.append(0); r += 1
+    A = csr_matrix(A[:r])
+    nrow_used = r
+    res = milp(c, constraints=LinearConstraint(A, np.array(lo), np.array(hi)), integrality=integrality, bounds=Bounds(lb, ub),
+               options={"time_limit": time_limit, "mip_rel_gap": 1e-4})
+    out = {"status": int(res.status), "message": res.message}
+    if res.x is None:
+        out["ok"] = False; return out
+    x = res.x; n = np.rint(x[:na]).astype(int)
+    out.update(ok=True, counts={k_: int(n[i]) for i, k_ in enumerate(keys)}, objective=float(res.fun), skipped_patches=skipped)
+    out["abs_dev"] = float(np.abs(n - g).sum()); out["total_target"] = float(g.sum()); out["total_counts"] = int(n.sum())
+    sd = {}; viol = []
+    k = 0
+    for p in patches:
+        K = len(sides[p]); o = s_off[p]
+        sd[p] = [int(round(x[o + i])) for i in range(K)]
+        for i in range(K):
+            if x[sl_plus + k] + x[sl_minus + k] > 1e-6:
+                viol.append((p, i))
+            k += 1
+    out["s"] = sd; out["violations"] = viol
+    out["e"] = {p: [int(sum(n[ai[key]] for key, _ in sides[p][i])) for i in range(len(sides[p]))] for p in patches}
+    return out
+
+
+def check_tarini(e):
+    """Independent check of the closed form conditions for N = 3..6 (strict) : True / False, None when not covered."""
+    n = len(e)
+    if sum(e) % 2: return False
+    if n == 3: return all(e[(i - 1) % 3] + e[(i + 1) % 3] > e[i] for i in range(3))
+    if n == 4: return e[0] == e[2] and e[1] == e[3]
+    if n == 5: return all(e[i] + e[(i + 1) % 5] + e[(i + 2) % 5] > e[(i + 3) % 5] + e[(i + 4) % 5] for i in range(5))
+    if n == 6:
+        ev, od = [e[0], e[2], e[4]], [e[1], e[3], e[5]]
+        return all(2 * x < sum(ev) for x in ev) and all(2 * x < sum(od) for x in od) and sum(ev) % 2 == 0 and sum(od) % 2 == 0
+    return None

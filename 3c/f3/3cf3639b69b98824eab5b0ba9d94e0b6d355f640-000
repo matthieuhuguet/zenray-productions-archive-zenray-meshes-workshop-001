@@ -1,0 +1,84 @@
+"""Pass 9 : topology fingerprint of a polygon mesh (OBJ). Written 30 October 2026.
+Usage : python3 -I zr8_fingerprint.py path=MESH.obj   -> one JSON line, exit code 0 if the file parses and has faces.
+Fields : counts, face size histogram, valence histogram of interior vertices, poles per 1000 faces, Euler characteristic and genus, boundary loops,
+quad statistics (angle deviation, loop straightness, Jacobian) when quads are present, mirror symmetry score per axis (median distance of the reflected
+vertices to the nearest vertex, in mean edge lengths ; 0 = exact).
+FR : empreinte de topologie d'un maillage, pour l'index mots vers objets a topologie validee."""
+import sys, json, collections
+sys.path.insert(0, ".")
+import numpy as np
+from scipy.spatial import cKDTree
+import zr8_io as IO, zr8_judge as J
+
+
+def fingerprint(path):
+    V, F = IO.read_obj(path)
+    V = np.array(V, float)
+    if len(F) == 0:
+        raise ValueError("no faces")
+    used = np.unique(np.concatenate([np.array(f) for f in F]))
+    sizes = collections.Counter(len(f) for f in F)
+    out = {"vertices": int(len(used)), "faces": int(len(F)), "face_sizes": {str(k): v for k, v in sorted(sizes.items())}}
+    ec = collections.Counter(); 
+    for f in F:
+        for k in range(len(f)):
+            a, b = f[k], f[(k + 1) % len(f)]; ec[(min(a, b), max(a, b))] += 1
+    out["edges"] = int(len(ec)); out["euler"] = int(len(used) - len(ec) + len(F))
+    bnd = [e for e, c in ec.items() if c == 1]
+    out["boundary_edges"] = int(len(bnd)); out["nonmanifold_edges"] = int(sum(1 for c in ec.values() if c > 2))
+    # boundary loops
+    nxt = collections.defaultdict(list)
+    for a, b in bnd:
+        nxt[a].append(b); nxt[b].append(a)
+    seen = set(); loops = 0
+    for a in list(nxt):
+        if a in seen: continue
+        loops += 1; stack = [a]
+        while stack:
+            x = stack.pop()
+            if x in seen: continue
+            seen.add(x); stack.extend(nxt[x])
+    out["boundary_loops"] = loops
+    comps = 0; adj = collections.defaultdict(set)
+    for (a, b) in ec: adj[a].add(b); adj[b].add(a)
+    seen = set()
+    for a in used:
+        if a in seen: continue
+        comps += 1; stack = [a]
+        while stack:
+            x = stack.pop()
+            if x in seen: continue
+            seen.add(x); stack.extend(adj[x])
+    out["components"] = comps
+    out["genus"] = (2 * comps - out["euler"] - loops) / 2.0 if comps else None
+    onb = {v for e in bnd for v in e}
+    val = collections.Counter(len(adj[v]) for v in used if v not in onb)
+    out["valence_hist_interior"] = {str(k): v for k, v in sorted(val.items())}
+    nint = sum(val.values())
+    out["poles_per_1000_faces"] = round(1000.0 * sum(c for k, c in val.items() if k != (4 if sizes.get(4, 0) >= sizes.get(3, 0) else 6)) / len(F), 2) if nint else 0.0
+    out["regular_valence_assumed"] = 4 if sizes.get(4, 0) >= sizes.get(3, 0) else 6
+    diag = float(np.linalg.norm(V[used].max(0) - V[used].min(0)))
+    out["bbox_diagonal"] = round(diag, 6)
+    mean_edge = float(np.mean([np.linalg.norm(V[a] - V[b]) for (a, b) in ec]))
+    out["mean_edge"] = round(mean_edge, 6)
+    quads = np.array([f for f in F if len(f) == 4], int)
+    if len(quads) >= 4:
+        j = J.judge_plus(V, quads)
+        out["quad_stats"] = {k: round(float(j[k]), 4) for k in ("jac_mean", "folded_frac", "squashed_frac", "angle_dev_mean_deg", "angle_dev_p99_deg",
+                                                                 "loop_turn_mean_deg", "loop_turn_p90_deg", "edge_cv", "area_cv")}
+    c = (V[used].max(0) + V[used].min(0)) / 2
+    tree = cKDTree(V[used]); sym = {}
+    for ax, name in enumerate("xyz"):
+        R = V[used].copy(); R[:, ax] = 2 * c[ax] - R[:, ax]
+        d, _ = tree.query(R); sym[name] = round(float(np.median(d) / max(mean_edge, 1e-30)), 3)
+    out["mirror_symmetry_median_edges"] = sym
+    out["best_mirror_axis"] = min(sym, key=sym.get)
+    return out
+
+
+if __name__ == "__main__":
+    a = dict(kv.split("=", 1) for kv in sys.argv[1:])
+    try:
+        print(json.dumps(fingerprint(a["path"])))
+    except Exception as ex:
+        print(json.dumps({"error": repr(ex)[:200]})); sys.exit(1)

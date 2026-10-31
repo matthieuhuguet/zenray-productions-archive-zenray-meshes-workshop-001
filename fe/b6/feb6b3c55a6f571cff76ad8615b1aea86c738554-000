@@ -1,0 +1,479 @@
+"""30 October 2026 : ZenRay RETOPOLOGY, the one command. A triangle mesh in, a quad mesh out, a verdict per gate, a JSON report and a 3D board.
+EN: the layout engine is QuadWild Bi-MDF (called as an executable), everything around it is ZenRay : regime detector (hard edge or organic) from the share of strong creases, mirror plane detector (the half is meshed then mirrored, the symmetry is exact by construction), density control, layout aware Winslow barrier (ZrlLayoutBarrier), then the gates : folded, squashed, straightness, symmetry, closure, coverage, density. All the parameters live in PARAMS below (HDA law : one place, `--set key=value` or `--params file.json` changes them, the report records the values used).
+    python -I ZenRayRetopology.py run mesh.obj --target 5000 [--out dir] [--set regime=hard] [--set sharp_thr=80] [--params p.json] [--no-board]
+    python -I ZenRayRetopology.py gates report.json            (prints the gate table of a finished run)
+FR : la commande unique de ZenRay Retopology : detecteur de regime, detecteur de plan de symetrie (moitie puis miroir), QuadWild comme moteur de layout, barriere de Winslow consciente du layout, portes de verification et rapport."""
+import argparse, collections, json, os, shutil, subprocess, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "cloud8"))
+import numpy as np
+from scipy.spatial import cKDTree
+import QwMirror as MIR, QwSweep as SW, ZrlTopoJudge as TJ, ZrlLayoutBarrier as LB, ZrlQuadBarrier as QB
+
+# 30 October 2026 : THE PARAMETERS (one place). EN: regime thresholds, QuadWild settings per regime, barrier, symmetry, gates. FR : tous les reglages ici, aucun litteral ailleurs.
+PARAMS = {
+    "regime": "auto",                 # auto | hard | organic
+    "regime_band_lo": 0.07, "regime_band_hi": 0.20,   # ambiguous crease share band : both regimes are run, the better pass is kept
+    "hard_crease_share60": 0.12,      # regime detector : share of interior edges with a dihedral angle above 60 degrees ; arch 0.29, Manny 0.03, lily 0.05, eucalyptus 0.01 (measured 30 October 2026)
+    "sharp_thr_hard": 86,             # QuadWild sharp_feature_thr (degrees) for the hard regime (35 gave 2.3 percent squashed on the arch, 86 with alpha 0.05 gives 0.39 percent, creases kept 0.90, see the skill section 316)
+    "alpha_hard": 0.05,               # QuadWild flow alpha, hard regime
+    "barrier_theta_hard": 0.5,        # Winslow barrier theta (shape against area), hard regime
+    "sharp_thr_organic": -1,          # -1 = no sharp features
+    "alpha_organic": 0.005, "alpha_organic_candidates": [0.005, 0.5],   # organic regime : each QuadWild flow alpha is run, the best pass is kept (coverage, then green gates, then straightness) : 0.5 straightens Manny 3.08 to 2.46 and the eucalyptus 2.32 to 2.09 but loses the car door coverage (0.97 to 0.95)
+    "barrier_theta_organic": 0.3,
+    "sharp_file_deg": 0.0,            # > 0 : the creases of the input above this dihedral angle are GIVEN to QuadWild as a .sharp file (QwSweep.write_sharp) instead of its angle threshold : the grid follows the creases of a finished faceted shape (car session : 4.4 to 69.6 percent of the crease length kept sharp at 20 degrees, price : more poles)
+    "flow": "lemon",                  # QuadWild flow solver
+    "barrier_outer": 8, "barrier_inner": 60,
+    "fair_hard": 0.0, "fair_organic": 30.0,   # isoline straightness weight of the barrier (ZrlBarrierCore.fair) : 0 on hard surface (it trades folds for straightness), 30 on organic shapes (straightness 2.5 to 2.3 and thin tips kept on the eucalyptus, 3.8 to 3.1 on Manny)
+    "split": "auto",                  # auto | on | off : mesh every connected component on its own (QuadWild loses or fuses small components of a multi part input) ; auto = more than split_min_components components and no mirror
+    "split_min_components": 2, "split_min_quads": 6, "split_workers": 8, "split_density_passes": 3, "split_fallback_tris": 400,
+    "slide_deg": 0.0,                 # 0 = every layout node on a hard edge is fixed ; 25 = nodes where two hard-edge arcs continue each other within 25 degrees slide along the joined curve (measured on the arch seuil 85 : rectitude 5.29 to 4.97, squashed 0.39 to 0.46 percent, a wash)
+    "extras_split": 0, "extras_area_frac": 0.01,   # symmetric input : pieces under this share of the area are meshed on their own and mirrored (see run_pass)
+    "clip_by_component": 0,           # 1 = clip the half component by component (keeps pieces sewn onto the head apart but QuadWild then meshes overlapping sheets : Manny folded 0.00 to 0.45 percent, so 0)
+    "mirror_full_barrier": 1,         # 1 = mirror the raw half quads, then run the layout barrier on the WHOLE mesh (mirrored layout files) and re-symmetrize ; 0 = barrier on the half then mirror
+    "pin_plane": 1,                   # 1 = free vertices on the mirror plane stay on it during the barrier (the half will be mirrored)
+    "symmetry": "auto",               # auto | off | x | y | z
+    "sym_samples": 6000, "sym_p95_frac": 0.004,   # symmetric when the 95th percentile of the distance of the mirrored surface to the surface is under this fraction of the bounding diagonal
+    "density_tol": 0.10, "density_retries": 2,             # gate : |quads / target - 1|
+    "gate_folded": 0.001, "gate_squashed": 0.005, "gate_straight_deg": 2.0, "gate_symmetry_edges": 0.001,
+    "gate_cover": 0.97, "gate_component_recall": 0.9, "cover_tol_edges": 0.75,  # recall : share of the reference surface within this many mean quad edges of the result
+    "baseline_pole_margin": 8.0,      # poles per 1000 quads the result may have above the reference before the reference wins
+    "baseline_min_quad_share": 0.90, "baseline_guard": 1,              # 1 = an input that is already a quad mesh is judged by the same gates and returned when it beats the result at the same density (never worse than the reference)
+    "closure_len_ratio": 0.15,
+    "crease_deg": 60.0, "gate_crease_aligned": 0.85,   # hard edge fidelity gate : creases above crease_deg degrees must stay on quad edges        # open reference : the boundary length of the result must be within this fraction of the reference one
+}
+
+
+GATE_STRAIGHT = 2.0      # same value as PARAMS gate_straight_deg (module level for the comparison keys)
+
+
+def surface_samples(V, T, n, seed=1):
+    rng = np.random.default_rng(seed); a, b, c = V[T[:, 0]], V[T[:, 1]], V[T[:, 2]]; ar = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1); i = rng.choice(len(T), n, p=ar / ar.sum()); u = rng.random((n, 2)); m = u.sum(1) > 1; u[m] = 1 - u[m]
+    return a[i] + u[:, :1] * (b[i] - a[i]) + u[:, 1:] * (c[i] - a[i])
+
+
+def crease_share(V, T, deg=60.0):
+    """share of the interior edges whose two faces make a dihedral angle above deg."""
+    n = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]); a = np.linalg.norm(n, axis=1); n = n / np.maximum(a, 1e-30)[:, None]; ef = collections.defaultdict(list)
+    for i, t in enumerate(T):
+        for k in range(3): p, q = int(t[k]), int(t[(k + 1) % 3]); ef[(min(p, q), max(p, q))].append(i)
+    ang = [np.degrees(np.arccos(np.clip(n[f[0]] @ n[f[1]], -1, 1))) for f in ef.values() if len(f) == 2 and a[f[0]] > 1e-14 and a[f[1]] > 1e-14]
+    return float((np.array(ang) > deg).mean()) if ang else 0.0
+
+
+def detect_regime(V, T, P):
+    if P["regime"] != "auto": return {"regime": P["regime"], "crease_share60": None}
+    s = crease_share(V, T, 60.0); return {"regime": "hard" if s >= P["hard_crease_share60"] else "organic", "crease_share60": round(s, 4)}
+
+
+def mirror_distance(V, T, ax, c, n, tree_cache=None):
+    """distances (as a fraction of the bounding diagonal) from the mirrored surface samples to the surface itself, point to triangle distance."""
+    import trimesh
+    S = surface_samples(V, T, n); R = S.copy(); R[:, ax] = 2 * c - R[:, ax]; m = trimesh.Trimesh(V, T, process=False); _, d, _ = trimesh.proximity.closest_point(m, R); return d / float(np.linalg.norm(V.max(0) - V.min(0)))
+
+
+def detect_symmetry(V, T, P):
+    """best mirror plane among the three axis planes, centre refined from the bounding box centre by two median steps. Returns the axis, the centre, the p95 and the verdict."""
+    if P["symmetry"] == "off": return {"symmetric": False, "axis": None, "reason": "off"}
+    best = None
+    for ax in ("xyz" if P["symmetry"] == "auto" else P["symmetry"]):
+        i = "xyz".index(ax); c = float((V[:, i].max() + V[:, i].min()) / 2); S = surface_samples(V, T, P["sym_samples"], 3); tree = cKDTree(surface_samples(V, T, 6 * P["sym_samples"], 4))
+        for _ in range(2):                                                                          # centre refinement : the median offset between mirrored samples and their nearest surface samples
+            R = S.copy(); R[:, i] = 2 * c - R[:, i]; _, ix = tree.query(R); c += float(np.median(tree.data[ix][:, i] - R[:, i])) / 2
+        d = mirror_distance(V, T, i, c, P["sym_samples"]); r = {"axis": ax, "index": i, "center": round(c, 6), "p95": round(float(np.percentile(d, 95)), 5), "p50": round(float(np.median(d)), 5)}
+        if best is None or r["p95"] < best["p95"]: best = r
+    best["symmetric"] = best["p95"] <= P["sym_p95_frac"]; return best
+
+
+def load_quads(path):
+    V, F = TJ.load(path); return V, np.array([f for f in F if len(f) == 4], np.int64)
+
+
+def boundary_length(V, F):
+    ec = collections.Counter()
+    for f in F:
+        for i in range(len(f)): p, q = f[i], f[(i + 1) % len(f)]; ec[(min(p, q), max(p, q))] += 1
+    e = [k for k, c in ec.items() if c == 1]
+    return (float(sum(np.linalg.norm(V[a] - V[b]) for a, b in e)), len(e))
+
+
+def components(F, n):
+    par = list(range(n))
+    def fd(x):
+        while par[x] != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    for f in F:
+        for v in f[1:]: par[fd(int(v))] = fd(int(f[0]))
+    return len({fd(int(v)) for f in F for v in f})
+
+
+def coverage(V, T, Vq, Q, tol):
+    """recall = share of the reference surface within tol of the result, precision = the reverse, and the worst recall over the connected components of the reference (a lost component is a recall near 0 on that component)."""
+    S = surface_samples(V, T, 40000, 5); QT = np.vstack([Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]]); Sq = surface_samples(Vq, QT, 40000, 6); tree = cKDTree(Sq); d = tree.query(S)[0]
+    par = list(range(len(V)))
+    def fd(x):
+        while par[x] != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    for t in T: par[fd(int(t[1]))] = fd(int(t[0])); par[fd(int(t[2]))] = fd(int(t[0]))
+    comp = np.array([fd(int(t[0])) for t in T]); worst = 1.0; hidden = 0; solid = None
+    for cid in np.unique(comp):
+        sub = T[comp == cid]; Sc = surface_samples(V, sub, 2000, 8); rc = float((tree.query(Sc)[0] <= tol).mean())
+        if rc < 0.9:                                                                                # a piece the result does not reach : lost, or hidden INSIDE the closed result (an eyeball behind the lids) : only a lost piece counts
+            if solid is None:
+                import trimesh
+                solid = trimesh.Trimesh(Vq, QT, process=False); solid = solid if solid.is_watertight else False
+            if solid is not False and float(solid.contains(Sc[:300]).mean()) >= 0.8: hidden += 1; continue
+        worst = min(worst, rc)
+    coverage.hidden = hidden
+    return float((d <= tol).mean()), float((cKDTree(S).query(Sq)[0] <= tol).mean()), worst
+
+
+def component_faces(T, n):
+    """list of triangle index arrays, one per connected component (vertex connectivity)."""
+    par = list(range(n))
+    def fd(x):
+        while par[x] != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    for t in T: par[fd(int(t[1]))] = fd(int(t[0])); par[fd(int(t[2]))] = fd(int(t[0]))
+    g = collections.defaultdict(list)
+    for i, t in enumerate(T): g[fd(int(t[0]))].append(i)
+    return [np.array(v) for v in g.values()]
+
+
+def safe_straighten(pre, Vq, Qq, theta, P, bad, pin=None):
+    """the layout barrier, or the unstraightened quads when the barrier raises (a degenerate piece) : the failure is recorded in bad, never silent."""
+    try:
+        Pb = LB.straighten(pre, Vq, Qq, P["barrier_outer"], P["barrier_inner"], theta, "keep", log=lambda s: None, fair=P["fair"], pin=pin, slide_deg=P["slide_deg"])[0]
+        if np.isfinite(Pb).all(): return Pb
+        bad.append("non finite result")
+    except Exception as ex: bad.append(repr(ex)[:100])
+    return Vq
+
+
+def tri_to_quads(V, T):
+    """last resort for a component QuadWild cannot mesh : every triangle becomes three quads (edge midpoints and centroid) : a pure quad cover of the exact same surface, angles between 60 and 120 degrees, irregular vertices only at the old corners. Returns (vertices, quads)."""
+    P = [list(v) for v in V]; mid = {}; Q = []
+    def m(a, b):
+        k = (min(a, b), max(a, b))
+        if k not in mid: mid[k] = len(P); P.append(list((np.asarray(V[a]) + np.asarray(V[b])) / 2))
+        return mid[k]
+    for t in T:
+        a, b, c = int(t[0]), int(t[1]), int(t[2]); g = len(P); P.append(list((np.asarray(V[a]) + np.asarray(V[b]) + np.asarray(V[c])) / 3)); ab, bc, ca = m(a, b), m(b, c), m(c, a)
+        Q += [[a, ab, g, ca], [b, bc, g, ab], [c, ca, g, bc]]
+    return np.array(P), Q
+
+
+def best_quad_file(smooth):
+    """QuadWild's own smoothing collapses thin pieces (a leaf ribbon thinner than one quad : 19 percent squashed after smoothing against 8 percent before) : of the smoothed and the raw quadrangulation of a piece the one with fewer folded or squashed quads is kept (the smoothed one on a tie)."""
+    import ZrlQuadStats as QS
+    raw = os.path.join(os.path.dirname(smooth), "part_rem_p0_123_quadrangulation.obj"); best = None
+    for f in (smooth, raw):
+        if not os.path.exists(f): continue
+        try:
+            V, Q = load_quads(f)
+            if not len(Q): continue
+            j = QS.stats(V, Q)[2]; bad = float((~(j >= 0.3)).mean())      # NaN (a zero area quad) counts as bad
+        except Exception: continue
+        if best is None or bad < best[0] - 1e-9: best = (bad, V, Q)
+    return best[1], best[2]
+
+
+def run_split(V, T, mesh, out, target, thr, alpha, theta, P, log=print, pin=None):
+    """30 October 2026 : COMPONENT BY COMPONENT : every connected component is cut out, meshed by QuadWild with its share of the target (by area), straightened by the layout barrier and the results are concatenated. No component can vanish or fuse with another : a component QuadWild cannot mesh gets the three quads per triangle cover (up to split_fallback_tris triangles), otherwise it is listed as lost. The density loop keeps the PASS whose total is closest to the target (the per component minimum of quads makes the count non monotonic)."""
+    from concurrent.futures import ProcessPoolExecutor
+    comps = component_faces(T, len(V)); a = V[T[:, 0]]; areas = 0.5 * np.linalg.norm(np.cross(V[T[:, 1]] - a, V[T[:, 2]] - a), axis=1); ca = np.array([areas[c].sum() for c in comps]); wd = os.path.join(out, "split"); os.makedirs(wd, exist_ok=True); srcs = []
+    for ci, fl in enumerate(comps):
+        used = np.unique(T[fl]); mp = {int(v): k + 1 for k, v in enumerate(used)}; path = os.path.join(wd, "c%04d.obj" % ci)
+        open(path, "w").write("".join("v %.7f %.7f %.7f\n" % tuple(V[v]) for v in used) + "".join("f %d %d %d\n" % tuple(mp[int(k)] for k in T[f]) for f in fl)); srcs.append(path)
+    scale = 1.0; tries = []; passes = []
+    for attempt in range(P["split_density_passes"]):
+        tg = [max(P["split_min_quads"], int(round(scale * target * ca[i] / ca.sum()))) for i in range(len(comps))]; jobs = [(srcs[i], wd, srcs[i], tg[i], str(thr), alpha, P["flow"], "p%d_q%04d" % (attempt, i)) for i in range(len(comps))]
+        with ProcessPoolExecutor(P["split_workers"]) as ex: out_ = list(ex.map(SW.one, jobs))
+        results = {int(n.split("_q")[1]): r for n, r in out_}; got = sum(r["quads"] for r in results.values() if "file" in r) + 3 * sum(len(comps[i]) for i in range(len(comps)) if "file" not in results.get(i, {}) and len(comps[i]) <= P["split_fallback_tris"]); ratio = got / target; tries.append({"scale": round(scale, 3), "quads": got, "ratio": round(ratio, 3)}); passes.append(results)
+        if abs(ratio - 1) <= 0.5 * P["density_tol"]: break
+        scale /= ratio
+    best = min(range(len(passes)), key=lambda k: abs(tries[k]["ratio"] - 1)); results = passes[best]
+    allV = []; allF = []; raw = []; lost = []; bad = []; fallback = []
+    order = sorted(range(len(passes)), key=lambda k: abs(tries[k]["ratio"] - 1)); rescued = []
+    failed = [i for i in range(len(comps)) if not any("file" in passes[k].get(i, {}) for k in range(len(passes)))]
+    for mult in (4, 16, 64):                                                                      # a piece QuadWild cannot mesh at its share of the target (a leaf of a few quads) is retried at 4, 16 then 64 times that count : a few extra quads rather than a lost piece
+        if not failed: break
+        jobs = [(srcs[i], wd, srcs[i], int(max(P["split_min_quads"], round(target * ca[i] / ca.sum())) * mult), str(thr), alpha, P["flow"], "r%d_q%04d" % (mult, i)) for i in failed]
+        with ProcessPoolExecutor(P["split_workers"]) as ex: out_ = list(ex.map(SW.one, jobs))
+        got_ = {int(n.split("_q")[1]): r for n, r in out_ if "file" in r}
+        if got_: passes.append(got_); tries.append({"scale": "rescue x%d" % mult, "quads": 0, "ratio": 99.0}); rescued += list(got_)
+        failed = [i for i in failed if i not in got_]
+    order = order + [k for k in range(len(passes)) if k not in order]
+    for i in range(len(comps)):
+        r = next((passes[k][i] for k in order if "file" in passes[k].get(i, {})), {})      # a component that failed in the chosen pass takes its result from the closest other pass
+        if "file" not in r:
+            if len(comps[i]) <= P["split_fallback_tris"]:
+                used = np.unique(T[comps[i]]); mp = {int(v): k for k, v in enumerate(used)}; Vc, Qc = tri_to_quads(V[used], [[mp[int(k)] for k in T[f]] for f in comps[i]]); off = sum(len(x) for x in allV); allV.append(Vc); allF += [[int(k) + off for k in q] for q in Qc]; fallback.append(i)
+            else: lost.append(i)
+            continue
+        pre = os.path.join(os.path.dirname(r["file"]), "part_rem_p0"); Vq, Qq = best_quad_file(r["file"]); Pb = safe_straighten(pre, Vq, Qq, theta, P, bad, pin); off = sum(len(x) for x in allV); allV.append(Pb); allF += [list(map(lambda k: int(k) + off, q)) for q in Qq]; raw.append(r["file"])
+    return np.vstack(allV), allF, {"components": len(comps), "lost_components": lost, "triangle_cover_components": fallback, "split_tries": tries, "split_best_pass": best, "rescued_components": rescued, "barrier_failed_components": bad}
+
+
+def mirror_layout(prefix, ax, c, diag, out_prefix):
+    """30 October 2026 : the QuadWild layout of a half, mirrored through the plane ax = c and welded on the plane, written as the five layout files of out_prefix : the layout aware barrier can then run on the WHOLE mirrored quad mesh (the seam is no longer a border). Hard edge lists lose the edges lying on the plane (they were the cut border, not creases)."""
+    import zr8_layout as LY, zr8_io as IO
+    lay = LY.Layout(prefix); V = lay.V; F = lay.F; n = len(V); nf = len(F); tol = 1e-6 * diag; onp = np.abs(V[:, ax] - c) < tol; mid = np.arange(n); k = n; Vm = V.copy(); Vm[:, ax] = 2 * c - Vm[:, ax]; extra = []
+    for v in range(n):
+        if not onp[v]: mid[v] = k; k += 1; extra.append(Vm[v])
+    Vn = np.vstack([V] + ([np.array(extra)] if extra else [])); Fn = np.vstack([F, np.array([[mid[a], mid[cc], mid[b]] for a, b, cc in F])]); pid = np.concatenate([lay.pid, lay.pid + lay.npatch]); corners = [list(map(int, cs)) for cs in lay.corners] + [[int(mid[v]) for v in cs] for cs in lay.corners]
+    def on_plane_edge(f, e): a, b = int(Fn[f][e]), int(Fn[f][(e + 1) % 3]); return onp[a if a < n else 0] and onp[b if b < n else 0] if (a < n and b < n) else False
+    feats = [(f, e) for f, e in lay.features if not on_plane_edge(f, e)] + [(nf + f, [2, 1, 0][e]) for f, e in lay.features if not on_plane_edge(f, e)]; cf = [v for v in lay.c_features if not onp[v]]; cf = cf + [int(mid[v]) for v in cf]
+    with open(out_prefix + ".obj", "w") as o: o.write("".join("v %.9g %.9g %.9g\n" % tuple(p) for p in Vn)); o.write("".join("f %d %d %d\n" % tuple(int(i) + 1 for i in t) for t in Fn))
+    open(out_prefix + ".patch", "w").write("%d\n%s\n" % (len(Fn), "\n".join(str(int(p)) for p in pid))); open(out_prefix + ".corners", "w").write("%d\n%s\n" % (len(corners), "\n".join("%d %s" % (len(cs), " ".join(map(str, cs))) for cs in corners)))
+    open(out_prefix + ".feature", "w").write("%d\n%s\n" % (len(feats), "\n".join("%d,%d" % (f, e) for f, e in feats))); open(out_prefix + ".c_feature", "w").write("%d\n%s\n" % (len(cf), "\n".join(map(str, cf)))); return out_prefix
+
+
+def symmetrize(Pf, pair, ax, c):
+    """exact mirror symmetry of the whole quad mesh after a global optimisation : every vertex and its partner are replaced by the mean of the vertex and the reflection of its partner ; plane vertices are put on the plane."""
+    Pf = Pf.copy(); n = len(pair)
+    for v in range(n):
+        w = int(pair[v])
+        if w == v: Pf[v, ax] = c
+        elif v < w:
+            r = Pf[w].copy(); r[ax] = 2 * c - r[ax]; m = 0.5 * (Pf[v] + r); Pf[v] = m; r2 = m.copy(); r2[ax] = 2 * c - r2[ax]; Pf[w] = r2
+    return Pf
+
+
+def clip_half_components(V, T, ax, c):
+    """30 October 2026 : the half x >= c clipped COMPONENT BY COMPONENT : QwMirror.clip_half welds vertices by position, which fuses pieces sewn onto another one (eyelashes, hair cards, teeth that share exact positions with the head) into one non manifold sheet whose smaller triangles are then dropped. Clipping every component on its own keeps them apart. Returns (vertices, triangles)."""
+    Vs = []; Ts = []; off = 0
+    for fl in component_faces(T, len(V)):
+        used = np.unique(T[fl]); mp = {int(v): k for k, v in enumerate(used)}; sub = np.array([[mp[int(k)] for k in T[f]] for f in fl])
+        if V[used][:, ax].max() <= c + 1e-12: continue                                       # entirely on the other side : the mirror recreates it
+        try: HV, HT = MIR.clip_half(V[used], sub, ax, c)
+        except Exception: continue
+        if len(HT) == 0: continue
+        Vs.append(HV); Ts.append(HT + off); off += len(HV)
+    return np.vstack(Vs), np.vstack(Ts)
+
+
+def combine_extras(Vf, Ff, ex):
+    """append the separately meshed small pieces (already mirrored) to the body result."""
+    if not ex: return Vf, Ff
+    off = len(Vf); return np.vstack([Vf, ex[0]]), list(Ff) + [[int(k) + off for k in q] for q in ex[1]]
+
+
+def run_pass(mesh, target, out, P, board=True, split=False):
+    os.environ["QW_SHARP_DEG"] = str(P["sharp_file_deg"]); t0 = time.time(); mesh = os.path.abspath(mesh); out = os.path.abspath(out); os.makedirs(out, exist_ok=True); V, T = MIR.load_tri(mesh); diag = float(np.linalg.norm(V.max(0) - V.min(0))); rep = {"method": "ZenRay Retopology (layout engine: QuadWild Bi-MDF)", "mesh": mesh, "target": target, "params": P, "triangles": int(len(T))}
+    reg = detect_regime(V, T, P); rep["regime"] = reg; hard = reg["regime"] == "hard"; P = dict(P); P["fair"] = P["fair_hard"] if hard else P["fair_organic"]; thr = P["sharp_thr_hard"] if hard else P["sharp_thr_organic"]; alpha = P["alpha_hard"] if hard else P["alpha_organic"]; theta = P["barrier_theta_hard"] if hard else P["barrier_theta_organic"]
+    sym = detect_symmetry(V, T, P); rep["symmetry_detect"] = sym; use_sym = bool(sym.get("symmetric"))
+    if use_sym:
+        i = sym["index"]; c = sym["center"]; Tsrc = T; ex = None; pin0 = (i, c, 0.02 * diag) if P["pin_plane"] else None
+        if P["extras_split"]:                                                                     # 30 October 2026 : SMALL PIECES sewn onto the body (eyelashes, hair cards, teeth : Manny has 12 of them under 1 percent of the area) are meshed on their own, component by component, then mirrored : meshed with the body, QuadWild welds them by position into non manifold sheets and drops them
+            comps_ = component_faces(T, len(V)); a_ = V[T[:, 0]]; ar_ = 0.5 * np.linalg.norm(np.cross(V[T[:, 1]] - a_, V[T[:, 2]] - a_), axis=1); small = [cc for cc in comps_ if ar_[cc].sum() < P["extras_area_frac"] * ar_.sum()]
+            if small and len(small) < len(comps_):
+                keep = np.ones(len(T), bool)
+                for cc in small: keep[cc] = False
+                Tsrc = T[keep]; HVe, HTe = clip_half_components(V, T[~keep], i, c)
+                if len(HTe):
+                    n_ex = max(P["split_min_quads"], int(round(0.5 * target * ar_[~keep].sum() / ar_.sum()))); Vh_e, Fh_e, info_e = run_split(HVe, HTe, mesh, os.path.join(out, "extras"), n_ex, thr, alpha, theta, P, pin=pin0); Vf_e, Ff_e, _ = MIR.mirror_weld(Vh_e, Fh_e, i, c, diag); ex = (Vf_e, Ff_e); rep["extras"] = dict(info_e, pieces=len(small), quads=len(Ff_e))
+        HV, HT = (clip_half_components(V, Tsrc, i, c) if P["clip_by_component"] else MIR.clip_half(V, Tsrc, i, c)); half = os.path.join(out, "half.obj")
+        if ex: target_body = max(16, target - len(ex[1]))
+        open(half, "w").write("".join("v %.7f %.7f %.7f\n" % tuple(p) for p in HV) + "".join("f %d %d %d\n" % tuple(int(k) + 1 for k in t) for t in HT)); src, tgt, ref = half, max(8, (target_body if ex else target) // 2), half
+    else: src, tgt, ref = mesh, target, mesh; ex = None
+    Vw, Tw = (HV, HT) if use_sym else (V, T); nrefc = len(component_faces(Tw, len(Vw))); do_split = bool(split) and nrefc >= 1; rep["split"] = do_split; rep["working_components"] = nrefc; pin = (sym["index"], sym["center"], 0.02 * diag) if (use_sym and P["pin_plane"]) else None
+    if do_split:
+        Vh, Fh, info = run_split(Vw, Tw, mesh, out, tgt, thr, alpha, theta, P, pin=pin); rep.update(info); raw = ""
+        if use_sym: Vf, Ff, snapped = MIR.mirror_weld(Vh, Fh, sym["index"], sym["center"], diag); rep["mirror_snapped_border_vertices"] = snapped
+        else: Vf, Ff = Vh, Fh
+        Vf, Ff = combine_extras(Vf, Ff, ex)
+        return finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board)
+    tg = tgt; tries = []
+    for attempt in range(P["density_retries"] + 1):                                              # 30 October 2026 : QuadWild lands within 8 percent only by luck on thin patches : re-aim the target until the count is within half of the density tolerance
+        res = SW.one((src, out, ref, tg, str(thr), alpha, P["flow"], "qw_half" if use_sym else "qw_full"))[1]
+        if "file" not in res: break
+        got = res["quads"] * (2 if use_sym else 1); ratio = got / target; tries.append({"aim": tg, "quads": got, "ratio": round(ratio, 3)})
+        if abs(ratio - 1) <= 0.5 * P["density_tol"]: break
+        tg = max(8, int(round(tg / ratio)))
+    rep["density_tries"] = tries
+    if "file" not in res: rep["error"] = "QuadWild failed : %s" % str(res)[:300]; json.dump(rep, open(os.path.join(out, "report.json"), "w"), indent=1); return rep
+    raw = res["file"]; prefix = os.path.join(os.path.dirname(raw), "part_rem_p0"); Vq, Qq = load_quads(raw)
+    if use_sym and P["mirror_full_barrier"]:
+        Vf, Ff, snapped = MIR.mirror_weld(Vq, [list(q) for q in Qq], sym["index"], sym["center"], diag); pair = MIR.mirror_weld.last_map; rep["mirror_snapped_border_vertices"] = snapped
+        full_prefix = mirror_layout(prefix, sym["index"], sym["center"], diag, os.path.join(out, "mirror_layout_p0")); Qf0 = np.array(Ff, np.int64); bad = []
+        Pb = safe_straighten(full_prefix, Vf, Qf0, theta, P, bad); Vf = symmetrize(Pb, pair, sym["index"], sym["center"]); rep["barrier_failed"] = bad
+    else:
+        Pb, kind = LB.straighten(prefix, Vq, Qq, P["barrier_outer"], P["barrier_inner"], theta, "keep", log=lambda s: None, fair=P["fair"], pin=pin, slide_deg=P["slide_deg"])
+        if use_sym: Vf, Ff, snapped = MIR.mirror_weld(Pb, [list(q) for q in Qq], sym["index"], sym["center"], diag); rep["mirror_snapped_border_vertices"] = snapped
+        else: Vf, Ff = Pb, [list(q) for q in Qq]
+    Vf, Ff = combine_extras(Vf, Ff, ex)
+    return finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board)
+
+
+def gate_score(rep):
+    """ordering of two passes : coverage first (a lost piece is the worst failure), then the number of green gates, then the recall."""
+    if "gates" not in rep: return (-1, -1, -1)
+    return (int(rep["gates"]["coverage"]["pass"]), sum(int(g["pass"]) for g in rep["gates"].values()), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))      # straightness below its gate is a tie : only a failing value is compared
+
+
+def run_one(mesh, target, out, P, board=True):
+    """30 October 2026 : split = off | on | auto. auto = mesh the whole input first (best for a single piece or a hard surface assembly : QuadWild keeps the creases across pieces) and, only when the coverage gate is red (a piece lost or fused), mesh component by component and keep the better pass."""
+    out = os.path.abspath(out); os.makedirs(out, exist_ok=True)
+    if P["split"] in ("off", "on"): return run_pass(mesh, target, out, P, board, P["split"] == "on")
+    r0 = run_pass(mesh, target, os.path.join(out, "pass_whole"), P, board, False); tried = [{"pass": "whole", "score": gate_score(r0)}]
+    best = r0
+    if "gates" in r0 and not r0["gates"]["coverage"]["pass"]:
+        r1 = run_pass(mesh, target, os.path.join(out, "pass_split"), P, board, True); tried.append({"pass": "split", "score": gate_score(r1)})
+        if gate_score(r1) > gate_score(r0): best = r1
+    for f in ("result.obj", "report.json", "board.png"):
+        src = os.path.join(os.path.dirname(best["files"]["result"]) if "files" in best else out, f)
+        if os.path.exists(src): shutil.copy(src, os.path.join(out, f))
+    best["passes"] = tried; best["files"]["result"] = os.path.join(out, "result.obj")
+    if "board" in best["files"]: best["files"]["board"] = os.path.join(out, "board.png")
+    json.dump(best, open(os.path.join(out, "report.json"), "w"), indent=1); return best
+
+
+def crease_alignment(V, T, Vq, Q, deg, edge):
+    """HARD EDGE FIDELITY : share of the points of the reference creases (dihedral above deg) that lie within a quarter of a mean quad edge of an EDGE of the result (a quad mesh that drops its creases would otherwise win the squashed gate), and the mean distance in mean edges. Returns (share, mean, number of crease points)."""
+    n = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]); a = np.linalg.norm(n, axis=1); n = n / np.maximum(a, 1e-30)[:, None]; ef = collections.defaultdict(list)
+    for i, t in enumerate(T):
+        for k in range(3): p, q = int(t[k]), int(t[(k + 1) % 3]); ef[(min(p, q), max(p, q))].append(i)
+    pts = []
+    for e, f in ef.items():
+        if len(f) == 2 and a[f[0]] > 1e-14 and a[f[1]] > 1e-14 and np.degrees(np.arccos(np.clip(n[f[0]] @ n[f[1]], -1, 1))) > deg:
+            A, B = V[e[0]], V[e[1]]; m = max(2, int(np.linalg.norm(B - A) / (0.25 * edge))); pts += [A + (B - A) * t / m for t in range(m + 1)]
+    if not pts: return None
+    E = set()
+    for q in Q:
+        for k in range(4): x, y = int(q[k]), int(q[(k + 1) % 4]); E.add((min(x, y), max(x, y)))
+    E = np.array(sorted(E)); t = (np.arange(9) / 8)[None, :, None]; S = (Vq[E[:, 0]][:, None, :] * (1 - t) + Vq[E[:, 1]][:, None, :] * t).reshape(-1, 3); d = cKDTree(S).query(np.array(pts))[0]
+    return float((d < 0.25 * edge).mean()), float(d.mean() / edge), len(pts)
+
+
+def run_core(mesh, target, out, P, board=True):
+    """30 October 2026 : REGIME TOURNAMENT : when the crease share is in the ambiguous band (a car fender : 0.09, between the lily 0.05 and the arch 0.29) both regimes are run and the better pass (gate_score) is kept ; outside the band the detector decides alone."""
+    out = os.path.abspath(out); os.makedirs(out, exist_ok=True)
+    if P["regime"] == "auto":
+        V, T = MIR.load_tri(os.path.abspath(mesh)); share = crease_share(V, T, 60.0)
+        if P["regime_band_lo"] <= share <= P["regime_band_hi"]:
+            reps = {rg: run_one(mesh, target, os.path.join(out, "regime_" + rg), dict(P, regime=rg), board) for rg in ("hard", "organic")}; best_name = max(reps, key=lambda k: gate_score(reps[k])); best = reps[best_name]
+            if "files" in best:
+                for f in ("result.obj", "report.json", "board.png"):
+                    src = os.path.join(out, "regime_" + best_name, f)
+                    if os.path.exists(src): shutil.copy(src, os.path.join(out, f))
+                best["regime_tournament"] = {k: {"score": gate_score(v), "crease_share60": round(share, 4)} for k, v in reps.items()}; best["regime_tournament"]["winner"] = best_name; best["files"]["result"] = os.path.join(out, "result.obj")
+                json.dump(best, open(os.path.join(out, "report.json"), "w"), indent=1)
+            return best
+    if P["regime"] != "hard" and len(P["alpha_organic_candidates"]) > 1:
+        V, T = MIR.load_tri(os.path.abspath(mesh)); share = crease_share(V, T, 60.0)
+        if P["regime"] == "organic" or share < P["hard_crease_share60"]:
+            reps = {a: run_one(mesh, target, os.path.join(out, "alpha_%s" % a), dict(P, regime="organic", alpha_organic=float(a)), board) for a in P["alpha_organic_candidates"]}; best_a = max(reps, key=lambda k: gate_score(reps[k])); best = reps[best_a]
+            if "files" in best:
+                for f in ("result.obj", "report.json", "board.png"):
+                    src = os.path.join(out, "alpha_%s" % best_a, f)
+                    if os.path.exists(src): shutil.copy(src, os.path.join(out, f))
+                best["alpha_tournament"] = {str(k): {"score": gate_score(v)} for k, v in reps.items()}; best["alpha_tournament"]["winner"] = best_a; best["files"]["result"] = os.path.join(out, "result.obj")
+                json.dump(best, open(os.path.join(out, "report.json"), "w"), indent=1)
+            return best
+    return run_one(mesh, target, out, P, board)
+
+
+def read_obj_faces(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+def quality_key(rep):
+    """kept for the tournaments : coverage, then the number of green gates other than density, then the straightness when it is red."""
+    g = rep["gates"]; return (int(g["coverage"]["pass"]), sum(int(v["pass"]) for k, v in g.items() if k != "density"), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))
+
+
+def reference_wins(ours, ref, P):
+    """30 October 2026 : who keeps the result when the input is already a quad mesh at the same density. Order of Matthieu : never worse than the reference, and a look at the hood showed that the gates alone are not enough (the reference was a clean grid with 2 poles per 1000 and a 0.34 percent folded edge, the result was green on folds but had 18 poles per 1000 and a ragged border). Rules : (1) coverage decides first ; (2) the reference wins when it has more green gates (density apart) ; (3) otherwise, even when the result has MORE green gates, the reference wins when the result is geometrically worse : straightness above both the gate and 1.25 times the reference, or more than 8 poles per 1000 above the reference. Returns (reference_wins, reason)."""
+    go, gr = ours["gates"], ref["gates"]
+    if go["coverage"]["pass"] != gr["coverage"]["pass"]: return (not go["coverage"]["pass"]), "coverage"
+    no, nr = sum(int(v["pass"]) for k, v in go.items() if k != "density"), sum(int(v["pass"]) for k, v in gr.items() if k != "density")
+    if nr > no: return True, "green gates %d (result) against %d (reference)" % (no, nr)
+    so, sr = ours["measures"]["straight_iso_mean_deg"], ref["measures"]["straight_iso_mean_deg"]; po, pr = ours["measures"]["poles_per_1000_quads"], ref["measures"]["poles_per_1000_quads"]
+    if so > max(P["gate_straight_deg"], 1.25 * sr): return True, "straightness %.2f against %.2f" % (so, sr)
+    if po > pr + P["baseline_pole_margin"]: return True, "poles per 1000 : %.1f against %.1f" % (po, pr)
+    return False, "result not worse"
+
+
+def run(mesh, target, out, P, board=True):
+    """30 October 2026 : NO REGRESSION GUARD (order of Matthieu : never a work worse than the reference). When the input is itself a quad mesh (90 percent quads or more), the reference quads are judged by the SAME gates ; if their count is within the density tolerance of the target and they beat the ZenRay Retopology result (quality_key), the reference quads are returned (result_source = reference) ; otherwise the result stays and the comparison is written in the report (key baseline)."""
+    out = os.path.abspath(out); rep = run_core(mesh, target, out, P, board)
+    if "gates" not in rep or not P["baseline_guard"]: return rep
+    Vb, Fb = read_obj_faces(os.path.abspath(mesh)); quads = [f for f in Fb if len(f) == 4]
+    if len(Fb) == 0 or len(quads) < P["baseline_min_quad_share"] * len(Fb): rep["baseline"] = {"available": False, "reason": "input is not a quad mesh"}; json.dump(rep, open(os.path.join(out, "report.json"), "w"), indent=1); return rep
+    V, T = MIR.load_tri(os.path.abspath(mesh)); used = sorted({v for f in quads for v in f}); mp = {v: i for i, v in enumerate(used)}; Vq = Vb[used]; Fq = [[mp[v] for v in f] for f in quads]; bdir = os.path.join(out, "baseline"); os.makedirs(bdir, exist_ok=True)
+    rb = {"method": "reference quads", "mesh": mesh, "target": target, "params": P, "triangles": int(len(T)), "regime": rep["regime"], "symmetry_detect": rep["symmetry_detect"]}; rb = finish(rb, time.time(), bdir, os.path.abspath(mesh), V, T, Vq, Fq, "", target, rep["symmetry_detect"], False, P, False)
+    wins, why = reference_wins(rep, rb, P); same_density = abs(len(Fq) / target - 1) <= P["density_tol"]; ours, ref = quality_key(rep), quality_key(rb)
+    rep["baseline"] = {"available": True, "quads": len(Fq), "same_density": same_density, "gates": {k: {"pass": v["pass"], "value": v["value"]} for k, v in rb["gates"].items()}, "key_reference": ref, "key_ours": ours, "reason": why, "measures": {k: rb["measures"].get(k) for k in ("quads", "straight_iso_mean_deg", "poles_per_1000_quads", "folded_share", "squashed_share")}}
+    if same_density and wins:
+        shutil.copy(os.path.join(bdir, "result.obj"), os.path.join(out, "result.obj")); rep["result_source"] = "reference"; rep["retopology_gates_before_guard"] = rep["gates"]; rep["retopology_measures_before_guard"] = rep["measures"]; rep["gates"] = rb["gates"]; rep["measures"] = rb["measures"]; rep["all_pass"] = rb["all_pass"]; rep["baseline"]["decision"] = "reference quads kept : " + why
+    else: rep["result_source"] = "zenray_retopology"; rep["baseline"]["decision"] = "ZenRay Retopology kept" if same_density else "reference at another density : compared, not substituted"
+    json.dump(rep, open(os.path.join(out, "report.json"), "w"), indent=1); return rep
+
+
+def boundary_loop_report(V, F, tol=0.05):
+    """open boundary loops of the result and how many of them are zero area SLITS (all vertices on one line : a non conforming interface, 2 edges on one side against 4 on the other, which QuadWild leaves on thin plates) : the cause of a red closure gate is then explicit."""
+    cnt = collections.Counter(); he = []
+    for q in F:
+        for k in range(len(q)): a, b = int(q[k]), int(q[(k + 1) % len(q)]); cnt[(min(a, b), max(a, b))] += 1; he.append((a, b))
+    nxt = collections.defaultdict(list)
+    for a, b in he:
+        if cnt[(min(a, b), max(a, b))] == 1: nxt[a].append(b)
+    seen = set(); loops = 0; slits = 0
+    for st in list(nxt):
+        if st in seen: continue
+        loop = [st]; seen.add(st); cur = nxt[st][0]
+        while cur != st and cur not in seen and len(loop) < 100000:
+            loop.append(cur); seen.add(cur); cur = nxt[cur][0] if nxt[cur] else st
+        loops += 1; P = V[loop]
+        if len(loop) >= 3:
+            c = P.mean(0); u = np.linalg.svd(P - c, full_matrices=False)[2][0]; d = np.linalg.norm((P - c) - np.outer((P - c) @ u, u), axis=1).max(); e = np.linalg.norm(np.diff(np.vstack([P, P[:1]]), axis=0), axis=1).mean(); slits += int(d < tol * e)
+    return loops, slits
+
+
+def finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board):
+    final = os.path.join(out, "result.obj"); QB.save_obj(final, Vf, Ff); rep["seconds"] = round(time.time() - t0, 1); rep["files"] = {"result": final, "quadwild_raw": raw}
+    J = TJ.judge(final, mesh); Qf = np.array(Ff, np.int64); keys = ("quads", "folded_share", "squashed_share", "jac_mean", "angle_dev_mean_deg", "straight_iso_mean_deg", "symmetry_axis", "symmetry_mean_edge", "poles_per_1000_quads", "boundary_edges", "euler", "dev_mean_mm"); rep["measures"] = {k: J.get(k) for k in keys}
+    edge = float(np.mean([np.linalg.norm(Vf[Qf[:, k]] - Vf[Qf[:, (k + 1) % 4]], axis=1).mean() for k in range(4)])); rec, prec, worst = coverage(V, T, Vf, Qf, P["cover_tol_edges"] * edge); bl, be = boundary_length(Vf, Ff); rl, re_ = boundary_length(V, [list(t) for t in T])
+    ca = crease_alignment(V, T, Vf, Qf, P["crease_deg"], edge); rep["measures"].update({"crease_points": ca[2] if ca else 0, "crease_aligned_share": round(ca[0], 3) if ca else None, "crease_mean_edges": round(ca[1], 3) if ca else None})
+    bl_, sl_ = boundary_loop_report(Vf, Ff); rep["measures"].update({"boundary_loops": bl_, "zero_area_slit_loops": sl_, "coverage_recall": round(rec, 4), "coverage_precision": round(prec, 4), "worst_component_recall": round(worst, 4), "hidden_components": getattr(coverage, "hidden", 0), "components": components(Ff, len(Vf)), "reference_components": components([list(t) for t in T], len(V)), "boundary_length": round(bl, 4), "reference_boundary_length": round(rl, 4)})
+    m = rep["measures"]; g = {}
+    g["density"] = (abs(m["quads"] / target - 1) <= P["density_tol"], round(m["quads"] / target, 3), "within %.0f percent" % (100 * P["density_tol"]))
+    g["folded"] = (m["folded_share"] < P["gate_folded"], m["folded_share"], "under %s" % P["gate_folded"]); g["squashed"] = (m["squashed_share"] < P["gate_squashed"], m["squashed_share"], "under %s" % P["gate_squashed"])
+    g["straightness"] = (m["straight_iso_mean_deg"] < P["gate_straight_deg"], m["straight_iso_mean_deg"], "under %s degrees" % P["gate_straight_deg"])
+    g["symmetry"] = ((m["symmetry_mean_edge"] is not None and m["symmetry_mean_edge"] < P["gate_symmetry_edges"]) if sym.get("symmetric") else True, m["symmetry_mean_edge"], "0 on a symmetric input (not required: the input is not symmetric)" if not sym.get("symmetric") else "under %s edge" % P["gate_symmetry_edges"])
+    g["closure"] = ((m["boundary_edges"] == 0) if rl <= 1e-9 else bl <= rl * (1 + P["closure_len_ratio"]), m["boundary_edges"] if rl <= 1e-9 else round(bl / rl, 3), ("no open edge (closed reference) ; %d open loops, %d of them zero area slits" % (bl_, sl_)) if rl <= 1e-9 else "boundary length at most %.0f percent above the reference (a closed result is welcome)" % (100 * P["closure_len_ratio"]))
+    g["coverage"] = (rec >= P["gate_cover"] and worst >= P["gate_component_recall"], round(rec, 4), "recall at least %s and every reference component at least %s (worst %.3f)" % (P["gate_cover"], P["gate_component_recall"], worst))
+    g["creases"] = (True if (not ca or rep["regime"]["regime"] != "hard") else ca[0] >= P["gate_crease_aligned"], round(ca[0], 3) if ca else "no crease", ("at least %.0f percent of the reference crease points within a quarter edge of a result edge" % (100 * P["gate_crease_aligned"])) if rep["regime"]["regime"] == "hard" else "not applicable (organic regime keeps no creases)")
+    rep["gates"] = {k: {"pass": bool(v[0]), "value": v[1], "rule": v[2]} for k, v in g.items()}; rep["all_pass"] = all(v[0] for v in g.values()); rep["used_mirror"] = use_sym
+    if board:
+        cells = ["--cell", "Reference=" + mesh] + (["--cell", "QuadWild brut=" + raw] if raw else []) + ["--cell", "ZenRay Retopology=" + final]; png = os.path.join(out, "board.png")
+        subprocess.run([sys.executable, "-I", os.path.join(HERE, "ZrlBoard3D.py"), png, "--title", "ZenRay Retopology (QuadWild)", "--az", "35", "--el", "22"] + cells, capture_output=True, text=True); rep["files"]["board"] = png
+    json.dump(rep, open(os.path.join(out, "report.json"), "w"), indent=1); return rep
+
+
+def print_gates(rep):
+    print("%s  %s  regime %s  mirror %s  source %s  %s s" % (rep.get("method"), os.path.basename(rep["mesh"]), rep["regime"]["regime"], rep.get("used_mirror"), rep.get("result_source", "zenray_retopology"), rep.get("seconds")))
+    for k, v in rep["gates"].items(): print("  %-13s %-5s %-10s %s" % (k, "GREEN" if v["pass"] else "RED", v["value"], v["rule"]))
+
+
+def main():
+    ap = argparse.ArgumentParser(); sp = ap.add_subparsers(dest="cmd", required=True); r = sp.add_parser("run"); r.add_argument("mesh"); r.add_argument("--target", type=int, required=True); r.add_argument("--out"); r.add_argument("--set", action="append", default=[]); r.add_argument("--params"); r.add_argument("--no-board", action="store_true"); r.add_argument("--no-baseline", action="store_true"); g = sp.add_parser("gates"); g.add_argument("report"); a = ap.parse_args()
+    if a.cmd == "gates": print_gates(json.load(open(a.report))); return
+    P = dict(PARAMS)
+    if a.params: P.update(json.load(open(a.params)))
+    for kv in a.set:
+        k, v = kv.split("=", 1)
+        if k not in P: raise SystemExit("unknown parameter %s (known : %s)" % (k, ", ".join(P)))
+        P[k] = json.loads(v) if isinstance(PARAMS[k], list) else (type(PARAMS[k])(v) if not isinstance(PARAMS[k], str) else v)
+    if a.no_baseline: P["baseline_guard"] = 0
+    out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.mesh)), "retopo_" + os.path.splitext(os.path.basename(a.mesh))[0]); rep = run(a.mesh, a.target, out, P, not a.no_board)
+    if "error" in rep: raise SystemExit(rep["error"])
+    print_gates(rep); print("report", os.path.join(out, "report.json"))
+
+
+if __name__ == "__main__": main()

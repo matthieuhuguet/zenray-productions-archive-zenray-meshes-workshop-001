@@ -1,0 +1,150 @@
+# Passe 5 : vrais coins, anneaux et lentilles, normale du Jacobien (30 October 2026)
+
+Statuts : [DOC] lu ou résumé de recherche ; [CODE] lu dans quadwild-bimdf ; [MESURÉ] calculé ici (python -I, venv zenray-meshes, modules du projet importés en lecture seule, zones = ZrlAny.segment avec zone-deg 25 et merge-deg 35 comme dans ZrlTutteFill.py) ; [ESTIMÉ] jugement. Outils : /Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/pass5_tools/ (corners5.py, annulus.py, annulus2.py, lens.py, sweep.py, montage.py, jac3.py).
+
+## 1. Choisir de VRAIS coins (3 à 8) sur un bord bruité
+
+### 1.1 Méthodes publiées (ce qui a été retrouvé)
+- Espace d'échelle des courbures (Mokhtarian, Mackworth, IEEE PAMI 14(8):789-805, 1992) : la courbure du contour se calcule à plusieurs lissages ; les coins sont les maxima de |courbure| qui persistent à grande échelle, puis sont localisés à petite échelle ; critique : le multi-échelle ne sert souvent qu'à la localisation, la détection restant à une échelle, et les seuils globaux sont remplacés par des seuils adaptatifs locaux [DOC via recherche : https://www.cs.ubc.ca/~mack/Publications/b2hd-IEEE-PAMI92.html ; https://www.ece.lsu.edu/gunturk/EE7700/CSS.pdf].
+- Points dominants (Teh, Chin, IEEE PAMI 11(8):859-872, 1989) : région de support de chaque point choisie par propriétés locales, mesure de significativité (courbure), puis suppression des non-maxima ; les auteurs soutiennent que le choix de la région de support compte plus que la mesure [DOC via recherche : https://researchportal.hkust.edu.hk/en/publications/on-the-detection-of-dominant-points-on-digital-curves/]. Une variante k-cosinus et une région de support asymétrique existent (Ray et Ray ; 1992) [DOC via recherche]. Ansari et Delp 1989 : points dominants stables pour contours bruités (lissage gaussien puis découpage et fusion) [DOC via recherche].
+- Douglas-Peucker (simplification de polyligne par tolérance) : classique, aucune source lue dans cette passe [ESTIMÉ, de mémoire] ; la persistance des sommets conservés à plusieurs tolérances joue ici le rôle de l'espace d'échelle.
+- QuadWild [CODE, quadwild_source_notes] : classe chaque sommet de bord par le nombre k de virages de 90 degrés du champ (droit, virage à droite, à gauche, demi-tour) ; un patch doit avoir entre MinVal = 3 et MaxVal = 5 coins ; sinon réparation par somme d'angles du bord (plus petite somme ajoutée, plus grande somme retirée sauf sommets Narrow, Concave, Convex). Pas de seuil d'angle propre : les coins viennent du champ et des features.
+- Takayama 2014 : ne détecte rien, les coins sont donnés par l'utilisateur (patch à N côtés, 2 <= N <= 6, longueurs de côtés quelconques) [DOC, takayama_patch_templates].
+- ZrlAutoPatch.corners (projet) : virages mesurés sur une fenêtre de 0,02 m, seuil 35 degrés, écart minimal 12 % du contour, complétion à 4 par la boîte orientée ; une échelle fixe en mètres et un nombre de coins imposé.
+
+### 1.2 Algorithme retenu : persistance multi-échelle par Douglas-Peucker et virage intégré
+Idées (formules) :
+1. Rééchantillonner le bord à n = 360 points équidistants en abscisse curviligne, avec une normale locale par point (moyenne des normales de triangles aux sommets de bord, pondérée par l'aire).
+2. Pour chaque tolérance eps_s = f_s x périmètre, f = (0,4 %, 0,8 %, 1,6 %, 3,2 %), Douglas-Peucker fermé donne des sommets conservés ; le virage signé en un sommet conservé j entre ses voisins i et k est l'angle de rotation entre les cordes (i,j) et (j,k), mesuré dans le plan tangent de la normale en j : theta = atan2((u x v).n, u.v) avec u, v projetés sur le plan tangent. Si DP rend 2 sommets seulement, le contour est une bande ou une lentille : les deux sommets sont les deux pointes, virage 180 degrés convexe.
+3. Orientation : le signe de la somme des virages à l'échelle la plus grossière donne le sens du contour ; seuls les virages de ce signe (convexes) comptent ; un virage concave, même de 180 degrés, est une fente et n'est jamais un coin (les pointes de bande sont des demi-tours CONVEXES, donc admises : ce qu'AP.corners interdit à tort).
+4. Regroupement : deux sommets conservés sont dans le même groupe si leur écart d'abscisse est au plus 6 % du contour ET leur distance 3D est au plus 0,5 fois la largeur locale (distance minimale à un point du bord éloigné de 10 % d'abscisse) : une pointe arrondie (plusieurs sommets proches) devient UN coin, les deux coins d'un bout étroit de rectangle restent séparés si le bout est plus large que le double de leur écart.
+5. Virage intégré d'un groupe à l'échelle s : T_s = min(180, somme des virages convexes des sommets du groupe à cette échelle).
+6. Un groupe est un VRAI coin si T_fin >= 28 degrés (échelle 0,4 %), T_grossier >= 35 degrés (échelle 3,2 %) et T_fin / T_grossier >= 0,55 : un coin garde son virage à toutes les échelles, un arc lisse de rayon r a un virage qui croît comme racine carrée de la tolérance (theta ~ 2 racine(2 eps / r)), donc T_fin / T_grossier est voisin de 0,35 et il est rejeté.
+7. Réparation du nombre : garder les 8 plus forts (QuadWild garde MaxVal) ; moins de 2 : rendre 0 coin (zone ronde : le choix de 3 ou 4 coins revient à l'appelant, par exemple les extrémités de la boîte orientée, marquées comme coins faux) ; 2 coins : lentille ou bande (section 3).
+Paramètres : n 360 ; eps_frac (0,004, 0,008, 0,016, 0,032) ; cluster_frac 0,06 (écart d'abscisse maximal du regroupement) ; merge_width 0,5 ; width_arc 0,1 ; t_fine 28 ; t_coarse 35 ; ratio 0,55 ; spike_concave 150 (le filtre de signe l'applique déjà) ; max_corners 8.
+
+### 1.3 Résultats [MESURÉ]
+Vérité = coins TOPOLOGIQUES : sommets de bord où la zone voisine change le long du contour (les coins d'un layout de patchs, comme ceux de QuadWild), après absorption des tronçons de moins de 3 % du périmètre ; calculée sur les 72 zones de l'arche à contour simple qui ont au moins 2 côtés topologiques.
+| Détecteur | Nombre de coins exact | À plus ou moins 1 | Rappel de position (3 % du périmètre) | Précision |
+|---|---|---|---|---|
+| nouveau (cette passe) | 94,4 % | 95,8 % | 95,5 % | 98,1 % |
+| AP.corners avec 8 cherchés (virages >= 35 degrés) | 65,3 % | 76,4 % | non mesuré | non mesuré |
+| AP.corners avec 4 (forme imposée) | 68,1 % | 79,2 % | non mesuré | non mesuré |
+Paires (topologie, détecté) sur l'arche : (2,2) : 16 zones, (4,4) : 50, (4,3) : 1, (4,2) : 1, (6,4) : 2, (8,8) : 2.
+Réglage : balayage de 4 valeurs de cluster_frac et 4 jeux (t_fine, t_coarse, ratio) : meilleur 0,025 avec (28, 35, 0,55) à 93,1 % sur l'arche ; la fusion par largeur locale (cette version) donne 94,4 % et sépare les bouts étroits des bandes du lys.
+Lys : la topologie des zones n'est pas une vérité utilisable (38 zones sur 70 n'ont qu'une seule voisine ; les lames sont des lentilles dont les pointes ne sont pas des changements de voisin). Jugé à l'œil sur la planche des 36 premières zones (bande, lentille, bande effilée, pétale ; image dans le scratchpad : montage_lily_plant_0.png) [ESTIMÉ] : 8 bandes droites : 2 pointes trouvées (correct) ; 14 lentilles : 2 pointes (correct) ; 7 bandes effilées : 3 coins (pointe étroite fusionnée avec raison) ; 7 pétales : 2 à 6 coins, dont 4 corrects à l'œil (les excroissances « poils » du bord droit rendent 2 des 7 incertains) ; soit environ 33 sur 36 plausibles. AP.corners(4) rend 4 par construction : plausible seulement sur les bandes effilées et pétales, soit au plus 14 sur 36 ; sur les bandes et lentilles il fabrique 2 coins faux.
+Limites : la vérité topologique est une approximation ; les zones bruitées par des « poils » (fentes) demandent un nettoyage préalable (ZrlAutoPatch fait déjà prune et fill) ; la largeur locale coûte O(n^2) (360 points : négligeable).
+
+### 1.4 Code (numpy seul), testé le 30 October 2026
+```python
+# ------------------------------------------------------------ boundary resampling with local normals
+def resample_loop(P, normals, n):
+    """closed polyline P (k,3) with a normal per vertex -> n points equally spaced in arc length, with interpolated unit normals."""
+    Y = np.vstack([P, P[:1]]); NN = np.vstack([normals, normals[:1]]); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Y, axis=0), axis=1))]
+    t = np.linspace(0, cum[-1], n, endpoint=False); X = np.stack([np.interp(t, cum, Y[:, k]) for k in range(3)], 1); Nr = np.stack([np.interp(t, cum, NN[:, k]) for k in range(3)], 1)
+    Nr /= np.maximum(np.linalg.norm(Nr, axis=1, keepdims=True), 1e-12); return X, Nr, cum[-1]
+
+def tangent_turn(X, Nr, i, j, k):
+    """signed turning angle (deg) at X[j] between the chords i->j and j->k, measured in the tangent plane of the normal at j."""
+    u = X[j] - X[i]; v = X[k] - X[j]; n = Nr[j]; u = u - (u @ n) * n; v = v - (v @ n) * n
+    a, b = np.linalg.norm(u), np.linalg.norm(v)
+    if a < 1e-12 or b < 1e-12: return 0.0
+    c = np.clip(u @ v / (a * b), -1, 1); s = np.cross(u, v) @ n / (a * b); return float(np.degrees(np.arctan2(s, c)))
+
+# ------------------------------------------------------------ Douglas-Peucker on a closed loop
+def dp_closed(X, eps):
+    """indices of a Douglas-Peucker simplification of the closed polyline X with tolerance eps (distance in 3D)."""
+    n = len(X); a = 0; d = np.linalg.norm(X - X[a], axis=1); b = int(np.argmax(d)); keep = {a, b}
+    def rec(i, j):                                  # open arc i -> j (indices modulo n, going forward)
+        idx = [(i + t) % n for t in range(1, ((j - i) % n))]
+        if not idx: return
+        p, q = X[i], X[j]; qq = q - p; L = max(np.linalg.norm(qq), 1e-12)
+        dist = np.array([np.linalg.norm(np.cross(X[m] - p, qq)) / L if np.linalg.norm(qq) > 1e-12 else np.linalg.norm(X[m] - p) for m in idx])
+        k = int(np.argmax(dist))
+        if dist[k] > eps: m = idx[k]; keep.add(m); rec(i, m); rec(m, j)
+    rec(a, b); rec(b, a); return sorted(keep)
+
+# ------------------------------------------------------------ the detector
+PARAMS = dict(n=360, eps_frac=(0.004, 0.008, 0.016, 0.032), cluster_frac=0.025, t_fine=28.0, t_coarse=35.0, ratio=0.55, spike_concave=150.0, max_corners=8)
+
+def detect(P, normals, prm=PARAMS):
+    """true corners of a closed boundary : Douglas-Peucker at four tolerances (scale space), the turns of the kept vertices are integrated inside clusters (a tip that is rounded gives two vertices), a cluster is a corner when
+    its integrated turn is >= t_fine at the finest scale, >= t_coarse at the coarsest scale and the two are of the same order (turn_fine / turn_coarse >= ratio : a smooth arc gives a turn that grows like sqrt(tolerance), a corner does not).
+    A concave turn above spike_concave is a slit and never a corner ; a convex turn up to 180 (the tip of a strip) is allowed. returns (indices in the resampled loop, integrated turns, resampled loop, perimeter)."""
+    n = prm["n"]; X, Nr, per = resample_loop(P, normals, n); S = len(prm["eps_frac"]); verts = []                                  # (sample, scale, signed turn)
+    for s, ef in enumerate(prm["eps_frac"]):
+        K = dp_closed(X, ef * per)
+        if len(K) == 2: verts += [(K[0], s, 180.0), (K[1], s, 180.0)]; continue                 # a strip or a lens collapses to two vertices : its two tips, convex U-turns
+        if len(K) < 3: continue
+        for a in range(len(K)): verts.append((K[a], s, tangent_turn(X, Nr, K[a - 1], K[a], K[(a + 1) % len(K)])))
+    coarse = [t for (j, s, t) in verts if s == S - 1]; sign = 1.0 if sum(coarse) >= 0 else -1.0                                      # loop orientation : convex turns have the sign of the total turning
+    # local width : distance from a sample to the boundary samples that are far away along the arc (the other side of a strip)
+    far = max(3, int(prm.get("width_arc", 0.1) * n)); D = np.linalg.norm(X[:, None, :] - X[None, :, :], axis=2); idxs = np.arange(n); sep = np.minimum(np.abs(idxs[:, None] - idxs[None, :]), n - np.abs(idxs[:, None] - idxs[None, :])); W = np.where(sep >= far, D, np.inf).min(axis=1)
+    gmax = prm.get("gap_max", 0.06) * n; pts = sorted({j for j, s, t in verts if sign * t > 5.0}); clusters = []
+    def close(a, b): return min(abs(a - b), n - abs(a - b)) <= gmax and np.linalg.norm(X[a] - X[b]) <= prm.get("merge_width", 0.5) * min(W[a], W[b])
+    for j in pts:
+        if clusters and close(clusters[-1][-1], j): clusters[-1].append(j)
+        else: clusters.append([j])
+    if len(clusters) > 1 and close(clusters[-1][-1], clusters[0][0]): clusters[0] = clusters.pop() + clusters[0]
+    out = []
+    for c in clusters:
+        cs = set(c); T = []
+        for s in range(S): T.append(min(180.0, sum(sign * t for (j, ss, t) in verts if ss == s and j in cs and sign * t > 0)))
+        # concave spikes are filtered because only convex (sign) turns are summed
+        if T[0] >= prm["t_fine"] and T[-1] >= prm["t_coarse"] and T[0] / max(T[-1], 1e-9) >= prm["ratio"]:
+            best = max(c, key=lambda j: max([sign * t for (jj, ss, t) in verts if jj == j] or [0])); out.append((best, T[-1]))
+    out.sort(key=lambda r: -r[1]); out = out[:prm["max_corners"]]; out.sort(key=lambda r: r[0])
+    return [r[0] for r in out], [r[1] for r in out], X, per
+
+```
+Appel : idx, turns, X, per = detect(P_boucle (k,3), normales_boucle (k,3)) ; idx = indices dans la boucle rééchantillonnée X (n = 360) ; remonter au sommet de bord d'origine par la plus proche abscisse curviligne (le correctif de ZrlTutteFill accroche déjà les coins à un sommet de bord).
+
+## 2. Zones annulaires (2 boucles) et lentilles (2 coins)
+
+### 2.1 Couper ou fusionner : ce que fait la littérature lue
+- QuadWild [CODE] : le tracé est récursif et traite explicitement les patchs non disque : passes « CHECK NO DISK ONES » puis « FORCE SOLVING NO DISK ONES » dans RecursiveProcess, avec GetTopologicallyNotOKPartitionsIndex ; le papier exige un patch homéomorphe à un disque (condition topologique) et ajoute des chemins de coupe (rondes de boucles, de bord à bord). Il n'existe pas de motif d'anneau dans le code de motifs.
+- Takayama 2014 : seulement des disques à 2 à 6 côtés ; un anneau est découpé par l'artiste (document : « the user has to manually split the polygon »).
+- Les anneaux de l'arche sont à une seule rangée de quads : mesurés sur les 25 anneaux (arche, zones à 2 boucles, partition de cette passe) : 8 triangles médians (min 8, max 46), boucles de 4 sommets médianes ; l'intérieur de la boucle interne est bordé par des triangles NON zonés (étiquette -1, composantes de 12 triangles médianes, 34 au plus), pas par une zone voisine ; fusion avec le remplissage du trou (composante non zonée qui ne touche que l'anneau) : possible pour 6 anneaux sur 25 seulement ; fusion avec une zone voisine qui serait un disque : 0 sur 25.
+
+### 2.2 Coupes le long du plus court chemin entre les boucles [MESURÉ]
+Algorithme : (1) boucle externe = la plus longue, interne = l'autre ; (2) Dijkstra sur le graphe des arêtes de la zone, poids = longueur 3D, des sommets de la boucle externe vers ceux de la boucle interne : chemin P1 ; (3) ouvrir : dupliquer les sommets le long de P1 (les coins de triangle d'un même sommet sont fusionnés par union-find seulement à travers les arêtes non coupées) ; (4) deuxième coupe : départ sur la boucle externe à mi-périmètre de P1 (fenêtre de plus ou moins 1/8), Dijkstra vers la boucle interne en interdisant les sommets de P1 : chemin P2 ; ouvrir.
+Résultats sur les 25 anneaux de l'arche :
+| Coupe | Disque (caractéristique d'Euler 1, une boucle de bord) |
+|---|---|
+| une coupe | 25 sur 25 |
+| deux coupes : deux disques | 25 sur 25 |
+| deux coupes : les deux pièces ont 4 vrais coins détectés | 9 sur 25 (30 pièces sur 50 ont 4 coins ; 11 pièces 2 coins, 7 pièces 3 coins) |
+Les pièces à 2 ou 3 coins sont de minces bandes de quelques triangles ; les anneaux de 4 sommets par boucle (8 triangles) sont de simples rangées de 4 quads.
+Recommandation [ESTIMÉ] : (a) anneau à une rangée (aire / (longueur moyenne de boucle x edge) <= environ 1,5, ou nombre de triangles <= 2 x longueur de boucle) : ne pas couper, émettre UN anneau de quads le long de la boucle (n quads, n du MILP, les deux boucles sont les bords) ; (b) anneau large : deux coupes (ci-dessus) donnent deux patchs à 4 côtés (arc externe, coupe, arc interne, coupe) à remplir par le polygone cyclique ; (c) si le trou est une composante non zonée qui ne touche que l'anneau (6 cas sur 25), fusionner l'anneau et le trou en un disque. Une seule coupe suffit pour le plongement de Tutte (un disque à 4 côtés qui contient deux fois le chemin) mais crée un patch dont deux côtés sont la même arête de coupe : il faut alors imposer le même compte aux deux côtés (contrainte d'égalité dans le MILP).
+
+### 2.3 Lentilles et bandes (zones à 2 vrais coins) [MESURÉ + Tarini 2021]
+Mesures : arche 17 zones à 2 coins détectés, lys 28.
+- Tarini N = 2 (déjà établi) : e0 et e1 pairs ; un doublet central ; s0 = e1 / 2, s1 = e0 / 2 ; Takayama évite le doublet par les motifs 2-0 (l = (3 + 2 p1 + y, 1 + 2 p0 + y)) et 2-1 (l = (2 + 2 p1 + x + y, 2 + 2 p0 + x + y)).
+- Alternative 1 (coupe au milieu) : relier les milieux des deux arcs par le plus court chemin et couper : deux triangles (pointe + 2 extrémités de la coupe), traités par N = 3 de Tarini (inégalité triangulaire) ; testé : deux disques obtenus pour 15 zones sur 17 (arche) et 28 sur 28 (lys). Rapport périmètre / (2 x longueur de coupe) médian : 48,5 (arche : bandes très étroites) et 7,4 (lys).
+- Alternative 2 (bande étroite, rapport périmètre / coupe > environ 20) : une seule rangée de quads le long de la bande : n quads sur la longueur, 1 sur la largeur ; les deux pointes sont des triangles dégénérés ou des quads avec un côté de longueur nulle : traiter la pointe comme un coin de valence 2 (doublet, accepté seulement si l'application l'accepte) ou la fermer par un quad.
+- Alternative 3 (fusion) : rattacher la lentille à sa zone voisine la plus longue et la traiter comme un bord ; rarement possible (les lentilles du lys sont isolées).
+Choix : bandes étroites (rapport > 20) : alternative 2 ; lentilles larges : alternative 1 ; sinon Takayama 2-0 ou 2-1.
+
+## 3. La normale du Jacobien d'un quad gauche
+
+### 3.1 Définitions de la littérature [DOC]
+Verdict (Stimpson, Ernst, Knupp, Pébay, Thompson ; manuel SAND2007-1751) : le Jacobien normalisé (scaled Jacobian) d'un quad est le MINIMUM sur les 4 coins de J_i / (L_i L_{i-1}) ; il vaut 1 pour un carré unité ; plage acceptable [0,3 ; 1], plage normale [-1 ; 1] (commentaire du code de VTK-m, https://docs-m.vtk.org/latest/CellScaledJacobianMetric_8h_source.html). Le code de Verdict (https://raw.githubusercontent.com/Kitware/VTK/master/ThirdParty/verdict/vtkverdict/V_QuadMetric.cpp) calcule : arêtes e0 = P1-P0, e1 = P2-P1, e2 = P3-P2, e3 = P0-P3 ; axes principaux p0 = e0 - e2, p1 = e1 - e3 ; NORMALE AU CENTRE n = normalize(p0 x p1) ; produits vectoriels de coin c0 = e3 x e0, c1 = e0 x e1, c2 = e1 x e2, c3 = e2 x e3 ; aires signées de coin A_i = n . c_i ; SJ_i = A_i / (L_i L_{i-1}) ; résultat = min SJ_i. Les références : Knupp, « Algebraic mesh quality metrics », SIAM J. Sci. Comput. 23(1), 2001 ; Pébay, « Planar quadrilateral quality measures », Engineering with Computers 20, 2004 (le rapport INRIA RR-4436, 2002, montre que certaines mesures étendues du triangle aux quads ne détectent pas la dégénérescence en triangle) [DOC via recherche]. Sandia : pour un quad à 4 noeuds la mesure de forme est proportionnelle au gauchissement (https://www.sandia.gov/files/sierra/SM_Users_5_30/user_manual/commands/metrics.html).
+
+### 3.2 Identités et mesures [MESURÉ]
+- p0 x p1 = 2 (d1 x d2) avec d1 = P2 - P0, d2 = P3 - P1 : la normale au centre de Verdict EST la normale des diagonales (vérifié numériquement sur 1 000 quads aléatoires : rapport 2,000000, parallèles).
+- La somme des quatre produits de coin non normalisés c0 + c1 + c2 + c3 vaut aussi 2 (d1 x d2) : même direction. La moyenne des quatre normales de coin NORMALISÉES est une autre quantité, plus tolérante.
+- Effet sur les quads de l'arche et du lys (zones à réseau relevé sans relax, snap, sag) :
+| Normale | Arche : J < 0 | Arche : J < 0,3 | Lys : J < 0 | Lys : J < 0,3 |
+|---|---|---|---|---|
+| coin 0 (code actuel de ZrlQuadStats) | 1 249 (10,74 %) | 9 198 (79,11 %) | 429 (1,04 %) | 23 794 (57,60 %) |
+| diagonales = normale au centre de Verdict | 862 (7,41 %) | 9 198 | 413 (1,00 %) | 23 754 (57,50 %) |
+| moyenne des 4 normales de coin normalisées | 561 (4,82 %) | 9 198 | 316 (0,76 %) | 23 741 (57,47 %) |
+| normale de surface (moyenne aux 4 sommets) | 1 029 (8,85 %) | 9 200 | 429 (1,04 %) | 23 767 (57,53 %) |
+L'angle entre la normale du coin 0 et celle des diagonales : médiane 0,0 degré, 90e centile 21,3 degrés (arche), maximum 180 degrés (quads dont le coin 0 est inversé).
+Les écrasés (J < 0,3) ne dépendent pas du choix : le cisaillement est réel.
+
+### 3.3 Proposition
+1. Mesure de forme (le « squashed » du juge) : Jacobien normalisé de Verdict avec la normale au centre n = normalize((P2 - P0) x (P3 - P1)) (identique à p0 x p1 de Verdict) : c'est la définition de la littérature, indépendante du choix du coin, stable pour un quad gauche ; seuils : plié J < 0 ; écrasé J < 0,3 (limite basse de la plage acceptable de Verdict) ; qualité : J >= 0,5.
+2. Test d'orientation (le vrai pli) : le quad est replié si sa normale au centre est opposée à la normale de la surface à son emplacement : n_quad . n_surface < 0 (normale de surface = moyenne des normales des triangles où tombent les 4 sommets) ; c'est ce test, et non le signe d'un coin, qui distingue un pli d'un quad simplement gauche. Les deux plis (J < 0 selon Verdict, orientation selon la surface) se rapportent séparément.
+3. Ne pas utiliser la moyenne des normales de coin normalisées : elle masque des inversions réelles (4,82 % contre 7,41 % sur l'arche) et n'est pas dans la littérature.
+4. Changement minimal dans ZrlQuadStats.stats : remplacer n0 = cross(P1 - P0, P3 - P0) par n0 = cross(P2 - P0, P3 - P1) (le reste est inchangé). Effet mesuré : arche 1 249 -> 862 plis, lys 429 -> 413, écrasés inchangés.

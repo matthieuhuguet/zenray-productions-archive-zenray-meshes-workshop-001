@@ -1,0 +1,40 @@
+"""Pass 9 : compare straighteners on QuadWild raw outputs. Usage : python3 -I run_straighten.py dir=WORK names=sphere:qw,potato:qw2 out=results.json
+FR : compare les redresseurs sur les sorties brutes de QuadWild avec le meme juge."""
+import sys, json, time
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_io as IO, zr8_judge as J, zr8_straighten as S
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:])
+base = a["base"]; rows = []
+for spec in a["names"].split(","):
+    n, d = spec.split(":")
+    pre = "%s/%s/%s_rem_p0" % (base, d, n)
+    Vr, Fr = IO.read_obj_tri_or_quad(pre + ".obj"); surf = S.Surface(Vr, Fr)
+    V, Q = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation.obj")
+    Vs, Qs = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation_smooth.obj")
+    border = np.zeros(len(V), bool)
+    import collections
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            x, y = int(q[k]), int(q[(k + 1) % 4]); ec[(min(x, y), max(x, y))] += 1
+    for (x, y), c in ec.items():
+        if c == 1: border[x] = border[y] = True
+    res = {"name": n, "dir": d}
+    def add(label, P, secs=0.0):
+        r = J.judge_plus(P, Q, ref_tris=(Vr, Fr)); r["seconds"] = round(secs, 1); res[label] = r
+    add("raw", V); add("qw_smooth", Vs)
+    t = time.time(); add("tf30", S.template_fit(V, Q, surf, fixed=border, steps=30), time.time() - t)
+    t = time.time(); add("tf300", S.template_fit(V, Q, surf, fixed=border, steps=300), time.time() - t)
+    t = time.time(); P, h = S.barrier(V, Q, surf, fixed=border, outer=10, inner=60, size="keep"); add("barrier_keep", P, time.time() - t)
+    t = time.time(); P, h = S.barrier(V, Q, surf, fixed=border, outer=10, inner=60, size="smooth"); add("barrier_smooth", P, time.time() - t)
+    rows.append(res)
+    print(n, d, "done", flush=True)
+json.dump(rows, open(a["out"], "w"), indent=1)
+labels = ["raw", "qw_smooth", "tf30", "tf300", "barrier_keep", "barrier_smooth"]
+print("%-12s %-15s %5s %5s %6s %7s %7s %7s %7s %7s %6s %5s" % ("mesh", "method", "fold%", "sq%", "jacM", "angDev", "angP99", "turn", "turnP90", "edgeCV", "areaCV", "sec"))
+for r in rows:
+    for l in labels:
+        x = r[l]
+        print("%-12s %-15s %5.2f %5.2f %6.3f %7.2f %7.1f %7.2f %7.2f %7.3f %6.3f %5.1f" % (r["name"] + ("(d)" if r["dir"] == "qw2" else ""), l, 100 * x["folded_frac"], 100 * x["squashed_frac"], x["jac_mean"], x["angle_dev_mean_deg"], x["angle_dev_p99_deg"], x["loop_turn_mean_deg"], x["loop_turn_p90_deg"], x["edge_cv"], x["area_cv"], x["seconds"]))

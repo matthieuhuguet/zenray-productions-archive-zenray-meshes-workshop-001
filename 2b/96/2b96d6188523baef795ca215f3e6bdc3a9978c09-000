@@ -1,0 +1,204 @@
+# Hybride QuadWild et ZenRay : brancher le layout de patchs sur les comptes partagés, le remplissage intrinsèque et la soudure exacte (30 October 2026)
+
+Passe 8 de l'agent cloud, module ZenRay Retopology (produit ZenRay Meshes). Statuts : [MESURÉ] exécuté dans le bac à sable cloud pendant cette passe (code dans `pass8_tools/`) ; [DOC] lu dans un fichier ou une page à l'URL citée ; [ESTIMÉ] jugement non vérifié. Rien du code du projet n'est modifié : seuls des fichiers de recherche sont ajoutés. (30 October 2026)
+
+## 0. Ce qui est établi, en douze lignes (30 October 2026)
+- QuadWild Bi-MDF (commit e722c7e961982cf61db7c10812329dd0fc7d60df) est compilé et exécuté dans le bac à sable cloud, sans Gurobi ni Blossom V, sur 9 exécutions (sphère, tore, patate, bande, tube courbe, arche, équerre, plus patate et tore denses). [MESURÉ] (30 October 2026)
+- Le layout se lit dans quatre fichiers texte plus le maillage `_rem_p0.obj` : formats vérifiés ligne à ligne en section 2. Piège mesuré : la liste des coins d'un patch n'est PAS dans l'ordre cyclique du bord (5 maillages sur 7 concernés). [MESURÉ] (30 October 2026)
+- Le vecteur ILP de QuadWild contient exactement un entier par ARC ÉLÉMENTAIRE, c'est-à-dire un arc du bord coupé à tous les coins de tous les patchs (T-jonctions comprises) : 9 exécutions sur 9. [MESURÉ] (30 October 2026)
+- Les comptes d'arêtes de QuadWild vérifient la forme fermée de Tarini 2021 sur 97 patchs testés sur 97 (patchs de 3, 4 et 5 côtés). [MESURÉ] (30 October 2026)
+- Un MILP global maison (scipy.optimize.milp, solveur HiGHS, moins d'une seconde ici) avec les entiers `s_i` de Tarini retrouve exactement la même quantification que QuadWild sur 5 cas sur 9 (mêmes quads, mêmes mesures au millième), sans paires miroir ni coût propre à QuadWild. [MESURÉ] (30 October 2026)
+- Le remplissage maison (Tutte à valeur moyenne, régions de coin de Tarini, grille harmonique, relèvement barycentrique) avec les comptes de QuadWild redonne la sortie BRUTE de QuadWild avec les mêmes mesures à 0,01 près sur 4 maillages : le « remplissage intrinsèque » de ZenRay et celui de QuadWild sont la même opération. [MESURÉ] (30 October 2026)
+- La soudure par clés combinatoires (nœud, arc et rang sur l'arc) est exacte par construction : 0 arête non variété, 0 arête de bord sur les maillages fermés, caractéristique d'Euler égale à celle de l'entrée, sur les 9 exécutions. [MESURÉ] (30 October 2026)
+- La régularité vient du lissage final de QuadWild (30 pas d'ajustement de polygone régulier), pas du remplissage : sur la patate à 688 quads, le Jacobien normalisé moyen passe de 0,840 (brut) à 0,955 (lissé) et les quads écrasés de 4,5 % à 0 %. [MESURÉ] (30 October 2026)
+- Les layouts de QuadWild ne sont pas symétriques même sur des entrées symétriques : 4 paires miroir sur 12 arcs pour l'arche, 0 sur la sphère, le tore, le tube et l'équerre. Les contraintes miroir du MILP ne servent donc qu'avec un layout symétrique par construction (moitié puis reflet). [MESURÉ] (30 October 2026)
+- Conséquence de conception : l'hybride se décompose en trois couches indépendantes (layout, comptes, remplissage et soudure) puis une quatrième couche de redressement qui reste à concevoir (fichier `quad_straightening_30-October-2026.md`). (30 October 2026)
+- Le bac à sable cloud atteint GitHub, gitlab.com et les dépôts apt, mais ni arxiv.org, ni doi.org, ni le GitLab de RWTH (port 9000) : les articles sont cités comme « non ouvert » quand leur contenu n'a pas pu être relu ici. Pour ouvrir les articles, il faut autoriser arxiv.org, doi.org et dl.acm.org dans les réglages réseau de la session. [MESURÉ] (30 October 2026)
+
+## 1. Reproduire l'environnement (30 October 2026)
+Tout est dans `pass8_tools/build_quadwild_sandbox.sh` (recette commentée) et `pass8_tools/quadwild_sandbox.patch` (diff des deux fichiers modifiés). Résumé des écarts avec le dépôt amont, tous nécessaires parce que le bac à sable n'atteint que GitHub : (30 October 2026)
+
+| Écart | Cause | Effet mesuré | Date |
+|---|---|---|---|
+| gmm++ installé par apt (`libgmm++-dev`, 5.4.2) | l'URL savannah du CMakeLists n'est pas résolue | configuration réussie | 30 October 2026 |
+| OpenMesh pris sur le miroir https://github.com/Lawrencemm/OpenMesh au commit 4e2e481 (10 March 2019, VERSION 8.0) | le dépôt amont est sur https://www.graphics.rwth-aachen.de:9000 (connexion réinitialisée) ; le commit épinglé 8d527cd est introuvable sur le miroir | il faut ajouter les dossiers d'inclusion à la cible `OpenMeshCoreStatic` | 30 October 2026 |
+| CoMISo pris sur https://github.com/libigl/CoMISo au commit 562efe3 (6 April 2023) | même raison ; commit épinglé e018965 introuvable | il faut un alias `CoMISo::CoMISo` | 30 October 2026 |
+| Sous-modules épinglés récupérés par SHA : cmake-library, libsatsuma 4e96979, lemon 3c6aa54, libTimekeeper f4f4866, json 55f9368, vcglib 5cae2ab, xfield_tracer_fork 2913b67, eigen bc3b398 (GitLab accessible), libigl f68e055 | clone superficiel sans sous-modules | identiques aux commits épinglés | 30 October 2026 |
+| Patch de 20 lignes dans `components/quad_from_patches/main.cpp` | `main.cpp` ne sauve ni `ilpResult`, ni `quadmeshPartitions`, ni `quadmeshCorners` | fichier `<nom>_<num>_dump.txt` | 30 October 2026 |
+
+Compilation (`cmake . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSATSUMA_ENABLE_BLOSSOM5=0 -DQUADRETOPOLOGY_WITH_GUROBI=0` puis `ninja -C build -j4`, 171 cibles, quatre cœurs) : réussie, trois exécutables `quadwild`, `quad_from_patches`, `cli_trace`. Temps de calcul d'une exécution complète sur ces maillages synthétiques : 2 à 7 s pour les étapes 1 et 2, 0,3 à 4 s pour l'étape 3. [MESURÉ] (30 October 2026)
+
+Source du CMakeLists, des exécutables et de leurs arguments : https://github.com/cgg-bern/quadwild-bimdf/blob/e722c7e961982cf61db7c10812329dd0fc7d60df/quadwild/quadwild.cpp (usage : `quadwild mesh.obj [1|2|3] [*.sharp|*.rosy|*.txt]`) et https://github.com/cgg-bern/quadwild-bimdf/blob/e722c7e961982cf61db7c10812329dd0fc7d60df/components/quad_from_patches/main.cpp (usage : `quad_from_patches input.obj [num] [setup.txt] [out_stats.json]`). [DOC] (30 October 2026)
+
+## 2. Formats vérifiés par exécution (30 October 2026)
+Écriture des fichiers par le tracé : https://github.com/cgg-bern/xfield_tracer_fork/blob/2913b67607a2515bdc8019c582939fb32affbaa0/tracing/tracer_interface.h (lignes 1300 à 1410) ; lecture : https://github.com/cgg-bern/quadwild-bimdf/blob/e722c7e961982cf61db7c10812329dd0fc7d60df/components/quad_from_patches/load_save.cpp. [DOC] (30 October 2026)
+
+| Fichier | Contenu (relu sur les sorties) | Exemple réel | Piège mesuré | Date |
+|---|---|---|---|---|
+| `<nom>_rem_p0.obj` | maillage triangulaire remaillé ET dédoublonné ; tous les indices des autres fichiers se rapportent à lui, jamais à l'entrée | sphère : 4 608 sommets, 9 212 triangles | l'entrée de 2 562 sommets est remaillée : l'indexation change | 30 October 2026 |
+| `.patch` | premier nombre = nombre de faces, puis un identifiant de patch par face (base 0) | `9212 0 0 0 ...` | identifiants contigus de 0 à P moins 1 | 30 October 2026 |
+| `.corners` | nombre de patchs, puis pour chaque patch : nombre de coins, puis les indices de sommets | sphère : `8 3 2236 ...` | ORDRE NON CYCLIQUE : arche patch 0, coins `[28, 0, 29, 55]` à des positions `[153, 44, 144, 54]` de la boucle ; hors cyclique sur 4 patchs de 4 du tore, 10 de 28 de la patate, 1 de 1 de la bande, 4 de 6 de l'arche, 7 de 10 de l'équerre | 30 October 2026 |
+| `.feature` | nombre d'arêtes vives, puis `face,arête` par ligne (arête j de la face i = du sommet j au sommet j plus 1) | arche : 516 arêtes, lignes `6455,2` | une ligne vide finale ; indices de faces du maillage `_rem_p0` | 30 October 2026 |
+| `.c_feature` | nombre de sommets-coins vifs, puis leurs indices | arche : 8 sommets | utile seulement avec des arêtes vives | 30 October 2026 |
+| `_<num>_dump.txt` (patch du bac à sable) | `ILP n v1 ... vn`, `QFACES nq`, `QPART p` puis une ligne par patch (nombre de quads puis indices), `QCORNERS p` puis une ligne par patch | sphère : `ILP 12 27 16 13 10 23 22 3 13 15 13 12 15` | l'ordre de `ILP` est celui des arches internes de QuadWild, pas le nôtre : les comptes se retrouvent par la géométrie (section 5) | 30 October 2026 |
+
+Invariants du layout, mesurés sur les 9 exécutions par `layout_probe.py` : chaque patch a UNE boucle de bord et une caractéristique d'Euler 1 (disque) ; il y a 3, 4 ou 5 coins par patch (le code de tracé plafonne MaxVal à 5, https://github.com/cgg-bern/quadwild-bimdf/blob/e722c7e961982cf61db7c10812329dd0fc7d60df/quadwild/trace.cpp) ; tout sommet touché par au moins trois patchs est un coin d'au moins un patch ; des T-jonctions existent (44 incidences sur la patate, 4 sur l'équerre) ; un patch peut toucher le bord du maillage (la bande : 1 patch, 510 arêtes de bord, 4 arcs tous vifs). [MESURÉ] (30 October 2026)
+
+## 3. Structures de données ZenRay pour l'hybride (30 October 2026)
+Noms en anglais, dans `pass8_tools/zr8_layout.py`, `zr8_counts.py`, `zr8_fill.py`. Toutes les entités sont indexées par des clés combinatoires, jamais par des coordonnées, ce qui rend la soudure exacte. (30 October 2026)
+
+| Structure | Champs | Rôle | Date |
+|---|---|---|---|
+| `Layout` | `V` (n,3), `F` (m,3), `pid` (m,), `corners[p]`, `features`, `c_features`, `loops[p]` (boucle de bord, intérieur à gauche), `faces_of_patch[p]` | lecture directe des fichiers ci-dessus | 30 October 2026 |
+| nœud | sommet du maillage qui est coin d'au moins un patch | coupe tous les bords en arcs élémentaires | 30 October 2026 |
+| arc élémentaire | clé = tuple des sommets de la chaîne dans le sens canonique (le plus petit entre la chaîne et son inverse) ; `len`, `patches`, `feature` | l'inconnue entière `n_a` du MILP | 30 October 2026 |
+| côté d'un patch | liste de `(clé d'arc, sens)` dans l'ordre de la boucle ; K côtés par patch | `e_i` = somme des `n_a` du côté i | 30 October 2026 |
+| plan de patch | `e` (K,), `s` (K,), polygone `C` (K,2), `bidx`, `buv` (frontière du maillage dans le plan) | entrée du remplissage | 30 October 2026 |
+| clé de sommet global | `('node', v)`, `('arc', clé d'arc, j)` pour 0 < j < n_a, `('int', p, clé locale)` | identité pour la soudure | 30 October 2026 |
+
+## 4. Les huit étapes (30 October 2026)
+1. Lire le layout (section 2), calculer les boucles de bord par chaînage des demi-arêtes orientées (intérieur à gauche, grâce à l'orientation cohérente des faces), vérifier un disque par patch. (30 October 2026)
+2. Trier les coins de chaque patch par POSITION sur la boucle (la liste du fichier n'est pas cyclique), couper la boucle en K côtés. (30 October 2026)
+3. Couper chaque côté aux nœuds étrangers (T-jonctions) : on obtient les arcs élémentaires partagés par deux patchs (ou un patch et le bord du maillage). (30 October 2026)
+4. Poser les cibles `g_a = len_a / h` (h = arête moyenne de `_rem_p0.obj` fois `scaleFact`, ou une cible par région), les paires miroir, la parité et la forme fermée de Tarini. (30 October 2026)
+5. Résoudre UN MILP global (section 5) : comptes `n_a`, entiers `s_(p,i)`, écarts élastiques. (30 October 2026)
+6. Pour chaque patch : polygone convexe cible, plongement de Tutte à valeur moyenne du maillage du patch, grille entière dans le polygone (grille directe si K = 4, K régions de coin de Tarini sinon), relèvement barycentrique (section 6). (30 October 2026)
+7. Souder par clés : les sommets de bord sont calculés une seule fois par arc, à abscisse curviligne j sur n_a ; deux voisins calculent la même clé donc le même sommet. (30 October 2026)
+8. Juger (plié, écrasé, valence, pôles, régularité), puis redresser (couche à concevoir, fichier `quad_straightening_30-October-2026.md`). (30 October 2026)
+
+Pseudo-code des étapes 1 à 5 (le code complet, testé, est dans `zr8_layout.py` et `zr8_counts.py`) : (30 October 2026)
+
+```python
+# 30 October 2026, steps 1 to 5. numpy / scipy only.
+lay = Layout(prefix)                          # reads _rem_p0.obj, .patch, .corners, .feature, .c_feature
+nodes = {c for cs in lay.corners for c in cs}
+arcs, sides = {}, {}
+for p in range(lay.npatch):
+    loop = lay.loops[p][0]                    # one loop per patch, interior on the left
+    pos = sorted(loop.index(c) for c in lay.corners[p])    # corners are NOT in cyclic order in the file
+    sides[p] = []
+    for a, b in zip(pos, pos[1:] + [pos[0] + len(loop)]):
+        chain = [loop[t % len(loop)] for t in range(a, b + 1)]
+        cuts = [0] + [t for t in range(1, len(chain) - 1) if chain[t] in nodes] + [len(chain) - 1]   # T junctions
+        side = []
+        for u, v in zip(cuts, cuts[1:]):
+            seq = chain[u:v + 1]
+            key = min(tuple(seq), tuple(seq[::-1]))
+            arcs.setdefault(key, {"len": polyline_length(lay.V[list(key)]), "patches": []})["patches"].append(p)
+            side.append((key, tuple(seq) == key))
+        sides[p].append(side)
+h = mean_edge(lay.V, lay.F) * scale
+sol = solve_counts(arcs, sides, edge=h, mirror_pairs=pairs)    # step 5, section 5
+```
+
+## 5. Le MILP global de comptes partagés (30 October 2026)
+Variables : `n_a` entier au moins 1 pour chaque arc ; `s_(p,i)` entier au moins 1 pour chaque côté de chaque patch de K = 3 ou de K = 5 à 8 côtés ; deux variables d'écart continues par égalité de Tarini (mode élastique) ; `t_a` pour l'erreur d'objectif. Code : `pass8_tools/zr8_counts.py`. (30 October 2026)
+
+| Contrainte | Forme | Origine | Date |
+|---|---|---|---|
+| Tarini | `e_i = s_(i-1) + s_(i+1)` pour tout côté i d'un patch de K = 3 ou de K = 5 à 8 côtés, avec `e_i` somme des `n_a` du côté | forme fermée d'un patch à N côtés avec un seul pôle de valence N, https://arxiv.org/abs/2101.11569 (article lu en entier à la passe 2 de l'agent local, voir `patch_conditions_tarini_30-October-2026.md`, non rouvert ici : arxiv.org est fermé) [DOC] | 30 October 2026 |
+| Parité | impliquée : la somme des `e_i` vaut 2 fois la somme des `s_i` | identité algébrique de l'égalité précédente, vérifiée aussi sur les 97 patchs de QuadWild [MESURÉ] | 30 October 2026 |
+| K = 4 | deux égalités `e_0 = e_2` et `e_1 = e_3`, SANS variables `s` | cas sans pôle ; un côté peut n'avoir qu'une arête (bande 1 x 34 de la patate). Mesure : avec les `s` imposés aussi à K = 4, 4 faux écarts sur les comptes de QuadWild, tous sur des côtés d'une arête [MESURÉ] | 30 October 2026 |
+| Miroir | `n_a = n_b` pour chaque paire d'arcs symétriques | détection géométrique par réflexion, tolérance 0,2 % de la diagonale (fonction `detect_mirror_pairs`) | 30 October 2026 |
+| Élastique | `e_i - s_(i-1) - s_(i+1) - u+ + u- = 0`, coût `M (u+ + u-)`, M = 200 | si le layout est infaisable, le solveur dit quels côtés violent la forme fermée au lieu de rendre « infaisable » | 30 October 2026 |
+
+Pourquoi les entiers `s_i` suffisent pour N = 3 et N de 5 à 8 (N = 4 se traite par deux égalités) : l'égalité `e_i = s_(i-1) + s_(i+1)` EST la forme fermée de Tarini (strict : `s_i` au moins 1), elle contient les inégalités triangulaires de N = 3, les trois-contre-deux de N = 5, les parités paires et impaires de N = 6, et laisse le solveur choisir les deux paramètres libres de N = 8. Un seul bloc de contraintes linéaires remplace donc les cas par cas. Le test indépendant `check_tarini` (formules de la table de `patch_conditions_tarini`) valide les comptes de sortie pour N de 3 à 6. [MESURÉ] (30 October 2026)
+
+Objectif : somme des erreurs au carré `(n_a - g_a)^2`, approchées par l'interpolation linéaire par morceaux aux entiers (cordes `t_a >= (k - g)^2 + (2k + 1 - 2g)(n_a - k)` pour k voisin de g : exacte aux entiers, 9 lignes par arc). (30 October 2026)
+
+| Objectif | Quads / cible sur le tore (arête 3x) | Remarque | Date |
+|---|---|---|---|
+| L1 `|n - g|` | 0,75 (364 quads pour 488) | la fonction est plate entre deux cibles opposées d'un même patch : le solveur tombe à une extrémité, biais de densité | 30 October 2026 |
+| carré relatif `(n - g)^2 / g` | 0,83 | favorise la plus petite cible (moyenne harmonique) | 30 October 2026 |
+| carré `(n - g)^2` (défaut) | 0,92 (448 quads) | moyenne arithmétique ; coïncide avec QuadWild sur 5 cas sur 9 | 30 October 2026 |
+
+Résultats mesurés sur le bac synthétique (arête cible = arête moyenne de `_rem_p0` fois `scaleFact`, quads et cible = aire sur h au carré) : sphère 1 092 quads pour une cible de 989 (QuadWild 1 092), tore 448 pour 488 (QuadWild 532), patate 692 pour 536 (QuadWild 688), tube 502 pour 430 (502), arche 486 pour 468 (486), équerre 470 pour 466 (470), patate dense 4 686 pour 4 820 (4 644), tore dense 10 318 pour 12 209 (12 596). [MESURÉ] Le gonflement vient des petits patchs : chaque arc a au moins 1 arête et la parité arrondit (même effet que le +35 % de la passe 7). (30 October 2026)
+
+Cibles par arc à brancher sur le même MILP sans changer sa structure : la corde pour les caps de bande (`targets[key] = corde`, passe 7), une taille locale par région (`weights` et `targets`), un compte imposé (`weights` très grand). [ESTIMÉ, deux de ces trois usages sont déjà exercés dans l'essai `counts=qw` de `zr8_hybrid.py`, qui impose les comptes de QuadWild par poids 1000] (30 October 2026)
+
+## 6. Remplissage intrinsèque et soudure, étape par étape (30 October 2026)
+Code : `pass8_tools/zr8_fill.py`. Le patch est un disque triangulé de bord fixé par l'étape 3. (30 October 2026)
+
+1. Polygone cible : K = 4, rectangle `e_0 x e_1` (cases carrées pour un patch 28 x 8 du tore) ; K différent de 4, polygone cyclique de côtés proportionnels aux `e_i` si le plus grand est plus petit que la somme des autres, sinon polygone régulier. Chaque côté reçoit une flèche de 1e-3 de sa longueur (parabole vers l'extérieur) pour que le polygone soit strictement convexe : les triangles dégénérés disparaissent (reprend la passe 3). (30 October 2026)
+2. Frontière du maillage dans le polygone : chaque sommet de bord d'un arc de compte `n_a` reçoit le paramètre `(C_a + phi n_a) / e_i`, `C_a` = comptes déjà passés sur le côté et `phi` = abscisse curviligne relative sur l'arc. Les sommets de bord de l'arc sont donc parcourus par abscisse curviligne, ce qui rend les positions des points de la grille indépendantes du patch voisin. (30 October 2026)
+3. Plongement de Tutte à poids de valeur moyenne (Floater) des sommets intérieurs : un système creux par patch (`scipy.sparse.linalg.spsolve`). Garantie de non-pli seulement si le polygone est convexe. [ESTIMÉ sur Floater 2003, https://people.engr.tamu.edu/schaefer/research/meanvalue.pdf, lu à la passe 3 de l'agent local] (30 October 2026)
+4. Grille dans le polygone : K = 4, transfinie de Coons sur les quatre courbes de bord. K différent de 4, K régions de coin autour du pôle : la région du coin i plus 1 est une grille `s_(i+1) x s_i`, bordée par les deux moitiés de côtés de longueurs `s_(i-1)` et `s_(i+1)` sur le côté i, `s_i` sur le côté i plus 1 et deux rayons de `s_i` et `s_(i+1)` arêtes vers le pôle. Chaque sommet reçoit une clé combinatoire (`corner`, `side`, `spoke`, `pole`, `reg`). (30 October 2026)
+5. Grille harmonique : les sommets libres de la grille sont repositionnés par UNE résolution creuse de Tutte à poids uniformes sur le graphe de la grille (point fixe du lissage laplacien itératif de la passe 7, obtenu sans itérer). La grille est un plongement valide (aire positive de chaque quad) sur les 9 exécutions. Un essai précédent (Coons seul dans des cerfs-volants non convexes) laissait 2 patchs non injectifs sur la sphère. [MESURÉ] (30 October 2026)
+6. Relèvement : chaque sommet intérieur de la grille est localisé dans le maillage plongé (`matplotlib.tri.Triangulation.get_trifinder`, carte trapézoïdale) puis relevé par coordonnées barycentriques (repli : triangle au centre le plus proche, 0 cas sur 9). Les sommets de bord ne sont jamais localisés : ils sortent directement de la polyligne de l'arc (`arc_points`). (30 October 2026)
+7. Soudure : dictionnaire clé globale vers indice. Aucun test de proximité, aucune tolérance. (30 October 2026)
+
+Pseudo-code de l'étape 6 (code testé dans `zr8_fill.fill_patch`) : (30 October 2026)
+
+```python
+# 30 October 2026, step 6, one patch.
+e = [sum(counts[k] for k, _ in side) for side in sides[p]]
+C = polygon_corners(e)                                   # rectangle if K == 4, cyclic polygon otherwise
+bidx, buv = boundary_uv(sides[p], counts, C)             # (C_a + phi * n_a) / e_i, side_point() adds the 1e-3 sagitta
+uv = mean_value_embed(V3, T, bidx, buv)                  # sparse solve, mean value weights
+keys, guv, quads = build_grid(e, s[p], C)                # Coons if K == 4, K Tarini corner regions otherwise
+guv = harmonic_uv(guv, quads, fixed={k for k in keys if k[0] in ("corner", "side")})   # one sparse solve
+tri = matplotlib.tri.Triangulation(uv[:, 0], uv[:, 1], T).get_trifinder()
+for key, i in interior_keys(keys):
+    t = tri(*guv[i]); bc = barycentric(uv[T[t]], guv[i]); pos[i] = bc @ V3[T[t]]
+for key, i in boundary_keys(keys):
+    pos[i] = arc_points(V, arc_of(key), counts[arc_of(key)])[rank_on_arc(key)]
+```
+
+## 7. Mesures, QuadWild contre hybride, même juge (30 October 2026)
+Juge de `pass8_tools/zr8_judge.py` (mêmes définitions que les passes précédentes : normale par les diagonales, Jacobien normalisé aux quatre coins, plié inférieur à 0, écrasé inférieur à 0,3), vérifié dans les deux sens sur une grille parfaite et une grille cassée. Maillages et exécutions : `compare_run.py`. « QW brut » = `quadrangulation.obj`, « QW lissé » = `quadrangulation_smooth.obj`, « hybride MILP » = nos comptes, « hybride QW » = les comptes de QuadWild retrouvés à partir de ses quads. Colonnes : Jmoy = Jacobien normalisé minimal par quad, moyenné ; CV arêtes = écart-type sur moyenne des longueurs d'arêtes. (30 October 2026)
+
+| Maillage (quads QW) | Méthode | Plié % | Écrasé % | Jmoy | CV arêtes | Pôles / 1000 | Date |
+|---|---|---|---|---|---|---|---|
+| sphère (1 092) | QW brut | 0,09 | 0,64 | 0,912 | 0,232 | 7,3 | 30 October 2026 |
+| sphère | QW lissé | 0 | 0 | 0,956 | 0,145 | 7,3 | 30 October 2026 |
+| sphère | hybride MILP et hybride QW | 0,09 | 0,64 | 0,912 | 0,232 | 7,3 | 30 October 2026 |
+| patate (688) | QW brut | 0,29 | 4,51 | 0,840 | 0,381 | 34,9 | 30 October 2026 |
+| patate | QW lissé | 0 | 0 | 0,955 | 0,228 | 34,9 | 30 October 2026 |
+| patate | hybride MILP (692 quads) | 0 | 3,18 | 0,856 | 0,388 | 34,7 | 30 October 2026 |
+| patate | hybride QW | 0,29 | 4,51 | 0,840 | 0,381 | 34,9 | 30 October 2026 |
+| patate dense (4 644) | QW brut | 0 | 0,02 | 0,939 | 0,338 | 5,2 | 30 October 2026 |
+| patate dense | QW lissé | 0 | 0 | 0,975 | 0,243 | 5,2 | 30 October 2026 |
+| patate dense | hybride MILP (4 686) | 0 | 0 | 0,947 | 0,338 | 5,1 | 30 October 2026 |
+| tore (532) | QW brut | 0 | 0 | 0,989 | 0,232 | 0 | 30 October 2026 |
+| tore | QW lissé | 0 | 0 | 0,997 | 0,203 | 0 | 30 October 2026 |
+| tore | hybride MILP (448) | 0 | 0 | 0,985 | 0,281 | 0 | 30 October 2026 |
+| tube courbe (502) | QW brut, hybride MILP | 0 | 0 | 0,936 | 0,163 | 15,9 | 30 October 2026 |
+| tube courbe | QW lissé | 0 | 0 | 0,971 | 0,141 | 15,9 | 30 October 2026 |
+| arche (486) | QW brut, QW lissé, hybride | 0 | 0 | 0,979 | 0,105 | 16,5 | 30 October 2026 |
+| équerre (470) | QW brut, QW lissé, hybride | 0 | 0 | 0,999 | 0,061 | 25,5 | 30 October 2026 |
+| bande (408) | QW brut, QW lissé, hybride | 0 | 0 | 0,999 | 0,029 | 0 | 30 October 2026 |
+
+Lectures : (30 October 2026)
+1. À comptes égaux, le remplissage maison et celui de QuadWild coïncident (sphère, tube, arche, équerre, bande au millième). La section 28 du fichier du projet notait que Tutte « n'est pas plus régulier » que QuadWild : elle s'explique ainsi, le remplissage de QuadWild est déjà un plongement harmonique d'un patron de Takayama dans un polygone, et c'est le LISSAGE FINAL qui fait la différence (patate : Jmoy 0,840 vers 0,955, écrasé 4,5 % vers 0 %). (30 October 2026)
+2. Sur la hard surface (arche, équerre, bande), le lissage final ne change presque rien (0,979 vers 0,979 ; 0,999 vers 0,999) : les arêtes vives et les patchs à côtés droits laissent peu de liberté. Le redressement utile se joue sur les patchs organiques à 3 ou 5 côtés. (30 October 2026)
+3. Le MILP pur (isométrie seule plus Tarini, alors que le coût de QuadWild donne 99,5 % du poids à la régularité avec alpha 0,005) retrouve des comptes très proches (patate : 692 quads contre 688 pour une cible de 536, les deux gonflent) ; il ne gagne pas en régularité, et ne réduit pas non plus les écrasés de la patate (3,18 % contre 4,51 % bruts). (30 October 2026)
+4. Sur les 18 exécutions hybrides (9 maillages, comptes MILP puis comptes de QuadWild) : 0 patch en échec, 0 patch non injectif dans le plan, 0 localisation de repli, 0 violation de la forme fermée, 0 arête non variété. Le seul quad plié de la sphère (0,09 %) est déjà dans la sortie brute de QuadWild. [MESURÉ] (30 October 2026)
+
+## 8. Trois modes de l'hybride (30 October 2026)
+| Mode | Comptes | Quads de patch | Redressement | Quand | Date |
+|---|---|---|---|---|---|
+| A, tout ZenRay | MILP (miroir, densité par région, Tarini 3 à 8, élastique) | Tutte maison | couche 4 à concevoir | layouts de ZenRay Lines, patchs à 7 et 8 côtés, symétrie exacte | 30 October 2026 |
+| B, QuadWild d'abord | ceux de QuadWild (ou MILP si on veut le miroir) | quads de QuadWild gardés | lissage de QuadWild remplacé par un redressement à garanties (couche 4) | organique, layout automatique | 30 October 2026 |
+| C, tournoi par patch | un seul MILP pour tous | pour chaque patch le meilleur de {Tutte maison, quads de QuadWild, motif de Takayama} sur plié, écrasé et Jacobien moyen | couche 4 sur l'ensemble | cas mixtes, voiture | 30 October 2026 |
+
+Condition d'interchangeabilité du tournoi : tous les candidats d'un patch partagent exactement les mêmes sommets de bord (positions à abscisse curviligne j sur n_a de chaque arc). Vérifié pour QuadWild BRUT : les comptes retrouvés et les mesures identiques à comptes égaux montrent que ses sommets de bord sont à cette abscisse (la médiane des distances entre milieux d'arêtes de bord de QuadWild et polylignes d'arcs est de 0,0035 à 0,0038, soit 3 à 11 % d'une arête, écart de corde et non de position). [MESURÉ] Après le lissage de QuadWild les sommets de bord glissent : le tournoi doit être fait AVANT lissage, le redressement venant après la soudure, avec les sommets d'arc libres de glisser le long de leur arc (1D) et les nœuds fixes. (30 October 2026)
+
+## 9. Risques et parades (30 October 2026)
+| Risque | Cause ou mesure | Parade proposée | Date |
+|---|---|---|---|
+| Licence | quadwild-bimdf est sous GPL v3 (fichier `LICENSE`, https://github.com/cgg-bern/quadwild-bimdf/blob/e722c7e961982cf61db7c10812329dd0fc7d60df/LICENSE) ; vcglib sous GPL v3 (`LICENSE.txt` au commit 5cae2ab) ; le miroir de CoMISo sous GPL v3 ; libSatsuma sous licence MIT (copyright 2023 Martin Heistermann, https://github.com/cgg-bern/libsatsuma/blob/4e96979ecb11bbfe8d9c05e8f8be1ecb992ca5fd/LICENSE) ; LEMON sous sa licence permissive propre [DOC, fichiers lus dans le bac à sable] | appeler les exécutables comme outils externes et échanger des fichiers (frontière de processus) ; ou réécrire le tracé ; avis juridique non obtenu [ESTIMÉ] | 30 October 2026 |
+| Ordre des coins | `.corners` non cyclique | toujours trier par position sur la boucle (fait, `Layout.arcs`) | 30 October 2026 |
+| Indexation | tous les indices se rapportent à `_rem_p0.obj` | garder ce fichier comme référence unique de distance et de projection | 30 October 2026 |
+| Patchs de plus de 5 côtés | le tracé plafonne MaxVal à 5 ; QuadWild refuse N hors de 2 à 6 au remplissage | notre MILP et notre remplissage couvrent 3 à 8 : pour 6 à 8 côtés, il faut le layout de ZenRay Lines ou un tracé modifié | 30 October 2026 |
+| Patchs non disques, anneaux | aucun dans les 9 exécutions (tous les patchs ont une boucle) ; 25 anneaux sur l'arche de la passe 7 [lu dans `tutte_fill_pass7_30-October-2026.md`] | prévoir `belt` / `cut` de la passe 7 dans la couche de comptes (fichier `rings_shared_counts` à écrire, passe 10) | 30 October 2026 |
+| Cisaillement des patchs allongés | patchs 28 x 8 (tore), 3 x 33 (arche) : cases carrées dans le rectangle mais pas sur la surface | cap étroit et corde de la passe 7 (passe 10) | 30 October 2026 |
+| Symétrie | layouts non symétriques (0 paire sur la sphère) | quadrangulation d'une moitié puis reflet, pas de contrainte miroir sur un layout asymétrique | 30 October 2026 |
+| Distance à l'entrée | l'hybride relève sur `_rem_p0.obj`, distance nulle à CE maillage ; la distance à l'entrée originale n'est pas mesurée ici | mesurer `dist(entrée, _rem_p0)` une fois, borne de l'écart total | 30 October 2026 |
+| Passage à l'échelle | MILP de 0,53 s pour 74 arcs (patate dense) [MESURÉ] ; arche de la passe 7 : 1 208 arcs en 0,2 à 0,9 s avec un autre solveur [lu dans `tutte_fill_pass7_30-October-2026.md`] | temps limite et mode élastique | 30 October 2026 |
+| Sommets de bord vifs | arcs vifs : 12 sur 12 (arche), 20 sur 22 (équerre) | arcs marqués `feature`, glissement interdit hors de leur polyligne | 30 October 2026 |
+
+## 10. Prochaines questions (30 October 2026)
+1. Redressement à garanties applicable après la soudure : quel énergie, quel solveur, quelle garantie d'injectivité (fichier `quad_straightening_30-October-2026.md`) ? (30 October 2026)
+2. Symétrie exacte : moitié de layout, reflet des clés, soudure sur le plan (essai sur l'arche et le tore à la passe 10). (30 October 2026)
+3. Anneaux et caps étroits dans les comptes partagés, avec cibles par corde. (30 October 2026)
+4. Tournoi par patch : mesure de la part de patchs où QuadWild brut bat Tutte maison (sur les 18 exécutions : zéro écart, donc il faut des layouts plus difficiles). (30 October 2026)

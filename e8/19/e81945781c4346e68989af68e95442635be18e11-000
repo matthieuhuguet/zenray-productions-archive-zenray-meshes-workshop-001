@@ -1,0 +1,33 @@
+"""Pass 9 : scan a hybrid output for folded or squashed quads and for quads whose four vertices are all on hard edges (feature arcs or feature nodes).
+Usage : python3 -I scan_fixed_quads.py base=WORK names=hard:micro_stairs,... scale=2.5   Written 30 October 2026.
+FR : repere les quads plies ou ecrases et ceux dont les quatre sommets sont tous sur des aretes vives."""
+import sys, collections
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_hybrid as H, zr8_judge as J, zr8_io as IO
+
+
+def classify_vertices(r):
+    arcs, keys = r["arcs"], r["vkeys"]
+    feat_node = set()
+    for k, v in arcs.items():
+        if v["feature"]:
+            feat_node.add(int(k[0])); feat_node.add(int(k[-1]))
+    node_f = np.array([k[0] == "node" and k[1] in feat_node for k in keys])
+    arc_f = np.array([k[0] == "arc" and arcs[k[1]]["feature"] for k in keys])
+    return node_f, arc_f
+
+
+if __name__ == "__main__":
+    a = dict(kv.split("=", 1) for kv in sys.argv[1:]); base = a["base"]; scale = a.get("scale", "2.5")
+    for spec in a["names"].split(","):
+        d, n = spec.split(":"); pre = "%s/%s/%s_rem_p0" % (base, d, n)
+        r = H.build({"prefix": pre, "scale": scale, "counts": "qw", "dump": pre + "_123_dump.txt", "quad": pre + "_123_quadrangulation.obj"})
+        P, Q = r["P"], r["Q"]; node_f, arc_f = classify_vertices(r)
+        on = node_f | arc_f
+        Jm = J.corner_jacobians(P, Q).min(axis=1)
+        all_on = on[Q].all(axis=1); all_fixed = node_f[Q].all(axis=1); all_node_or_arc2 = (node_f[Q].sum(axis=1) >= 2) & all_on
+        Vs, Qs = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation_smooth.obj"); Js = J.corner_jacobians(Vs, Qs).min(axis=1)
+        bad = Jm < 0.3
+        print("%-14s quads %5d | raw: folded %d squashed %d | 4 vertices on hard edges %d (with 2 or more fixed nodes %d, 4 fixed nodes %d) | bad quads among those %d | QW smooth: folded %d squashed %d"
+              % (n, len(Q), (Jm < 0).sum(), bad.sum(), all_on.sum(), all_node_or_arc2.sum(), all_fixed.sum(), (bad & all_on).sum(), (Js < 0).sum(), (Js < 0.3).sum()))

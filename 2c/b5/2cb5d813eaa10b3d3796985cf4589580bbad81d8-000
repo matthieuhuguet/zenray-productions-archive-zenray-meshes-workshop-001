@@ -1,0 +1,164 @@
+"""Pass 7 : the patches of a mesh welded. (A) independent patches (the current state), (B) weld by tolerance, (C) shared arc counts : ONE global MILP (ZrlCounts.solve) over all patches, elementary arcs cut at every corner of every patched zone.
+FR : recollage des patchs : A indépendants, B soudure par tolérance, C comptes d'arêtes partagés par un MILP global."""
+import sys, json, time, collections, os
+sys.path.insert(0, '.'); import numpy as np, ZrlTutte7 as T, ZrlAnnulus7 as A
+from scipy.spatial import cKDTree
+import ZrlTopoJudge as TJ
+GT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/"
+
+def write_obj(path, V, F):
+    with open(path, "w") as f: f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V) + "".join("f " + " ".join(str(int(x) + 1) for x in q) + "\n" for q in F))
+
+def corner_preps(m, zones, opts):
+    """corners only (no counts) for every disk zone that has a patch : {zone: prep}"""
+    prs = {}
+    for z, (Z, seed) in enumerate(zones):
+        pr = T.prep(m, Z, 0.0, dict(T.OPTS, **opts, corners_only=True))
+        if "fail" in pr: continue
+        if opts.get("skip_tiny3") and pr["K"] == 3 and len(Z) <= opts["skip_tiny3"]: continue
+        prs[z] = pr
+    return prs
+
+def build_layout(m, prs):
+    nodes = set()
+    for pr in prs.values(): nodes |= {int(pr["B"][c]) for c in pr["ci"]}
+    key2name = {}; poly = {}; length = {}; zarcs = {}; P = m["P"]
+    for z, pr in prs.items():
+        B = pr["B"]; nB = len(B); pos = [i for i in range(nB) if int(B[i]) in nodes]; lst = []
+        for a_i, pa in enumerate(pos):
+            pb = pos[(a_i + 1) % len(pos)]; span = (pb - pa) % nB or nB; seq = [int(B[(pa + t) % nB]) for t in range(span + 1)]
+            key = min(tuple(seq), tuple(seq[::-1]))
+            if key not in key2name: key2name[key] = "e%d" % len(key2name); poly[key2name[key]] = key; length[key2name[key]] = float(np.linalg.norm(np.diff(P[list(key)], axis=0), axis=1).sum())
+            lst.append((pa, key2name[key]))
+        zarcs[z] = lst
+    side_arcs = {}; patches = []
+    for z, pr in prs.items():
+        nB = len(pr["B"]); ci = pr["ci"]; K = pr["K"]; sides = [[] for _ in range(K)]
+        for (qa, name) in sorted(zarcs[z], key=lambda t: (t[0] - ci[0]) % nB):
+            off = (qa - ci[0]) % nB; k = max(i for i in range(K) if (ci[i] - ci[0]) % nB <= off); sides[k].append(name)
+        if any(len(s) == 0 for s in sides): continue
+        side_arcs[z] = sides; patches.append({"name": "Z%d" % z, "sides": sides})
+    use = collections.Counter(a for z in side_arcs for sd in side_arcs[z] for a in sd); real = dict(length); tgt = dict(length); capuse = collections.defaultdict(list)
+    for z, pr in prs.items():
+        if z not in side_arcs: continue
+        for k, chord in (pr.get("cap_chord") or {}).items():                  # a cap counts by its chord (the true width of the strip) : an arc gets the scaled target length when EVERY patch that uses it sees it as a cap
+            for a in side_arcs[z][k]: capuse[a].append(real[a] * chord / max(pr["sl"][k], 1e-12))
+    for a, v in capuse.items():
+        if len(v) == use[a]: tgt[a] = min(v)
+    return {"arcs": tgt, "real": real, "mirror": [], "patches": patches}, side_arcs, poly
+
+def solve_global(lay, edge, tmax=300):
+    CT = T.CT; CT.PARAMS["time_limit_s"] = tmax; t0 = time.time(); sol = CT.solve(lay, edge); dropped = []
+    if not sol.get("ok"):
+        el = CT.solve(lay, edge, elastic=True); bad = set(el.get("violations", {})) if el.get("ok") else set(); dropped = sorted(bad)
+        keep = [p for p in lay["patches"] if p["name"] not in bad]; used = {a for p in keep for s in p["sides"] for a in s}; lay = dict(lay, patches=keep, arcs={a: v for a, v in lay["arcs"].items() if a in used}, real=lay["real"]); sol = CT.solve(lay, edge)
+    return sol, lay, dropped, time.time() - t0
+
+def apply_counts(prs, side_arcs, sol, lay):
+    counts = sol["counts"]; names = {p["name"] for p in lay["patches"]}; out = {}
+    for z, pr in prs.items():
+        if "Z%d" % z not in names: continue
+        K = pr["K"]; e = [int(sum(counts[a] for a in side_arcs[z][k])) for k in range(K)]; bps = {}
+        for k in range(K):
+            off = 0.0; pts = []
+            for a in side_arcs[z][k]: n = counts[a]; l = lay["real"][a]; pts += [off + j * l / n for j in range(n)]; off += l
+            pts.append(off); bps[k] = np.array(pts)
+        q = dict(pr); q["e"] = e; q["sp"] = sol["tarini"].get("Z%d" % z) if K != 4 else None; q["bps"] = bps; q["sl"] = [float(bps[k][-1]) for k in range(K)]; out[z] = q
+    return out
+
+def fill_all(m, prs, edge, opts):
+    V = []; Q = []; parts = []; off = 0; fails = collections.Counter()
+    for z, pr in prs.items():
+        try: P3, Qd, rep = T.fill(m, pr["Z"], edge, dict(T.OPTS, **opts), pr=pr)
+        except Exception as ex: P3 = None; rep = {"fail": "error " + str(ex)[:30]}
+        if P3 is None: fails[rep.get("fail", "?")] += 1; continue
+        V.append(P3); Q.append(Qd + off); off += len(P3); parts += [z] * len(Qd)
+    return (np.vstack(V), np.vstack(Q), np.array(parts), fails) if V else (None, None, None, fails)
+
+def edge_counts(Q):
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
+    return ec
+
+def shared_samples(m, lay, side_arcs, poly, edge):
+    use = collections.Counter(a for z in side_arcs for s in side_arcs[z] for a in s); pts = []; L = 0.0; P = m["P"]
+    for a, c in use.items():
+        if c < 2: continue
+        X = P[list(poly[a])]; L += lay["real"][a]
+        for i in range(len(X) - 1):
+            n = max(2, int(np.linalg.norm(X[i + 1] - X[i]) / (0.02 * edge))); pts.append(X[i] + (X[i + 1] - X[i]) * np.linspace(0, 1, n, endpoint=False)[:, None])
+    return (np.vstack(pts) if pts else np.zeros((0, 3))), L
+
+def crack(V, Q, samples, Lsh, edge):
+    """length of the open quad edges lying on the shared arcs / (2 x the shared length) : 0 = every shared arc is closed on both sides, 1 = open on both sides"""
+    if not len(samples): return 0.0, 0
+    ec = edge_counts(Q); tr = cKDTree(samples); n = 0; L = 0.0
+    for (a, b), c in ec.items():
+        if c != 1: continue
+        if tr.query(0.5 * (V[a] + V[b]))[0] < 0.03 * edge and tr.query(V[a])[0] < 0.03 * edge and tr.query(V[b])[0] < 0.03 * edge: n += 1; L += float(np.linalg.norm(V[a] - V[b]))
+    return L / max(2 * Lsh, 1e-12), n
+
+def tol_weld(V, Q, parts, edge, r_frac=0.35):
+    """B : boundary vertices of different patches closer than r_frac x edge are merged (union find, positions averaged) ; quads that lose a vertex are dropped."""
+    ec = edge_counts(Q); bv = sorted({v for (a, b), c in ec.items() if c == 1 for v in (a, b)}); owner = collections.defaultdict(set)
+    for qi, q in enumerate(Q):
+        for v in q: owner[int(v)].add(int(parts[qi]))
+    X = V[bv]; tr = cKDTree(X); parent = {v: v for v in bv}
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for i, j in tr.query_pairs(r_frac * edge):
+        a, b = bv[i], bv[j]
+        if owner[a].isdisjoint(owner[b]): parent[find(a)] = find(b)
+    grp = collections.defaultdict(list)
+    for v in bv: grp[find(v)].append(v)
+    V2 = V.copy(); remap = np.arange(len(V))
+    for r, g in grp.items():
+        if len(g) > 1: V2[r] = V[g].mean(0)
+        for v in g: remap[v] = r
+    Q2 = remap[Q]; ok = np.array([len(set(q)) == 4 for q in Q2]); used = np.unique(Q2[ok]); m_ = -np.ones(len(V2), int); m_[used] = np.arange(len(used))
+    return V2[used], m_[Q2[ok]], int((~ok).sum()), sum(1 for g in grp.values() if len(g) > 1)
+
+def crack_overlay(V, Q, samples, edge, out):
+    """the quads plus, on every crack edge, a bow tie quad (self crossing, so the board paints it red) : makes the open edges along shared arcs visible"""
+    ec = edge_counts(Q); tr = cKDTree(samples) if len(samples) else None; extra = []; Vx = [tuple(p) for p in V]; n0 = len(V)
+    for (a, b), c in ec.items():
+        if c != 1 or tr is None: continue
+        if tr.query(0.5 * (V[a] + V[b]))[0] < 0.03 * edge and tr.query(V[a])[0] < 0.03 * edge and tr.query(V[b])[0] < 0.03 * edge:
+            d = (V[b] - V[a]); nrm = np.cross(d, np.array([0.0, 0.0, 1.0])); nrm = nrm / max(np.linalg.norm(nrm), 1e-9) if np.linalg.norm(nrm) > 1e-9 else np.array([0, 1.0, 0]); off = 0.35 * edge * nrm
+            i = len(Vx); Vx += [tuple(V[a] + off), tuple(V[b] + off)]; extra.append([a, b, i, i + 1])
+    write_obj(out, np.array(Vx), list(Q) + extra)
+
+def report(tag, V, Q, obj, samples, Lsh, edge, extra=None):
+    V, Q = A.weld(V, Q, 1e-6); out = "dbg/_w_%s.obj" % tag; write_obj(out, V, Q); crack_overlay(V, Q, samples, edge, "dbg/_wc_%s.obj" % tag); j = TJ.judge(out, obj); ec = edge_counts(Q); cf, n = crack(V, Q, samples, Lsh, edge); nonman = sum(1 for c in ec.values() if c > 2)
+    r = dict(tag=tag, quads=len(Q), folded=j["folded"], squashed=j["squashed"], squashed_pct=round(100 * j["squashed_share"], 2), folded_pct=round(100 * j["folded_share"], 2), open_edges=sum(1 for c in ec.values() if c == 1), nonmanifold=nonman, crack_fraction=round(cf, 3), crack_edges=n, dev=j["dev_mean_frac_diag"])
+    if extra: r.update(extra)
+    return r, V, Q
+
+def main(mesh, edge, mf, opts, tmax=300):
+    obj = GT + mesh + ".obj"; m = T.AP.mesh(obj); zones = T.ANY.segment(m, 25.0, max(1, int(mf * len(m["F"]))), merge_deg=35.0, log=lambda s: None); tri = m["P"][m["F"]]; area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); tot = float(area.sum())
+    prs = corner_preps(m, zones, opts); lay, side_arcs, poly = build_layout(m, prs); samples, Lsh = shared_samples(m, lay, side_arcs, poly, edge); res = []
+    print("zones with corners", len(prs), "arcs", len(lay["arcs"]), "shared arc length %.2f" % Lsh, flush=True)
+    # A : independent counts per zone (the current state)
+    prsA = {}
+    for z, pr in prs.items():
+        q = T.prep(m, pr["Z"], edge, dict(T.OPTS, **opts))
+        if "fail" not in q: prsA[z] = q
+    V, Q, parts, fails = fill_all(m, prsA, edge, opts); cov = sum(float(area[prs[z]["Z"]].sum()) for z in prsA) / tot
+    rA, VA, QA = report("A_independent", V, Q, obj, samples, Lsh, edge, dict(coverage=round(cov, 3), patches=len(prsA))); res.append(rA)
+    # B : tolerance weld of A
+    VW, QW = A.weld(V, Q, 1e-6); parts_w = parts
+    V2, Q2, dropped, merged = tol_weld(VW, QW, parts, edge); rB, _, _ = report("B_tol_weld", V2, Q2, obj, samples, Lsh, edge, dict(coverage=round(cov, 3), degenerate_dropped=dropped, merged_groups=merged)); res.append(rB)
+    # C : shared counts (global MILP)
+    sol, lay2, dropped_p, secs = solve_global(lay, edge, tmax)
+    if not sol.get("ok"): print("global solve failed", sol); return res
+    prsC = apply_counts(prs, side_arcs, sol, lay2); V, Q, parts, failsC = fill_all(m, prsC, edge, opts); covC = sum(float(area[prsC[z]["Z"]].sum()) for z in prsC if z in set(np.unique(parts))) / tot
+    samples2, Lsh2 = shared_samples(m, lay2, {z: side_arcs[z] for z in prsC}, poly, edge)
+    rC, VC, QC = report("C_shared_counts", V, Q, obj, samples2, Lsh2, edge, dict(coverage=round(covC, 3), patches=len(prsC), milp_s=round(secs, 1), dropped_patches=len(dropped_p), mean_rel_dev=round(sol["mean_rel_dev"], 3), fills_failed=dict(failsC))); res.append(rC)
+    rA2, _, _ = report("A_on_C_arcs", *fill_all(m, prsA, edge, opts)[:2], obj, samples2, Lsh2, edge); res.append(rA2)
+    return res
+
+if __name__ == "__main__":
+    mesh, edge, mf = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]); opts = json.loads(sys.argv[4]) if len(sys.argv) > 4 else {}
+    for r in main(mesh, edge, mf, opts): print(json.dumps(r))

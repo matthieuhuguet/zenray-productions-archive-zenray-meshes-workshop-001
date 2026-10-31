@@ -1,0 +1,149 @@
+"""30 October 2026 : robust corner detection (3 to 8 true corners) on the boundary of a mesh zone : multi scale Douglas-Peucker persistence + turning angle in the local tangent plane + repair of the corner count. numpy only.
+Used with the project modules imported read-only. python -I corners5.py"""
+import sys, os, collections, json
+sys.dont_write_bytecode = True
+SD = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines'; sys.path.insert(0, SD)
+import numpy as np
+import ZrlAutoPatch as AP, ZrlAny as ANY
+
+# ------------------------------------------------------------ boundary resampling with local normals
+def resample_loop(P, normals, n):
+    """closed polyline P (k,3) with a normal per vertex -> n points equally spaced in arc length, with interpolated unit normals."""
+    Y = np.vstack([P, P[:1]]); NN = np.vstack([normals, normals[:1]]); cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(Y, axis=0), axis=1))]
+    t = np.linspace(0, cum[-1], n, endpoint=False); X = np.stack([np.interp(t, cum, Y[:, k]) for k in range(3)], 1); Nr = np.stack([np.interp(t, cum, NN[:, k]) for k in range(3)], 1)
+    Nr /= np.maximum(np.linalg.norm(Nr, axis=1, keepdims=True), 1e-12); return X, Nr, cum[-1]
+
+def tangent_turn(X, Nr, i, j, k):
+    """signed turning angle (deg) at X[j] between the chords i->j and j->k, measured in the tangent plane of the normal at j."""
+    u = X[j] - X[i]; v = X[k] - X[j]; n = Nr[j]; u = u - (u @ n) * n; v = v - (v @ n) * n
+    a, b = np.linalg.norm(u), np.linalg.norm(v)
+    if a < 1e-12 or b < 1e-12: return 0.0
+    c = np.clip(u @ v / (a * b), -1, 1); s = np.cross(u, v) @ n / (a * b); return float(np.degrees(np.arctan2(s, c)))
+
+# ------------------------------------------------------------ Douglas-Peucker on a closed loop
+def dp_closed(X, eps):
+    """indices of a Douglas-Peucker simplification of the closed polyline X with tolerance eps (distance in 3D)."""
+    n = len(X); a = 0; d = np.linalg.norm(X - X[a], axis=1); b = int(np.argmax(d)); keep = {a, b}
+    def rec(i, j):                                  # open arc i -> j (indices modulo n, going forward)
+        idx = [(i + t) % n for t in range(1, ((j - i) % n))]
+        if not idx: return
+        p, q = X[i], X[j]; qq = q - p; L = max(np.linalg.norm(qq), 1e-12)
+        dist = np.array([np.linalg.norm(np.cross(X[m] - p, qq)) / L if np.linalg.norm(qq) > 1e-12 else np.linalg.norm(X[m] - p) for m in idx])
+        k = int(np.argmax(dist))
+        if dist[k] > eps: m = idx[k]; keep.add(m); rec(i, m); rec(m, j)
+    rec(a, b); rec(b, a); return sorted(keep)
+
+# ------------------------------------------------------------ the detector
+PARAMS = dict(n=360, eps_frac=(0.004, 0.008, 0.016, 0.032), cluster_frac=0.025, t_fine=28.0, t_coarse=35.0, ratio=0.55, spike_concave=150.0, max_corners=8)
+
+def detect(P, normals, prm=PARAMS):
+    """true corners of a closed boundary : Douglas-Peucker at four tolerances (scale space), the turns of the kept vertices are integrated inside clusters (a tip that is rounded gives two vertices), a cluster is a corner when
+    its integrated turn is >= t_fine at the finest scale, >= t_coarse at the coarsest scale and the two are of the same order (turn_fine / turn_coarse >= ratio : a smooth arc gives a turn that grows like sqrt(tolerance), a corner does not).
+    A concave turn above spike_concave is a slit and never a corner ; a convex turn up to 180 (the tip of a strip) is allowed. returns (indices in the resampled loop, integrated turns, resampled loop, perimeter)."""
+    n = prm["n"]; X, Nr, per = resample_loop(P, normals, n); S = len(prm["eps_frac"]); verts = []                                  # (sample, scale, signed turn)
+    for s, ef in enumerate(prm["eps_frac"]):
+        K = dp_closed(X, ef * per)
+        if len(K) == 2: verts += [(K[0], s, 180.0), (K[1], s, 180.0)]; continue                 # a strip or a lens collapses to two vertices : its two tips, convex U-turns
+        if len(K) < 3: continue
+        for a in range(len(K)): verts.append((K[a], s, tangent_turn(X, Nr, K[a - 1], K[a], K[(a + 1) % len(K)])))
+    coarse = [t for (j, s, t) in verts if s == S - 1]; sign = 1.0 if sum(coarse) >= 0 else -1.0                                      # loop orientation : convex turns have the sign of the total turning
+    # local width : distance from a sample to the boundary samples that are far away along the arc (the other side of a strip)
+    far = max(3, int(prm.get("width_arc", 0.1) * n)); D = np.linalg.norm(X[:, None, :] - X[None, :, :], axis=2); idxs = np.arange(n); sep = np.minimum(np.abs(idxs[:, None] - idxs[None, :]), n - np.abs(idxs[:, None] - idxs[None, :])); W = np.where(sep >= far, D, np.inf).min(axis=1)
+    gmax = prm.get("gap_max", 0.06) * n; pts = sorted({j for j, s, t in verts if sign * t > 5.0}); clusters = []
+    def close(a, b): return min(abs(a - b), n - abs(a - b)) <= gmax and np.linalg.norm(X[a] - X[b]) <= prm.get("merge_width", 0.5) * min(W[a], W[b])
+    for j in pts:
+        if clusters and close(clusters[-1][-1], j): clusters[-1].append(j)
+        else: clusters.append([j])
+    if len(clusters) > 1 and close(clusters[-1][-1], clusters[0][0]): clusters[0] = clusters.pop() + clusters[0]
+    out = []
+    for c in clusters:
+        cs = set(c); T = []
+        for s in range(S): T.append(min(180.0, sum(sign * t for (j, ss, t) in verts if ss == s and j in cs and sign * t > 0)))
+        # concave spikes are filtered because only convex (sign) turns are summed
+        if T[0] >= prm["t_fine"] and T[-1] >= prm["t_coarse"] and T[0] / max(T[-1], 1e-9) >= prm["ratio"]:
+            best = max(c, key=lambda j: max([sign * t for (jj, ss, t) in verts if jj == j] or [0])); out.append((best, T[-1]))
+    out.sort(key=lambda r: -r[1]); out = out[:prm["max_corners"]]; out.sort(key=lambda r: r[0])
+    return [r[0] for r in out], [r[1] for r in out], X, per
+
+# ------------------------------------------------------------ ground truth : where the neighbour zone changes along the boundary
+def zone_labels(m, zones):
+    lab = -np.ones(len(m["F"]), int)
+    for r, (Z, s) in enumerate(zones): lab[Z] = r
+    return lab
+
+def boundary_runs(m, lab, r, Z, B):
+    """neighbour label of every boundary edge of zone r along the ordered loop B ; returns labels and perimeter fractions ; mesh border = -2."""
+    inz = np.zeros(len(m["F"]), bool); inz[Z] = True; edge_nb = {}
+    for t in Z:
+        for k in range(3):
+            u = m["nb"][t, k]
+            if u < 0: edge_nb[(int(m["F"][t, k]), int(m["F"][t, (k + 1) % 3]))] = -2
+            elif not inz[u]: edge_nb[(int(m["F"][t, k]), int(m["F"][t, (k + 1) % 3]))] = int(lab[u])
+    labs = [edge_nb.get((int(B[i]), int(B[(i + 1) % len(B)])), -3) for i in range(len(B))]
+    L = np.linalg.norm(np.diff(m["P"][np.r_[B, B[:1]]], axis=0), axis=1); return labs, L
+
+def topological_corners(labs, L, merge_frac=0.03):
+    """number of sides = runs of constant neighbour label (cyclic) after absorbing runs shorter than merge_frac of the perimeter ; and the arc positions (fractions) of the run starts."""
+    n = len(labs); per = L.sum(); runs = []
+    start = next((i for i in range(n) if labs[i] != labs[i - 1]), None)
+    if start is None: return 0, []
+    i = start; 
+    while True:
+        j = i; ln = 0.0
+        while labs[j % n] == labs[i % n] and (j - i) < n: ln += L[j % n]; j += 1
+        runs.append([labs[i % n], ln, i % n]); i = j
+        if (i - start) >= n: break
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for q in range(len(runs)):
+            if runs[q][1] < merge_frac * per and len(runs) > 2:
+                prev = runs[q - 1]; nxt = runs[(q + 1) % len(runs)]
+                if prev[0] == nxt[0] or True:
+                    tgt = prev if prev[1] >= nxt[1] else nxt; tgt[1] += runs[q][1]; runs.pop(q); changed = True; break
+        # merge equal consecutive labels
+        k = 0
+        while k < len(runs) and len(runs) > 1:
+            if runs[k][0] == runs[(k + 1) % len(runs)][0] and len(runs) > 1: runs[k][1] += runs[(k + 1) % len(runs)][1]; runs.pop((k + 1) % len(runs)); changed = True
+            else: k += 1
+    cum = np.r_[0, np.cumsum(L)]
+    return (len(runs) if len(runs) > 1 else 0), [cum[r[2]] / per for r in runs] if len(runs) > 1 else []
+
+def vertex_normals_on_loop(m, Z, B):
+    acc = collections.defaultdict(lambda: np.zeros(3))
+    A = np.linalg.norm(np.cross(m["P"][m["F"][Z, 1]] - m["P"][m["F"][Z, 0]], m["P"][m["F"][Z, 2]] - m["P"][m["F"][Z, 0]]), axis=1)
+    for t, a in zip(Z, A):
+        for v in m["F"][t]: acc[int(v)] += m["N"][t] * a
+    N = np.array([acc[int(v)] for v in B]); return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+
+def evaluate(obj, merge_deg=35.0):
+    m = AP.mesh(os.path.abspath(obj)); zones = ANY.segment(m, 25.0, max(4, int(0.002 * len(m["F"]))), merge_deg=merge_deg, log=lambda s: None); lab = zone_labels(m, zones); rows = []
+    for r, (Z, seed) in enumerate(zones):
+        Ls, ln = AP.loops(m, Z)
+        if len(Ls) != 1: rows.append(dict(zone=r, loops=len(Ls), tris=len(Z))); continue
+        B = np.asarray(Ls[0]); labs, L = boundary_runs(m, lab, r, Z, B); top, topfrac = topological_corners(labs, L)
+        Nl = vertex_normals_on_loop(m, Z, B); idx, turns, X, per = detect(m["P"][B], Nl)
+        # AP.corners : default (4) and 8 searched ; true corner = turn >= 35
+        Xa, tot = AP.resample_closed(m["P"][B], AP.PARAMS["step_m"]); nrm = m["N"][Z].mean(0); nrm /= np.linalg.norm(nrm)
+        C4, t4 = AP.corners(Xa, tot, nrm, dict(AP.PARAMS, max_corners=4)); C8, t8 = AP.corners(Xa, tot, nrm, dict(AP.PARAMS, max_corners=8))
+        ap4_true = sum(1 for c in C4 if t4[c] >= 35); ap8_true = sum(1 for c in C8 if t8[c] >= 35)
+        # recall / precision of positions against topological corners (arc fractions, tolerance 3 percent)
+        det_frac = [i / len(X) for i in idx]; tf = topfrac
+        def near(a, b): d = abs(a - b); return min(d, 1 - d) <= 0.03
+        rec = sum(1 for a in tf if any(near(a, b) for b in det_frac)); prec = sum(1 for b in det_frac if any(near(a, b) for a in tf))
+        rows.append(dict(zone=r, loops=1, tris=len(Z), top=top, det=len(idx), ap4=len(C4), ap4_true=ap4_true, ap8_true=ap8_true, rec=rec, prec=prec, ntop=len(tf), per=float(per)))
+    return rows
+
+if __name__ == "__main__":
+    S = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt'
+    for name in ("arch_hard", "lily_plant"):
+        rows = evaluate(S + "/%s.obj" % name); one = [r for r in rows if r["loops"] == 1]; ann = [r for r in rows if r["loops"] != 1]
+        print(name, "zones", len(rows), "single loop", len(one), "annuli/other", len(ann))
+        def share(f, rr=one): return round(sum(1 for r in rr if f(r)) / max(len(rr), 1), 3)
+        base = [r for r in one if r["top"] >= 2]
+        print("  topological sides >= 2 :", len(base), "| zones with a single neighbour (no corner by topology):", len(one) - len(base))
+        print("  exact count match  new detector:", share(lambda r: r["det"] == r["top"], base), " AP.corners(8) true corners:", share(lambda r: r["ap8_true"] == r["top"], base), " AP.corners(4) true corners:", share(lambda r: r["ap4_true"] == r["top"], base))
+        print("  within +-1          new:", share(lambda r: abs(r["det"] - r["top"]) <= 1, base), " AP8:", share(lambda r: abs(r["ap8_true"] - r["top"]) <= 1, base), " AP4:", share(lambda r: abs(r["ap4_true"] - r["top"]) <= 1, base))
+        rec = sum(r["rec"] for r in base) / max(sum(r["ntop"] for r in base), 1); prec = sum(r["prec"] for r in base) / max(sum(r["det"] for r in base), 1); print("  position recall of topological corners (3 percent of perimeter):", round(rec, 3), " precision of detected:", round(prec, 3))
+        hist = collections.Counter((r["top"], r["det"]) for r in base); print("  (top,det) pairs:", dict(sorted(hist.items())))
+        json.dump(rows, open("/private/tmp/claude-501/-Users-zenray--claude-Memory1/09d15ec8-88ad-4965-a2f0-80b68515e880/scratchpad/p5/rows_%s.json" % name, "w"))

@@ -1,0 +1,72 @@
+"""Pass 6 harness (30 October 2026): QuadWild Bi-MDF parameter study, configs copied in the scratchpad, never in place.
+FR : banc d'essai des parametres QuadWild avec des configs copiees (jamais modifiees en place)."""
+import glob, json, os, re, shutil, subprocess, sys, time
+QW = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf"
+HERE = os.path.dirname(os.path.abspath(__file__)); CFG = HERE + "/cfg"; WORK = HERE + "/work"
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines")
+GT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt"
+PREP_BASE = dict(do_remesh=1, sharp_feature_thr=35, alpha=0.01, scaleFact=1)
+
+
+def write_prep(path, **kw):
+    p = dict(PREP_BASE); p.update(kw)
+    open(path, "w").write(f"do_remesh {p['do_remesh']}\nsharp_feature_thr {p['sharp_feature_thr']}\nalpha {p['alpha']}\nscaleFact {p['scaleFact']}\n")
+
+
+def write_flow(path, base="flow_noalign_lemon", satsuma=None, flowjson=None, **kw):
+    """Copy a main_config template, replace values (order kept: the C++ fscanf parser is strict), repoint the json paths to our copies."""
+    txt = open(f"{CFG}/main_config/{base}.txt").read()
+    for k, v in kw.items():
+        txt, n = re.subn(rf"^{k} .*$", f"{k} {v}", txt, flags=re.M); assert n == 1, k
+    ms = re.search(r'satsuma_config_filename "config/satsuma/(.*)"', txt); mf = re.search(r'flow_config_filename "config/main_config/(.*)"', txt)
+    if ms: txt = re.sub(r'satsuma_config_filename ".*"', f'satsuma_config_filename "{CFG}/satsuma/{satsuma or ms.group(1)}"', txt)
+    if mf: txt = re.sub(r'flow_config_filename ".*"', f'flow_config_filename "{CFG}/main_config/{flowjson or mf.group(1)}"', txt)
+    open(path, "w").write(txt)
+
+
+def run(cmd, tmo):
+    t = time.time()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=tmo, cwd=QW, env=dict(os.environ, OMP_NUM_THREADS="1"))
+        return r.returncode, r.stdout, r.stderr, round(time.time() - t, 2)
+    except subprocess.TimeoutExpired as e:
+        return -9, (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""), "TIMEOUT", round(time.time() - t, 2)
+
+
+def stage12(mesh, tag, prep_kw, tmo=1200, src=None):
+    """Run quadwild steps 1 and 2 once per (mesh, prep). Returns dict with the _rem_p0.obj path, time, log tail."""
+    d = f"{WORK}/{os.path.splitext(os.path.basename(mesh))[0]}__{tag}"; os.makedirs(d, exist_ok=True)
+    name = os.path.splitext(os.path.basename(mesh))[0]; dst = f"{d}/{name}.obj"
+    if src is None: shutil.copy(mesh, dst)
+    else: shutil.copy(src, dst)
+    cfgp = f"{d}/prep.txt"; write_prep(cfgp, **prep_kw)
+    rem = f"{d}/{name}_rem_p0.obj"
+    if os.path.exists(rem) and os.path.exists(f"{d}/stage12.json"): return json.load(open(f"{d}/stage12.json"))
+    rc, out, err, sec = run([f"{QW}/build/Build/bin/quadwild", dst, "2", cfgp], tmo)
+    open(f"{d}/stage12.log", "w").write(out + "\n---stderr---\n" + err)
+    res = dict(dir=d, name=name, rc=rc, seconds=sec, rem=rem if os.path.exists(rem) else None, tail=(out + err)[-400:])
+    m = re.search(r"Loaded (\d+) faces and (\d+) vertices", out); res["input_faces"] = int(m.group(1)) if m else None
+    m = re.findall(r"After Iter \d - faces: (\d+)", out); res["remesh_faces"] = int(m[-1]) if m else None
+    json.dump(res, open(f"{d}/stage12.json", "w")); return res
+
+
+def stage3(s12, tag, flow_kw, ref, num, tmo=900, flow_base="flow_noalign_lemon", **fk):
+    import ZrlTopoJudge as J
+    d = s12["dir"]; name = s12["name"]; cfgp = f"{d}/flow_{tag}.txt"; write_flow(cfgp, base=flow_base, **flow_kw)
+    out = f"{d}/{name}_rem_p0_{num}_quadrangulation_smooth.obj"; js = f"{d}/stats_{tag}.json"
+    if os.path.exists(out): os.remove(out)
+    rc, so, se, sec = run([f"{QW}/build/Build/bin/quad_from_patches", s12["rem"], str(num), cfgp, js], tmo)
+    open(f"{d}/stage3_{tag}.log", "w").write(so + "\n---stderr---\n" + se)
+    res = dict(tag=tag, mesh=name, rc=rc, seconds=sec, tail=(so + se)[-300:])
+    m = re.search(r"Loaded (\d+) patches", so); res["patches"] = int(m.group(1)) if m else None
+    m = re.search(r"Edge Size ([0-9.eE+-]+)", so); res["edge_size"] = float(m.group(1)) if m else None
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        try:
+            j = J.judge(out, ref); res.update(j)
+        except Exception as e: res["judge_error"] = repr(e)
+    else: res["no_output"] = True
+    if os.path.exists(js):
+        try:
+            q = json.load(open(js)); qe = q.get("quant_eval", {}); res["n_regular_charts"] = qe.get("n_regular_charts"); res["n_charts"] = qe.get("n_charts"); res["sing_pairs"] = qe.get("total_singularity_pairs"); res["iso_term"] = round(qe.get("isometry_term", 0), 3)
+        except Exception: pass
+    return res

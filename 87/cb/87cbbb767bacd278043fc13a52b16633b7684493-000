@@ -1,0 +1,217 @@
+"""Pass 9 : two straightening methods for a quad mesh on a reference surface, same projection, same judge. Written 30 October 2026.
+(1) template_fit : re-implementation of the smoothing kernel of QuadWild (per face rigid fit of a regular square of equal area,
+    per vertex weighted average, 30 percent Laplacian, damping, projection), optional fold guard.
+(2) barrier : minimization of the Winslow type energy sum over corners of (1 - theta) tr(J^T J) / chi(det J) + theta (1 + det^2) / chi(det J)
+    with the regularized chi(d) = (d + sqrt(eps^2 + d^2)) / 2 (Garanzha et al. 2021, formula from the slides of the authors), on the tangent
+    plane of every vertex, L-BFGS inside, projection on the reference surface between outer iterations.
+FR : deux redresseurs de quads sur une surface de reference : ajustement de gabarit carre (noyau de QuadWild) et energie de Winslow a barriere."""
+import numpy as np
+import trimesh
+from scipy.optimize import minimize
+
+
+class Surface:
+    def __init__(self, V, F):
+        self.m = trimesh.Trimesh(V, F, process=False)
+
+    def project(self, X):
+        cp, d, tid = trimesh.proximity.closest_point(self.m, X)
+        return cp
+
+
+def quad_normals(P, Q):
+    n = np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]])
+    return n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30)
+
+
+def quad_areas(P, Q):
+    return 0.5 * np.linalg.norm(np.cross(P[Q[:, 2]] - P[Q[:, 0]], P[Q[:, 3]] - P[Q[:, 1]]), axis=1)
+
+
+def min_corner_det(P, Q):
+    n = quad_normals(P, Q); d = []
+    for k in range(4):
+        a = P[Q[:, (k + 1) % 4]] - P[Q[:, k]]; b = P[Q[:, (k - 1) % 4]] - P[Q[:, k]]
+        d.append(np.einsum("ij,ij->i", np.cross(a, b), n))
+    return np.min(d, axis=0)
+
+
+def vertex_adjacency(Q, n):
+    nb = [set() for _ in range(n)]
+    for q in Q:
+        for k in range(4):
+            nb[q[k]].add(int(q[(k + 1) % 4])); nb[q[k]].add(int(q[(k - 1) % 4]))
+    ptr = np.array([0] + [len(s) for s in nb]).cumsum(); flat = np.array([w for s in nb for w in s])
+    return ptr, flat
+
+
+def laplacian_avg(P, ptr, flat):
+    cnt = np.diff(ptr)
+    return np.add.reduceat(P[flat], ptr[:-1]) / cnt[:, None]
+
+
+# ============================================================================================================================
+# (1) template fit
+# ============================================================================================================================
+def template_fit(P, Q, surf, fixed=None, steps=30, damp=0.5, smooth_term=0.3, weight="deviation", guard=False, verbose=False):
+    P = P.copy(); n = len(P); fixed = np.zeros(n, bool) if fixed is None else fixed
+    ptr, flat = vertex_adjacency(Q, n)
+    sq = np.array([[-1, -1], [1, -1], [1, 1], [-1, 1]], float) / 2.0      # unit square, counter clockwise
+    for s in range(steps):
+        nrm = quad_normals(P, Q); A = quad_areas(P, Q)
+        c = P[Q].mean(axis=1)
+        # tangent frame of each quad : e1 along the first diagonal projected, e2 = n x e1
+        e1 = P[Q[:, 2]] - P[Q[:, 0]]; e1 = e1 - nrm * np.einsum("ij,ij->i", e1, nrm)[:, None]; e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-30)
+        e2 = np.cross(nrm, e1)
+        loc = P[Q] - c[:, None, :]
+        x = np.einsum("fkj,fj->fk", loc, e1); y = np.einsum("fkj,fj->fk", loc, e2)       # (m,4) planar coordinates
+        # best rotation of the square T (side sqrt(A)) onto the planar points, equal area => no scaling
+        side = np.sqrt(np.maximum(A, 1e-30))[:, None]
+        tx = sq[:, 0][None, :] * side; ty = sq[:, 1][None, :] * side
+        num = (tx * y - ty * x).sum(axis=1); den = (tx * x + ty * y).sum(axis=1)
+        th = np.arctan2(num, den)
+        # the square diagonal 0 -> 2 is at 45 degrees : the fit above is relative to the diagonal frame, so rotate the template
+        cs, sn = np.cos(th)[:, None], np.sin(th)[:, None]
+        rx = cs * tx - sn * ty; ry = sn * tx + cs * ty
+        tgt = c[:, None, :] + rx[:, :, None] * e1[:, None, :] + ry[:, :, None] * e2[:, None, :]
+        dev = ((tgt - P[Q]) ** 2).sum(axis=(1, 2)) / np.maximum(A, 1e-30)
+        w = dev + 1e-5 if weight == "deviation" else 1.0 / np.maximum(A, 1e-30)
+        acc = np.zeros_like(P); ws = np.zeros(n)
+        for k in range(4):
+            np.add.at(acc, Q[:, k], tgt[:, k, :] * w[:, None]); np.add.at(ws, Q[:, k], w)
+        new = np.where(ws[:, None] > 0, acc / np.maximum(ws, 1e-30)[:, None], P)
+        lap = laplacian_avg(P, ptr, flat)
+        new = new * (1 - smooth_term) + lap * smooth_term
+        cand = P * damp + new * (1 - damp)
+        cand[fixed] = P[fixed]
+        cand = surf.project(cand); cand[fixed] = P[fixed]
+        if guard:
+            t = 1.0
+            while t > 1e-3:
+                trial = surf.project(P + (cand - P) * t); trial[fixed] = P[fixed]
+                if min_corner_det(trial, Q).min() > 0 or min_corner_det(P, Q).min() <= 0:
+                    cand = trial; break
+                t *= 0.5
+            else:
+                cand = P
+        P = cand
+    return P
+
+
+# ============================================================================================================================
+# (2) Winslow type barrier energy
+# ============================================================================================================================
+def tangent_frames(N):
+    t = np.where(np.abs(N[:, [0]]) < 0.9, np.array([[1.0, 0, 0]]), np.array([[0, 1.0, 0]]))
+    e1 = np.cross(N, t); e1 /= np.maximum(np.linalg.norm(e1, axis=1, keepdims=True), 1e-30)
+    e2 = np.cross(N, e1)
+    return e1, e2
+
+
+def barrier_energy_grad(X, Q, nq, At, eps, theta):
+    """Energy and gradient w.r.t. the vertex positions X, quad normals nq frozen, target areas At (per quad)."""
+    E = 0.0; G = np.zeros_like(X)
+    for k in range(4):
+        i0, i1, i2 = Q[:, k], Q[:, (k + 1) % 4], Q[:, (k - 1) % 4]
+        a = X[i1] - X[i0]; b = X[i2] - X[i0]
+        d = np.einsum("ij,ij->i", np.cross(a, b), nq) / At
+        S = (np.einsum("ij,ij->i", a, a) + np.einsum("ij,ij->i", b, b)) / At
+        r = np.sqrt(eps ** 2 + d ** 2); chi = np.maximum(0.5 * (d + r), 1e-12); dchi = 0.5 * (1 + d / r)
+        shape = S / chi; area = (1 + d ** 2) / chi
+        E += ((1 - theta) * shape + theta * area).sum()
+        dF_dS = (1 - theta) / chi
+        dF_dd = (1 - theta) * (-S * dchi / chi ** 2) + theta * (2 * d / chi - (1 + d ** 2) * dchi / chi ** 2)
+        ga = (dF_dS / At)[:, None] * 2 * a + (dF_dd / At)[:, None] * np.cross(b, nq)
+        gb = (dF_dS / At)[:, None] * 2 * b + (dF_dd / At)[:, None] * np.cross(nq, a)
+        np.add.at(G, i1, ga); np.add.at(G, i2, gb); np.add.at(G, i0, -(ga + gb))
+    return E, G
+
+
+class ArcSet:
+    """Polylines of the elementary arcs : nearest point, tangent, projection for vertices that slide along their arc."""
+    def __init__(self, polys):
+        self.polys = [np.asarray(p, float) for p in polys]
+
+    def nearest(self, aid, X):
+        """For points X (k,3) of arc aid : nearest point on the polyline and the unit tangent of the nearest segment."""
+        A = self.polys[aid]; a = A[:-1]; b = A[1:]; ab = b - a
+        L2 = np.maximum((ab ** 2).sum(axis=1), 1e-30)
+        t = np.clip(((X[:, None, :] - a[None]) * ab[None]).sum(axis=2) / L2[None], 0, 1)
+        C = a[None] + t[:, :, None] * ab[None]
+        d2 = ((X[:, None, :] - C) ** 2).sum(axis=2); j = d2.argmin(axis=1)
+        idx = np.arange(len(X)); tan = ab[j]; tan = tan / np.maximum(np.linalg.norm(tan, axis=1, keepdims=True), 1e-30)
+        return C[idx, j], tan
+
+
+def barrier(P, Q, surf, fixed=None, outer=12, inner=60, theta=1.0 / 128, size="keep", size_smooth=5, groups=None, kind=None, arc_of=None, arcs=None, verbose=False):
+    """kind (n,) : 0 free on the surface, 1 slides along arc arc_of[v] of the ArcSet arcs, 2 fixed."""
+    P = P.copy(); n = len(P)
+    if kind is None:
+        kind = np.zeros(n, int) if fixed is None else np.where(fixed, 2, 0)
+    kind = np.asarray(kind)
+    free = np.where(kind != 2)[0]
+    A0 = quad_areas(P, Q)
+    if size == "smooth":                          # target areas diffused over the face graph : sizes vary smoothly, shape energy does the rest
+        fa = {}
+        for qi, q in enumerate(Q):
+            for k in range(4):
+                fa.setdefault((min(q[k], q[(k + 1) % 4]), max(q[k], q[(k + 1) % 4])), []).append(qi)
+        pairs = np.array([v for v in fa.values() if len(v) == 2])
+        At = A0.copy()
+        for _ in range(size_smooth):
+            nbsum = np.zeros_like(At); cnt = np.zeros_like(At)
+            np.add.at(nbsum, pairs[:, 0], At[pairs[:, 1]]); np.add.at(cnt, pairs[:, 0], 1)
+            np.add.at(nbsum, pairs[:, 1], At[pairs[:, 0]]); np.add.at(cnt, pairs[:, 1], 1)
+            At = 0.5 * At + 0.5 * nbsum / np.maximum(cnt, 1)
+    elif size == "patch" and groups is not None:
+        # target area = (total area of the patch) / (number of quads of the patch), then one diffusion step so that neighbouring patches blend
+        g = np.asarray(groups); tot = np.bincount(g, weights=A0); cnt = np.bincount(g)
+        At = (tot / np.maximum(cnt, 1))[g]
+    else:
+        At = A0
+    hist = []
+    for it in range(outer):
+        nq = quad_normals(P, Q)
+        N = np.zeros_like(P)
+        for k in range(4):
+            np.add.at(N, Q[:, k], nq * quad_areas(P, Q)[:, None])
+        N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-30)
+        e1, e2 = tangent_frames(N)
+        if arcs is not None:
+            for aid in np.unique(arc_of[kind == 1]):
+                vs = np.where((kind == 1) & (arc_of == aid))[0]
+                _, tan = arcs.nearest(aid, P[vs]); e1[vs] = tan; e2[vs] = 0.0
+        dmin = (min_corner_det(P, Q) / At).min()
+        eps = np.sqrt(1e-6 ** 2 + 0.04 * min(dmin, 0.0) ** 2)
+        eps = max(eps, 1e-9)
+
+        def f(t):
+            X = P.copy()
+            X[free] += t[:len(free), None] * e1[free] + t[len(free):, None] * e2[free]
+            E, G = barrier_energy_grad(X, Q, nq, At, eps, theta)
+            g = np.concatenate([np.einsum("ij,ij->i", G[free], e1[free]), np.einsum("ij,ij->i", G[free], e2[free])])
+            return E, g
+        t0 = np.zeros(2 * len(free))
+        res = minimize(f, t0, jac=True, method="L-BFGS-B", options={"maxiter": inner, "maxcor": 20})
+        t = res.x
+        X = P.copy(); X[free] += t[:len(free), None] * e1[free] + t[len(free):, None] * e2[free]
+        def proj(Y):
+            Z = Y.copy(); m = kind == 0
+            Z[m] = surf.project(Y[m])
+            if arcs is not None:
+                for aid in np.unique(arc_of[kind == 1]):
+                    vs = np.where((kind == 1) & (arc_of == aid))[0]
+                    Z[vs], _ = arcs.nearest(aid, Y[vs])
+            Z[kind == 2] = P[kind == 2]
+            return Z
+        X = proj(X)
+        # fold guard on the projected result : halve the step if it created a fold that the previous state did not have
+        step = 1.0
+        while step > 1e-3 and min_corner_det(X, Q).min() <= 0 < min_corner_det(P, Q).min():
+            step *= 0.5
+            X = proj(P + (X - P) * step)
+        P = X
+        hist.append((it, float(res.fun), float(min_corner_det(P, Q).min() / At.mean())))
+        if verbose:
+            print(hist[-1])
+    return P, hist

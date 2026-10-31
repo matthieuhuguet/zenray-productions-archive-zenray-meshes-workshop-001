@@ -1,0 +1,156 @@
+"""30 October 2026 : ZenRay Retopology TUTTE FILL : the INTRINSIC fill of a four sided patch laid on a curved region of a triangle mesh.
+EN: the region (a disk of triangles) is flattened by Tutte's embedding with mean value weights (Floater 2003) onto the rectangle [0, n0] x [0, n1] whose sides are the integer edge counts of the patch (the boundary goes onto the rectangle by arc length, side by side) ; the integer lattice of the rectangle is then lifted back to 3D by barycentric coordinates in the flattened triangles. A Tutte embedding onto a convex polygon has no fold, so the quads cannot fold, whatever the curvature of the region.
+    python -I ZrlTutteFill.py mesh.obj --out work/lines/tutte/<name> [--edge 0.05] [--merge-deg 35] [--min-area-frac 0.002]
+FR : le remplissage intrinseque d'un patch a quatre cotes sur une region courbe : la region est aplatie par un plongement de Tutte (poids de valeur moyenne) sur le rectangle des comptes d'aretes, le reseau entier du rectangle est releve en 3D par coordonnees barycentriques ; aucun pli possible sur une region en disque."""
+import argparse, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, scipy.sparse as sps
+from scipy.sparse.linalg import spsolve
+from scipy.spatial import cKDTree
+import ZrlAutoPatch as AP, ZrlAny as ANY, ZrlCorners as CR
+CORNERS = "robust"                                                                       # "robust" (ZrlCorners) or "classic" (ZrlAutoPatch.corners), --corners
+
+
+def mvc_weights(P, F, vid):
+    """mean value weights of the interior vertices of the region : w_ij = (tan(a/2) + tan(b/2)) / |v_i - v_j| (always positive)."""
+    rows = []; cols = []; vals = []
+    for t in F:
+        for k in range(3):
+            i, j, l = t[k], t[(k + 1) % 3], t[(k + 2) % 3]                          # the angle at vertex i of the triangle (i, j, l)
+            a = P[j] - P[i]; b = P[l] - P[i]; ang = np.arccos(np.clip(a @ b / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-20), -1, 1)); tn = np.tan(ang / 2.0)
+            rows += [vid[i], vid[i]]; cols += [vid[j], vid[l]]; vals += [tn / max(np.linalg.norm(a), 1e-20), tn / max(np.linalg.norm(b), 1e-20)]
+    n = len(vid); return sps.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr()
+
+
+def cyclic_polygon(e):
+    """vertices (K, 2) of the convex polygon whose sides are proportional to the integer counts e : the cyclic one (all vertices on a circle) when the longest side is shorter than the sum of the others and its centre is inside, else the regular one."""
+    e = np.asarray(e, float); K = len(e); reg = lambda: np.stack([np.cos(2 * np.pi * np.arange(K) / K), np.sin(2 * np.pi * np.arange(K) / K)], 1) * (e.mean() / (2 * np.sin(np.pi / K)))
+    if K == 4 and e[0] == e[2] and e[1] == e[3]: return np.array([[0, 0], [e[0], 0], [e[0], e[1]], [0, e[1]]], float)
+    g = lambda R: np.sum(2 * np.arcsin(np.clip(e / (2 * R), 0, 1))) - 2 * np.pi
+    lo = e.max() / 2.0
+    if e.max() >= e.sum() - e.max() or g(lo) < 0: return reg()
+    hi = lo * 1e4
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if g(mid) > 0: lo = mid
+        else: hi = mid
+    R = 0.5 * (lo + hi); th = np.r_[0, np.cumsum(2 * np.arcsin(e / (2 * R)))][:K]; return np.stack([R * np.cos(th), R * np.sin(th)], 1)
+
+
+def coons(bottom, right, top, left):
+    """transfinite (Coons) grid of four straight, evenly spaced polylines : bottom c00 to c10 (m + 1 points), right c10 to c11 (n + 1), top c01 to c11 (m + 1), left c00 to c01 (n + 1) ; returns the (m + 1, n + 1, 2) points."""
+    m = len(bottom) - 1; n = len(left) - 1; c00, c10, c01, c11 = bottom[0], bottom[-1], top[0], top[-1]; G = np.zeros((m + 1, n + 1, 2))
+    for i in range(m + 1):
+        for j in range(n + 1):
+            u, v = i / m, j / n; G[i, j] = (1 - v) * bottom[i] + v * top[i] + (1 - u) * left[j] + u * right[j] - ((1 - u) * (1 - v) * c00 + u * (1 - v) * c10 + (1 - u) * v * c01 + u * v * c11)
+    return G
+
+
+def fillN(m, Z, edge, prm=AP.PARAMS, relax_iters=0):
+    """one 3 to 8 sided patch of the region Z (its TRUE corners only) : (vertices (n,3), quads (q,4), report) or (None, None, reason)."""
+    import ZrlCounts as CT
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 1: return None, None, "loops %d (not a disk)" % len(Ls)
+    B = np.asarray(Ls[0], np.int64); Pb = m["P"][B]; normal = m["N"][Z].mean(0); normal /= max(np.linalg.norm(normal), 1e-9)
+    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(np.vstack([Pb, Pb[:1]]), axis=0), axis=1))]; Ltot = cum[-1]
+    if CORNERS == "robust":                                                                  # 30 October 2026 : persistence of the turns over four scales (ZrlCorners, 94 percent exact on the arch)
+        Cr, _, Xr, per = CR.detect(Pb, CR.vertex_normals_on_loop(m, Z, B)); C = [float(c) / CR.PARAMS["n"] for c in Cr]
+    else:
+        X, total = AP.resample_closed(Pb, prm["step_m"]); Cc, turn = AP.corners(X, total, normal, dict(prm, max_corners=8)); C = [c / len(X) for c in Cc if turn[c] >= prm["corner_deg"]]
+    if len(C) == 2:                                                                          # 30 October 2026 : a STRIP or a lens (two true corners, its tips) : four corners, two on each side of every tip, a small cap apart ; the caps get one edge and the long sides the strip's length
+        t0, t1 = sorted(C); la = (t1 - t0) * Ltot; lb = Ltot - la; dd = min(0.5 * edge, 0.1 * min(la, lb)) / Ltot; C = [(t0 + dd) % 1.0, (t1 - dd) % 1.0, (t1 + dd) % 1.0, (t0 - dd) % 1.0]
+    if not 3 <= len(C) <= 8: return None, None, "true corners %d" % len(C)
+    K = len(C)
+    ci = sorted({int(np.argmin(np.abs(cum[:-1] - C[k] * Ltot))) for k in range(K)})                  # the corners snapped on boundary VERTICES
+    if len(ci) != K and 3 <= len(B) <= 8: ci = list(range(len(B))); K = len(B)                  # 30 October 2026 : a tiny zone whose boundary has 3 to 8 vertices : every boundary vertex is a corner
+    if len(ci) != K: return None, None, "corners snap together"
+    sl = [(cum[ci[(k + 1) % K]] - cum[ci[k]]) % Ltot for k in range(K)]
+    lay = {"arcs": {"a%d" % k: float(sl[k]) for k in range(K)}, "mirror": [], "patches": [{"name": "P", "sides": [["a%d" % k] for k in range(K)]}]}; sol = CT.solve(lay, edge)
+    if not sol.get("ok"): return None, None, "counts infeasible"
+    e = [int(sol["counts"]["a%d" % k]) for k in range(K)]; sp = sol["tarini"].get("P") if K != 4 else None
+    V = cyclic_polygon(e); S2 = [V[k] + (V[(k + 1) % K] - V[k]) * (np.arange(e[k] + 1) / e[k])[:, None] for k in range(K)]; uv = {}
+    for bi, v in enumerate(B):
+        s_ = cum[bi]
+        for k in range(K):
+            d = (s_ - cum[ci[k]]) % Ltot
+            if d <= sl[k] + 1e-9: t = float(np.clip(d / max(sl[k], 1e-12), 0, 1)); uv[int(v)] = V[k] + (V[(k + 1) % K] - V[k]) * t; break
+    F = m["F"][Z]; used = np.unique(F); vid = {int(v): i for i, v in enumerate(used)}; Pm = m["P"]; inner = [int(v) for v in used if int(v) not in uv]
+    Wm = mvc_weights(Pm, F, vid); n = len(used); U = np.zeros((n, 2))
+    for v, p in uv.items(): U[vid[v]] = p
+    if inner:
+        ii = np.array([vid[v] for v in inner]); bi_ = np.array([vid[v] for v in uv]); Dg = np.asarray(Wm.sum(1)).ravel(); Lap = (sps.diags(Dg) - Wm).tocsr()
+        U[ii] = spsolve(Lap[ii][:, ii].tocsc(), -(Lap[ii][:, bi_] @ U[bi_])).reshape(len(ii), 2)
+    pts = {}; Qd = []
+    def vkey(p): return (int(round(p[0] * 1e6)), int(round(p[1] * 1e6)))
+    def add(G):
+        for i in range(G.shape[0] - 1):
+            for j in range(G.shape[1] - 1): Qd.append([pts.setdefault(vkey(G[a, b]), (len(pts), G[a, b]))[0] for a, b in ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))])
+        for i in range(G.shape[0]):
+            for j in range(G.shape[1]): pts.setdefault(vkey(G[i, j]), (len(pts), G[i, j]))
+    if K == 4: add(coons(S2[0], S2[1], S2[2][::-1], S2[3][::-1]))
+    else:
+        P0 = V.mean(0); spoke = [P0 + (S2[i][sp[i - 1]] - P0) * (np.arange(sp[i] + 1) / sp[i])[:, None] for i in range(K)]
+        for i in range(K): add(coons(S2[i][:sp[i - 1] + 1], spoke[i][::-1], spoke[i - 1][::-1], S2[i - 1][sp[(i - 2) % K]:][::-1]))
+    Q2 = np.zeros((len(pts), 2))
+    for _, (k_, p_) in pts.items(): Q2[k_] = p_
+    T2 = np.array([[vid[int(a)] for a in t] for t in F]); cen = U[T2].mean(1); tree = cKDTree(cen); P3 = np.zeros((len(Q2), 3)); bad = 0; _, cand = tree.query(Q2, k=min(24, len(T2)))
+    for qi, q in enumerate(Q2):
+        found = False
+        for t in np.atleast_1d(cand[qi]):
+            a, b, c = U[T2[t]]; M = np.array([[b[0] - a[0], c[0] - a[0]], [b[1] - a[1], c[1] - a[1]]])
+            if abs(np.linalg.det(M)) < 1e-18: continue
+            l1, l2 = np.linalg.solve(M, q - a)
+            if l1 >= -1e-6 and l2 >= -1e-6 and l1 + l2 <= 1 + 1e-6: P3[qi] = (1 - l1 - l2) * Pm[used[T2[t, 0]]] + l1 * Pm[used[T2[t, 1]]] + l2 * Pm[used[T2[t, 2]]]; found = True; break
+        if not found: t = int(cand[qi][0]); P3[qi] = Pm[used[T2[t]]].mean(0); bad += 1
+    Qd = np.array(Qd, np.int64); nq = np.cross(P3[Qd[:, 2]] - P3[Qd[:, 0]], P3[Qd[:, 3]] - P3[Qd[:, 1]]).sum(0)
+    if nq @ normal < 0: Qd = Qd[:, ::-1]                                                  # the grid takes the orientation of the surface
+    if relax_iters: P3 = relax_free(P3, Qd, m["P"][F], relax_iters)
+    return P3, Qd, {"sides": K, "counts": e, "triangles": int(len(F)), "unlocated": int(bad)}
+
+
+def relax_free(P, Q, tri, iters):
+    """optional tangential smoothing of the vertices that are not on the border of the patch (the border = the vertices of an edge used by one quad)."""
+    import collections, ZrlNetMesh as NM
+    ec = collections.Counter()
+    for q in Q:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
+    bd = {v for (a, b), c in ec.items() if c == 1 for v in (a, b)}; free = np.array([v for v in range(len(P)) if v not in bd], np.int64)
+    if not len(free): return P
+    n = len(P); E = np.array(list(ec.keys())); W = sps.coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(n, n)).tocsr(); W = sps.diags(1.0 / np.maximum(np.asarray(W.sum(1)).ravel(), 1)) @ W; ref = NM.Ref(tri); P = P.copy()
+    for it in range(iters):
+        P[free] = 0.5 * P[free] + 0.5 * (W @ P)[free]
+        if (it + 1) % 5 == 0 or it == iters - 1: P[free] = ref.closest(P[free])[0]
+    return P
+
+
+def relax(P, Q, n0, n1, tri, iters=150):
+    """tangential Laplacian smoothing of the interior of the grid, projected back on the region after every step (the border stays) : the shear of Tutte's embedding goes away, the start is fold free."""
+    import ZrlNetMesh as NM
+    n = len(P); E = np.concatenate([Q[:, [0, 1]], Q[:, [1, 2]], Q[:, [2, 3]], Q[:, [3, 0]]]); E = np.unique(np.sort(E, axis=1), axis=0)
+    W = sps.coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(n, n)).tocsr(); deg = np.maximum(np.asarray(W.sum(1)).ravel(), 1); W = sps.diags(1.0 / deg) @ W
+    gi, gj = np.meshgrid(np.arange(n0 + 1), np.arange(n1 + 1), indexing="ij"); inner = ((gi > 0) & (gi < n0) & (gj > 0) & (gj < n1)).ravel(); free = np.flatnonzero(inner)
+    if not len(free): return P
+    ref = NM.Ref(tri); P = P.copy()
+    for it in range(iters):
+        Pn = W @ P; P[free] = 0.5 * P[free] + 0.5 * Pn[free]
+        if (it + 1) % 5 == 0 or it == iters - 1: P[free] = ref.closest(P[free])[0]
+    return P
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("obj"); ap.add_argument("--out", required=True); ap.add_argument("--edge", type=float, default=0.05); ap.add_argument("--zone-deg", type=float, default=25.0); ap.add_argument("--min-area-frac", type=float, default=0.002); ap.add_argument("--merge-deg", type=float, default=35.0); ap.add_argument("--corners", default="robust"); a = ap.parse_args(); globals()["CORNERS"] = a.corners
+    os.makedirs(a.out, exist_ok=True); m = AP.mesh(os.path.abspath(a.obj)); zones = ANY.segment(m, a.zone_deg, max(1, int(a.min_area_frac * len(m["F"]))), merge_deg=a.merge_deg, log=lambda s: None)
+    V = []; F = []; parts = []; fails = {}; off = 0; tri = m["P"][m["F"]]; area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); covered = 0.0; fail_area = {}
+    for k, (Z, seed) in enumerate(zones):
+        try: P3, Qd, rep = fillN(m, Z, a.edge)
+        except Exception as ex: P3, Qd, rep = None, None, "error %s" % str(ex)[:40]
+        if P3 is None: fails[rep] = fails.get(rep, 0) + 1; fail_area[rep] = fail_area.get(rep, 0.0) + float(area[Z].sum()); continue
+        V.append(P3); F.append(Qd + off); off += len(P3); parts += ["ZONE_%03d" % k] * len(Qd); covered += float(area[Z].sum())
+    if not V: print("no patch", fails); return
+    V = np.vstack(V); F = np.vstack(F); obj = os.path.join(a.out, "tutte.obj")
+    with open(obj, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V)); f.write("".join("f %d %d %d %d\n" % tuple(int(x) + 1 for x in q) for q in F))
+    json.dump(parts, open(obj + ".parts.json", "w")); import ZrlTopoJudge as TJ; j = TJ.judge(obj, a.obj); j.update({"zones": len(zones), "patched": len(set(parts)), "fails": fails, "coverage": round(covered / float(area.sum()), 3), "fail_area_frac": {k: round(v / float(area.sum()), 3) for k, v in fail_area.items()}, "uncut_small_frac": round(1 - (covered + sum(fail_area.values())) / float(area.sum()), 3)}); json.dump(j, open(os.path.join(a.out, "judge.json"), "w"), indent=1); print(json.dumps({k: j[k] for k in ("zones", "patched", "coverage", "quads", "folded", "squashed", "folded_share", "squashed_share", "dev_mean_frac_diag", "fails", "fail_area_frac", "uncut_small_frac")}))
+
+
+if __name__ == "__main__": main()

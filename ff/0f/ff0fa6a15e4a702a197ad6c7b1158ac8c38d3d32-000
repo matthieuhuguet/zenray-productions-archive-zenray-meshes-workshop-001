@@ -1,0 +1,176 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH, step 1 : in-place FACET FILTER of a welded multi-part quad mesh (the car).
+A feature-preserving filter on the face NORMALS (bilateral, iterated), then a vertex update that makes every vertex fit the planes of the faces around it : ripples flatten into planes, creases sharpen into straight intersection lines, soft dihedrals disappear. Only the vertices move (never a face), so no component can vanish and no join can open ; a vertex never moves farther than --max-move-mm from where it started ; every quad that got worse is put back.
+    python -I CarFacetFilter.py in.obj out.obj [--sigma-r-deg 12] [--ring 3] [--normal-iters 15] [--vertex-iters 20] [--max-move-mm 12] [--sigma-s-edges 2.0]
+Parameters (HDA interface, the defaults give the delivered result) : sigma-r-deg = angle under which two faces are one plane (the larger, the flatter, the softer the creases) ; ring = neighbourhood in face rings ; normal-iters, vertex-iters = strength ; max-move-mm = the leash (the fidelity to the reference ; the cloud measured the sheet at about 8 mm per pixel) ; sigma-s-edges = spatial reach in mean edge lengths.
+FR : filtre de facettes en place : lissage bilateral des normales (plis conserves) puis ajustement des sommets aux plans des faces voisines ; seuls les sommets bougent, laisse de 12 mm, tout quad empire est remis."""
+import argparse, collections, os, re, sys, time
+import numpy as np
+import scipy.sparse as sp
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "lines"))
+import ZrlQuadStraighten as QS
+
+
+def load_obj(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+FREEZE_DEFAULT = "wheel|susp|bolt|grille|headlight|closer|splitter_blade|arch_|vent_"          # 30 October 2026 : round or tiny parts are not facets : tyres, rims, arches, lights, grille, ladder pieces stay exactly as built
+
+
+def frozen_vertices(path, pattern, n_vertices):
+    """vertices of every face of a group whose name matches the pattern : they never move."""
+    fz = np.zeros(n_vertices, bool)
+    if not pattern: return fz
+    rx = re.compile(pattern); hit = False
+    for l in open(path):
+        if l.startswith("g "): hit = bool(rx.search(l[2:].strip()))
+        elif hit and l.startswith("f "):
+            for x in l.split()[1:]: fz[int(x.split("/")[0]) - 1] = True
+    return fz
+
+
+def contact_clusters(V, used, tol=0.0015):
+    """vertices of DIFFERENT parts that sit on the same spot (unwelded joins) form one cluster : they move together so a join never opens. Returns (cluster id per vertex, number of clusters)."""
+    from scipy.spatial import cKDTree
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    idx = np.flatnonzero(used); pr = cKDTree(V[idx]).query_pairs(tol, output_type="ndarray"); n = len(V)
+    if not len(pr): return np.arange(n), n
+    a = idx[pr[:, 0]]; b = idx[pr[:, 1]]; g = coo_matrix((np.ones(len(a)), (a, b)), shape=(n, n)); nc, lab = connected_components(g, directed=False); return lab, nc
+
+
+def quad_geom(V, Q):
+    n = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); A = 0.5 * np.linalg.norm(n, axis=1); n = n / np.maximum(2 * A, 1e-30)[:, None]
+    return n, A, V[Q].mean(1)
+
+
+def face_adjacency(Q):
+    """sparse symmetric face adjacency over manifold edges ; also the boundary / non manifold vertex mask."""
+    ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ef[(min(a, b), max(a, b))].append(qi)
+    r = []; c = []; fixed = np.zeros(Q.max() + 1, bool)
+    for (a, b), f in ef.items():
+        if len(f) == 2: r += [f[0], f[1]]; c += [f[1], f[0]]
+        else: fixed[a] = fixed[b] = True
+    return sp.csr_matrix((np.ones(len(r), np.int8), (r, c)), shape=(len(Q), len(Q))), fixed
+
+
+def filter_normals(V, Q, adj, sigma_r, sigma_s, ring, iters):
+    n, A, C = quad_geom(V, Q); B = sp.identity(len(Q), dtype=np.int8, format="csr") + adj; M = B.copy()
+    for _ in range(ring - 1): M = (M @ B); M.data[:] = 1
+    M = M.tocoo(); i, j = M.row, M.col; d2 = ((C[i] - C[j]) ** 2).sum(1); ws = np.exp(-d2 / (2 * sigma_s ** 2)); n0 = n.copy()
+    for _ in range(iters):
+        wr = np.exp(-((n[i] - n[j]) ** 2).sum(1) / (2 * sigma_r ** 2)); w = (ws * wr * A[j])[:, None] * n[j]
+        s = np.zeros_like(n); np.add.at(s, i, w); L = np.linalg.norm(s, axis=1, keepdims=True); n = np.where(L > 1e-20, s / np.maximum(L, 1e-30), n0)
+    return n
+
+
+def crease_slide(V, Q, deg):
+    """vertices on a crease chain of the INPUT mesh (dihedral above deg) may only slide along it : returns (tangent (n,3) with zeros for free vertices, mask of vertices that are pinned because they sit on a junction or an end)."""
+    n, A, C = quad_geom(V, Q); ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): u, w = int(q[k]), int(q[(k + 1) % 4]); ef[(min(u, w), max(u, w))].append(qi)
+    cosf = np.cos(np.radians(deg)); nb = collections.defaultdict(list)
+    for (u, w), f in ef.items():
+        if len(f) == 2 and float(n[f[0]] @ n[f[1]]) < cosf: nb[u].append(w); nb[w].append(u)
+    tan = np.zeros_like(V); pin = np.zeros(len(V), bool)
+    for v, l in nb.items():
+        if len(l) == 2: t = V[l[0]] - V[l[1]]; ln = np.linalg.norm(t); tan[v] = t / ln if ln > 1e-12 else 0
+        else: pin[v] = True
+    return tan, pin
+
+
+def update_vertices(V0, Q, n, fixed, iters, leash, cid=None, ncl=0, pairs=None, tan=None):
+    P = V0.copy(); inc = np.bincount(Q.ravel(), minlength=len(V0)).astype(float); inc[inc == 0] = 1
+    if cid is not None:
+        fc = np.zeros(ncl, bool); fc[cid[fixed]] = True; fixed = fc[cid]; cnt = np.bincount(cid, minlength=ncl).astype(float)
+    for _ in range(iters):
+        C = P[Q].mean(1); acc = np.zeros_like(P)
+        for k in range(4):
+            v = Q[:, k]; d = (n * (C - P[v])).sum(1)[:, None] * n; np.add.at(acc, v, d)
+        step = acc / inc[:, None]
+        if cid is not None:
+            sm = np.zeros((ncl, 3)); np.add.at(sm, cid, step); step = (sm / cnt[:, None])[cid]                      # a cluster of coincident vertices moves as one
+        if tan is not None:
+            on = np.linalg.norm(tan, axis=1) > 0; step[on] = (step[on] * tan[on]).sum(1)[:, None] * tan[on]                       # crease vertices slide along their crease only
+        step[fixed] = 0; P = P + step
+        if pairs is not None: P = restore_thickness(P, pairs[0], pairs[1], pairs[2], fixed, cid, ncl, iters=1, lam=1.0)                    # the two layers of a thin shell keep their offset at every step
+        off = P - V0; L = np.linalg.norm(off, axis=1); far = L > leash; P[far] = V0[far] + off[far] / L[far][:, None] * leash
+    return P
+
+
+def mirror_mates(V, used, tol=0.0003):  # tol in model units ; callers pass 0.012 mean edges
+    """index of the mirror vertex across the plane x = middle (the car is built half then mirrored) ; -1 without a partner ; a vertex on the plane is its own mate."""
+    from scipy.spatial import cKDTree
+    cx = 0.5 * (V[used, 0].min() + V[used, 0].max()); M = V.copy(); M[:, 0] = 2 * cx - M[:, 0]; idx = np.flatnonzero(used); d, j = cKDTree(V[idx]).query(M[idx]); mate = -np.ones(len(V), np.int64)
+    ok = d < tol; mate[idx[ok]] = idx[j[ok]]; return mate, cx
+
+
+def symmetrize(P, mate, cx):
+    """average every vertex with the mirror of its mate, so the filtered car stays exactly symmetric."""
+    Q_ = P.copy(); has = mate >= 0; m = mate[has]; R = P[m].copy(); R[:, 0] = 2 * cx - R[:, 0]; Q_[has] = 0.5 * (P[has] + R); return Q_
+
+
+def thickness_pairs(V, Q, reach):
+    """pairs (v, w, t0) of vertices that face each other across a thin shell : w lies within reach of v, on the inner side of v (against its normal), with an opposite normal. t0 is the original thickness. A hood, a roof, a door are closed shells 12 mm thick : both layers must keep that offset when they are flattened."""
+    from scipy.spatial import cKDTree
+    n, A, C = quad_geom(V, Q); vn = np.zeros_like(V)
+    for k in range(4): np.add.at(vn, Q[:, k], n * A[:, None])
+    L = np.linalg.norm(vn, axis=1, keepdims=True); vn = vn / np.maximum(L, 1e-30); used = np.flatnonzero(np.bincount(Q.ravel(), minlength=len(V)) > 0); T = cKDTree(V[used]); pr = T.query_pairs(reach, output_type="ndarray"); a = used[pr[:, 0]]; b = used[pr[:, 1]]
+    d = V[b] - V[a]; dl = np.linalg.norm(d, axis=1); ok = (dl > 1e-5) & ((vn[a] * vn[b]).sum(1) < -0.7) & (np.abs((d * vn[a]).sum(1)) > 0.8 * dl) & ((d * vn[a]).sum(1) < 0)
+    a, b, dl = a[ok], b[ok], dl[ok]
+    best = {}
+    for i, j, t in zip(a, b, dl):                                                              # nearest partner of each vertex, both ways
+        for u, w in ((i, j), (j, i)):
+            if u not in best or t < best[u][1]: best[u] = (w, t)
+    u = np.array(list(best), np.int64); return u, np.array([best[x][0] for x in u], np.int64), np.array([best[x][1] for x in u])
+
+
+def restore_thickness(P, u, w, t0, fixed, cid, ncl, iters=10, lam=1.0):
+    cnt = np.bincount(cid, minlength=ncl).astype(float)
+    for _ in range(iters):
+        d = P[u] - P[w]; dl = np.linalg.norm(d, axis=1); dl[dl < 1e-9] = 1e-9; corr = (0.5 * lam * (t0 - dl) / dl)[:, None] * d; step = np.zeros_like(P); cn = np.zeros(len(P)); np.add.at(step, u, corr); np.add.at(cn, u, 1.0); np.add.at(step, w, -corr); np.add.at(cn, w, 1.0)
+        step = step / np.maximum(cn, 1)[:, None]; sm = np.zeros((ncl, 3)); np.add.at(sm, cid, step); step = (sm / cnt[:, None])[cid]; step[fixed] = 0; P = P + step
+    return P
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--sigma-r-deg", type=float, default=12.0); ap.add_argument("--ring", type=int, default=3); ap.add_argument("--normal-iters", type=int, default=15); ap.add_argument("--vertex-iters", type=int, default=20)
+    ap.add_argument("--max-move-mm", type=float, default=12.0); ap.add_argument("--max-move-edges", type=float, default=0.0, help="leash in mean edge lengths, overrides --max-move-mm (unit independent)"); ap.add_argument("--sigma-s-edges", type=float, default=2.0); ap.add_argument("--no-symmetry", action="store_true"); ap.add_argument("--keep-creases", type=float, default=0.0, help="degrees : vertices on creases above this dihedral only slide along them (for meshes whose edges already follow their creases)"); ap.add_argument("--no-thickness", action="store_true", help="do not restore the thickness of thin shells"); ap.add_argument("--thickness-mode", default="off", choices=["off", "both", "post"], help="off = flattest (default), post = restore the thickness of thin shells at the end, both = at every vertex step too"); ap.add_argument("--freeze", default=FREEZE_DEFAULT); a = ap.parse_args(); t0 = time.time()
+    lines = open(a.inp).read().split("\n"); V, F = load_obj(a.inp); Q = np.array([f for f in F if len(f) == 4], np.int64); adj, fixed = face_adjacency(Q); fixed = np.concatenate([fixed, np.zeros(len(V) - len(fixed), bool)]); fixed = fixed | frozen_vertices(a.inp, a.freeze, len(V))
+    n, A, C = quad_geom(V, Q); el = np.linalg.norm(V[Q[:, 0]] - V[Q[:, 1]], axis=1).mean(); sigma_r = 2 * np.sin(np.radians(a.sigma_r_deg) / 2)
+    leash = (a.max_move_edges * el) if a.max_move_edges > 0 else a.max_move_mm / 1000.0
+    nf = filter_normals(V, Q, adj, sigma_r, a.sigma_s_edges * el, a.ring, a.normal_iters); cid, ncl = contact_clusters(V, np.isin(np.arange(len(V)), Q.ravel()), 0.06 * el); pairs = None if (a.no_thickness or a.thickness_mode == "off") else thickness_pairs(V, Q, 1.1 * el); tan = None
+    if a.keep_creases > 0: tan, cpin = crease_slide(V, Q, a.keep_creases); fixed = fixed | cpin
+    P = update_vertices(V, Q, nf, fixed, a.vertex_iters, leash, cid, ncl, pairs if a.thickness_mode == "both" else None, tan)
+    if not a.no_thickness and a.thickness_mode != "off":
+        fcl = np.zeros(ncl, bool); fcl[cid[fixed]] = True; P = restore_thickness(P, pairs[0], pairs[1], pairs[2], fcl[cid], cid, ncl, iters=80)
+    used = np.zeros(len(V), bool); used[Q.ravel()] = True; mate, cx = mirror_mates(V, used, 0.012 * el); sym = not a.no_symmetry
+    if sym: P = symmetrize(P, mate, cx)
+    moved_back = 0; j0v = QS.quad_jmin(V, Q); pp = collections.defaultdict(list)
+    if pairs is not None:
+        for x, y in zip(pairs[0].tolist(), pairs[1].tolist()): pp[x].append(y); pp[y].append(x)
+    for _ in range(12):                                                                       # never worsen a quad : put back the vertices of every quad whose scaled Jacobian fell under 0.3 or went below its start
+        jn = QS.quad_jmin(P, Q); bad = np.flatnonzero(jn < np.minimum(j0v, 0.3) - 1e-9)
+        if not len(bad): break
+        for q in Q[bad]:
+            P[q] = V[q]; moved_back += 1
+            ex = [y for v in q.tolist() for y in pp.get(v, [])]; P[ex] = V[ex]                  # the facing layer of a thin shell goes back with it
+            mem = np.flatnonzero(np.isin(cid, cid[q])); P[mem] = V[mem]                       # the coincident vertices of other parts go back with it
+            if sym: mm = mate[q][mate[q] >= 0]; P[mm] = V[mm]                                    # revert the mirror partners too : symmetry kept
+    cm = np.bincount(cid, minlength=ncl).astype(float); sm = np.zeros((ncl, 3)); np.add.at(sm, cid, P); Pm = (sm / np.maximum(cm, 1)[:, None])[cid]; multi = cm[cid] > 1; P = np.where(multi[:, None], Pm, P)          # final weld : coincident vertices of different parts end up exactly together
+    it = iter(P); out = []
+    for l in lines:
+        if l.startswith("v "): out.append("v %.6f %.6f %.6f" % tuple(next(it)))
+        else: out.append(l)
+    open(a.out, "w").write("\n".join(out)); off = np.linalg.norm(P - V, axis=1) * 1000
+    print("quads %d  edge %.1f mm  moved mean %.2f mm  p99 %.1f  max %.1f  reverted quads %d  %.0f s" % (len(Q), 1000 * el, off.mean(), np.percentile(off, 99), off.max(), moved_back, time.time() - t0))
+
+
+if __name__ == "__main__": main()

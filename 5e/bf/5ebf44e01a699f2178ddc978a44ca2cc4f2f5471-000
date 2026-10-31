@@ -1,0 +1,141 @@
+"""Pass 9 : topological repair of the corners of a patch layout whose interior angle is too large for ONE quad. Written 30 October 2026.
+A patch corner v with interior angle theta (sum of the triangle angles at v inside the patch) receives exactly one quad of the patch, whose corner angle
+is then theta. The repair cuts the patch by a path of mesh edges that leaves v in the direction theta / n (n = round rule of the table, theta / n between
+58 and 122 degrees), so that v carries n quads. FR : reparation topologique des coins de patch dont l'angle est trop grand pour un seul quad."""
+import collections
+import numpy as np
+import zr8_layout as L
+
+LO, HI = 58.0, 122.0
+
+
+def quads_needed(theta):
+    """Smallest n with theta / n inside [LO, HI] (None if no n works, for instance an angle below LO)."""
+    for n in range(1, 8):
+        if LO <= theta / n <= HI: return n
+    return None
+
+
+def fan_at_corner(lay, p, v):
+    """Neighbours of v in rotational order inside patch p, from the next boundary vertex to the previous one, and the cumulative angles (degrees)."""
+    F = lay.F[lay.faces_of_patch[p]]; V = lay.V
+    nxt = {}
+    for t in F:
+        for k in range(3):
+            if int(t[k]) == v:
+                nxt[int(t[(k + 1) % 3])] = int(t[(k + 2) % 3])      # triangle (v, a, b) counter clockwise : a -> b
+    start = [a for a in nxt if a not in nxt.values()]
+    if len(start) != 1: return None, None
+    chain = [start[0]]
+    while chain[-1] in nxt: chain.append(nxt[chain[-1]])
+    ang = [0.0]
+    for a, b in zip(chain[:-1], chain[1:]):
+        x = V[a] - V[v]; y = V[b] - V[v]
+        ang.append(ang[-1] + np.degrees(np.arccos(np.clip(x @ y / max(np.linalg.norm(x) * np.linalg.norm(y), 1e-30), -1, 1))))
+    return chain, np.array(ang)
+
+
+def corner_table(lay):
+    """List of (patch, corner vertex, interior angle theta in degrees) for every patch corner."""
+    out = []
+    for p in range(lay.npatch):
+        if len(lay.loops[p]) != 1: continue
+        for v in lay.corners[p]:
+            chain, ang = fan_at_corner(lay, p, int(v))
+            if chain is not None: out.append((p, int(v), float(ang[-1])))
+    return out
+
+
+def trace_cut(lay, p, v, chain, ang, alpha):
+    """Path of mesh edges from corner v, leaving along the fan neighbour whose cumulative angle is closest to alpha, then going as straight as
+    possible through interior vertices of p until it reaches a vertex of the boundary of p. Returns (path vertex list, index in the fan of the first neighbour)."""
+    V = lay.V; loopset = set(lay.loops[p][0])
+    nb = collections.defaultdict(set)
+    for t in lay.F[lay.faces_of_patch[p]]:
+        for k in range(3):
+            a, b = int(t[k]), int(t[(k + 1) % 3]); nb[a].add(b); nb[b].add(a)
+    order = np.argsort(np.abs(ang - alpha))
+    first = None
+    for i in order:
+        if 0 < i < len(chain) and chain[i] not in loopset: first = int(i); break
+    if first is None: return None, None
+    path = [v, chain[first]]; d = V[path[1]] - V[v]; d /= max(np.linalg.norm(d), 1e-30)
+    for _ in range(4000):
+        u = path[-1]
+        cands = []
+        for w in nb[u]:
+            if w in path: continue
+            e = V[w] - V[u]; ne = np.linalg.norm(e)
+            if ne < 1e-30: continue
+            cands.append((float(e @ d / ne), w))
+        if not cands: return None, None
+        cands.sort(reverse=True); c, w = cands[0]
+        if c < 0.2: return None, None
+        path.append(w)
+        if w in loopset:
+            return (path, first) if len(path) >= 4 else (None, None)
+        e = V[w] - V[u]; d = 0.5 * d + 0.5 * e / np.linalg.norm(e); d /= np.linalg.norm(d)
+    return None, None
+
+
+def split_patch(lay, p, v, alpha_frac_list):
+    """Cut patch p once from corner v at the angle fraction alpha_frac * theta. Returns a new Layout or None."""
+    chain, ang = fan_at_corner(lay, p, v)
+    if chain is None: return None
+    theta = ang[-1]
+    path, first = trace_cut(lay, p, v, chain, ang, theta * alpha_frac_list)
+    if path is None: return None
+    w = path[-1]
+    pe = {(min(a, b), max(a, b)) for a, b in zip(path[:-1], path[1:])}
+    fs = lay.faces_of_patch[p]
+    tri_ef = collections.defaultdict(list)
+    for fi in fs:
+        t = lay.F[fi]
+        for k in range(3):
+            a, b = int(t[k]), int(t[(k + 1) % 3]); tri_ef[(min(a, b), max(a, b))].append(int(fi))
+    # sector A : triangles reached from the first fan triangle without crossing the cut
+    fan_start = chain[0]; seed = None
+    for fi in fs:
+        t = [int(x) for x in lay.F[fi]]
+        if v in t and t[(t.index(v) + 1) % 3] == fan_start: seed = int(fi); break
+    seen = {seed}; stack = [seed]
+    while stack:
+        f = stack.pop(); t = lay.F[f]
+        for k in range(3):
+            a, b = int(t[k]), int(t[(k + 1) % 3]); e = (min(a, b), max(a, b))
+            if e in pe: continue
+            for g in tri_ef[e]:
+                if g not in seen: seen.add(g); stack.append(g)
+    A = seen; B = set(int(f) for f in fs) - A
+    if not A or not B: return None
+    pid = lay.pid.copy(); newid = lay.npatch
+    for f in B: pid[f] = newid
+    # corners of the two sectors from the position on the old boundary loop
+    loop = lay.loops[p][0]; n = len(loop); iv = loop.index(v)
+    rot = loop[iv:] + loop[:iv]                                     # starts at v, goes along the loop
+    # the fan starts at the next loop vertex after v only if the loop direction matches : check
+    if rot[1] != fan_start: rot = [rot[0]] + rot[:0:-1]
+    iw = rot.index(w); oldc = set(int(c) for c in lay.corners[p])
+    cA = {c for c in rot[:iw + 1] if c in oldc} | {v, w}
+    cB = {c for c in rot[iw:] if c in oldc} | {v, w}
+    corners = [list(c) for c in lay.corners] + [sorted(cB)]
+    corners[p] = sorted(cA)
+    new = L.Layout.from_arrays(lay.V, lay.F, pid, corners)
+    new.features = lay.features; new.c_features = lay.c_features
+    return new
+
+
+def repair_layout(lay, max_rounds=400, verbose=False):
+    """Repeat: pick the corner with the largest angle above the rule, split its patch. Returns (new layout, log)."""
+    log = []; tried = set()
+    for rnd in range(max_rounds):
+        tab = [(p, v, th) for p, v, th in corner_table(lay) if quads_needed(th) not in (None, 1) and (p, v) not in tried]
+        if not tab: break
+        tab.sort(key=lambda t: -t[2]); p, v, th = tab[0]
+        n = quads_needed(th)
+        new = split_patch(lay, p, v, 1.0 / n)
+        if new is None:
+            tried.add((p, v)); log.append(("failed", p, v, round(th, 1), n)); continue
+        log.append(("split", p, v, round(th, 1), n)); lay = new
+        tried = {(a, b) for a, b in tried}                          # patch ids of the first sector are unchanged, keep the failures
+    return lay, log

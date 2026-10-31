@@ -1,0 +1,99 @@
+"""30 October 2026 : SYMMETRY BY CONSTRUCTION : cut the mesh at its mirror plane, quad-mesh ONE half with QuadWild (organic or mechanical setting, density controlled), snap the cut border on the plane, mirror the half, weld the border : the two sides are the same mesh, so the symmetry error is zero by construction (QuadWild layouts are not symmetric on a symmetric input, measured 0.29 edge on Manny).
+    python -I QwMirror.py mesh.obj out_dir target_quads [--axis x] [--thr -1] [--center auto|<value>]
+FR : symetrie par construction : une moitie est maillee en quads, bord de coupe plaque sur le plan, puis miroir et soudure du bord."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+import QwSweep as SW, QwParts as QP
+
+
+def load_tri(path):
+    V = []; T = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f":
+            f = [int(x.split("/")[0]) - 1 for x in t[1:]]
+            for k in range(1, len(f) - 1): T.append((f[0], f[k], f[k + 1]))
+    return np.array(V), np.array(T, np.int64)
+
+
+def clip_half(V, T, ax, c):
+    """keep the part of the triangle mesh with coordinate ax >= c, cutting the crossing triangles exactly on the plane (Sutherland Hodgman), no dependency."""
+    out = []; key = {}; P = []
+    def vid(p):
+        k = tuple(np.round(p, 7))
+        if k not in key: key[k] = len(P); P.append(p)
+        return key[k]
+    for t in T:
+        poly = [V[i] for i in t]; d = [p[ax] - c for p in poly]
+        if all(x <= 1e-9 for x in d): continue
+        res = []
+        for i in range(3):
+            a, b, da, db = poly[i], poly[(i + 1) % 3], d[i], d[(i + 1) % 3]
+            if da >= 0: res.append(a)
+            if (da > 0 and db < 0) or (da < 0 and db > 0):
+                q = a + (b - a) * (da / (da - db)); q[ax] = c; res.append(q)
+        for k in range(1, len(res) - 1): out.append((vid(res[0]), vid(res[k]), vid(res[k + 1])))
+    P = np.array(P); T2 = np.array(out, np.int64); return P, clean_tris(P, T2)
+
+
+def clean_tris(P, T):
+    """drop degenerate triangles and, edge by edge, the smallest triangle of every non manifold edge (QuadWild refuses non manifold input)."""
+    ar = 0.5 * np.linalg.norm(np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]]), axis=1); keep = ar > 1e-10 * max(ar.max(), 1e-12); T = T[keep]; ar = ar[keep]
+    for _ in range(10):
+        ef = collections.defaultdict(list)
+        for i, t in enumerate(T):
+            for k in range(3): a, b = int(t[k]), int(t[(k + 1) % 3]); ef[(min(a, b), max(a, b))].append(i)
+        drop = set()
+        for e, fs in ef.items():
+            if len(fs) > 2: drop |= set(sorted(fs, key=lambda i: ar[i])[:len(fs) - 2])
+        if not drop: break
+        m = np.ones(len(T), bool); m[list(drop)] = False; T = T[m]; ar = ar[m]
+    return T
+
+
+def mirror_weld(V, F, ax, c, ext):
+    """30 October 2026 : mirror a quad half through the plane ax = c and weld the cut border (vertices within 2 percent of the extent of the plane are snapped on it). Returns (vertices, faces, number of snapped border vertices)."""
+    V = np.array(V, float); ec = collections.Counter()
+    for f in F:
+        for i in range(len(f)): p, q = f[i], f[(i + 1) % len(f)]; ec[(min(p, q), max(p, q))] += 1
+    bv = sorted({v for (p, q), k in ec.items() if k == 1 for v in (p, q)}); on_plane = [v for v in bv if abs(V[v][ax] - c) < 0.02 * ext]; V[on_plane, ax] = c
+    nv = len(V); Vm = V.copy(); Vm[:, ax] = 2 * c - Vm[:, ax]; mirror_id = {}; allV = V.tolist(); on = set(on_plane)
+    for v in range(nv):
+        if v in on: mirror_id[v] = v
+        else: mirror_id[v] = len(allV); allV.append(Vm[v].tolist())
+    allF = [list(f) for f in F] + [[mirror_id[v] for v in reversed(f)] for f in F]
+    mirror_weld.last_map = np.array([mirror_id[v] for v in range(nv)]); return np.array(allV), allF, len(on_plane)      # 30 October 2026 : mirror_weld.last_map[v] = the vertex that mirrors v (v itself on the plane) : the pairing used to re-symmetrize after a full mesh barrier
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("out"); ap.add_argument("target", type=int); ap.add_argument("--axis", default="x"); ap.add_argument("--thr", default="-1"); ap.add_argument("--center", default="auto"); a = ap.parse_args()
+    a.out = os.path.abspath(a.out); a.mesh = os.path.abspath(a.mesh)                      # QuadWild runs from its own folder : every path must be absolute
+    os.makedirs(a.out, exist_ok=True); ax = "xyz".index(a.axis); V0, T0 = load_tri(a.mesh); c = float((V0[:, ax].max() + V0[:, ax].min()) / 2) if a.center == "auto" else float(a.center); ext = float((V0.max(0) - V0.min(0)).max())
+    HV, HT = clip_half(V0, T0, ax, c)
+    with open(os.path.join(a.out, "half.obj"), "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in HV)); f.write("".join("f %d %d %d\n" % tuple(int(i) + 1 for i in t) for t in HT))
+    print("plane %s = %.4f : half has %d triangles" % (a.axis, c, len(HT)))
+    res = SW.one((os.path.join(a.out, "half.obj"), a.out, os.path.join(a.out, "half.obj"), a.target // 2, a.thr, 0.005, "lemon", "qw_half"))[1]
+    if "file" not in res: raise SystemExit("QuadWild failed on the half : %s" % res)
+    V, F = [], []
+    for l in open(res["file"]):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    V = np.array(V); ec = collections.Counter()
+    for f in F:
+        for i in range(len(f)): p, q = f[i], f[(i + 1) % len(f)]; ec[(min(p, q), max(p, q))] += 1
+    bv = sorted({v for (p, q), k in ec.items() if k == 1 for v in (p, q)}); on_plane = [v for v in bv if abs(V[v][ax] - c) < 0.02 * ext]; V[on_plane, ax] = c              # snap the cut border on the plane
+    nv = len(V); Vm = V.copy(); Vm[:, ax] = 2 * c - Vm[:, ax]; mirror_id = {}; allV = V.tolist(); on = set(on_plane)
+    for v in range(nv):
+        if v in on: mirror_id[v] = v
+        else: mirror_id[v] = len(allV); allV.append(Vm[v].tolist())
+    allF = [list(f) for f in F] + [[mirror_id[v] for v in reversed(f)] for f in F]
+    with open(os.path.join(a.out, "mirrored.obj"), "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in allV)); f.write("".join("f " + " ".join(str(i + 1) for i in q) + "\n" for q in allF))
+    print("half quads %d, border vertices %d (on the plane %d), mirrored mesh %d quads" % (len(F), len(bv), len(on_plane), len(allF)))
+
+
+if __name__ == "__main__": main()

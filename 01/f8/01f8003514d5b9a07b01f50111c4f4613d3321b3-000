@@ -1,0 +1,123 @@
+"""Essai E2 (H1, H2, H3) : briques communes. Déterministe. 30 October 2026."""
+import numpy as np, cv2, trimesh, shapely.geometry as sg
+from scipy.spatial import cKDTree
+from facetcar import *; from facet_mesh import *; from facet_render import *
+from clay_render import render, tri_normals, view_basis
+import verifiers as VF
+
+VIEWS6 = ("front", "back", "left", "right", "top", "bottom")
+
+def make_case(params=None, px=0.008, noise_img=0.0, edge_jitter=0.0, scale_err=0.0, seed=0, light_rel=(-0.5, 0.8, 0.6)):
+    """Voiture, vérité, vues, images argile ; perturbations de type 'planche générée' : bruit d'image, bruit de bord de masque (pixels), erreur d'échelle par vue."""
+    rng = np.random.default_rng(seed)
+    car, p = build(params)
+    views = render_views(car, px=px)
+    imgs = clay_from_views(views, light_rel=light_rel, noise=noise_img, rng=rng)
+    truth, lab = closed_mesh(car, 0.05)
+    masks = {}
+    for nm, v in views.items():
+        m = v["mask"].astype(np.uint8)
+        if edge_jitter > 0:
+            # bruit de contour : on déplace chaque pixel de bord de +-edge_jitter pixels par flou puis seuil bruité
+            k = int(2 * round(edge_jitter) + 1)
+            f = cv2.GaussianBlur(m.astype(np.float32), (k, k), edge_jitter)
+            f = f + rng.normal(0, 0.15, f.shape).astype(np.float32)
+            m = (f > 0.5).astype(np.uint8)
+        masks[nm] = m
+    return dict(car=car, params=p, views=views, imgs=imgs, masks=masks, truth=truth, px=px, scale_err=scale_err, rng=rng)
+
+def view_frame(v):
+    a, b, d, x0, y1, px = v["frame"]; H, W = v["mask"].shape
+    return a, b, d, x0, y1, px, H, W
+
+def fit_polygons(mask, eps_px):
+    """Contours extérieurs et trous du masque, simplifiés par Douglas-Peucker (droites, pas de marches de pixel)."""
+    cnts, hier = cv2.findContours(mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    polys = []
+    for i, c in enumerate(cnts):
+        if cv2.contourArea(c) < 30: continue
+        ap = cv2.approxPolyDP(c, eps_px, True)[:, 0, :].astype(float)
+        if len(ap) >= 3: polys.append((ap, hier[0][i][3] >= 0))
+    return polys
+
+def pix_to_uv(pts, x0, y1, px):
+    return np.c_[x0 + (pts[:, 0] + 0.5) * px, y1 - (pts[:, 1] + 0.5) * px]
+
+def prism(poly_uv, a, b, d, scale=1.0, half=6.0):
+    pg = sg.Polygon(poly_uv)
+    if not pg.is_valid: pg = pg.buffer(0)
+    if pg.is_empty: return None
+    if pg.geom_type == "MultiPolygon": pg = max(pg.geoms, key=lambda g: g.area)
+    m = trimesh.creation.extrude_polygon(pg, height=2 * half)
+    T = np.eye(4); T[:3, 0] = a; T[:3, 1] = b; T[:3, 2] = d; T[:3, 3] = -d * half
+    m.apply_transform(T)
+    return m
+
+def visual_hull(case, eps_px=1.5, use_masks=None):
+    masks = use_masks or case["masks"]
+    parts = []
+    for nm in VIEWS6:
+        a, b, d, x0, y1, px, H, W = view_frame(case["views"][nm])
+        polys = fit_polygons(masks[nm], eps_px)
+        ext = [p for p, hole in polys if not hole]
+        if not ext: continue
+        big = max(ext, key=lambda p: cv2.contourArea(p.astype(np.float32)))
+        uv = pix_to_uv(big, x0, y1, px)
+        if case["scale_err"]:
+            s = 1.0 + case["scale_err"] * (hash(nm) % 7 - 3) / 3.0
+            uv = uv * s
+        pm = prism(uv, a, b, d)
+        if pm is not None: parts.append(pm)
+    hull = trimesh.boolean.intersection(parts, engine="manifold")
+    return hull
+
+def surface_samples(mesh, n, rng):
+    pts, fi = trimesh.sample.sample_surface(mesh, n, seed=int(rng.integers(1 << 30)))
+    return pts, mesh.face_normals[fi]
+
+def fidelity(est, truth, n=30000, seed=3):
+    """Chamfer moyen, p95, Hausdorff (échantillonnés), erreur d'angle de normale, IoU de volume."""
+    rng = np.random.default_rng(seed)
+    pe, ne = surface_samples(est, n, rng); pt, nt = surface_samples(truth, n, rng)
+    te = cKDTree(pt); tt = cKDTree(pe)
+    d1, i1 = te.query(pe); d2, i2 = tt.query(pt)
+    ang = np.degrees(np.arccos(np.clip((ne * nt[i1]).sum(1), -1, 1)))
+    try:
+        inter = trimesh.boolean.intersection([est, truth], engine="manifold").volume
+        iou = inter / (est.volume + truth.volume - inter)
+    except Exception:
+        iou = float("nan")
+    return {"chamfer_mean_mm": float((d1.mean() + d2.mean()) / 2 * 1000), "p95_mm": float(np.percentile(np.r_[d1, d2], 95) * 1000), "hausdorff_mm": float(max(d1.max(), d2.max()) * 1000),
+            "normal_err_mean_deg": float(ang.mean()), "normal_err_p95_deg": float(np.percentile(ang, 95)), "volume_iou": float(iou)}
+
+def verify(mesh, max_edge=0.05):
+    V, F = trimesh.remesh.subdivide_to_size(np.array(mesh.vertices), np.array(mesh.faces), max_edge=max_edge)
+    return VF.run_all(V, F, n_samples=3000)
+
+def vsummary(r):
+    return {"closed": r["closure"]["pass"], "facets": round(r["facet_planarity"]["planar_area_fraction"], 3), "creases_seg_per_m": round(r["crease_straightness"].get("segments_per_m", float("nan")), 2),
+            "undulation": round(r["undulation"]["undulation_length_fraction"], 4), "mirror_p99_mm": round(r["symmetry"]["mirror_p99_mm"], 3)}
+
+def baseline_voxel(case, voxel=0.02, smooth=10):
+    """B0 de type loft : sculpture de voxels par les masques bruts, surface par cubes marchants, lissage de Taubin (ce que font les approches 'lisses')."""
+    from skimage.measure import marching_cubes
+    allv = np.concatenate([P.verts for P in case["car"].pieces]); lo = allv.min(0) - 0.1; hi = allv.max(0) + 0.1
+    xs = np.arange(lo[0], hi[0], voxel); ys = np.arange(lo[1], hi[1], voxel); zs = np.arange(lo[2], hi[2], voxel)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    P = np.c_[X.ravel(), Y.ravel(), Z.ravel()]
+    occ = np.ones(len(P), bool)
+    for nm in VIEWS6:
+        a, b, d, x0, y1, px, H, W = view_frame(case["views"][nm])
+        u = P @ a; v = P @ b
+        c = np.floor((u - x0) / px).astype(int); r = np.floor((y1 - v) / px).astype(int)
+        ok = (c >= 0) & (c < W) & (r >= 0) & (r < H)
+        m = np.zeros(len(P), bool); m[ok] = case["masks"][nm][r[ok], c[ok]] > 0
+        occ &= m
+    vol = occ.reshape(X.shape).astype(np.float32)
+    vol = np.pad(vol, 1)
+    verts, faces, _, _ = marching_cubes(vol, 0.5, spacing=(voxel,) * 3)
+    verts = verts - voxel + lo
+    mesh = trimesh.Trimesh(verts, faces, process=True)
+    mesh.fix_normals()
+    if smooth: trimesh.smoothing.filter_taubin(mesh, iterations=smooth)
+    return mesh

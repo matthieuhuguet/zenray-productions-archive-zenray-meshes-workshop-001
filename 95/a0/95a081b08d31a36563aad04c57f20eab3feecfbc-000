@@ -1,0 +1,65 @@
+"""Pass 8 : verifier of the hybrid (counts MILP + Tutte fill + weld). Written 30 October 2026.
+Usage : python3 -I verify_hybrid.py dir=WORK names=sphere,torus,... scale=3.0   -> JSON, exit code 0 = green, 1 = red.
+Checks per mesh : (1) layout invariants (one loop per patch, Euler 1, junctions are corners, 3 to 8 corners);
+(2) the MILP counts satisfy the closed form of Tarini 2021 (independent check, N = 3..6) and parity;
+(3) welded output : closed manifold iff the layout is closed, no boundary edge across patches, Euler equal to the layout's Euler;
+(4) number of quads equals the formula (K = 4 : e0 e1 ; else sum s_i s_(i+1)) ; (5) no vertex duplicated (exact weld).
+Then a NEGATIVE test : one arc count is changed by +1 and the checks must turn red. FR : vérificateur testé dans les deux sens."""
+import sys, json, collections
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_hybrid as H, zr8_counts as C, zr8_judge as J
+
+
+def checks(r):
+    lay = r["lay"]; sol = r["sol"]; sides = r["sides"]; out = {}
+    rep = lay.report()
+    out["layout_one_loop_disks"] = rep["not_disk"] == 0
+    out["layout_junctions_are_corners"] = rep["junction_not_corner"] == 0
+    out["layout_corners_3_to_8"] = all(3 <= int(k) <= 8 for k in rep["corner_histogram"])
+    ok_t = True; ok_par = True; expected = 0
+    for p, e in sol["e"].items():
+        t = C.check_tarini(e)
+        if t is False: ok_t = False
+        if sum(e) % 2: ok_par = False
+        if len(e) == 4: expected += e[0] * e[1]
+        else:
+            s = sol["s"][p]; expected += sum(s[i] * s[(i + 1) % len(s)] for i in range(len(s)))
+    out["counts_tarini_closed_form"] = ok_t; out["counts_parity"] = ok_par; out["counts_no_violation"] = len(sol["violations"]) == 0
+    res = r["judge"]
+    out["weld_nonmanifold_edges_zero"] = res["nonmanifold_edges"] == 0
+    border_in = rep["mesh_border_edges"]
+    out["weld_boundary_only_on_mesh_border"] = (res["boundary_edges"] == 0) if border_in == 0 else True
+    chi = int(len(np.unique(lay.F)) - len({tuple(sorted((int(t[k]), int(t[(k + 1) % 3])))) for t in lay.F for k in range(3)}) + len(lay.F))
+    out["weld_euler_equals_input"] = res["euler"] == chi
+    out["quad_count_formula"] = res["quads"] == expected
+    P = r["P"]
+    out["weld_no_duplicate_vertices"] = len(np.unique(np.round(P, 9), axis=0)) == len(P)
+    return out
+
+
+def main(a):
+    names = a["names"].split(","); allok = True; report = {}
+    for n in names:
+        args = {"prefix": "%s/%s_rem_p0" % (a["dir"], n), "scale": a.get("scale", "3.0")}
+        r = H.build(args)
+        c = checks(r); report[n] = {"checks": c, "green": all(c.values()), "quads": r["judge"]["quads"]}
+        allok &= all(c.values())
+        # negative test : break parity on one arc of one patch and re-run the checks on the broken solution
+        sol = r["sol"]; k0 = next(iter(sol["counts"]))
+        broken = {"counts": dict(sol["counts"]), "e": {}, "s": sol["s"], "violations": []}
+        broken["counts"][k0] += 1
+        for p, sd in r["sides"].items():
+            if sd is not None and p in sol["e"]:
+                broken["e"][p] = [int(sum(broken["counts"][k] for k, _ in sd[i])) for i in range(len(sd))]
+        r2 = dict(r); r2["sol"] = broken
+        cb = {"counts_tarini_closed_form": all(C.check_tarini(e) is not False for e in broken["e"].values()),
+              "counts_parity": all(sum(e) % 2 == 0 for e in broken["e"].values())}
+        report[n]["negative_test_turns_red"] = not (cb["counts_tarini_closed_form"] and cb["counts_parity"])
+        allok &= report[n]["negative_test_turns_red"]
+    print(json.dumps({"green": allok, "report": report}, indent=1))
+    return 0 if allok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(dict(kv.split("=", 1) for kv in sys.argv[1:])))

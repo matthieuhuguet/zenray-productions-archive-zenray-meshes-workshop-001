@@ -1,0 +1,124 @@
+"""Q9, mesure 5 : arêtes de v752. (1) histogramme des angles dièdres sur la peau extérieure ; (2) chaînes d'arêtes vives (> 35 deg) :
+longueur, écart à la droite (RMS mm), écart à l'arc ; (3) escaliers : virages proches de 90 deg par mètre ; (4) boucles d'arêtes ouvertes.
+30 October 2026."""
+import sys, json, collections
+import numpy as np
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]; sgn = ext["sign"]
+N = N * sgn[:, None]
+ed = edge_table(Q)
+# (1) dièdres sur la peau extérieure (les deux faces visibles)
+ang = []; w = []; e_list = []
+for (u, v), fl in ed.items():
+    if len(fl) != 2: continue
+    f1, f2 = fl
+    if not (vis[f1] and vis[f2]): continue
+    # même couche : normales orientées vers l'extérieur ; le dièdre est l'angle entre les normales
+    c = np.clip(N[f1] @ N[f2], -1, 1)
+    a = np.degrees(np.arccos(c))
+    ang.append(a); L = np.linalg.norm(V[u] - V[v]); w.append(L); e_list.append((u, v, f1, f2))
+ang = np.array(ang); w = np.array(w)
+bins = [0, 0.1, 0.5, 1, 2, 5, 15, 35, 60, 91, 181]
+hist = []
+for lo, hi in zip(bins[:-1], bins[1:]):
+    m = (ang >= lo) & (ang < hi)
+    hist.append({"from_deg": lo, "to_deg": hi, "edges": int(m.sum()), "length_m": float(w[m].sum())})
+    print(f"dièdre [{lo:6.1f}, {hi:6.1f}) : {m.sum():7d} arêtes  {w[m].sum():8.1f} m  ({100*m.mean():5.2f} % des arêtes)")
+# (2) chaînes d'arêtes vives (angle > 35 deg) sur la peau extérieure
+sharp = [(u, v) for (u, v, f1, f2), a in zip(e_list, ang) if a > 35 and a < 175]
+adj = collections.defaultdict(list)
+for u, v in sharp:
+    adj[u].append(v); adj[v].append(u)
+seen = set(); chains = []
+def walk(start, nxt):
+    ch = [start, nxt]; seen.add((min(start, nxt), max(start, nxt)))
+    prev, cur = start, nxt
+    while len(adj[cur]) == 2:
+        n2 = [x for x in adj[cur] if x != prev]
+        if not n2: break
+        n2 = n2[0]
+        k = (min(cur, n2), max(cur, n2))
+        if k in seen: break
+        seen.add(k); ch.append(n2); prev, cur = cur, n2
+    return ch
+for v0 in list(adj):
+    if len(adj[v0]) != 2:
+        for n0 in adj[v0]:
+            k = (min(v0, n0), max(v0, n0))
+            if k not in seen: chains.append(walk(v0, n0))
+for v0 in list(adj):      # boucles fermées
+    for n0 in adj[v0]:
+        k = (min(v0, n0), max(v0, n0))
+        if k not in seen: chains.append(walk(v0, n0))
+def line_dev(p):
+    c = p.mean(0); u, s, vt = np.linalg.svd(p - c, full_matrices=False)
+    d = (p - c) - np.outer((p - c) @ vt[0], vt[0])
+    return np.sqrt((np.linalg.norm(d, axis=1) ** 2).mean()), np.linalg.norm(d, axis=1).max()
+def circ_dev(p):
+    # cercle 3D : plan PCA puis cercle algébrique de Kasa
+    c = p.mean(0); u, s, vt = np.linalg.svd(p - c, full_matrices=False)
+    q = (p - c) @ vt[:2].T
+    Aa = np.c_[2 * q, np.ones(len(q))]; bb = (q ** 2).sum(1)
+    sol, *_ = np.linalg.lstsq(Aa, bb, rcond=None)
+    cx, cy = sol[:2]; r = np.sqrt(max(sol[2] + cx * cx + cy * cy, 1e-12))
+    resid = np.sqrt(((q - [cx, cy]) ** 2).sum(1)) - r
+    off = (p - c) @ vt[2]
+    return np.sqrt((resid ** 2 + off ** 2).mean()), r
+rows = []
+for ch in chains:
+    p = V[ch]
+    Lc = np.linalg.norm(np.diff(p, axis=0), axis=1).sum()
+    if Lc < 0.15 or len(ch) < 8: continue
+    rl, ml = line_dev(p)
+    rc, rad = circ_dev(p)
+    # virages : angle entre arêtes successives
+    d = np.diff(p, axis=0); d /= np.linalg.norm(d, axis=1)[:, None] + 1e-12
+    cosv = np.clip((d[:-1] * d[1:]).sum(1), -1, 1); turn = np.degrees(np.arccos(cosv))
+    t90 = int(((turn > 60) & (turn < 120)).sum())
+    # inflexions (changement de signe de la courbure signée dans le plan PCA)
+    c0 = p.mean(0); u_, s_, vt_ = np.linalg.svd(p - c0, full_matrices=False)
+    q = (p - c0) @ vt_[:2].T
+    dq = np.diff(q, axis=0); cr = dq[:-1, 0] * dq[1:, 1] - dq[:-1, 1] * dq[1:, 0]
+    sg = np.sign(cr[np.abs(cr) > 1e-9]); infl = int((np.diff(sg) != 0).sum()) if len(sg) > 1 else 0
+    chord = np.linalg.norm(p[-1] - p[0]); tort = float(Lc / chord) if chord > 1e-6 else float("inf")
+    rows.append({"tortuosity": tort, "length_m": float(Lc), "edges": len(ch), "line_rms_mm": rl * 1000, "line_max_mm": ml * 1000, "arc_rms_mm": rc * 1000, "arc_radius_m": float(rad),
+                 "turns_60_120": t90, "turns_per_m": t90 / Lc, "inflections": infl, "closed": ch[0] == ch[-1],
+                 "x0": V[ch[0]].tolist(), "x1": V[ch[-1]].tolist()})
+rows.sort(key=lambda r: -r["length_m"])
+ot = np.array([r["tortuosity"] for r in rows if np.isfinite(r["tortuosity"])])
+print("tortuosité (longueur / corde) des chaînes ouvertes : médiane %.3f, p90 %.3f, chaînes > 1.15 : %d sur %d" % (np.median(ot), np.percentile(ot, 90), (ot > 1.15).sum(), len(ot)))
+for r in sorted([r for r in rows if np.isfinite(r["tortuosity"])], key=lambda r: -r["tortuosity"])[:8]: print("  tort %.2f  L %.2f m  rms-droite %.1f mm  de %s a %s" % (r["tortuosity"], r["length_m"], r["line_rms_mm"], [round(x,2) for x in r["x0"]], [round(x,2) for x in r["x1"]]))
+print("chaînes d'arêtes vives de plus de 15 cm :", len(rows), " longueur totale m", sum(r["length_m"] for r in rows))
+Ls = np.array([r["length_m"] for r in rows]); rl = np.array([r["line_rms_mm"] for r in rows]); ra = np.array([r["arc_rms_mm"] for r in rows])
+print("rms à la droite : médiane %.2f mm, p90 %.2f mm ; à l'arc : médiane %.2f, p90 %.2f" % (np.median(rl), np.percentile(rl, 90), np.median(ra), np.percentile(ra, 90)))
+for thr in (0.5, 1, 2, 5):
+    print(f"chaînes droites au millimètre près ... rms ligne < {thr} mm : {(rl < thr).mean()*100:.1f} % des chaînes, {Ls[rl < thr].sum()/Ls.sum()*100:.1f} % de la longueur")
+tp = np.array([r["turns_per_m"] for r in rows]); infl = np.array([r["inflections"] for r in rows])
+print("virages 60-120 deg par mètre : médiane %.2f, p90 %.2f ; chaînes avec >= 10 virages/m : %d" % (np.median(tp), np.percentile(tp, 90), (tp >= 10).sum()))
+print("inflexions : médiane %.1f ; chaînes avec >= 4 inflexions : %.1f %%" % (np.median(infl), 100 * (infl >= 4).mean()))
+# (4) trous : boucles d'arêtes ouvertes
+bd = [e for e, fl in ed.items() if len(fl) == 1]
+badj = collections.defaultdict(list)
+for u, v in bd: badj[u].append(v); badj[v].append(u)
+seenv = set(); loops = []
+for s in badj:
+    if s in seenv: continue
+    comp = [s]; seenv.add(s); st = [s]
+    while st:
+        x = st.pop()
+        for y in badj[x]:
+            if y not in seenv: seenv.add(y); comp.append(y); st.append(y)
+    pts = V[comp]
+    loops.append({"verts": len(comp), "bbox_mm": ((pts.max(0) - pts.min(0)) * 1000).round(1).tolist(), "centre": pts.mean(0).round(3).tolist(),
+                  "groups": sorted({names[g] for g in set(Gq[np.where(np.isin(Q, comp).any(1))[0]])})[:3]})
+loops.sort(key=lambda l: -l["verts"])
+print("arêtes ouvertes", len(bd), "composantes de bord", len(loops))
+for l in loops[:12]: print(l)
+json.dump({"dihedral_hist": hist, "chains": rows[:400], "chain_summary": {"count": len(rows), "line_rms_median_mm": float(np.median(rl)), "line_rms_p90_mm": float(np.percentile(rl, 90)),
+           "arc_rms_median_mm": float(np.median(ra)), "turns_per_m_median": float(np.median(tp)), "inflections_median": float(np.median(infl))},
+           "open_edges": len(bd), "open_loops": loops[:60]}, open("out/q9_edges.json", "w"), indent=1)

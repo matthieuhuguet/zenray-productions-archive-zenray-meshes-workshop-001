@@ -1,0 +1,74 @@
+"""31 October 2026 : CAR COMPONENT 1, the WHEEL, version 3 : every part is a CLOSED SOLID (watertight, outward normals), built atom by atom with Houdini modeling nodes, numbers MEASURED on the reference crop (left view, 1175 px per metre on the 3x zoom, hub at the ring centre). Axis Z, centre at the origin, metres.
+Atoms : ONE SPOKE (flat bar, PolyExtrude with back face, PolyBevel) -> SPOKES (Copy to Points at the measured angles) -> HUB (revolved closed section) -> RIM BAND (revolved closed section, rounded well) -> DISH (revolved closed disc, recessed) -> TYRE (revolved closed section, sidewall bulge). Every number is in the dict P.
+    exec inside Houdini : builds /obj/Car_Wheel, audits closure and orientation of every atom, writes OUT."""
+import hou
+P = dict(spoke_angles=[24.7, 90.0, 154.6, 218.7, 270.0, 321.6], spoke_len_in=0.02, spoke_len_out=0.318, spoke_w_in=0.07, spoke_w_out=0.096, spoke_depth=0.05, spoke_z=0.065, bevel=0.007, bevel_div=2,
+         hub=[(0.0, -0.01), (0.034, -0.01), (0.034, 0.10), (0.030, 0.122), (0.0, 0.128)],
+         rim=[(0.271, -0.085), (0.318, -0.085), (0.318, 0.085), (0.310, 0.088), (0.292, 0.078), (0.275, 0.060), (0.271, 0.040)],
+         dish=[(0.03, -0.012), (0.272, -0.032), (0.272, -0.052), (0.03, -0.032)],
+         tyre=[(0.314, -0.085), (0.319, -0.110), (0.348, -0.128), (0.368, -0.115), (0.380, -0.085), (0.383, -0.040), (0.383, 0.040), (0.380, 0.085), (0.368, 0.115), (0.348, 0.128), (0.319, 0.110), (0.314, 0.085)], div=96)
+import json, os, math
+FIT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/spokes_fit.json"          # 31 October 2026 : output of FitSpokes.py (edge alignment on the reference), overrides the hand defaults
+P["spoke_offsets"] = [0.0] * len(P["spoke_angles"])
+if os.path.exists(FIT):
+    fit = json.load(open(FIT)); P["spoke_angles"] = [f["angle"] for f in fit]; P["spoke_offsets"] = [f["offset_m"] for f in fit]
+    P["spoke_w_in"] = round(sum(f["w_in"] for f in fit) / len(fit) - 0.0008, 4); P["spoke_w_out"] = round(sum(f["w_out"] for f in fit) / len(fit) + 0.0002, 4)
+OUT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/Car_Wheel.obj"
+old = hou.node("/obj/Car_Wheel")
+if old: old.destroy()
+G = hou.node("/obj").createNode("geo", "Car_Wheel")
+def mk(typ, name, *ins, **parms):
+    n = G.createNode(typ, name)
+    for i, x in enumerate(ins):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items(): n.parm(k).set(v)
+    return n
+def poly(name, pts):
+    """a closed polygon from (x, y, z) points through the Add SOP"""
+    n = mk("add", name, keep=0, points=len(pts))
+    for i, q in enumerate(pts):
+        for k, ax in enumerate("xyz"): n.parm("pt%d%s" % (i, ax)).set(q[k])
+    n.parm("prims").set(1); n.parm("prim0").set("0-%d" % (len(pts) - 1)); n.parm("closed0").set(1); return n
+def section(name, rz):
+    """a closed section in the XZ half plane from (radius, z) pairs, revolved around Z into a quad solid"""
+    r = mk("revolve", name, poly(name + "_section", [(a, 0.0, b) for a, b in rz]), divs=P["div"], surftype=5); r.parmTuple("dir").set((0, 0, 1)); r.parmTuple("origin").set((0, 0, 0)); return r
+def outward(name, node):
+    """a Reverse is added only when the signed volume says the shell is inside out"""
+    node.cook(force=True); v = 0.0
+    for p in node.geometry().prims():
+        q = [x.point().position() for x in p.vertices()]
+        for i in range(1, len(q) - 1): v += q[0].dot(q[i].cross(q[i + 1])) / 6.0
+    return mk("reverse", name, node) if v < 0 else node
+# ---- atom 1 : ONE SPOKE : a flat tapered bar pointing along +Y, closed by its back face, chamfered edges
+w0, w1, d = P["spoke_w_in"] / 2, P["spoke_w_out"] / 2, P["spoke_depth"]
+Rt = P["spoke_len_out"]; tip = [(w1 * k / 2.0, math.sqrt(Rt * Rt - (w1 * k / 2.0) ** 2), 0) for k in (2, 1, 0, -1, -2)]
+prof = poly("spoke_profile", [(-w0, P["spoke_len_in"], 0), (w0, P["spoke_len_in"], 0)] + tip)
+ext = mk("polyextrude::2.0", "spoke_extrude", prof, dist=d, outputback=1)
+bev = mk("polybevel::3.0", "spoke_bevel", ext, offset=P["bevel"], divisions=P["bevel_div"]); spoke = outward("spoke_outward", bev)
+# ---- atom 2 : SPOKES : the spoke copied on points at the origin, rotated to each measured angle (0 degrees = +Y)
+n = len(P["spoke_angles"]); pc = mk("add", "spoke_points", keep=0, points=n)
+for i in range(n):
+    th = math.radians(P["spoke_angles"][i]); o = P["spoke_offsets"][i]
+    for k, v in enumerate((-o * math.sin(th), o * math.cos(th), P["spoke_z"])): pc.parm("pt%d%s" % (i, "xyz"[k])).set(v)
+ang = "{" + ",".join(str(a - 90.0) for a in P["spoke_angles"]) + "}"
+wr = mk("attribwrangle", "spoke_orient", pc, snippet="float a[] = %s; @orient = quaternion(radians(a[@ptnum]), {0,0,1});" % ang.replace("{", "array(").replace("}", ")")); wr.parm("class").set(2)
+six = mk("copytopoints::2.0", "spokes", spoke, wr)
+# ---- atoms 3 to 6 : hub, rim band, dish, tyre : revolved closed sections, each checked for orientation
+hub = outward("hub_outward", section("hub", P["hub"])); rim = outward("rim_outward", section("rim_band", P["rim"])); dish = outward("dish_outward", section("dish", P["dish"])); tyre = outward("tyre_outward", section("tyre", P["tyre"]))
+mrg = mk("merge", "merge_wheel", six, hub, rim, dish, tyre); out = mk("null", "OUT_WHEEL", mrg); out.setDisplayFlag(True); out.setRenderFlag(True); G.layoutChildren()
+def audit(node):
+    """closure and orientation : open edges, non manifold edges, quad share, signed volume"""
+    node.cook(force=True); g = node.geometry(); e = {}
+    for p in g.prims():
+        vs = [v.point().number() for v in p.vertices()]
+        for i in range(len(vs)):
+            a, b = vs[i], vs[(i + 1) % len(vs)]; k = (min(a, b), max(a, b)); e[k] = e.get(k, 0) + 1
+    vol = 0.0
+    for p in g.prims():
+        q = [v.point().position() for v in p.vertices()]
+        for i in range(1, len(q) - 1): vol += q[0].dot(q[i].cross(q[i + 1])) / 6.0
+    quads = sum(1 for p in g.prims() if p.numVertices() == 4)
+    return {"prims": len(g.prims()), "open_edges": sum(1 for c in e.values() if c == 1), "non_manifold": sum(1 for c in e.values() if c > 2), "quad_share": round(quads / max(len(g.prims()), 1), 3), "volume": round(vol, 5)}
+out.cook(force=True); out.geometry().saveToFile(OUT)
+RESULT = {n_: audit(x) for n_, x in (("spokes", six), ("spoke", spoke), ("hub", hub), ("rim", rim), ("dish", dish), ("tyre", tyre), ("OUT_WHEEL", out))}
+RESULT["errors"] = {c.name(): c.errors()[0][:90] for c in G.children() if c.errors()}

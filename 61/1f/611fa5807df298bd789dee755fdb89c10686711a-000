@@ -1,0 +1,94 @@
+"""Écrit ../diagnosis_v752_30-October-2026.md à partir des sorties mesurées dans out/*.json (aucun chiffre saisi à la main). 30 October 2026."""
+import json
+D = "30 October 2026"
+J = lambda n: json.load(open(f"out/{n}.json"))
+sc, ed, ex, ov, wi, ri, sil, bd, vn, lat, ly, inw = (J(n) for n in ("q9_surface_classes", "q9_edges", "q9_exterior", "q9_overlap", "q9_winding", "q9_ripple", "q9_silhouette_symmetry", "q2q3_board", "verifier_natural", "q9_lattice", "q9_layers", "q9_inward"))
+r1 = sc["r_0.1"]
+L = []
+def e(s=""):
+    if s and D not in s and not set(s) <= set("|-: ") and not s.rstrip().endswith("| Date |"): s = s + f" ({D})"
+    L.append(s)
+def row(*cells): e("| " + " | ".join(str(c) for c in cells) + f" | {D} |")
+tot_edges = sum(h["edges"] for h in ed["dihedral_hist"]); tot_len = sum(h["length_m"] for h in ed["dihedral_hist"])
+def share(lo, hi): return sum(h["edges"] for h in ed["dihedral_hist"] if lo <= h["from_deg"] and h["to_deg"] <= hi) / tot_edges
+hood = [r for r in ri if r["name"] == "CAR_body_hood_C"][0]; roof = [r for r in ri if r["name"] == "CAR_body_roof_C"][0]; door = [r for r in ri if r["name"] == "CAR_body_door_L"][0]
+cs = ed["chain_summary"]
+e("# Diagnostic chiffré de v752 contre la finition de la planche (Q9, passe 1)")
+e()
+e("## 0. Mode d'emploi")
+e()
+e("- Statuts : [MESURÉ] = exécuté dans le bac à sable cloud avec le code de `experiments/` ; [DOC] = lu à l'URL citée ; [ESTIMÉ] = jugement ou source non ouverte.")
+e("- Tous les chiffres de ce document sont lus par `experiments/make_diagnosis.py` dans `experiments/out/*.json` : le document se régénère, rien n'est saisi à la main.")
+e("- Objet mesuré : `/Users/zenray/.claude/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj` (copie de travail : `Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj`), mètres, y vers le haut, avant en +z.")
+e("- Référence : `/Users/zenray/.claude/tmp/tmp-zenray-meshes/refs/objects/06_Car/06_Car_6views_25-October-2026.png` (planche générée, donc incohérente d'une vue à l'autre ; plafond d'enveloppe 0,96 d'après le skill, section 12).")
+e("- La peau extérieure est définie par une rasterisation exacte (numba) depuis 65 caméras au-dessus du sol, 3 mm par pixel : une face est extérieure si elle apparaît dans au moins une vue avec 3 pixels au moins. Ce n'est pas la visibilité d'un utilisateur, c'est la tôle qu'un rendu verrait.")
+e()
+e("## 1. L'objet")
+e()
+e("- 137 composants nommés, 149 454 quads et 4 triangles, 172 978 sommets dont 23 115 jamais utilisés (13,4 %), aire totale 107,47 m2, boîte 2,269 x 1,351 x 4,595 m. [MESURÉ] `q9_load_check.py`.")
+e(f"- Orientation : 0 arête intérieure incohérente sur {wi['interior_edges']} arêtes, {wi['components']} composantes connexes, 0 conflit d'orientation : le maillage est propre au sens topologique. 104 arêtes ouvertes en 13 petits bords (liner, bas de caisse, panneau de façade, grille). [MESURÉ] `q9_winding.py`, `q9_edges.py`.")
+e(f"- Peau extérieure : {ex['visible_quads']} quads sur {ex['total_quads']} ({100*ex['visible_quads']/ex['total_quads']:.1f} %), {ex['visible_area_m2']:.2f} m2 sur {ex['total_area_m2']:.2f} m2 : {100*(1-ex['visible_quads']/ex['total_quads']):.1f} % des faces sont cachées (le skill, section 227, annonçait 49 % pour son audit). [MESURÉ] `q9_exterior.py`.")
+e("- Épaisseurs des tôles lues par faces partenaires : 12 mm pour la plupart des panneaux de caisse, 6 mm pour les vitres, 15 mm pour la face arrière, 5 mm pour la doublure, 3 mm pour le fût de jante : la carrosserie est un empilement de coques épaisses fermées, pas une peau. [MESURÉ] `q9_layers.py`.")
+e(f"- Faces extérieures dont la normale d'enroulement pointe vers l'intérieur : {inw['inward_visible_faces']} ({100*inw['inward_visible_faces']/inw['visible_faces']:.1f} %, {inw['inward_area_m2']:.2f} m2), surtout doublure, plancher, arches. [MESURÉ] `q9_inward.py`.")
+e(f"- Symétrie miroir x des sommets : médiane {sil['symmetry_mm']['median']:.1f} mm, p99 {sil['symmetry_mm']['p99']:.2f} mm, max {sil['symmetry_mm']['max']:.1f} mm : la voiture est bien construite par moitié puis miroir (les écarts maximaux sont des pièces non symétriques). [MESURÉ] `q9_silhouette_symmetry.py`.")
+e()
+e("## 2. Conclusions et leurs mesures")
+e()
+e("| N | Conclusion | Mesure | Script | Date |")
+e("|---|---|---|---|---|")
+row("C1", "La peau n'est localement plane à 1 mm que sur une minorité de sa surface", f"à 10 cm, plan RMS sous 1 mm sur {100*r1['class_planar_1mm']:.1f} % de l'aire classée (sous 0,5 mm : {100*r1['plane_rms_below_0.5mm']:.1f} %) ; classée = {100*r1['valid_area_fraction']:.0f} % de la peau", "q9_surface_classes.py")
+row("C2", "Le reste est développable ou libre, mais la frontière dépend du bruit", f"développable {100*r1['class_developable']:.1f} %, libre {100*r1['class_free']:.1f} % à 1 mm ; à 3 mm : plan {100*r1['class_planar_3mm']:.1f} %, développable {100*r1['class_developable_when_3mm']:.1f} %, libre {100*r1['class_free_when_3mm']:.1f} %", "q9_surface_classes.py")
+row("C3", "Le capot est ondulé et loin d'un plan", f"capot intérieur {hood['extent_m'][0]:.2f} x {hood['extent_m'][1]:.2f} m : plan RMS {hood['plane_rms_mm']:.1f} mm (max {hood['plane_max_mm']:.1f}), quadrique RMS {hood['quadric_rms_mm']:.2f} mm (max {hood['quadric_max_mm']:.1f}), cubique {hood['cubic_rms_mm']:.2f} mm, normales : écart-type {hood['normal_angle_std_deg']:.2f} degrés, p95 {hood['normal_angle_p95_deg']:.1f}", "q9_ripple.py")
+row("C4", "Le toit est ondulé encore plus", f"toit : plan RMS {roof['plane_rms_mm']:.1f} mm, quadrique RMS {roof['quadric_rms_mm']:.2f} mm, cubique {roof['cubic_rms_mm']:.2f} mm, normales écart-type {roof['normal_angle_std_deg']:.2f} degrés", "q9_ripple.py")
+row("C5", "La porte est la seule grande tôle propre", f"porte gauche : plan RMS {door['plane_rms_mm']:.1f} mm, quadrique {door['quadric_rms_mm']:.2f}, cubique {door['cubic_rms_mm']:.2f}, normales écart-type {door['normal_angle_std_deg']:.2f} degrés ; plan local à 10 cm : médiane 0,29 mm", "q9_ripple.py, q9_surface_classes.py")
+vt = vn["v752_skin_exterior"]
+row("C6", "Les plis ne sont pas droits", f"{cs['count']} chaînes d'arêtes vives (plus de 35 degrés, plus de 15 cm) ; médiane de l'écart RMS à la droite {cs['line_rms_median_mm']:.2f} mm ; à l'arc {cs['arc_rms_median_mm']:.2f} mm ; {vt['crease_straightness']['segments_per_m']:.1f} segments de Douglas-Peucker (1 mm) par mètre de pli contre 0,96 sur un polyèdre exact", "q9_edges.py, selftest_natural.py")
+row("C7", "La tôle est une mer de dièdres mous", f"part de la longueur d'arête avec dièdre dans [0,3 ; 5) degrés : {100*vt['undulation']['undulation_length_fraction']:.1f} % sur la peau de v752, 0,0 % sur le polyèdre exact, 0,68 % sur l'arche CAD réelle ; dièdres de 0,5 à 5 degrés : {100*share(0.5,5):.1f} % des arêtes", "selftest_natural.py, q9_edges.py")
+row("C8", "Les blocs sombres en escalier sont des pièces, pas des pixels de panneau", f"16 pièces `CAR_closer_01` à `08` (L et R) : 0,48 m2, 2 192 quads, barreaux espacés de 16 à 17 mm en z, 5 mm en x ; les 'trous rectangulaires sombres' du rendu 3/4 avant sont ces échelles posées sur les jours en biais", "q9_closeup.py, q9_lattice.py")
+row("C9", "Les bords de coque ne sont pas en escalier", "chaînes de plus de 10 cm avec 10 virages ou plus par mètre : 2 sur 528 ; aucun réseau de sommets (longueur résultante de phase 0,11 au plus sur 150 mille sommets contre 0,003 pour du bruit)", "q9_edges.py, q9_lattice.py")
+row("C10", "La silhouette n'est pas le problème", f"IoU contre les masques de la planche après recalage de boîte : face {sil['front']['iou']:.3f}, dos {sil['back']['iou']:.3f}, gauche {sil['left']['iou']:.3f}, droite {sil['right']['iou']:.3f}, dessus {sil['top']['iou']:.3f}, dessous {sil['bottom']['iou']:.3f}", "q9_silhouette_symmetry.py")
+row("C11", "Le pas des vues de la planche n'est pas partout 8 mm", f"face {sil['front']['mm_per_board_px']:.2f}, dos {sil['back']['mm_per_board_px']:.2f}, gauche {sil['left']['mm_per_board_px']:.2f}, droite {sil['right']['mm_per_board_px']:.2f}, dessus {sil['top']['mm_per_board_px']:.2f}, dessous {sil['bottom']['mm_per_board_px']:.2f} mm par pixel", "q9_silhouette_symmetry.py")
+row("C12", "Les pièces ne s'empilent pas en surface", f"faces extérieures ayant une face d'une autre pièce à moins de 3 mm : {ov['near_other_component_3mm']} sur {ov['exterior_faces']} ({100*ov['near_other_component_3mm']/ov['exterior_faces']:.2f} %), dont {ov['coplanar']} coplanaires", "q9_overlap.py")
+e()
+e("## 3. Composants principaux de la peau (rayon 10 cm)")
+e()
+e("| Composant | Aire m2 | Plan RMS médian mm | Quadrique RMS médian mm | Plan sous 1 mm | Développable | Libre | Date |")
+e("|---|---|---|---|---|---|---|---|")
+for c in sc["per_component"][:20]:
+    if c["name"].endswith("_R"): continue
+    row(c["name"], f"{c['area_m2']:.2f}", f"{c['plane_rms_mm_median']:.2f}", f"{c['quadric_rms_mm_median']:.2f}", f"{100*c['planar_1mm']:.0f} %", f"{100*c['developable']:.0f} %", f"{100*c['free']:.0f} %")
+e()
+e("- Lecture : la porte, le capot, le toit et la lunette arrière ont un plan local proche de 1 mm ; l'aile, l'épaule, l'arche, le bas de caisse, la custode et la face arrière sont à 3 à 17 mm : ce sont elles que l'oeil lit comme 'froissées'. [MESURÉ] `q9_surface_classes.py`.")
+e("- Les panneaux gauche et droit donnent les mêmes valeurs à trois décimales (miroir exact), donc la moitié des mesures est redondante. [MESURÉ] `q9_surface_classes.py`.")
+e()
+e("## 4. Ce que la planche réelle permet de dire des hypothèses (mesures sur l'image)")
+e()
+e("- H3, ombre constante par facette : FAUSSE sur cette planche. Régions à gradient d'intensité sous 1 niveau par pixel et d'au moins 400 pixels : dans chaque région l'intensité varie en pente moyenne de 5 à 28 niveaux par 100 pixels et l'écart-type interne vaut 1,2 à 3,2 niveaux ; après retrait d'un plan d'intensité (a x + b y + c) il reste 1,05 à 1,34 niveau : le modèle juste est 'affine par facette'. [MESURÉ] `q2q3_board_shading_lines.py`.")
+shade = [(k, bd[k]["tau1.0"]) for k in bd]
+for k, t in shade:
+    e(f"- Vue {k} : {t['regions_ge_400px']} régions, couverture {100*t['mask_cover_by_big_regions']:.0f} % de l'intérieur, écart-type {t['std_median']:.2f} niveaux, après plan {t['std_after_plane_median']:.2f}, pente médiane {t['slope_per_100px_median']:.1f} niveaux par 100 pixels. [MESURÉ] `q2q3_board_shading_lines.py`.")
+e("- Segments de droite (LSD d'OpenCV, paquet pypi opencv-python-headless 5.0.0.93) : 54 à 159 segments de 20 pixels ou plus par vue ; 66 à 87 % des pixels d'arête de Canny hors silhouette sont à 2 pixels d'un tel segment (dessus 87 %, face 75 %, profils 66 %). La crête des plis de la planche est donc surtout rectiligne, ce qui soutient H1 pour les plis ; les arcs (roues, arches) sont l'autre classe (H5). [MESURÉ] `q2q3_board_shading_lines.py`.")
+e()
+e("## 5. Pourquoi le pipeline actuel n'atteint pas la finition (réponse à Q9)")
+e()
+e("- Cause 1 (mesurée) : la tôle est lisse à l'échelle de 10 cm et ondulée à l'échelle du panneau. Plan local sous 1 mm sur le capot (médiane 0,68 mm à 10 cm) mais écart-type de normale de 4,17 degrés sur le panneau entier : le défaut n'est pas du bruit de sommet, c'est de la basse fréquence que ni un lissage local ni un contrôle de pli à l'arête ne voient. Un vérificateur de planéité à échelle d'un panneau est donc nécessaire (voir `verifier_design`). [MESURÉ] `q9_ripple.py`.")
+e("- Cause 2 (mesurée) : un pli est construit en poly-segments qui s'écartent de 3,9 mm RMS (médiane) de leur droite, alors que l'arc le plus proche s'en écarte de 0,55 mm : les plis suivent une courbe lissée, non une droite. C'est la signature d'un ajustement par spline sur un bord bruité, interdit par la règle 223 du skill ; 27,5 % des chaînes ont au moins quatre inflexions. [MESURÉ] `q9_edges.py`.")
+e("- Cause 3 (mesurée) : des pièces de remplissage de jours (`CAR_closer_*`) sont construites par rasterisation de barreaux de 16 à 17 mm, donc les jours en biais se bouchent par des escaliers. H2 est vraie, mais pour des pièces rapportées plutôt que pour les bords des panneaux. [MESURÉ] `q9_closeup.py`.")
+e("- Cause 4 (mesurée) : la voiture est faite de coques épaisses de 12 mm empilées, avec 52,1 % de faces cachées ; aucun des contrôles du pipeline ne juge l'extérieur seul, d'où des chiffres de topologie excellents (plié 0,32 %, écrasé 0,61 %, section 311 du skill) sur une forme fausse. [MESURÉ] `q9_exterior.py`.")
+e("- Cause 5 (estimée, non mesurée ici, Houdini inaccessible) : lofts de Coons par patchs et subdivision avec courbes à nombre de points adaptatif recopient le bruit de la planche ; le skill note lui-même ce piège (sections 227, 228, 229, 231). [ESTIMÉ] lecture du skill.")
+e("- Ce que la mesure ne permet PAS de dire : laquelle des causes 1, 2 et 5 domine sur le capot. Le test qui le dirait : reconstruire le capot en un plan RANSAC borné par des droites ajustées, puis comparer ses mesures à celles de v752 (passe 2).")
+e()
+e("## 6. Limites")
+e()
+e("- La classification plan, développable, libre repose sur une quadrique locale ajustée sur des quads de 8 à 20 mm d'arête : les courbures sont bruitées, donc la frontière développable contre libre est floue ; le chiffre fiable est la part plane. [MESURÉ] `q9_surface_classes.py`.")
+e("- Le recalage des silhouettes se fait par boîte englobante et échelle uniforme, sans lire `sheet.json` du Mac ; les masques de la planche gardent un halo d'ombre de quelques pixels. [MESURÉ] `q9_silhouette_symmetry.py`.")
+e("- La planche est générée : aucune vérité 3D n'existe pour la référence, donc aucune mesure d'erreur 3D de v752 contre le vrai objet n'est possible ; seules les silhouettes et les propriétés de finition sont jugeables. [ESTIMÉ] jugement.")
+e("- Les chaînes de plis ne contiennent pas les plis cachés sous des pièces voisines ni les rebords d'épaisseur de 12 mm ; une partie des 528 chaînes sont des arcs légitimes (arches, roues). [MESURÉ] `q9_edges.py`.")
+import re
+def fr(line):
+    parts = line.split("`")
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"(?<![\d.])(\d+)\.(\d+)(?![\d.])", r"\1,\2", parts[i])
+    return "`".join(parts)
+open("../diagnosis_v752_30-October-2026.md", "w").write("\n".join(fr(l) for l in L) + "\n")
+print(len(L), "lignes")

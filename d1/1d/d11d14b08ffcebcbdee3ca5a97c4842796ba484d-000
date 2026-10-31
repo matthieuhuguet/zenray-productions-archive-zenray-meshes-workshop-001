@@ -1,0 +1,383 @@
+"""Pass 8 : intrinsic fill of one patch (mean value Tutte embedding into a convex polygon, Tarini corner regions, barycentric lift)
+and exact welding of all patches through shared arcs. Written 30 October 2026.
+FR : remplissage intrinsèque d'un patch (Tutte a valeur moyenne dans un polygone convexe, regions de coin de Tarini, relevement
+barycentrique) et soudure exacte des patchs par les arcs partages."""
+import collections
+import numpy as np
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
+import matplotlib.tri as mtri
+
+
+# ============================================================================================================================
+# polygon geometry
+# ============================================================================================================================
+def polygon_corners(e):
+    """CCW corner coordinates of the target polygon for side counts e. K = 4 : rectangle e0 x e1. Otherwise cyclic polygon with
+    side lengths proportional to e when max(e) < sum of the others, else regular polygon."""
+    K = len(e)
+    if K == 4:
+        return np.array([[0, 0], [e[0], 0], [e[0], e[1]], [0, e[1]]], float)
+    l = np.array(e, float)
+    if l.max() < l.sum() - l.max():
+        lo = l.max() / 2.0 * (1 + 1e-9); hi = l.sum()
+        f = lambda R: np.sum(2 * np.arcsin(np.minimum(l / (2 * R), 1.0))) - 2 * np.pi
+        if f(lo) > 0:
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                if f(mid) > 0: lo = mid
+                else: hi = mid
+            R = 0.5 * (lo + hi); th = 2 * np.arcsin(l / (2 * R)); th *= 2 * np.pi / th.sum()
+        else:
+            th = np.full(K, 2 * np.pi / K); R = 1.0
+    else:
+        th = np.full(K, 2 * np.pi / K); R = 1.0
+    ang = np.concatenate([[0], np.cumsum(th)[:-1]])
+    pts = np.stack([np.cos(ang), np.sin(ang)], axis=1) * R
+    return pts - pts.mean(axis=0) * 0.0
+
+
+def side_point(C, e, i, t, sag=1e-3):
+    """Point of side i at parameter t in [0, 1] with a small outward parabola (sagitta) so the polygon is strictly convex."""
+    K = len(C); a = C[i]; b = C[(i + 1) % K]
+    d = b - a; L = np.linalg.norm(d)
+    nrm = np.array([d[1], -d[0]]) / max(L, 1e-30)           # outward for a CCW polygon
+    t = np.asarray(t, float)
+    return a + np.outer(t, d) + np.outer(4 * sag * L * t * (1 - t), nrm)
+
+
+# ============================================================================================================================
+# mean value Tutte embedding
+# ============================================================================================================================
+def mean_value_embed(V3, T, bidx, buv):
+    """V3 (n,3) vertices, T (m,3) local triangles, bidx boundary vertex indices, buv their uv. Returns uv (n,2)."""
+    n = len(V3); m = len(T)
+    I = []; J = []; W = []
+    for k in range(3):
+        a = T[:, k]; b = T[:, (k + 1) % 3]; c = T[:, (k + 2) % 3]
+        ab = V3[b] - V3[a]; ac = V3[c] - V3[a]
+        lab = np.linalg.norm(ab, axis=1); lac = np.linalg.norm(ac, axis=1)
+        cosang = np.einsum("ij,ij->i", ab, ac) / np.maximum(lab * lac, 1e-30)
+        th = np.arccos(np.clip(cosang, -1, 1)); tn = np.tan(th / 2.0)
+        I += [a, a]; J += [b, c]; W += [tn / np.maximum(lab, 1e-30), tn / np.maximum(lac, 1e-30)]
+    I = np.concatenate(I); J = np.concatenate(J); W = np.concatenate(W)
+    Wm = coo_matrix((W, (I, J)), shape=(n, n)).tocsr()
+    deg = np.asarray(Wm.sum(axis=1)).ravel()
+    isb = np.zeros(n, bool); isb[bidx] = True
+    inn = np.where(~isb)[0]
+    uv = np.zeros((n, 2)); uv[bidx] = buv
+    if len(inn):
+        L = (coo_matrix((deg[inn], (np.arange(len(inn)), inn)), shape=(len(inn), n)).tocsr() - Wm[inn]).tocsr()
+        Li = L[:, inn]; rhs = -(L[:, bidx] @ buv)
+        uv[inn, 0] = spsolve(Li.tocsc(), rhs[:, 0]); uv[inn, 1] = spsolve(Li.tocsc(), rhs[:, 1])
+    return uv
+
+
+# ============================================================================================================================
+# grid in the polygon
+# ============================================================================================================================
+def coons(bot, top, left, right):
+    """Transfinite interpolation. bot (m+1,2) from (0,0) to (m,0), top from (0,n) to (m,n), left (n+1,2) from (0,0) to (0,n),
+    right from (m,0) to (m,n). Returns (m+1, n+1, 2)."""
+    m = len(bot) - 1; n = len(left) - 1
+    u = (np.arange(m + 1) / m)[:, None, None]; v = (np.arange(n + 1) / n)[None, :, None]
+    X = ((1 - v) * bot[:, None, :] + v * top[:, None, :] + (1 - u) * left[None, :, :] + u * right[None, :, :]
+         - ((1 - u) * (1 - v) * bot[0] + u * (1 - v) * bot[-1] + (1 - u) * v * top[0] + u * v * top[-1]))
+    return X
+
+
+def build_grid(e, s, C):
+    """Quad grid of a patch in the polygon C. Returns (keys, uv, quads) where keys are combinatorial vertex keys.
+    K = 4 : one grid (a, b). K != 4 : K corner regions around the pole, region at corner i+1 is a (s_(i+1) x s_i) grid
+    (Tarini 2021, e_i = s_(i-1) + s_(i+1))."""
+    K = len(e); keys = {}; uv = []; quads = []
+
+    def vid(key, p):
+        if key not in keys:
+            keys[key] = len(uv); uv.append(p)
+        return keys[key]
+
+    def side_key(i, idx):
+        if idx == 0: return ("corner", i % K)
+        if idx == e[i % K]: return ("corner", (i + 1) % K)
+        return ("side", i % K, idx)
+
+    if K == 4:
+        m, n = e[0], e[1]
+        t0 = np.arange(m + 1) / m; t1 = np.arange(n + 1) / n
+        bot = side_point(C, e, 0, t0); right = side_point(C, e, 1, t1)
+        top = side_point(C, e, 2, 1 - t0); left = side_point(C, e, 3, 1 - t1)   # side 2 runs from c2 (x = m) to c3 (x = 0)
+        X = coons(bot, top, left, right)
+        ids = np.zeros((m + 1, n + 1), int)
+        def gk(a, b):
+            if b == 0: return side_key(0, a)
+            if a == m: return side_key(1, b)
+            if b == n: return side_key(2, m - a)
+            if a == 0: return side_key(3, n - b)
+            return ("g", a, b)
+        for a in range(m + 1):
+            for b in range(n + 1):
+                ids[a, b] = vid(gk(a, b), X[a, b])
+        for a in range(m):
+            for b in range(n):
+                quads.append([ids[a, b], ids[a + 1, b], ids[a + 1, b + 1], ids[a, b + 1]])
+        return keys, np.array(uv), np.array(quads)
+
+    for i in range(K):
+        assert e[i] == s[(i - 1) % K] + s[(i + 1) % K], "s must satisfy e_i = s_(i-1) + s_(i+1) (Tarini closed form)"
+    P = C.mean(axis=0)
+    for i in range(K):                                  # region at corner (i+1)
+        ci = (i + 1) % K
+        m = s[(i + 1) % K]; n = s[i]                      # A -> B has s_(i+1) steps, B -> C has s_i steps
+        a_i = s[(i - 1) % K]                              # side i : first part s_(i-1), second part s_(i+1)
+        # bottom : side i from t = a_i / e_i to 1 ; right : side i+1 from t = 0 to s_i / e_(i+1) ; spokes are straight
+        tb = (a_i + np.arange(m + 1)) / e[i]
+        bot = side_point(C, e, i, tb)
+        tr = np.arange(n + 1) / e[(i + 1) % K]
+        right = side_point(C, e, (i + 1) % K, tr)
+        Mi = bot[0]; Mi1 = right[-1]
+        left = Mi[None, :] + (P - Mi)[None, :] * (np.arange(n + 1) / n)[:, None]            # A -> D (spoke i reversed)
+        top = P[None, :] + (Mi1 - P)[None, :] * (np.arange(m + 1) / m)[:, None]             # D -> C (spoke i+1)
+        X = coons(bot, top, left, right)
+        ids = np.zeros((m + 1, n + 1), int)
+        for a in range(m + 1):
+            for b in range(n + 1):
+                if b == 0: key = side_key(i, a_i + a)
+                elif a == m: key = side_key((i + 1) % K, b)
+                elif b == n: key = ("pole",) if a == 0 else ("spoke", (i + 1) % K, a)
+                elif a == 0: key = ("spoke", i, s[i] - b)
+                else: key = ("reg", i, a, b)
+                ids[a, b] = vid(key, X[a, b])
+        for a in range(m):
+            for b in range(n):
+                quads.append([ids[a, b], ids[a + 1, b], ids[a + 1, b + 1], ids[a, b + 1]])
+    return keys, np.array(uv), np.array(quads)
+
+
+def quad_signed_area(uv, q):
+    p = uv[q]
+    x = p[..., 0]; y = p[..., 1]
+    return 0.5 * ((x[:, 0] * y[:, 1] - x[:, 1] * y[:, 0]) + (x[:, 1] * y[:, 2] - x[:, 2] * y[:, 1]) +
+                  (x[:, 2] * y[:, 3] - x[:, 3] * y[:, 2]) + (x[:, 3] * y[:, 0] - x[:, 0] * y[:, 3]))
+
+
+def harmonic_uv(uv, quads, fixed):
+    """Tutte embedding of the quad grid graph : the free vertices solve deg(x_i) x_i = sum of neighbours. This is the fixed point of the
+    Laplacian smoothing of the previous function, reached in ONE sparse solve, and it is injective when the boundary polygon is
+    strictly convex (Tutte 1963; faces of a 3 connected planar graph come out convex)."""
+    n = len(uv); I = []; J = []
+    for q in quads:
+        for k in range(4):
+            I.append(q[k]); J.append(q[(k + 1) % 4]); I.append(q[(k + 1) % 4]); J.append(q[k])
+    W = coo_matrix((np.ones(len(I)), (I, J)), shape=(n, n)).tocsr(); W.data[:] = 1.0     # duplicates (shared edges) count once
+    deg = np.asarray(W.sum(axis=1)).ravel()
+    free = np.array([v for v in range(n) if v not in fixed]); fx = np.array(sorted(fixed))
+    if len(free) == 0: return uv
+    L = coo_matrix((deg, (np.arange(n), np.arange(n))), shape=(n, n)).tocsr() - W
+    rhs = -(L[free][:, fx] @ uv[fx])
+    out = uv.copy(); A = L[free][:, free].tocsc()
+    out[free, 0] = spsolve(A, rhs[:, 0]); out[free, 1] = spsolve(A, rhs[:, 1])
+    return out
+
+
+def smooth_uv(uv, quads, fixed, iters=100):
+    """Laplacian smoothing of the free grid vertices in the plane, a step is halved until no quad changes sign."""
+    n = len(uv); nb = collections.defaultdict(set)
+    for q in quads:
+        for k in range(4):
+            nb[q[k]].add(q[(k + 1) % 4]); nb[q[k]].add(q[(k - 1) % 4])
+    free = [v for v in range(n) if v not in fixed]
+    if not free: return uv
+    ptr = np.array([0] + [len(nb[v]) for v in free]).cumsum(); flat = np.array([w for v in free for w in nb[v]])
+    free = np.array(free); a0 = quad_signed_area(uv, quads)
+    if (a0 <= 0).any(): return uv
+    for _ in range(iters):
+        avg = np.add.reduceat(uv[flat], ptr[:-1]) / np.diff(ptr)[:, None]
+        step = 1.0
+        while step > 1e-3:
+            new = uv.copy(); new[free] = uv[free] * (1 - step) + avg * step
+            if (quad_signed_area(new, quads) > 0).all(): uv = new; break
+            step *= 0.5
+        else:
+            break
+    return uv
+
+
+# ============================================================================================================================
+# point on an arc polyline
+# ============================================================================================================================
+def arc_points(V, key, n):
+    """The n + 1 points at equal arclength fractions j / n along the polyline of arc `key` (canonical direction)."""
+    P = V[list(key)]; seg = np.linalg.norm(np.diff(P, axis=0), axis=1); cum = np.concatenate([[0], np.cumsum(seg)])
+    tt = cum[-1] * np.arange(n + 1) / n
+    idx = np.clip(np.searchsorted(cum, tt, side="right") - 1, 0, len(seg) - 1)
+    f = (tt - cum[idx]) / np.maximum(seg[idx], 1e-30)
+    out = P[idx] + (P[idx + 1] - P[idx]) * f[:, None]
+    out[0] = P[0]; out[-1] = P[-1]
+    return out
+
+
+# ============================================================================================================================
+# fill one patch
+# ============================================================================================================================
+def fill_patch(lay, p, sides_p, counts, s, arc_pts, smooth_iters=100):
+    """Returns dict(keys (global vertex keys per local grid key), P3 (3d positions), quads (local ids), uv_ok)."""
+    V = lay.V; fs = lay.faces_of_patch[p]; F = lay.F[fs]
+    vset = np.unique(F.ravel()); loc = {int(v): i for i, v in enumerate(vset)}
+    T = np.vectorize(lambda x: loc[int(x)])(F) if F.size else F
+    V3 = V[vset]
+    K = len(sides_p); e = [int(sum(counts[k] for k, _ in sides_p[i])) for i in range(K)]
+    C = polygon_corners(e)
+    bidx = []; buv = []
+    for i in range(K):
+        cum = 0
+        for (key, fwd) in sides_p[i]:
+            n = counts[key]; seq = list(key) if fwd else list(key[::-1])
+            P = V[seq]; seg = np.linalg.norm(np.diff(P, axis=0), axis=1); cs = np.concatenate([[0], np.cumsum(seg)]); phi = cs / cs[-1]
+            t = (cum + phi * n) / e[i]
+            pts = side_point(C, e, i, t)
+            for q in range(len(seq) - 1):                 # skip the last vertex : it is the first of the next piece
+                bidx.append(loc[seq[q]]); buv.append(pts[q])
+            cum += n
+    bidx = np.array(bidx); buv = np.array(buv)
+    # a vertex can appear twice if a corner is a node of two pieces of different sides : keep the first
+    _, first = np.unique(bidx, return_index=True); bidx = bidx[first]; buv = buv[first]
+    uv_tri = mean_value_embed(V3, T, bidx, buv)
+    keys, guv, quads = build_grid(e, s, C)
+    fixed = {i for k, i in keys.items() if k[0] in ("corner", "side")}
+    guv0 = guv
+    guv = harmonic_uv(guv, quads, fixed) if smooth_iters else guv
+    ok_uv = bool((quad_signed_area(guv, quads) > 0).all())
+    # lift : boundary keys from the arcs, interior keys by barycentric lifting
+    tri = mtri.Triangulation(uv_tri[:, 0], uv_tri[:, 1], T)
+    finder = tri.get_trifinder()
+    pos = np.zeros((len(guv), 3)); gkeys = [None] * len(guv)
+    inter = [(k, i) for k, i in keys.items() if k[0] not in ("corner", "side")]
+    ti = finder(guv[[i for _, i in inter], 0], guv[[i for _, i in inter], 1]) if inter else np.array([], int)
+    miss = 0
+    for (k, i), t_ in zip(inter, ti):
+        x = guv[i]
+        if t_ < 0:
+            miss += 1
+            c = uv_tri[T].mean(axis=1); t_ = int(np.argmin(((c - x) ** 2).sum(axis=1)))
+        a, b, c3 = uv_tri[T[t_]]
+        M = np.array([[a[0] - c3[0], b[0] - c3[0]], [a[1] - c3[1], b[1] - c3[1]]])
+        try:
+            l1, l2 = np.linalg.solve(M, x - c3)
+        except np.linalg.LinAlgError:
+            l1 = l2 = 1 / 3
+        bc = np.clip([l1, l2, 1 - l1 - l2], -0.05, 1.05); bc = bc / bc.sum()
+        pos[i] = bc @ V3[T[t_]]
+        gkeys[i] = ("int", p) + k
+    # boundary
+    sidemap = {}
+    for i in range(K):
+        j0 = 0
+        for (key, fwd) in sides_p[i]:
+            n = counts[key]
+            for j in range(n + 1):
+                idx = j0 + j
+                jj = j if fwd else n - j
+                sidemap[(i, idx)] = (key, jj, n)
+            j0 += n
+    for k, i in keys.items():
+        if k[0] == "corner":
+            ci = k[1]
+            key, jj, n = sidemap[(ci, 0)]
+            node = int(key[jj if jj in (0, n) and jj == 0 else -1]) if False else None
+            # corner vertex = start of side ci
+            key0, fw0 = sides_p[ci][0]
+            v = int(key0[0] if fw0 else key0[-1])
+            gkeys[i] = ("node", v); pos[i] = V[v]
+        elif k[0] == "side":
+            key, jj, n = sidemap[(k[1], k[2])]
+            if jj == 0: gkeys[i] = ("node", int(key[0])); pos[i] = V[key[0]]
+            elif jj == n: gkeys[i] = ("node", int(key[-1])); pos[i] = V[key[-1]]
+            else:
+                gkeys[i] = ("arc", key, jj); pos[i] = arc_pts[key][jj] if key in arc_pts and len(arc_pts[key]) == n + 1 else arc_points(V, key, n)[jj]
+    return {"gkeys": gkeys, "P3": pos, "quads": quads, "uv_ok": ok_uv, "missed": miss, "e": e}
+
+
+def weld(parts, ref_normals=None):
+    """parts : list of fill_patch results. Merge by global keys. Returns (P, Q)."""
+    gid = {}; P = []; Q = []
+    for r in parts:
+        loc = np.zeros(len(r["gkeys"]), int)
+        for i, k in enumerate(r["gkeys"]):
+            if k not in gid:
+                gid[k] = len(P); P.append(r["P3"][i])
+            loc[i] = gid[k]
+        Q.append(loc[r["quads"]])
+    keys = [None] * len(gid)
+    for k, i in gid.items():
+        keys[i] = k
+    return np.array(P), np.vstack(Q), keys
+
+
+# ================================================================================================================================
+# analytic fill : the chart of a developable primitive (plane, cylinder, cone) replaces the Tutte embedding
+# ================================================================================================================================
+class PlaneSurface:
+    """Trivial reference 'surface' for the 2D barrier in a chart : the plane z = 0."""
+    def project(self, X):
+        Y = X.copy(); Y[:, 2] = 0.0; return Y
+
+
+def fill_patch_analytic(lay, p, sides_p, counts, s, chart, theta=1.0 / 8, outer=6, inner=60):
+    """Same output as fill_patch. The patch boundary (exact arc points) is mapped by the isometric chart, the grid is built inside the true
+    shape of the patch by harmonic embedding (Tutte on the grid graph) then Winslow barrier in 2D with the boundary fixed, then lifted by the
+    inverse chart : interior vertices lie EXACTLY on the primitive."""
+    import zr8_straighten as S
+    V = lay.V
+    K = len(sides_p); e = [int(sum(counts[k] for k, _ in sides_p[i])) for i in range(K)]
+    C = polygon_corners(e)
+    keys, guv, quads = build_grid(e, s, C)
+    # exact boundary positions of the keys corner / side
+    sidemap = {}
+    for i in range(K):
+        j0 = 0
+        for (key, fwd) in sides_p[i]:
+            n = counts[key]
+            for j in range(n + 1):
+                sidemap[(i, j0 + j)] = (key, j if fwd else n - j, n)
+            j0 += n
+    bid = []; bpos = []; gk = {}
+    for k, i in keys.items():
+        if k[0] == "corner":
+            key0, fw0 = sides_p[k[1]][0]; v = int(key0[0] if fw0 else key0[-1])
+            bid.append(i); bpos.append(V[v]); gk[i] = ("node", v)
+        elif k[0] == "side":
+            key, jj, n = sidemap[(k[1], k[2])]
+            if jj == 0: v = int(key[0]); bid.append(i); bpos.append(V[v]); gk[i] = ("node", v)
+            elif jj == n: v = int(key[-1]); bid.append(i); bpos.append(V[v]); gk[i] = ("node", v)
+            else: bid.append(i); bpos.append(arc_points(V, key, n)[jj]); gk[i] = ("arc", key, jj)
+    bid = np.array(bid); bpos = np.array(bpos)
+    ub = chart.fwd(bpos)
+    # orientation : signed area of the boundary loop in the chart must be positive (counter clockwise as the faces)
+    loop = []
+    for i in range(K):
+        for idx in range(e[i]):
+            k = ("corner", i) if idx == 0 else ("side", i, idx)
+            loop.append(keys[k])
+    pos_in_b = {int(b): t for t, b in enumerate(bid)}
+    Lp = ub[[pos_in_b[b] for b in loop]]
+    area = 0.5 * np.sum(Lp[:, 0] * np.roll(Lp[:, 1], -1) - np.roll(Lp[:, 0], -1) * Lp[:, 1])
+    if area < 0:
+        chart.flip = -chart.flip; ub = chart.fwd(bpos)
+    uv = guv.copy(); uv[bid] = ub
+    fixed = set(int(b) for b in bid)
+    uv = harmonic_uv(uv, quads, fixed)
+    # 2D Winslow barrier in the chart, boundary fixed, uniform target area
+    P2 = np.c_[uv, np.zeros(len(uv))]
+    kind = np.zeros(len(uv), int); kind[bid] = 2
+    P2, hist = S.barrier(P2, quads, PlaneSurface(), kind=kind, outer=outer, inner=inner, theta=theta, size="patch", groups=np.zeros(len(quads), int))
+    uv = P2[:, :2]
+    ok_uv = bool((quad_signed_area(uv, quads) > 0).all())
+    pos = chart.inv(uv)
+    gkeys = [None] * len(uv)
+    for i, g in gk.items():
+        gkeys[i] = g; pos[i] = bpos[pos_in_b[i]]
+    for k, i in keys.items():
+        if gkeys[i] is None:
+            gkeys[i] = ("int", p) + k
+    return {"gkeys": gkeys, "P3": pos, "quads": quads, "uv_ok": ok_uv, "missed": 0, "e": e}

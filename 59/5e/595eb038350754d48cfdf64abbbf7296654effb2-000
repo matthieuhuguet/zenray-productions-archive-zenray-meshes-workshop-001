@@ -1,0 +1,46 @@
+import cv2, numpy as np, json
+from skimage.segmentation import felzenszwalb
+from skimage.restoration import denoise_tv_chambolle
+rng = np.random.default_rng(1)
+H, W = 512, 768
+polys = [
+ ([(60,380),(180,300),(330,260),(560,270),(700,360),(700,420),(60,420)], 150),
+ ([(180,300),(330,260),(330,330),(140,340)], 205),
+ ([(330,260),(560,270),(600,340),(330,330)], 175),
+ ([(560,270),(700,360),(640,360),(600,340)], 120),
+ ([(60,380),(140,340),(330,330),(600,340),(640,360),(700,360),(700,420),(60,420)], 100),
+]
+img = np.full((H,W), 235, np.uint8); lab = np.zeros((H,W), np.int32)
+for k,(pts,g) in enumerate(polys, start=1):
+    cv2.fillPoly(img, [np.array(pts,np.int32)], g); cv2.fillPoly(lab, [np.array(pts,np.int32)], k)
+res=[]
+for sigma in [0,5,10,20]:
+    noisy = np.clip(img.astype(np.float32)+rng.normal(0,sigma,img.shape),0,255)
+    n8 = noisy.astype(np.uint8)
+    out = {}
+    for name, seg in [
+        ('felz_raw_scale200', felzenszwalb(noisy/255.0, scale=200, sigma=1.0, min_size=300)),
+        ('felz_TV_scale200', felzenszwalb(denoise_tv_chambolle(noisy/255.0, weight=0.15), scale=200, sigma=0.5, min_size=300)),
+        ('meanshift_sp8_sr20', cv2.pyrMeanShiftFiltering(cv2.cvtColor(n8, cv2.COLOR_GRAY2BGR), 8, 20)[...,0]),
+    ]:
+        if name.startswith('meanshift'):
+            # regions = connected components of identical quantized value
+            q = (seg//16).astype(np.int32); nl, cc = cv2.connectedComponents(q.astype(np.uint8)); seg = cc
+        nlab = int(len(np.unique(seg)))
+        # purity: fraction of pixels whose region majority GT label equals own GT label (GT only in polygons)
+        pur_num=0; tot=0
+        for r in np.unique(seg):
+            m = (seg==r)
+            gl = lab[m]; 
+            if gl.size==0: continue
+            cnt = np.bincount(gl); pur_num += cnt.max(); tot += gl.size
+        out[name]=dict(n_regions=nlab, purity=round(pur_num/tot,4))
+    res.append(dict(noise_sigma=sigma, **out))
+print(json.dumps(res))
+# triangulation d'un point par 2 vues orthographiques axis-alignees via cv2.triangulatePoints
+Pt = np.array([[1,0,0,0],[0,1,0,0],[0,0,0,1.]])   # top: (x,y)
+Pf = np.array([[0,0,1,0],[0,1,0,0],[0,0,0,1.]])   # front: (z,y)
+X = np.array([[0.3],[0.7],[-0.4],[1.0]])
+xt = (Pt@X)[:2]/ (Pt@X)[2]; xf = (Pf@X)[:2]/ (Pf@X)[2]
+Xh = cv2.triangulatePoints(Pt, Pf, xt, xf)
+print('triangulatePoints ortho:', (Xh[:3]/Xh[3]).ravel(), 'attendu', X[:3].ravel())

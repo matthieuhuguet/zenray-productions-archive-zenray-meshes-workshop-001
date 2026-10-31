@@ -1,0 +1,1007 @@
+#!/usr/bin/env python3
+"""Construit report.json et verifie chaque citation et chaque chiffre contre les fichiers lus.
+Usage: python3 -I build_report.py
+Code de sortie 0 si toutes les citations/chiffres sont retrouves, 1 sinon.
+"""
+import json, os, re, sys
+
+BASE = "/tmp/claude-0/-home-user-Memory/993a92cd-e483-55a9-9dfe-6c59fcf91767/scratchpad/agentA"
+C = "evidence/"
+R = "raw/"
+SP = "/usr/local/lib/python3.13/dist-packages/"
+GH = "git clone profondeur 1 de https://github.com/"
+RAWU = "https://raw.githubusercontent.com/"
+
+def path(p):
+    return p if p.startswith("/") else os.path.join(BASE, p)
+
+_cache = {}
+def lines_of(p):
+    if p not in _cache:
+        with open(path(p), errors="replace") as f:
+            _cache[p] = f.read().split("\n")
+    return _cache[p]
+
+def norm(s):
+    return re.sub(r"\s+", " ", s).strip()
+
+errors = []
+
+def find_quote(fichier, quote):
+    """Retourne le numero de ligne (1-indexe) ou la citation commence, apres normalisation des espaces."""
+    L = lines_of(fichier)
+    full = norm(" ".join(L))
+    if norm(quote) not in full:
+        return None
+    # numero de ligne: premiere ligne contenant les 25 premiers caracteres normalises
+    head = norm(quote)[:25]
+    for i, l in enumerate(L, 1):
+        if head in norm(l):
+            return i
+    # citation a cheval sur deux lignes dont le debut est coupe: chercher 12 caracteres
+    head = norm(quote)[:12]
+    for i, l in enumerate(L, 1):
+        if head in norm(l):
+            return i
+    return 0
+
+def find_token(fichier, token):
+    for i, l in enumerate(lines_of(fichier), 1):
+        if token in l:
+            return i
+    return None
+
+def E(id, sujet, nom, url, licence, statut, lu, quote, qfile, principe, reseau, alt, chiffres, utile, notes=None):
+    ch = []
+    for (valeur, f, token) in chiffres:
+        if f is None:
+            ch.append({"valeur": valeur, "ligne_source": token})
+            continue
+        n = find_token(f, token)
+        if n is None:
+            errors.append(f"[{id}] chiffre introuvable: {token!r} dans {f}")
+            ch.append({"valeur": valeur, "ligne_source": f"INTROUVABLE {f}"})
+        else:
+            ch.append({"valeur": valeur, "ligne_source": f"{f}:{n}"})
+    e = {
+        "id": id, "sujet": sujet, "nom": nom, "url_ouverte": url, "licence": licence,
+        "statut": statut, "ce_qui_a_ete_lu": lu,
+        "citation_courte": None, "fichier_citation": None,
+        "principe": principe, "reseau_de_neurones": reseau,
+        "alternative_sans_reseau": alt, "chiffres": ch,
+        "utile_pour_voiture_facettee": utile,
+    }
+    if quote:
+        n = find_quote(qfile, quote)
+        if n is None:
+            errors.append(f"[{id}] citation introuvable: {quote!r} dans {qfile}")
+            e["citation_courte"] = "INTROUVABLE"
+        else:
+            if len(quote.split()) > 20:
+                errors.append(f"[{id}] citation trop longue ({len(quote.split())} mots)")
+            e["citation_courte"] = '"' + quote + '"'
+            e["fichier_citation"] = f"{qfile}:{n}"
+    if notes:
+        e["notes"] = notes
+    return e
+
+S = []
+
+# ---------------------------------------------------------------- S1
+S.append(E("S1-01", "S1", "PlankAssembly (manycore-research), ICCV 2023",
+    GH + "manycore-research/PlankAssembly.git",
+    "GNU AFFERO GENERAL PUBLIC LICENSE, Version 3, 19 November 2007 (fichier LICENSE, 661 lignes)",
+    "DOC (README)",
+    "README lignes 1 a 80 (installation, entrees, branches), en-tete de LICENSE, liste des dossiers plankassembly/ et third_party/ ; le code du modele n'a pas ete lu.",
+    "supports three types of inputs: (1) visible and hidden lines, (2) visible edges only, and (3) sidefaces.",
+    C + "manycore-research_PlankAssembly/README.md",
+    "Un reseau apprend un programme de formes (des planches) a partir de trois vues orthographiques vectorielles (lignes visibles et cachees). Le README impose PyTorch Lightning, detectron2 et pythonocc-core, et renvoie les images raster vers une autre branche.",
+    True,
+    "Chaine classique sommets, aretes, faces, corps decrite dans la doc de S1-02 (CAD-Tool), sans apprentissage.",
+    [("Versions testees: Python 3.8, PyTorch 1.10.0, CUDA 11.3, PyTorch Lightning 1.7.6", C + "manycore-research_PlankAssembly/README.md", "Python 3.8, PyTorch 1.10.0")],
+    "Faible: entree vectorielle propre et non une image bruitee (les images raster sont une autre branche), reseau PyTorch hors cahier des charges, licence AGPL-3.0 qui oblige a publier le code de tout outil qui l'embarque.",
+    notes="Le jeu de donnees est annonce sur Hugging Face (README ligne 78), hote ferme ici, non verifie."))
+
+S.append(E("S1-02", "S1", "CAD-Tool (manishtanwar), reconstruction de polyèdre depuis trois vues",
+    GH + "manishtanwar/CAD-Tool.git",
+    "Aucun fichier LICENSE dans le clone (racine: CAD_Tool.pro, README.md, app, doc, include, src, tests). Droit par defaut non confirme.",
+    "DOC (code)",
+    "README (format d'entree 2D vers 3D), noms des fichiers include/ et src/ (planar_graph_generator, faceloop_generator, body_loop), et doc/Mathematical_Model.pdf pages 1 a 3 et 9 a 13 (lu en image et en texte pdftotext).",
+    "In this project we are considering only polyhedron 3-D objects which have flat polygon faces.",
+    R + "cadtool_math.txt",
+    "Chaine en six etapes (PDF pages 10 a 13): sommets 3D deduits des trois projections, aretes candidates (une paire de sommets est candidate si son segment existe dans chaque vue), retrait des aretes colineaires qui se chevauchent pour obtenir le fil de fer, graphes planaires (un plan par paire d'aretes voisines, doublons et plans a contour ouvert elimines), boucles de faces, boucles de corps. Les sommets sont fournis deja apparies entre les trois vues dans le fichier d'entree.",
+    False,
+    None,
+    [],
+    "Moyen pour l'idee, faible pour le code: l'algorithme suppose des sommets parfaits et deja apparies entre vues, ce que six rendus bruites ne donnent pas ; code C++ Qt de projet d'etudiant, sans licence.",
+    notes="Ligne d'appariement dans le PDF: 'there is a correspondence between the points in all the three views' (cadtool_math.txt ligne 501). Le README (lignes 76 a 78) montre le format: pour chaque sommet, ses projections top, front, side."))
+
+S.append(E("S1-03", "S1", "Reconstruction-Isometric-Orthographic-Projections (ashraygupta1)",
+    GH + "ashraygupta1/Reconstruction-Isometric-Orthographic-Projections-.git",
+    "Aucun fichier LICENSE dans le clone (racine: README.md, html, include, latex, sample, src, t.conf).",
+    "DOC (code)",
+    "README (format de fichier 2D avec drapeau cache/visible), src/model_3d.cpp lignes 240 a 300 (form_wireframe, form_3dfaces).",
+    "Form 3d faces on the wireframe model using Minimum Surface Angle approach",
+    C + "ashraygupta1_Reconstruction-Isometric-Orthographic-Projections-/src/model_3d.cpp",
+    "Le fil de fer est construit en reprenant x,y de la vue de dessus et z de la vue de face pour les sommets de meme numero, donc l'appariement est donne par la numerotation. Les faces sont ensuite formees sur le fil de fer par une approche d'angle de surface minimal. Interface GTK et OpenGL.",
+    False,
+    None,
+    [],
+    "Faible: meme limite que S1-02 (sommets numerotes et deja apparies), pas de licence, pas de tolerance au bruit lisible dans le code lu.",
+    notes="Variante nommee dans le code: 'Minimum Surface Angle' pour l'etape faces. Les noms Idesawa ou Shin et Shin ne figurent pas dans les fichiers lus (grep sans resultat)."))
+
+S.append(E("S1-04", "S1", "FaceFormer (manycore-research), CVPR 2022",
+    GH + "manycore-research/faceformer.git",
+    "MIT License, Copyright (c) 2019 Manycore Tech Inc. (fichier LICENSE)",
+    "DOC (README)",
+    "README: dataset ABC, commandes d'evaluation et de reconstruction, FAQ ; liste des dossiers.",
+    "Neural Face Identification in a 2D Wireframe Projection of a Manifold Object",
+    C + "manycore-research_faceformer/README.md",
+    "Un reseau identifie les faces dans un fil de fer 2D, puis deux scripts reconstruisent un fil de fer 3D (.ply) et un maillage (.obj). Entrainement sur des pieces mecaniques du jeu ABC.",
+    True,
+    "Enumeration de boucles de faces planes sur le fil de fer, comme dans la doc de S1-02.",
+    [],
+    "Faible a moyen: resout seulement l'etape faces a partir d'un fil de fer deja propre, le reste de la chaine reste a ecrire ; poids sur Google Drive, ferme ici.",
+    notes="Les poids entraines et le jeu de donnees sont sur Google Drive (README), non ouverts."))
+
+S.append(E("S1-05", "S1", "SketchModeling (happylun), 3DV 2017",
+    GH + "happylun/SketchModeling.git",
+    "GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007 (LICENSE) ; README: Our code is released under GPL v3 license ; COPYING: TensorFlow sous Apache 2.0.",
+    "DOC (README)",
+    "README racine (deux parties: reseau et fusion), en-tete de LICENSE et COPYING.",
+    "The fusion part contains C++ code for fusing depth and normal maps to 3D shapes.",
+    C + "happylun_SketchModeling/README.md",
+    "Un reseau TensorFlow predit des cartes de profondeur et de normales depuis des croquis, puis du C++ les fusionne en forme 3D. Visual Studio est exige pour compiler.",
+    True,
+    "Aucune dans ce depot: pour des vues orthographiques propres, voir S1-02.",
+    [],
+    "Faible: croquis a main levee et non vues orthographiques, GPL v3, reseau, chaine Windows.",
+    notes="Seule la partie fusion (profondeur et normales vers surface) pourrait inspirer un outil sans reseau, non evalue."))
+
+S.append(E("S1-06", "S1", "python-visual-hull (egrigokhan)",
+    GH + "egrigokhan/python-visual-hull.git",
+    "MIT License, Copyright (c) 2020 Gokhan Egri (fichier LICENSE)",
+    "DOC (README)",
+    "README (deux paragraphes), liste des fichiers (carnets .ipynb, modeles .dae).",
+    "the Python implementation for creating object visual hulls from camera masks.",
+    C + "egrigokhan_python-visual-hull/README.md",
+    "Enveloppe visuelle: on garde les points de l'espace dont la projection tombe dans le masque de chaque vue. Code adapte d'un depot MATLAB (maximm8/VisualHull, cite dans le README, non ouvert). Livre sous forme de carnets Jupyter.",
+    False,
+    None,
+    [],
+    "Moyen comme point de depart: six silhouettes orthographiques donnent une enveloppe qui borne la voiture mais ne retrouve pas les creux visibles seulement par l'ombrage ; le depot ne montre pas de camera orthographique (non verifie).",
+    notes="Le clone mesurait 103 Mo, au-dessus de la limite de 100 Mo fixee (taille inconnue avant clonage)."))
+
+S.append(E("S1-07", "S1", "voxel-carving (twjhlee), Open3D",
+    GH + "twjhlee/voxel-carving.git",
+    "Aucun fichier LICENSE dans le clone (racine: README.md, carve.py, results, temple).",
+    "DOC (code)",
+    "README (donnees Temple, K et R t), carve.py lignes 1 a 57.",
+    "voxel_grid.carve_silhouette(img, params)",
+    C + "twjhlee_voxel-carving/carve.py",
+    "Grille dense Open3D (VoxelGrid.create_dense) puis sculpture par silhouette image par image avec des parametres de camera pinhole (o3d.camera.PinholeCameraParameters).",
+    False,
+    None,
+    [("312 vues echantillonnees sur un hemisphere (jeu Temple, Middlebury)", C + "twjhlee_voxel-carving/README.md", "312 views")],
+    "Moyen: montre l'appel Open3D de sculpture par silhouette, mais la camera est pinhole et non orthographique (non teste ici) ; pas de licence.",
+    notes="Le clone mesurait 160 Mo, au-dessus de la limite de 100 Mo fixee (taille inconnue avant clonage)."))
+
+S.append(E("S1-08", "S1", "Famille classique (Idesawa, Sakurai et Gossard, Shin et Shin, Kuo)",
+    None, "Sans objet", "non ouvert",
+    "Rien: aucun de ces algorithmes n'a ete ouvert. Les noms Sakurai et Gossard 1983, Shin et Shin 1998 et Kuo 1998 viennent d'un resultat de recherche web, Idesawa vient de la consigne. Seule la chaine generique (sommets, aretes, faces, corps) est lue, dans le PDF de S1-02.",
+    None, None,
+    "Famille de methodes qui reconstruisent le solide par correspondance de sommets, puis d'aretes, puis de faces (resume tel que lu dans S1-02, non attribue a un auteur).",
+    False, None, [],
+    "Non evalue: le texte des articles n'a pas ete ouvert (arxiv.org, doi.org, dl.acm.org fermes)."))
+
+# ---------------------------------------------------------------- S2
+S.append(E("S2-01", "S2", "scikit-image 0.26.0 (paquet installé)",
+    "https://pypi.org/pypi/scikit-image/json et " + SP + " (paquet installé, introspecté)",
+    "BSD-3-Clause (scikit_image-0.26.0.dist-info/LICENSE.txt) ; classifieur PyPI: License :: OSI Approved :: BSD License",
+    "DOC (code)",
+    "LICENSE.txt, liste des fonctions des sous-modules segmentation, graph, transform, filters, feature, restoration.",
+    "License: BSD-3-Clause",
+    SP + "scikit_image-0.26.0.dist-info/LICENSE.txt",
+    "Fournit la segmentation en regions (felzenszwalb, slic, quickshift, watershed, random_walker, chan_vese), la fusion sur graphe d'adjacence (rag_mean_color, merge_hierarchical, cut_threshold), le debruitage (denoise_tv_chambolle, denoise_bilateral, denoise_nl_means) et hough_line. Aucune fonction de forme par l'ombrage ni d'estimation de direction de lumiere dans les sous-modules listes.",
+    False, None, [],
+    "Moyen a haut: briques directes pour decouper un rendu argile en plages d'intensite constante ; ne donne ni normales ni direction de lumiere. Mesure locale: voir mesures_locales (Felzenszwalb)."))
+
+S.append(E("S2-02", "S2", "OpenCV 5.0.0.93 opencv-python-headless (paquet installé), fonctions de filtrage et segmentation",
+    "https://pypi.org/pypi/opencv-contrib-python-headless/json et " + SP + "cv2/ (paquet installé, introspecté)",
+    "Metadonnees PyPI: Apache 2.0. Le fichier cv2/LICENSE.txt du paquet est MIT (emballage, Olli-Pekka Heinisuo) ; LICENSE-3RD-PARTY.txt (179609 octets) dit que la licence Apache s'applique au binaire OpenCV et indique que FFmpeg (LGPL) est redistribue dans tous les paquets opencv-python.",
+    "DOC (code)",
+    "cv2.getBuildInformation, presence de fonctions par introspection, LICENSE.txt et LICENSE-3RD-PARTY.txt.",
+    "FFmpeg is redistributed within all opencv-python packages.",
+    SP + "cv2/LICENSE-3RD-PARTY.txt",
+    "Presentes dans l'install: pyrMeanShiftFiltering, floodFill, watershed, bilateralFilter, Canny, HoughLinesP, fitLine, approxPolyDP, kmeans, triangulatePoints, solvePnP. Le module cv2.ximgproc (contrib) est absent de la version headless installee.",
+    False, None, [],
+    "Moyen: bon socle de pretraitement et de lignes ; pas d'ombrage vers forme.",
+    notes="FFmpeg est lie dans la roue (getBuildInformation: FFMPEG YES) ; point de licence LGPL a traiter si l'outil final est redistribue."))
+
+S.append(E("S2-03", "S2", "Discontinuity-aware Normal Integration (facebookresearch/surface_normal_integration), ICCV 2025",
+    GH + "facebookresearch/surface_normal_integration.git",
+    "GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007 (fichier LICENSE, 621 lignes)",
+    "DOC (README)",
+    "README (resume, installation, structure des donnees DiLiGenT) ; main.py non lu.",
+    "Our key idea is based on a local planarity assumption",
+    C + "facebookresearch_surface_normal_integration/README.md",
+    "Calcule une surface de profondeur depuis une carte de normales en modélisant les discontinuités explicitement. Le resume dit que les methodes anterieures sont limitees aux cameras orthographiques ou pinhole ideales.",
+    False,
+    None,
+    [],
+    "Faible: il faut deja une carte de normales (dossier normals/<objet>/ avec K.txt, mask.png, normal_map.png), et une image argile donne une intensite, pas des normales ; GPL-3.0.",
+    notes="Je n'ai pas lu main.py: l'absence de reseau est deduite du README seul (aucun reseau mentionne)."))
+
+S.append(E("S2-04", "S2", "Photometric-Stereo (Sajjad-Mahmoudi), intégration Frankot-Chellappa",
+    GH + "Sajjad-Mahmoudi/Photometric-Stereo.git",
+    "Aucun fichier LICENSE dans le clone (ReadMe.txt, depth_from_gradient.py, frankoChapello.py, photometric_stereo.py, shadow_mask.py, dossiers masks et objects).",
+    "DOC (README)",
+    "ReadMe.txt (trois etapes: masques d'ombre, gradients p et q et albedo, profondeur par Frankot-Chellappa).",
+    "this module calculates gradients of the normals (p and q) and albedo.",
+    C + "Sajjad-Mahmoudi_Photometric-Stereo/ReadMe.txt",
+    "Stereo photometrique: plusieurs images de l'objet sous des eclairages differents donnent normales et albedo, puis une integration de gradients par FFT donne la profondeur.",
+    False, None, [],
+    "Faible: exige plusieurs eclairages, alors qu'un rendu argile unique par vue n'en donne qu'un ; utile seulement comme exemple d'integration de gradients.",
+    notes="Le depot zxkplus/PhotometricStereo (clone, 5 Mo, sans LICENSE) n'est pas retenu: README en chinois et meme limite multi-eclairage."))
+
+S.append(E("S2-05", "S2", "Numerical Tours (gpeyre), shape from shading par Fast Marching",
+    RAWU + "gpeyre/numerical-tours/NtToolBox/python/todo/graphics_7_shape_shading.ipynb",
+    "Non trouvee: LICENSE, LICENSE.md et LICENSE.txt renvoient HTTP 404 sur la branche master.",
+    "DOC (code)",
+    "Carnet complet (54 cellules, format nbformat 3), dossier python/todo, depend de nt_toolbox et nt_solutions.",
+    "the surface is perfectly diffuse (Lambertian).",
+    R + "nt_sfs.txt",
+    "Ombrage vers forme dans un cadre simplifie: camera orthographique, lumiere a l'infini perpendiculaire au plan focal, surface lambertienne ; resolution par Fast Marching. C'est le cadre le plus proche d'un rendu argile en vue orthographique, a condition que la lumiere soit frontale.",
+    False, None, [],
+    "Faible a moyen: hypothese de lumiere frontale (non verifiee pour le rendu du projet) et un seul eclairage rend le probleme mal pose en general ; le dossier todo laisse penser a un carnet inacheve (non verifie).",
+    notes="Citation lue dans la cellule markdown 'Forward Image Formation' ; raw/nt_sfs.txt est le texte extrait du carnet JSON (cellules jointes par des retours a la ligne)."))
+
+S.append(E("S2-06", "S2", "Intrinsic (compphoto), décomposition intrinsèque par ombrage ordinal",
+    GH + "compphoto/Intrinsic.git",
+    "Copyright 2021, Chris Careaga, Yağız Aksoy, Computational Photography Laboratory. This software is for academic use only (LICENSE). Le README mentionne Patent pending.",
+    "DOC (README)",
+    "README (introduction, installation), texte complet de LICENSE.",
+    "This software is for academic use only.",
+    C + "compphoto_Intrinsic/LICENSE",
+    "Un reseau estime une ombre en niveaux de gris puis un albedo, pour des photos en conditions reelles.",
+    True,
+    "Decomposition de Bell et al. 2014 (S2-07), par champ aleatoire sans reseau.",
+    [],
+    "Faible: licence academique et brevet en cours, reseau, et un rendu argile a un albedo uniforme donc l'ombre est deja l'image.",
+    notes="Le clone mesurait 74 Mo."))
+
+S.append(E("S2-07", "S2", "Intrinsic-Image-Decomposition (DefUs3r), Bell, Bala et Snavely 2014",
+    GH + "DefUs3r/Intrinsic-Image-Decomposition.git",
+    "Aucun fichier LICENSE dans le clone ; aucune mention de licence dans les fichiers .py, .md, .txt, .sh (grep).",
+    "DOC (README)",
+    "README, liste des fichiers (decompose.py, energy, judgements.py, install_deps.sh).",
+    "a simple Python wrapper to the C++ dense CRF inference code",
+    C + "DefUs3r_Intrinsic-Image-Decomposition/README.md",
+    "Decomposition intrinseque par champ aleatoire conditionnel dense, sans reseau de neurones d'apres le README.",
+    False, None, [],
+    "Faible: concu pour des photos reelles ; sur un rendu argile l'albedo est uniforme donc la decomposition n'apporte rien.",
+    notes="Depot a titre d'exemple de code classique ; je n'ai pas ouvert le depot d'origine des auteurs."))
+
+S.append(E("S2-08", "S2", "DSINE (baegwangbin), estimation de normales depuis une image",
+    GH + "baegwangbin/DSINE.git (README et LICENSE conservés dans le dossier raw ; clone supprimé)",
+    "DSINE SOFTWARE LICENCE AGREEMENT, Imperial College London: usage uniquement non commercial, interne ou de recherche academique (LICENSE lignes 33 a 35).",
+    "DOC (README)",
+    "README (dataset, entrainement, torch hub) et LICENSE.",
+    "You may use the Software solely for non-commercial, internal or academic research purposes",
+    R + "dsine/LICENSE",
+    "Reseau qui estime les normales de surface d'une image RGB.",
+    True,
+    "Pour un rendu argile en vue orthographique: shape from shading (S2-05) ou segmentation en plages d'intensite (S2-01).",
+    [],
+    "Moyen sur le principe (des normales par pixel permettraient de grouper les facettes), faible en pratique: licence non commerciale, reseau, poids heberges hors des domaines ouverts.",
+    notes="Le clone mesurait 354 Mo, bien au-dessus de la limite de 100 Mo fixee (taille inconnue avant clonage) ; supprime apres copie du README et du LICENSE."))
+
+S.append(E("S2-09", "S2", "PlaneRCNN (NVlabs), plans depuis une image",
+    GH + "NVlabs/planercnn.git",
+    "Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (LICENSE.md) ; README: Copyright (c) 2018 NVIDIA Corp. All Rights Reserved.",
+    "DOC (README)",
+    "README lignes 1 a 25 et en-tete de LICENSE.md.",
+    "detects arbitrary number of planes, and reconstructs piecewise planar surfaces from a single RGB image.",
+    C + "NVlabs_planercnn/README.md",
+    "Reseau PyTorch qui detecte des plans et reconstruit des surfaces lineaires par morceaux depuis une seule image RGB.",
+    True,
+    "Region growing et RANSAC sur normales ou nuage de points (S4-01, S4-03, S4-04).",
+    [],
+    "Faible: licence non commerciale et partage a l'identique, reseau.",
+    notes=None))
+
+S.append(E("S2-10", "S2", "Estimation de direction de lumière depuis une image (Sial et al., arXiv 2009.08941)",
+    None, "Non lue", "non ouvert",
+    "Rien: titre et resume vus seulement dans un resultat de recherche web, arxiv.org est ferme. Aucun depot de code ouvert pour l'estimation de direction de lumiere n'a ete trouve dans mes recherches.",
+    None, None,
+    "Regression profonde de la direction et de la couleur de la lumiere sur un jeu synthetique (d'apres le resultat de recherche).",
+    True,
+    "Approche lambertienne par moindres carres sur les pixels hors ombre decrite seulement dans des brevets (non ouverts).",
+    [],
+    "Non evalue."))
+
+# ---------------------------------------------------------------- S3
+S.append(E("S3-01", "S3", "OpenCV LineSegmentDetector (LSD), cv2.createLineSegmentDetector",
+    RAWU + "opencv/opencv/4.x/modules/imgproc/src/lsd.cpp ; " + RAWU + "opencv/opencv/4.x/modules/imgproc/include/opencv2/imgproc.hpp ; " + RAWU + "opencv/opencv/4.x/LICENSE ; paquet installé 5.0.0.93 (cv2.createLineSegmentDetector, help())",
+    "Apache License Version 2.0, January 2004 (LICENSE d'opencv/opencv). En-tete de lsd.cpp: License Agreement For Open Source Computer Vision Library, Copyright (C) 2013, OpenCV Foundation, clauses de type BSD ; aucun en-tete AGPL.",
+    "DOC (code)",
+    "En-tete et parametres par defaut de lsd.cpp (lignes 1 a 70), declaration dans imgproc.hpp (lignes 1430 a 1450), enum LineSegmentDetectorModes, signature Python de detect(), et un test local sur image synthetique bruitee.",
+    "Gradient angle tolerance in degrees.",
+    R + "opencv_lsd.cpp",
+    "LSD classique (gradient, regions alignees, rectangle englobant, validation par nombre de fausses alarmes). Entree: image 8 bits a un canal. Sortie de detect: lines (x1, y1, x2, y2), width, prec, nfa (nfa rempli seulement en mode LSD_REFINE_ADV). Trois modes de raffinement: NONE, STD, ADV.",
+    False, None,
+    [("refine par defaut LSD_REFINE_STD (valeur 1) et scale 0.8", R + "imgproc.hpp", "int refine = LSD_REFINE_STD, double scale = 0.8,"),
+     ("sigma_scale 0.6, quant 2.0, ang_th 22.5", R + "imgproc.hpp", "double sigma_scale = 0.6, double quant = 2.0, double ang_th = 22.5,"),
+     ("log_eps 0, density_th 0.7, n_bins 1024", R + "imgproc.hpp", "double log_eps = 0, double density_th = 0.7, int n_bins = 1024);"),
+     ("N_BINS 1024 (commentaire des parametres par defaut)", R + "opencv_lsd.cpp", "N_BINS      1024")],
+    "Haut: deja installe, licence permissive, et sur mon test synthetique (voir mesures_locales) le mode STD retrouve 27 aretes sur 27 aux niveaux de bruit 0, 5 et 10, et 23 sur 27 au niveau 20.",
+    notes="Dans cv2 5.0.0.93 les memes noms existent (createLineSegmentDetector, LSD_REFINE_NONE, LSD_REFINE_STD, LSD_REFINE_ADV), verifies par dir(cv2)."))
+
+S.append(E("S3-02", "S3", "pylsd (primetang), liaison Python de LSD ; PyPI pylsd 0.0.2 et pylsd-nova 1.2.1",
+    GH + "primetang/pylsd.git ; https://pypi.org/pypi/pylsd/json ; https://pypi.org/pypi/pylsd-nova/json",
+    "Conflit de licences. LICENSE racine: THE BSD LICENSE, Copyright 2015 Gefu Tang. PyPI pylsd 0.0.2 (6 February 2017): champ licence BSD. Mais source/src/lsd.cpp porte l'en-tete GNU Affero General Public License v3 ou ulterieure, et source/LICENSE est le texte GPL v3. PyPI pylsd-nova 1.2.1 (15 April 2023): champ licence BSD (source non ouverte).",
+    "DOC (code)",
+    "README, LICENSE racine, en-tete de source/src/lsd.cpp, source/LICENSE, metadonnees PyPI.",
+    "it under the terms of the GNU Affero General Public License as",
+    C + "primetang_pylsd/source/src/lsd.cpp",
+    "Liaison du code C original de LSD (Grompone von Gioi). Appel lsd(src) sur une image en niveaux de gris, retourne [x1, y1, x2, y2, width] par segment. Le README utilise xrange, donc du code Python 2.",
+    False, None, [],
+    "Faible: OpenCV fournit deja LSD sous Apache ; ici la licence reelle du code C est AGPL malgre l'etiquette BSD de PyPI.",
+    notes="Installation sur Python 3.13 non testee."))
+
+S.append(E("S3-03", "S3", "pytlsd (iago-suarez), LSD avec gradients personnalisés ; PyPI pytlsd 0.0.2",
+    GH + "iago-suarez/pytlsd.git ; https://pypi.org/pypi/pytlsd/json",
+    "Conflit de licences. LICENSE racine: MIT License, Copyright (c) 2021 Iago Suárez. Mais src/lsd.cpp et src/lsd.h (lignes 15 a 17): GNU Affero General Public License v3 ou ulterieure, Copyright (c) 2007-2011 rafael grompone von gioi. PyPI pytlsd 0.0.2 (29 December 2022): champ licence vide, roues pour Linux et macOS.",
+    "DOC (code)",
+    "README, LICENSE, en-tete de src/lsd.cpp, signatures Python dans src/PYAPI.cpp (lignes 196 a 216), tests/tests.py (debut).",
+    "Bindings over the original C implementation of LSD, that allows to change the different thresholds involved",
+    C + "iago-suarez_pytlsd/README.md",
+    "Liaison du LSD original avec seuils reglables et possibilite de fournir ses propres gradients (norme et angle), ce que DeepLSD et ScaleLSD exploitent. Fonctions lsd(img, scale, sigma_scale, density_th, gradnorm, gradangle, grad_nfa) et batched_lsd.",
+    False, None,
+    [("scale 0.8 par defaut", C + "iago-suarez_pytlsd/src/PYAPI.cpp", 'py::arg("scale") = 0.8,'),
+     ("sigma_scale 0.6 par defaut", C + "iago-suarez_pytlsd/src/PYAPI.cpp", 'py::arg("sigma_scale") = 0.6,'),
+     ("density_th 0.0 par defaut (OpenCV: 0.7)", C + "iago-suarez_pytlsd/src/PYAPI.cpp", 'py::arg("density_th") = 0.0,')],
+    "Moyen: utile si l'on veut injecter un gradient maison (par exemple un gradient d'ombrage debruite), mais la licence reelle est AGPL, ce qui contamine tout outil qui l'embarque.",
+    notes="LIMAP, DeepLSD et ScaleLSD tirent tous pytlsd (requirements de ScaleLSD ligne 21, .gitmodules de DeepLSD)."))
+
+S.append(E("S3-04", "S3", "ED_Lib (CihanTopal), EDLines, EDPF, EDCircles, EDColor",
+    GH + "CihanTopal/ED_Lib.git",
+    "MIT License, Copyright (c) 2019 Cihan Topal (fichier LICENSE, 21 lignes)",
+    "DOC (README)",
+    "README complet (liste des algorithmes, usage), liste des fichiers (ED.cpp, EDLines.cpp, EDPF.cpp ...).",
+    "EDLines is alos a parameter-free algorithm which validates all detected lines via Helmholtz Principle.",
+    C + "CihanTopal_ED_Lib/README.md",
+    "Edge Drawing relie des pixels d'ancrage le long de la crete du gradient pour former des segments de contour, puis EDLines en tire des segments de droite valides sans parametre (principe de Helmholtz). Code C++.",
+    False, None,
+    [("Dependance OpenCV 3.4", C + "CihanTopal_ED_Lib/README.md", "Dependencies: OpenCV 3.4")],
+    "Moyen: bon candidat sans parametre pour des aretes nettes ; pas de paquet PyPI verifie (non cherche), et OpenCV contrib embarque une version (S3-05).",
+    notes="Citation avec la faute d'origine 'alos'."))
+
+S.append(E("S3-05", "S3", "OpenCV contrib 5.0.0.93 (opencv-contrib-python-headless): ximgproc.EdgeDrawing (EDLines) et FastLineDetector",
+    "https://pypi.org/pypi/opencv-contrib-python-headless/json ; roue téléchargée par pip (69475842 octets, supprimée) dont les fichiers cv2/ximgproc/__init__.pyi, cv2/xfeatures2d/__init__.pyi et cv2/LICENSE.txt sont conservés dans raw/contrib_stubs ; " + RAWU + "opencv/opencv_contrib/4.x/modules/ximgproc/include/opencv2/ximgproc/edge_drawing.hpp",
+    "PyPI: Apache 2.0. Roue: cv2/LICENSE.txt est MIT (emballage). LICENSE d'opencv_contrib 4.x: Apache License Version 2.0.",
+    "DOC (code)",
+    "Stubs .pyi de ximgproc (classes EdgeDrawing et FastLineDetector, fonctions createEdgeDrawing et createFastLineDetector), en-tete de edge_drawing.hpp lignes 1 a 70.",
+    "Class implementing the ED (EdgeDrawing) @cite topal2012edge, EDLines @cite akinlar2011edlines",
+    R + "ocv_ed.hpp",
+    "EdgeDrawing expose detectEdges, getSegments, detectLines (EDLines), detectEllipses ; parametres EdgeDetectionOperator, GradientThresholdValue, AnchorThresholdValue, MinPathLength, Sigma, NFAValidation, MinLineLength, MaxDistanceBetweenTwoLines, LineFitErrorThreshold, MaxErrorThreshold. FastLineDetector.detect prend length_threshold, distance_threshold, canny_th1, canny_th2, canny_aperture_size, do_merge.",
+    False, None,
+    [("GradientThresholdValue 20 par defaut", R + "ocv_ed.hpp", "Default value is 20"),
+     ("MinPathLength 10 par defaut", R + "ocv_ed.hpp", "will be processed. Default value is 10"),
+     ("MaxDistanceBetweenTwoLines 6.0 par defaut", R + "ocv_ed.hpp", "Default value is 6.0"),
+     ("LineFitErrorThreshold 1.0 par defaut", R + "ocv_ed.hpp", "Default value is 1.0"),
+     ("Taille de la roue contrib", None, "ls -l du fichier téléchargé par pip: 69475842 octets")],
+    "Moyen a haut: EDLines et FLD sont installables par pip (roue de 69 Mo, 'opencv-contrib-python-headless' ne doit pas cohabiter avec le paquet opencv-python-headless dans le meme environnement, non teste ici) et sous licence permissive.",
+    notes="Je n'ai pas execute EdgeDrawing: seuls les stubs et l'en-tete ont ete lus."))
+
+S.append(E("S3-06", "S3", "ELSED (iago-suarez), Enhanced Line SEgment Drawing",
+    GH + "iago-suarez/ELSED.git",
+    "Apache License Version 2.0, January 2004 (fichier LICENSE, 201 lignes)",
+    "DOC (code)",
+    "README complet, src/ELSED.h (parametres par defaut), liste des fichiers ; pas d'execution.",
+    "segments, scores = pyelsed.detect(img)",
+    C + "iago-suarez_ELSED/README.md",
+    "Detecteur de segments par dessin de contour avec validation, tres rapide selon ses auteurs. Entree: image en niveaux de gris, sortie: segments et scores. Installation Python depuis git (les noms pyelsed et elsed donnent HTTP 404 sur PyPI), avec libopencv-dev.",
+    False, None,
+    [("gradientThreshold 30", C + "iago-suarez_ELSED/src/ELSED.h", "float gradientThreshold = 30;"),
+     ("anchorThreshold 8", C + "iago-suarez_ELSED/src/ELSED.h", "uint8_t anchorThreshold = 8;"),
+     ("minLineLen 15", C + "iago-suarez_ELSED/src/ELSED.h", "int minLineLen = 15;"),
+     ("lineFitErrThreshold 0.2", C + "iago-suarez_ELSED/src/ELSED.h", "double lineFitErrThreshold = 0.2;"),
+     ("Sortie de demonstration du README: 305 segments longs", C + "iago-suarez_ELSED/README.md", "ELSED detected: 305 (large) segments"),
+     ("Sortie de demonstration du README: 391 segments courts", C + "iago-suarez_ELSED/README.md", "ELSED detected: 391 (short) segments")],
+    "Moyen: option rapide sans reseau, mais a compiler soi-meme et a evaluer sur images bruitees (non fait) ; la mention 'fastest' est une affirmation des auteurs, non verifiee.",
+    notes="La phrase 'the fastest line segment detector in the literature' est au README ligne 8."))
+
+S.append(E("S3-07", "S3", "AGAST (cv2.AgastFeatureDetector)",
+    "Roue opencv-contrib-python-headless 5.0.0.93, stub raw/contrib_stubs/cv2/xfeatures2d/__init__.pyi ; paquet installé opencv-python-headless 5.0.0.93 (dir(cv2))",
+    "Apache 2.0 (PyPI, opencv-contrib-python-headless)",
+    "DOC (code)",
+    "Stub .pyi de xfeatures2d et introspection du paquet installe.",
+    "class AgastFeatureDetector(cv2.Feature2D):",
+    R + "contrib_stubs/cv2/xfeatures2d/__init__.pyi",
+    "AGAST est un detecteur de coins (points cles), pas de segments. Dans la version 5.0.0.93, il est absent du paquet installe (hasattr(cv2, 'AgastFeatureDetector') vaut False) et la classe se trouve dans cv2.xfeatures2d de la roue contrib.",
+    False, None, [],
+    "Faible: coins et non aretes ; utile seulement pour reperer des sommets de facettes ; OpenCV garde FastFeatureDetector dans le paquet installe.",
+    notes="Dans opencv 5.x features.hpp (main), le mot AGAST n'apparait pas (grep sans resultat) ; dans opencv_contrib 5.x xfeatures2d.hpp il n'apparait que dans des commentaires."))
+
+S.append(E("S3-08", "S3", "DeepLSD (cvg), CVPR 2023",
+    GH + "cvg/DeepLSD.git",
+    "MIT License, Copyright (c) 2022 Rémi Pautrat (LICENSE) ; README ligne 54: modeles aussi sous MIT.",
+    "DOC (README)",
+    "README complet, requirements.txt, install.sh, .gitmodules.",
+    "Both models are released under an MIT license, similarly as for the rest of this repo.",
+    C + "cvg_DeepLSD/README.md",
+    "Un reseau predit un champ de distance et un champ d'angle de ligne a partir de l'image, puis un LSD classique les utilise comme gradient (affinage possible de segments d'un autre detecteur). Poids sur cvg-data.inf.ethz.ch (non joignable d'ici, code 000). Le sous-module third_party/pytlsd est le LSD sous AGPL.",
+    True,
+    "LSD OpenCV (S3-01), EDLines ou ELSED (S3-05, S3-06).",
+    [("Teste avec GCC 9, Python 3.7, CUDA 11", C + "cvg_DeepLSD/README.md", "GCC 9, Python 3.7, and CUDA 11")],
+    "Moyen: pense pour la precision geometrique ; mais poids inaccessibles ici, CUDA, et dependance a pytlsd (AGPL).",
+    notes="Pas de chiffre de performance dans le README lu."))
+
+S.append(E("S3-09", "S3", "HAWP (cherubicXN), wireframe parsing, HAWPv2 et HAWPv3",
+    GH + "cherubicXN/hawp.git",
+    "MIT License, Copyright (c) 2023 Nan Xue (LICENSE) ; LEGAL.md vide (0 octet).",
+    "DOC (README)",
+    "readme.md (premieres lignes), docs/HAWPv2.md (tableau de resultats), docs/HAWPv3.md (survol).",
+    "HAWPv3 can be used as a good wireframe parser for the out-of-distribution images.",
+    C + "cherubicXN_hawp/readme.md",
+    "Reseau qui predit des segments de fil de fer ; HAWPv3 est auto-supervise. Commande d'exemple sur le jeu DTU dans le README.",
+    True,
+    "LSD (S3-01), EDLines (S3-05).",
+    [("HAWPv2, jeu Wireframe: sAP-5 65.8, sAP-10 69.8, sAP-15 71.4 (jhm 0.001)", C + "cherubicXN_hawp/docs/HAWPv2.md", "|Wireframe| 65.8 | 69.8 |71.4|"),
+     ("HAWPv2, jeu YorkUrban: sAP-5 29.0, sAP-10 31.4, sAP-15 32.8", C + "cherubicXN_hawp/docs/HAWPv2.md", "|YorkUrban|29.0|31.4|32.8|")],
+    "Moyen a faible: mesures sur photos (Wireframe, YorkUrban), pas sur rendus argile ; poids a telecharger (non verifie).",
+    notes=None))
+
+S.append(E("S3-10", "S3", "L-CNN (zhou13), End-to-End Wireframe Parsing",
+    GH + "zhou13/lcnn.git",
+    "MIT License, Copyright (c) 2019-2020 Yichao Zhou (LICENSE)",
+    "DOC (README)",
+    "README: introduction, tableau de resultats, structure du code.",
+    "is a conceptually simple yet effective neural network for detecting the wireframe from a given image.",
+    C + "zhou13_lcnn/README.md",
+    "Reseau a hourglass empile qui detecte jonctions et segments d'un fil de fer ; compare a LSD dans le README.",
+    True,
+    "LSD (S3-01).",
+    [("L-CNN, ShanghaiTech: sAP10 62.9", C + "zhou13_lcnn/README.md", "**62.9**"),
+     ("LSD, ShanghaiTech: AP^H 52.0 (valeur du README)", C + "zhou13_lcnn/README.md", "             52.0 ")],
+    "Faible: reseau, mesures sur photos, depot de 2019.",
+    notes=None))
+
+S.append(E("S3-11", "S3", "M-LSD (navervision), AAAI 2022",
+    GH + "navervision/mlsd.git",
+    "Apache License Version 2.0 (LICENSE, 201 lignes ; README lignes 143 a 157)",
+    "DOC (README)",
+    "README (apercu, demo, licence).",
+    "M-LSD exploits extremely efficient LSD architecture and novel training schemes, including SoL augmentation and geometric learning scheme.",
+    C + "navervision_mlsd/README.md",
+    "Detecteur de segments leger (TensorFlow, modeles tflite) qui tourne sur CPU et mobile ; la demo fournit aussi une detection de boites.",
+    True,
+    "LSD (S3-01), ELSED (S3-06).",
+    [],
+    "Faible: reseau, pense pour la vitesse sur mobile et non pour la precision geometrique.",
+    notes="Le clone mesurait 170 Mo (checkpoints inclus), au-dessus de la limite de 100 Mo fixee (taille inconnue avant clonage) ; supprime."))
+
+S.append(E("S3-12", "S3", "ScaleLSD (ant-research), CVPR 2025",
+    GH + "ant-research/scalelsd.git",
+    "MIT License, Copyright (c) 2023 Nan Xue (LICENSE) ; LEGAL.md vide (0 octet).",
+    "DOC (README)",
+    "readme.md (installation, inference, options), requirements.txt.",
+    "Because our line matching app is built on GlueStick with our ScaleLSD",
+    C + "ant-research_scalelsd/readme.md",
+    "Detecteur profond de segments, teste avec Ubuntu 22.04, CUDA 12.1, Python 3.10 et PyTorch 2.5.1 ; poids sur Hugging Face (non joignable d'ici) ; option 'use_lsd' (LSD-Rectifier) ; requirements.txt tire pytlsd depuis git (code LSD sous AGPL).",
+    True,
+    "LSD (S3-01), EDLines (S3-05).",
+    [("Teste avec Python 3.10", C + "ant-research_scalelsd/readme.md", "Python 3.10"),
+     ("Teste avec CUDA 12.1", C + "ant-research_scalelsd/readme.md", "CUDA 12.1"),
+     ("Teste avec Pytorch 2.5.1", C + "ant-research_scalelsd/readme.md", "Pytorch 2.5.1")],
+    "Faible: GPU et poids requis, aucune mesure chiffree dans le README, dependance pytlsd.",
+    notes="Le clone mesurait 47 Mo."))
+
+S.append(E("S3-13", "S3", "SOLD2 (cvg), CVPR 2021, et kornia.feature.SOLD2 ; PyPI kornia 0.9.0",
+    GH + "cvg/SOLD2.git ; https://pypi.org/pypi/kornia/json",
+    "SOLD2: MIT License, Copyright (c) 2020 Rémi Pautrat (LICENSE). kornia 0.9.0 (23 October 2026): Apache-2.0 (PyPI, metadonnees seulement).",
+    "DOC (README)",
+    "README SOLD2 (usage, entrainement en trois etapes), metadonnees PyPI de kornia.",
+    "SOLD² is integrated into",
+    C + "cvg_SOLD2/README.md",
+    "Detecteur et descripteur de lignes auto-supervise, robuste a l'occlusion ; entrainement en trois etapes dont un jeu synthetique, version integree a kornia depuis la version 0.6.7.",
+    True,
+    "LSD (S3-01).",
+    [("Integre a kornia depuis la version 0.6.7", C + "cvg_SOLD2/README.md", "since version 0.6.7")],
+    "Faible: reseau et dependance PyTorch/kornia ; sert surtout a l'appariement de lignes entre vues, inutile avec des vues orthographiques deja alignees.",
+    notes="Le clone mesurait 75 Mo."))
+
+S.append(E("S3-14", "S3", "Line3D++ (manhofer), triangulation de segments multivues",
+    GH + "manhofer/Line3Dpp.git",
+    "Mozilla Public License Version 2.0 (LICENSE, 373 lignes). Mais le dossier lsd/ (lsd.cpp, lsd.hpp) embarque le code LSD sous GNU Affero General Public License (lsd/lsd.cpp ligne 16).",
+    "DOC (code)",
+    "README complet, line3D.h (declaration de addImage et matchImages), liste des fichiers.",
+    "Line3D++ is a line-based Multi-View Stereo (MVS) algorithm written in C++",
+    C + "manhofer_Line3Dpp/README.md",
+    "A partir d'images orientees (resultat de structure par le mouvement), apparie les segments 2D entre vues par recouvrement epipolaire et construit un modele de segments 3D. addImage prend l'image, K, R, t et une profondeur mediane (line3D.h lignes 104 a 106), donc un modele de camera pinhole. Pas de reseau. CUDA, OpenMP et Ceres optionnels.",
+    False, None,
+    [("Teste sous Ubuntu 14.04 LTS avec OpenCV 2.4.10 ou 3.0", C + "manhofer_Line3Dpp/README.md", "OpenCV=={2.4.10, 3.0}")],
+    "Moyen sur le principe, faible en pratique: code de 2016 dont le README (31 January 2018) dit que les formats des outils amont ont peut-etre change ; camera pinhole avec profondeur mediane, pas orthographique (non teste) ; segments mixtes MPL et AGPL.",
+    notes="Le clone mesurait 162 Mo (donnees de test incluses), au-dessus de la limite de 100 Mo fixee (taille inconnue avant clonage) ; supprime."))
+
+S.append(E("S3-15", "S3", "LIMAP (cvg), cartographie 3D avec lignes ; PyPI pycolmap 4.2.1",
+    GH + "cvg/limap.git ; https://pypi.org/pypi/pycolmap/json",
+    "BSD 3-Clause License, Copyright (c) Shaohui Liu (LICENSE). pycolmap 4.2.1 (29 September 2026): BSD-3-Clause (PyPI, metadonnees seulement).",
+    "DOC (README)",
+    "README (fonctions, detecteurs et appariements supportes, installation), LICENSE, appels a pytlsd dans src/limap/image/line/LSD/lsd.py.",
+    "Visual mapping / triangulation",
+    C + "cvg_limap/README.md",
+    "Triangulation et cartographie avec lignes, points, points de fuite et primitives parametriques (spheres, cylindres), a partir d'images dont les poses sont connues, souvent depuis un modele COLMAP. Les detecteurs de lignes sont des registres: LSD via pytlsd, SOLD2, DeepLSD, TP-LSD ; les images doivent être rectifiées vers des caméras pinhole. Attention: le paquet PyPI nomme limap n'est pas ce projet (c'est 'LimerBoy Mapper', version 0.1 du 27 July 2020).",
+    False, None,
+    [("Python 3.10, 3.11, 3.12 ou 3.13", C + "cvg_limap/README.md", "Python 3.10/11/12/13")],
+    "Moyen sur le principe: sait trianguler des segments depuis des poses connues ; lourd (COLMAP, CUDA pour les reseaux), centre sur pinhole ; non teste avec des vues orthographiques.",
+    notes="Le README cite COLMAP 4.2.0 au 1 September 2026 (ecrit 'Sep 1, 2026' dans le README). Le clone mesurait 12 Mo."))
+
+S.append(E("S3-16", "S3", "cv2.triangulatePoints (OpenCV 5.0.0.93 installé)",
+    SP + "cv2/ (paquet installé, exécuté)",
+    "Apache 2.0 (voir S2-02)",
+    "DOC (code)",
+    "Execution locale d'un cas test: point 3D projete dans deux vues orthographiques axe-alignees (matrices 3x4), puis triangule.",
+    None, None,
+    "triangulatePoints prend deux matrices de projection 3x4 et les points 2D ; une camera orthographique s'ecrit avec derniere ligne [0 0 0 1] et la triangulation retrouve le point.",
+    False, None,
+    [("Point attendu (0.3, 0.7, -0.4), point retrouve (0.3, 0.7, -0.4)", "seg_test_out.txt", "triangulatePoints ortho:")],
+    "Haut pour les endpoints: avec six vues orthographiques axe-alignees, les extremites de segments appariees se triangulent directement ; l'appariement reste a faire.",
+    notes="Le resultat chiffre est dans seg_test_out.txt (derniere ligne)."))
+
+S.append(E("S3-17", "S3", "LSD original (Grompone von Gioi, IPOL 2012)",
+    None, "AGPL v3 ou ulterieure, lue dans l'en-tete de src/lsd.cpp de pytlsd (S3-03) et de Line3D++ ; la page IPOL n'a pas ete ouverte (HTTP 000).",
+    "non ouvert",
+    "Rien de l'article ; seuls les en-tetes de code copies dans d'autres depots ont ete lus.",
+    None, None,
+    "Algorithme de base derriere LSD, pylsd, pytlsd et le LSD d'OpenCV (l'en-tete d'OpenCV est sous licence OpenCV, pas AGPL).",
+    False, None, [],
+    "Voir S3-01."))
+
+# ---------------------------------------------------------------- S4
+S.append(E("S4-01", "S4", "CGAL Shape_detection: Efficient RANSAC (Schnabel et al.) et Region Growing",
+    RAWU + "CGAL/cgal/master/Shape_detection/package_info/Shape_detection/license.txt ; .../description.txt ; .../doc/Shape_detection/Shape_detection.txt ; " + RAWU + "CGAL/cgal/master/LICENSE.md",
+    "Paquet Shape_detection: GPL (v3 or later) (package_info license.txt). Les fichiers doc/ et test/ du depot sont sous CC0 1.0 sauf mention contraire (LICENSE.md).",
+    "DOC (code)",
+    "license.txt, description.txt, et la documentation utilisateur (41328 octets): introduction, parametres, exemples, performances, region growing.",
+    "Five types of primitive shapes are provided by this package: plane, sphere, cylinder, cone, and torus.",
+    R + "cgal_sd_doc.txt",
+    "Efficient RANSAC detecte des primitives dans un nuage de points non organise avec normales non orientees. Parametres: epsilon (distance maximale au modele), normal_threshold, cluster_epsilon (connexite), min_points, probability (probabilite de rater la plus grande forme). Le region growing detecte des plans sur un nuage ou sur un maillage polygonal. C++ seulement dans ce que j'ai lu.",
+    False, None,
+    [("Cinq types de primitives: plan, sphere, cylindre, cone, tore", R + "cgal_sd_doc.txt", "Five types of primitive shapes"),
+     ("Benchmark de la doc: detection de plans dans une scene de 5M points", R + "cgal_sd_doc.txt", "5M points"),
+     ("Region growing: detection de plans sur un maillage polygonal", R + "cgal_sd_doc.txt", "Plane detection on a \\ref Shape_detection_RegionGrowingMesh")],
+    "Haut pour decouper un nuage ou un maillage en plans ; GPL v3 ou plus, et il faut un nuage avec normales, que l'on n'a pas depuis des images seules.",
+    notes="L'article de Schnabel et al. 2007 n'a pas ete ouvert."))
+
+S.append(E("S4-02", "S4", "CGAL Surface_mesh_approximation (Variational Shape Approximation)",
+    RAWU + "CGAL/cgal/master/Surface_mesh_approximation/doc/Surface_mesh_approximation/Surface_mesh_approximation.txt ; .../package_info/Surface_mesh_approximation/license.txt",
+    "GPL (v3 or later) (package_info license.txt, 18 octets) ; description.txt renvoie HTTP 404.",
+    "DOC (code)",
+    "Documentation utilisateur (26656 octets): introduction, metriques, semis, exemple.",
+    "approximate an input surface mesh by a simpler surface triangle mesh.",
+    R + "cgal_vsa_doc.txt",
+    "Approxime un maillage triangule par un petit nombre de proxys (plans) par un regroupement de type Lloyd ; deux metriques pour proxys plans, L2 et L2,1. Entree: maillage triangule, 2-variete ; sortie: soupe de triangles construisible en maillage polygonal.",
+    False, None, [],
+    "Haut si l'on a un maillage bruite (par exemple une enveloppe visuelle): il le regroupe en grandes facettes planes ; n'impose pas parallelisme ni orthogonalite ; GPL v3 ou plus.",
+    notes=None))
+
+S.append(E("S4-03", "S4", "PCL (PointCloudLibrary): SampleConsensusModelPlane et RegionGrowing",
+    RAWU + "PointCloudLibrary/pcl/master/LICENSE.txt ; .../segmentation/include/pcl/segmentation/region_growing.h ; .../sample_consensus/include/pcl/sample_consensus/sac_model_plane.h",
+    "Software License Agreement (BSD License), Copyright (c) 2009-2012 Willow Garage, Inc. et 2012 Open Perception, Inc. (LICENSE.txt)",
+    "DOC (code)",
+    "LICENSE.txt, en-tete de region_growing.h (references, methodes setSmoothnessThreshold, setCurvatureThreshold, setNumberOfNeighbours, setMinClusterSize), sac_model_plane.h.",
+    "Segmentation of point clouds using smoothness constraint",
+    R + "pcl_rg.h",
+    "RegionGrowing groupe des points voisins dont les normales different de moins d'un seuil de lissage, avec un seuil de courbure ; SampleConsensusModelPlane ajuste un plan par RANSAC. C++ avec dependances lourdes.",
+    False, None, [],
+    "Moyen: reference classique sous licence BSD, mais bibliotheque C++ volumineuse ; les memes idees existent dans Open3D (S4-04) et CGAL (S4-01).",
+    notes="Je n'ai lu que des fichiers bruts, sans cloner PCL."))
+
+S.append(E("S4-04", "S4", "Open3D: segment_plane et detect_planar_patches ; PyPI open3d 0.20.0",
+    RAWU + "isl-org/Open3D/main/LICENSE ; .../cpp/open3d/geometry/PointCloud.h ; https://pypi.org/pypi/open3d/json",
+    "The MIT License (MIT), Copyright (c) 2018-2026 www.open3d.org (LICENSE) ; PyPI: MIT.",
+    "DOC (code)",
+    "LICENSE, declarations de SegmentPlane et DetectPlanarPatches dans PointCloud.h (lignes 435 a 490), metadonnees PyPI.",
+    "const double distance_threshold = 0.01,",
+    R + "open3d_pc.h",
+    "SegmentPlane est un RANSAC qui retourne l'equation du plan et les indices des points internes. DetectPlanarPatches retourne des boites orientees de patches plans selon des seuils de variance des normales, de coplanarite et de ratio d'aberrants.",
+    False, None,
+    [("SegmentPlane: distance_threshold 0.01", R + "open3d_pc.h", "const double distance_threshold = 0.01,"),
+     ("SegmentPlane: ransac_n 3", R + "open3d_pc.h", "const int ransac_n = 3,"),
+     ("SegmentPlane: num_iterations 100", R + "open3d_pc.h", "const int num_iterations = 100,"),
+     ("SegmentPlane: probability 0.99999999", R + "open3d_pc.h", "const double probability = 0.99999999) const;"),
+     ("DetectPlanarPatches: normal_variance_threshold_deg 60", R + "open3d_pc.h", "double normal_variance_threshold_deg = 60,"),
+     ("DetectPlanarPatches: coplanarity_deg 75", R + "open3d_pc.h", "double coplanarity_deg = 75,"),
+     ("DetectPlanarPatches: outlier_ratio 0.75", R + "open3d_pc.h", "double outlier_ratio = 0.75,"),
+     ("Roue open3d 0.20.0 cp310 manylinux_2_35 x86_64: 400802528 octets, mise en ligne le 16 September 2026", R + "pypi_meta.jsonl", "400802528")],
+    "Moyen a haut: plan RANSAC et patches plans sous licence MIT, mais la roue fait environ 400 Mo (cp310) ; ici le Python installe est 3.13, compatibilite non verifiee.",
+    notes=None))
+
+S.append(E("S4-05", "S4", "pyransac3d (leomariga), PyPI pyransac3d 0.7.0",
+    GH + "leomariga/pyRANSAC-3D.git ; https://pypi.org/pypi/pyransac3d/json",
+    "Apache License Version 2.0 (LICENSE, 202 lignes) ; PyPI: license_expression Apache-2.0, version 0.7.0 mise en ligne le 18 August 2026.",
+    "DOC (code)",
+    "README (fonctions, exemples plan et sphere), pyransac3d/plane.py (signature et boucle), liste des fichiers.",
+    "It fits primitive shapes such as planes, cuboids, and cylinders to point clouds",
+    C + "leomariga_pyRANSAC-3D/README.md",
+    "RANSAC en NumPy seul pour plan, cylindre, cone, cuboide, sphere, ligne, cercle, point. Plane.fit(points, thresh, maxIteration) tire 3 points au hasard et compte les points a distance inferieure au seuil. Pas de tore.",
+    False, None,
+    [("Plane.fit: thresh 0.05 par defaut", C + "leomariga_pyRANSAC-3D/pyransac3d/plane.py", "thresh: float = 0.05,"),
+     ("Plane.fit: maxIteration 1000 par defaut", C + "leomariga_pyRANSAC-3D/pyransac3d/plane.py", "maxIteration: int = 1000,")],
+    "Moyen: leger et permissif pour tester des plans, mais un plan a la fois et sans regularites globales ; le clone mesurait 70 Mo (images du depot).",
+    notes="Le README mentionne un DOI Zenodo (non ouvert)."))
+
+S.append(E("S4-06", "S4", "GlobFit (yangyanli), SIGGRAPH 2011",
+    GH + "yangyanli/globfit.git",
+    "Aucun fichier LICENSE dans le clone ; README d'une seule ligne ; aucune mention de licence dans les .h, .cpp, .md, .txt (grep).",
+    "DOC (code)",
+    "README, include/GlobFit.h, src/Relation.cpp (debut), liste de include/, src/ et matlab/.",
+    "bool orientationAlignment(double paraOrthThreshold, double equalAngleThreshold);",
+    C + "yangyanli_globfit/include/GlobFit.h",
+    "Trois etapes de regularisation globale sur des primitives deja ajustees: alignement d'orientation (parallele, orthogonal, angle egal), de placement (coaxial, coplanaire), d'egalite (longueur, rayon). Primitives: plan, sphere, cylindre, cone. Le solveur passe par des scripts MATLAB (matlab/Optimize*.m, createMatlabArraies) et la visualisation par OpenSceneGraph.",
+    False, None,
+    [("Seuils des trois etapes: paraOrthThreshold, equalAngleThreshold, coaxialThreshold, coplanarThreshold, equalLengthThreshold, equalRadiusThreshold", C + "yangyanli_globfit/include/GlobFit.h", "bool placementAlignment(double coaxialThreshold, double coplanarThreshold);")],
+    "Haut pour le principe (rendre des plans exactement paralleles ou orthogonaux est ce qui donne des aretes droites nettes), faible pour le code: dependance MATLAB, depot ancien, aucune licence ; le principe est reimplementable.",
+    notes="La phrase 'research use only' vue dans un resultat de recherche sur l'archive Google Code n'a pas ete ouverte."))
+
+S.append(E("S4-07", "S4", "RAPter (amonszpart), SIGGRAPH 2015",
+    GH + "amonszpart/RAPter.git",
+    "Apache License Version 2.0 (LICENSE, 201 lignes)",
+    "DOC (README)",
+    "README complet (modules, dependances, compilation, exemple).",
+    "RAPter provides a set of tools to generate, segment, approximate, and visualize 2D and 3D point clouds with ground truth.",
+    C + "amonszpart_RAPter/README.md",
+    "Extrait des arrangements reguliers de plans (angles et distances regularises) depuis un nuage de points ; le module inputGen produit des nuages 2D et leur verite terrain a partir de fichiers SVG. Depend de PCL, OpenCV, CoinBonmin (optimisation) et libfbi ; teste sous Ubuntu 14.04.",
+    False, None,
+    [("Teste sous Ubuntu 14.04 et Debian Testing", C + "amonszpart_RAPter/README.md", "Ubuntu 14.04")],
+    "Haut pour le principe (regularites d'angles entre plans), faible en pratique: chaine C++ ancienne avec solveur MINLP, licence permissive.",
+    notes="Le clone mesurait 13 Mo."))
+
+S.append(E("S4-08", "S4", "PolyFit (LiangliangNan), ICCV 2017",
+    GH + "LiangliangNan/PolyFit.git",
+    "GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007 (LICENSE, 674 lignes) ; README: GPL version 3 ou ulterieure.",
+    "DOC (README)",
+    "ReadMe.md lignes 1 a 135 (obtention, dependances, extraction de plans, solveurs, licence).",
+    "PolyFit assumes that the model is closed and all necessary planes are provided.",
+    C + "LiangliangNan_PolyFit/ReadMe.md",
+    "Hypothese et selection: a partir de plans fournis (format vg ou bvg), genere des faces candidates par intersection des plans, puis choisit un sous-ensemble par optimisation entiere pour obtenir un polyedre ferme. Solveurs: Gurobi (licence gratuite academique) ou SCIP (libre, plus lent). Depend de CGAL ; liaisons Python annoncees.",
+    False, None,
+    [("Donnees Fig1: Gurobi 0.02 secondes, lp_solve 15 minutes", C + "LiangliangNan_PolyFit/ReadMe.md", "Gurobi takes only 0.02 seconds, while lp_solve 15 minutes")],
+    "Haut: correspond au besoin (polyedre ferme a partir de plans) ; GPL v3 ou plus, et le nuage et les plans sont a produire en amont.",
+    notes="Le clone mesurait 58 Mo."))
+
+S.append(E("S4-09", "S4", "Easy3D (LiangliangNan), extraction RANSAC de primitives",
+    RAWU + "LiangliangNan/Easy3D/main/README.md ; .../LICENSE",
+    "GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007 (LICENSE, 35147 octets) ; README: badge GPL.",
+    "DOC (README)",
+    "README: fonctionnalites, liaisons Python, licence.",
+    "Easy3D is implemented in C++ and comes with **Python bindings**.",
+    R + "easy3d_README.md",
+    "Bibliotheque C++ avec liaisons Python qui inclut RANSAC, simplification de maillage, remaillage ; son application Mapple est celle que le README de PolyFit recommande pour extraire des plans.",
+    False, None, [],
+    "Moyen: pont pratique vers PolyFit, mais GPL v3.",
+    notes="Je n'ai pas lu le code RANSAC d'Easy3D."))
+
+S.append(E("S4-10", "S4", "SPFN (lingxiaoli94), Supervised Fitting of Geometric Primitives, CVPR 2019",
+    GH + "lingxiaoli94/SPFN.git",
+    "MIT License, Copyright (c) 2018 Lingxiao Li (LICENSE) ; README: This code is released under the MIT License.",
+    "DOC (README)",
+    "README: dependances, donnees, usage, licence.",
+    "Fitting geometric primitives to 3D point cloud data bridges a gap between low-level digitized 3D data",
+    C + "lingxiaoli94_SPFN/README.md",
+    "Reseau (PointNet++ en TensorFlow) qui ajuste des primitives a un nuage ; le mode test lit un fichier .xyz et ecrit un .h5. Teste avec TensorFlow 1.10 et Python 3.6.6 ; PointNet++ demande de compiler des operateurs CUDA.",
+    True,
+    "Efficient RANSAC de CGAL (S4-01) ou pyransac3d (S4-05).",
+    [("Jeu ANSI de pieces mecaniques: archive de 9.4GB", C + "lingxiaoli94_SPFN/README.md", "9.4GB zip file"),
+     ("Version haute resolution: 131,072 points par objet", C + "lingxiaoli94_SPFN/README.md", "131,072 (128k) points")],
+    "Faible: reseau d'une pile TensorFlow 1 vieillie, entraine sur pieces mecaniques.",
+    notes=None))
+
+S.append(E("S4-11", "S4", "ParSeNet (Hippogriff), ECCV 2020",
+    GH + "Hippogriff/parsenet-codebase.git",
+    "Aucune licence detectee: pas de fichier LICENSE, et aucune mention MIT, Apache, GPL ou BSD dans readme.md et readme_data.md (grep).",
+    "DOC (README)",
+    "readme.md, extrait de readme_data.md, liste de src/.",
+    "Experiments are done on Nvidia 1080ti gpus.",
+    C + "Hippogriff_parsenet-codebase/readme.md",
+    "Reseau d'ajustement de surfaces parametriques: primitives (plan, cylindre, cone, sphere) et splines B (ouvertes et fermees) ; jeu ABC.",
+    True,
+    "Efficient RANSAC (S4-01), pyransac3d (S4-05).",
+    [],
+    "Faible: reseau, aucune licence, donnees volumineuses.",
+    notes=None))
+
+S.append(E("S4-12", "S4", "HPNet (SimingYan), Deep Primitive Segmentation Using Hybrid Representations",
+    GH + "SimingYan/HPNet.git",
+    "Aucune licence detectee: pas de fichier LICENSE, aucune mention dans README.md (grep).",
+    "DOC (README)",
+    "README complet.",
+    "Please download our preprocessed dataset",
+    C + "SimingYan_HPNet/README.md",
+    "Reseau de segmentation en primitives, entraine sur ABCParts (jeu de ParSeNet) ; PyTorch 1.7.0 et TensorFlow 1.15.0 ; le modele pre-entraine est sur Google Drive (ferme ici).",
+    True,
+    "Efficient RANSAC (S4-01).",
+    [("Jeu ABCParts pretraite: 69G", C + "SimingYan_HPNet/README.md", "(69G)")],
+    "Faible: reseau, aucune licence, 69 Go de donnees.",
+    notes="Le clone mesurait 68 Mo."))
+
+S.append(E("S4-13", "S4", "ComplexGen (guohaoxiang), SIGGRAPH 2022",
+    GH + "guohaoxiang/ComplexGen.git",
+    "MIT License, Copyright (c) 2022 Haoxiang Guo (LICENSE) ; README: MIT Licence. L'extraction de la structure exige gurobipy 9.1.2 avec une licence Gurobi installee a la main (README ligne 132).",
+    "DOC (README)",
+    "README: resume, donnees, phases d'entrainement et d'extraction, licence.",
+    "The training takes about 3 days to converge.",
+    C + "guohaoxiang_ComplexGen/README.md",
+    "Reseau a transformeur qui predit sommets, aretes et morceaux de surface avec leurs relations (chaine de complexes B-Rep), puis une optimisation globale sous Gurobi (ou Mosek) extrait un B-Rep valide. Entrainement sur ABC avec 8 V100 par defaut.",
+    True,
+    "Chaine PolyFit (S4-08) a partir de plans, sans reseau.",
+    [("Entrainement: 8 V100 GPUs par defaut", C + "guohaoxiang_ComplexGen/README.md", "8 V100 GPUs")],
+    "Moyen sur le but (sortie B-Rep avec aretes et sommets), faible en pratique: entree nuage de points, trois jours d'entrainement, donnees sur BaiduYun/OneDrive (fermes), Gurobi.",
+    notes="Le clone mesurait 92 Mo."))
+
+S.append(E("S4-14", "S4", "trimesh (mikedh), mesh.facets ; PyPI trimesh 5.2.0",
+    GH + "mikedh/trimesh.git ; https://pypi.org/pypi/trimesh/json",
+    "The MIT License (MIT), Copyright (c) 2023 Michael Dawson-Haggerty (LICENSE.md) ; PyPI: MIT, version 5.2.0 mise en ligne le 24 October 2026.",
+    "DOC (code)",
+    "trimesh/base.py (proprietes facets, facets_area, facets_normal, facets_origin, facets_boundary), trimesh/graph.py (fonction facets), trimesh/constants.py (tolerances).",
+    "Return a list of face indices for coplanar adjacent faces.",
+    C + "mikedh_trimesh/trimesh/base.py",
+    "mesh.facets regroupe les triangles voisins coplanaires ; graph.facets decide la coplanarite avec un seuil (facet_threshold). Pur Python avec NumPy, pas de compilation.",
+    False, None,
+    [("tol.facet_threshold: int = 5000 (rapport (rayon / ecart) ** 2)", C + "mikedh_trimesh/trimesh/constants.py", "facet_threshold: int = 5000")],
+    "Haut pour le post-traitement: fusionner en facettes les triangles quasi coplanaires d'un maillage ; ne regularise pas les angles.",
+    notes="Le clone mesurait 48 Mo."))
+
+S.append(E("S4-15", "S4", "Polylidar3D (JeremyBYU)",
+    GH + "JeremyBYU/polylidar.git",
+    "MIT License, Copyright (c) 2020 Jeremy Castagno (LICENSE)",
+    "DOC (README)",
+    "README (fonctions cles, branches, cas d'usage), en-tete de LICENSE.",
+    "Polygon Extraction from 2D Point Sets, Unorganized/Organized 3D Point Clouds, and Triangular Meshes",
+    C + "JeremyBYU_polylidar/README.md",
+    "Extrait des polygones (avec trous) de plans a partir d'un nuage de points, d'une image de profondeur ou d'un maillage fourni par l'utilisateur ; C++ avec liaisons Python pybind11.",
+    False, None, [],
+    "Moyen: sortie directe en polygones plans depuis un maillage, mais pense pour le sol et les surfaces horizontales (cas d'usage listes: LiDAR, RealSense, KITTI).",
+    notes="Le clone mesurait 44 Mo."))
+
+# ----------------------------------------------------------------
+mesures_locales = [
+    {
+        "nom": "LSD OpenCV 5.0.0.93 sur image synthétique facettée bruitée",
+        "script": "scripts/lsd_test.py", "sortie": "lsd_test_out.txt",
+        "protocole": "Image 768 x 512: 5 polygones a niveaux de gris constants (facettes planes simulees) sur fond clair, plus 2 disques sombres (roues, courbes). Verite terrain: 27 aretes de polygones de longueur au moins 40 pixels (les polygones se recouvrent, certaines aretes sont partiellement masquees). Un segment detecte compte s'il est a moins de 3 pixels de ses deux extremites de l'arete et a moins de 6 degres. Bruit gaussien d'ecart-type 0, 5, 10, 20 niveaux (sur 255).",
+        "resultats": {
+            "sigma 0": {"NONE": "24/27 (36 segments)", "STD": "27/27 (56)", "ADV": "27/27 (50)"},
+            "sigma 5": {"NONE": "22/27 (38)", "STD": "27/27 (57)", "ADV": "27/27 (50)"},
+            "sigma 10": {"NONE": "25/27 (44)", "STD": "27/27 (79)", "ADV": "25/27 (69)"},
+            "sigma 20": {"NONE": "24/27 (54)", "STD": "23/27 (124)", "ADV": "21/27 (86)"},
+            "pre-lissage gaussien 2 px puis STD": {"sigma 10": "19/27 (43 segments)", "sigma 20": "19/27 (51)"},
+        },
+        "lecture": "Le nombre de segments detectes depasse largement 27: l'appariement ne mesure que le rappel, pas la precision, et les disques produisent des segments courts. Le pre-lissage a degrade le rappel dans ce test. Test unique, une graine, sans image reelle: indicatif.",
+    },
+    {
+        "nom": "Segmentation en plages d'intensité constante avec scikit-image sur la même image",
+        "script": "scripts/seg_test.py", "sortie": "seg_test_out.txt",
+        "protocole": "felzenszwalb (scale 200, sigma 1.0, min_size 300) sur l'image bruitee, avec ou sans debruitage TV (denoise_tv_chambolle, poids 0.15, puis felzenszwalb sigma 0.5). Purete: part des pixels dont la region a pour etiquette majoritaire de verite terrain la leur (6 classes: 5 facettes et le fond avec les roues).",
+        "resultats": {
+            "sigma 0": {"felz brut": "21 regions, purete 0.9974", "TV puis felz": "14 regions, purete 0.9991"},
+            "sigma 5": {"felz brut": "14 regions, purete 0.9966", "TV puis felz": "11 regions, purete 0.989"},
+            "sigma 10": {"felz brut": "13 regions, purete 0.9951", "TV puis felz": "12 regions, purete 0.9897"},
+            "sigma 20": {"felz brut": "12 regions, purete 0.9871", "TV puis felz": "14 regions, purete 0.996"},
+        },
+        "lecture": "La purete est haute mais ne penalise pas la sur-segmentation: 11 a 21 regions pour 6 classes de verite. Une ligne de test avec pyrMeanShiftFiltering et composantes connexes est invalide (bug de mon script, resultat a ignorer) et n'est pas reportee. Test unique, indicatif.",
+    },
+    {
+        "nom": "cv2.triangulatePoints avec deux caméras orthographiques axe-alignées",
+        "script": "scripts/seg_test.py", "sortie": "seg_test_out.txt",
+        "protocole": "Matrices 3x4 de projection vue de dessus [[1,0,0,0],[0,1,0,0],[0,0,0,1]] et vue de face [[0,0,1,0],[0,1,0,0],[0,0,0,1]], point (0.3, 0.7, -0.4).",
+        "resultats": {"point retrouve": "(0.3, 0.7, -0.4)"},
+        "lecture": "Triangulation exacte sans bruit pour des vues axe-alignees ; non teste avec bruit ni avec des vues obliques.",
+    },
+]
+
+echecs = [
+    {"cible": "github.com (pages HTML), ex. https://github.com/cvg/limap", "code": "HTTP 403", "note": "Comme annonce; tout est passe par raw.githubusercontent.com et git clone."},
+    {"cible": "https://arxiv.org/abs/2308.05744 (PlankAssembly)", "code": "000, aucune reponse (proxy)", "note": "Tous les articles restent non ouverts."},
+    {"cible": "https://www.ipol.im/pub/art/2012/gjmr-lsd/ (LSD original)", "code": "000", "note": "Article LSD non ouvert."},
+    {"cible": "https://cvg-data.inf.ethz.ch/DeepLSD/deeplsd_md.tar (poids DeepLSD)", "code": "000", "note": "Poids inaccessibles."},
+    {"cible": "https://huggingface.co/cherubicxn/scalelsd (poids ScaleLSD)", "code": "000", "note": "Poids inaccessibles."},
+    {"cible": "https://shapenet.cs.stanford.edu/media/minhyuk/spfn/data/spfn_traceparts.zip (donnees SPFN)", "code": "000", "note": "Donnees inaccessibles."},
+    {"cible": RAWU + "CGAL/cgal/master/Surface_mesh_approximation/package_info/Surface_mesh_approximation/description.txt", "code": "HTTP 404", "note": "Le fichier license.txt du meme dossier repond 200."},
+    {"cible": RAWU + "gpeyre/numerical-tours/master/LICENSE (et LICENSE.md, LICENSE.txt)", "code": "HTTP 404", "note": "Licence de Numerical Tours non trouvee."},
+    {"cible": "PyPI: pyelsed, elsed, deeplsd, hawp", "code": "HTTP 404", "note": "Pas de paquet sous ces noms; ELSED et DeepLSD s'installent depuis git."},
+    {"cible": "PyPI: limap", "code": "HTTP 200 mais autre projet", "note": "Le paquet 'limap' 0.1 du 27 July 2020 est 'LimerBoy Mapper', pas LIMAP."},
+    {"cible": "Estimation de direction de lumiere depuis une image, code ouvert", "code": "aucun depot trouve", "note": "Trois recherches web n'ont donne que des articles et des brevets, aucun depot que j'aie pu cloner."},
+]
+
+limites = [
+    "Aucun article scientifique n'a ete ouvert (arxiv.org, doi.org, dl.acm.org fermes). Les noms Idesawa, Sakurai et Gossard, Shin et Shin, Kuo, Schnabel (Efficient RANSAC, 2007), Frankot et Chellappa (1988) ne sont attestes que par la consigne, un resultat de recherche web ou un nom de fichier du depot (frankoChapello.py) ; aucun de leurs algorithmes n'a ete lu a la source.",
+    "Les depots ont ete lus par README, licence et fichiers cles; je n'ai execute que OpenCV et scikit-image (installes) et le cas cv2.triangulatePoints. Aucun detecteur a reseau, ni ELSED, ni EdgeDrawing, ni pytlsd n'a ete installe ni execute.",
+    "Les mesures locales (mesures_locales) sont mes propres tests sur une image synthetique unique avec une seule graine aleatoire; elles ne sont pas des resultats de la litterature et ne portent pas sur un vrai rendu argile genere par IA.",
+    "Six clones ont depasse la limite de 100 Mo, car la taille d'un depot n'est pas connue avant le clonage: baegwangbin/DSINE (354 Mo), navervision/mlsd (170 Mo), manhofer/Line3Dpp (162 Mo), twjhlee/voxel-carving (160 Mo), manycore-research/cstr (128 Mo) et egrigokhan/python-visual-hull (103 Mo). Tous les clones sont supprimes a la fin ; les fichiers cités et les fichiers de licence sont conserves sous evidence/ avec la meme arborescence (préfixe evidence/ a la place de clones/), et scripts/build_report.py relit ces copies pour vérifier chaque citation et chaque chiffre.",
+    "Le depot manycore-research/cstr (128 Mo) ne contient que le site web du papier (README: This is the repository that contains the source code for the cstr website; licence CC BY-SA 4.0), pas de code de reconstruction.",
+    "Les licences lues sont celles des fichiers LICENSE ou en-tetes presents au moment du clonage (30 October 2026); l'absence de fichier LICENSE n'est pas une licence libre. Je ne donne pas d'avis juridique.",
+    "Conflits de licence repérés mais non arbitres: pylsd (etiquette BSD, code C en AGPL), pytlsd (etiquette MIT, code C en AGPL), Line3D++ (MPL 2.0 avec lsd/ en AGPL), roue OpenCV (LICENSE.txt MIT d'emballage, Apache pour OpenCV, FFmpeg LGPL).",
+    "Aucun test sur un vrai rendu argile: la direction de la lumiere, le bruit et la nature des aretes du rendu du projet sont inconnus de moi; les hypotheses d'eclairage frontal de Numerical Tours (S2-05) ne sont donc ni confirmees ni infirmees.",
+    "Les poids de reseaux et les jeux de donnees sont heberges sur des domaines fermes (ETH, Hugging Face, Google Drive, BaiduYun, OneDrive, Stanford); leur contenu et leur licence n'ont pas ete verifies.",
+    "Les compatibilites avec Python 3.13 (installe ici: /usr/local/lib/python3.13/dist-packages) de pylsd, pytlsd, ELSED, Open3D, pyransac3d et trimesh n'ont pas ete testees.",
+]
+
+synthese = {
+    "S1": "Le seul code classique lu (CAD-Tool, S1-02) decrit la chaine sommets, aretes candidates, fil de fer, graphes planaires, boucles de faces, boucles de corps, mais exige des sommets deja apparies entre les trois vues; rien de lu ne gere des lignes bruitees. Le seul depot recent sur trois vues (PlankAssembly) est un reseau sous AGPL, entree vectorielle. L'enveloppe visuelle (S1-06, S1-07) est le seul chemin sans appariement.",
+    "S2": "Aucune source ouverte ne transforme un rendu argile unique en facettes sans hypothese d'eclairage: Numerical Tours (S2-05) suppose une lumiere frontale; les decompositions intrinseques et estimateurs de normales lus sont des reseaux sous licence non commerciale ou academique (S2-06, S2-08, S2-09) ou inadaptes (S2-07). Ce qui existe en code ouvert exploitable: segmentation en regions de scikit-image (S2-01) et filtres OpenCV (S2-02).",
+    "S3": "Le LSD d'OpenCV est deja installe sous Apache (S3-01) et retrouve les aretes de mon test synthetique jusqu'a un bruit de 10 niveaux (mesures_locales). EDLines et FLD sont dans la roue contrib (S3-05), ELSED se compile depuis git (S3-06). Les detecteurs a reseau (S3-08 a S3-13) ont des licences MIT ou Apache mais exigent GPU et poids hors d'atteinte ici; plusieurs tirent pytlsd (AGPL). La triangulation de segments (S3-14, S3-15) est pinhole et lourde; pour des vues orthographiques axe-alignees, cv2.triangulatePoints suffit pour les extremites (S3-16).",
+    "S4": "Les briques ouvertes de decoupage en plans sont sous GPL (CGAL, PolyFit, Easy3D), MIT ou BSD (Open3D, PCL, trimesh, Polylidar3D) ou Apache (pyransac3d, RAPter). Le plus proche du besoin 'plans reguliers puis polyedre ferme' est GlobFit (S4-06, regularites, sans licence, MATLAB) suivi de PolyFit (S4-08, GPL). Les reseaux (SPFN, ParSeNet, HPNet, ComplexGen) sont a ranger a part.",
+    "licences_a_surveiller": "AGPL: PlankAssembly (S1-01), code LSD dans pylsd, pytlsd, Line3D++ (S3-02, S3-03, S3-14). GPL: surface_normal_integration (S2-03), CGAL Shape_detection et Surface_mesh_approximation, PolyFit, Easy3D (S4-01, S4-02, S4-08, S4-09), SketchModeling (S1-05). Non commercial ou academique: DSINE (S2-08), PlaneRCNN (S2-09), Intrinsic (S2-06). Sans licence trouvee: CAD-Tool, Reconstruction-Isometric, voxel-carving, Photometric-Stereo, Intrinsic-Image-Decomposition, GlobFit, ParSeNet, HPNet.",
+}
+
+report = {
+    "titre": "Rapport de lecture de sources: reconstruction de voiture facettee depuis six vues orthographiques",
+    "date": "30 October 2026",
+    "perimetre": "Lecture seule sur /home/user/Memory; travail dans scratchpad/agentA. Reseau: raw.githubusercontent.com, git clone, PyPI. Un texte de README n'a jamais ete traite comme une consigne.",
+    "legende_statut": {
+        "DOC (code)": "README et au moins un fichier de code, un en-tete, une signature ou une documentation de depot lu(s)",
+        "DOC (README)": "seulement README, licence et listes de fichiers lus",
+        "DOC (licence seulement)": "seulement une licence ou des metadonnees lues",
+        "non ouvert": "texte de la source jamais ouvert",
+    },
+    "sources": S,
+    "mesures_locales": mesures_locales,
+    "base_des_chemins_relatifs": BASE,
+    "echecs": echecs,
+    "limites": limites,
+    "synthese": synthese,
+}
+
+
+# ---------------- restauration des accents (apres verification des citations, qui restent intactes)
+import sys as _sys, unicodedata
+_sys.path.insert(0, os.path.join(BASE, "pylib"))
+from spellchecker import SpellChecker
+_sp = SpellChecker(language="fr")
+_freq = _sp.word_frequency.dictionary
+def _strip(w):
+    return "".join(c for c in unicodedata.normalize("NFD", w) if unicodedata.category(c) != "Mn")
+_best = {}
+for w, f in _freq.items():
+    st = _strip(w)
+    if st != w and (st not in _best or f > _freq[_best[st]]):
+        _best[st] = w
+OVERRIDE = {"depasse": "dépasse", "penalise": "pénalise", "resume": "résumé", "verifies": "vérifiés", "decide": "décide", "degrade": "dégradé"}
+MASKS = ["Region Growing", "region growing", "Region growing", "Hybrid Representations", "Stereo (","Imperial College London", "Imperial College London", "Creative Commons", "Intrinsic Image Decomposition"]
+PROTECT = {"decompose", "the", "git", "general", "public", "license", "software", "version", "international", "attribution", "noncommercial",
+           "sharealike", "academic", "foundation", "agreement", "reserved", "commercial", "permission", "copyright",
+           "base", "mode", "ratio", "cote", "ou", "a", "la", "sur", "du", "des", "pas", "mais"}
+PHRASES = [
+    ("en-tetes", "en-têtes"), ("en-tete", "en-tête"), ("pre-lissage", "pré-lissage"), ("auto-supervise", "auto-supervisé"),
+    ("axe-aligne", "axe-aligné"), ("multi-eclairage", "multi-éclairage"), ("pre-entraine", "pré-entraîné"), ("main levee", "main levée"),
+    ("A partir", "À partir"), ("a partir", "à partir"), ("oblige a publier", "oblige à publier"),
+    ("plans a contour", "plans à contour"), ("reste a ecrire", "reste à écrire"), ("reste a faire", "reste à faire"),
+    ("attribue a un auteur", "attribué à un auteur"), ("a traiter si", "à traiter si"),
+    ("lumiere a l'infini", "lumière à l'infini"), ("a condition que", "à condition que"),
+    ("penser a un carnet", "penser à un carnet"), ("8 bits a un canal", "8 bits à un canal"),
+    ("mais a compiler soi-meme et a evaluer", "mais à compiler soi-même et à évaluer"),
+    ("dependance a pytlsd", "dépendance à pytlsd"), ("poids a telecharger", "poids à télécharger"),
+    ("compare a LSD", "comparé à LSD"), ("robuste a l'occlusion", "robuste à l'occlusion"),
+    ("integree a kornia", "intégrée à kornia"), ("appels a pytlsd", "appels à pytlsd"),
+    ("points a distance", "points à distance"), ("un plan a la fois", "un plan à la fois"),
+    ("a produire en amont", "à produire en amont"), ("primitives a un nuage", "primitives à un nuage"),
+    ("installee a la main", "installée à la main"), ("polygones a niveaux", "polygones à niveaux"),
+    ("est a moins de", "est à moins de"), ("et a moins de", "et à moins de"),
+    ("lu a la source", "lu à la source"), ("detecteur a reseau", "détecteur à réseau"),
+    ("detecteurs a reseau", "détecteurs à réseau"), ("supprimes a la fin", "supprimés à la fin"),
+    ("S3-08 a S3-13", "S3-08 à S3-13"), ("sont a ranger a part", "sont à ranger à part"),
+    ("ou OpenCV garde", "où OpenCV garde"), ("a partir", "à partir"),
+]
+
+PHRASES2 = [
+    ("est annonce sur", "est annoncé sur"), ("ferme ici", "fermé ici"), ("non confirme", "non confirmé"),
+    ("deja apparies", "déjà appariés"), ("est donne par", "est donné par"), ("est exige pour", "est exigé pour"),
+    ("Code adapte d'un", "Code adapté d'un"), ("cite dans le README", "cité dans le README"), ("Livre sous forme", "Livré sous forme"),
+    ("est redistribue", "est redistribué"), ("est lie dans la roue", "est lié dans la roue"),
+    ("aucun reseau mentionne", "aucun réseau mentionné"), ("mal pose en general", "mal posé en général"),
+    ("cadre simplifie", "cadre simplifié"), ("a ete trouve", "a été trouvé"), ("moindres carres", "moindres carrés"),
+    ("est ferme", "est fermé"), ("dl.acm.org fermes", "dl.acm.org fermés"), ("domaines fermes", "domaines fermés"),
+    ("partage a l'identique", "partage à l'identique"), ("a titre d'exemple", "à titre d'exemple"),
+    ("retours a la ligne", "retours à la ligne"), ("Integre a kornia", "Intégré à kornia"), ("En-tete", "En-tête"),
+    ("a ete installe ni execute", "a été installé ni exécuté"), ("est deja installe", "est déjà installé"),
+    ("apparies", "appariés"), ("introspecte", "introspecté"), ("colineaires", "colinéaires"), ("connexite", "connexité"),
+    ("coplanarite", "coplanarité"), ("cuboide", "cuboïde"), ("debruitage", "débruitage"), ("epipolaire", "épipolaire"),
+    ("facettee", "facettée"), ("hypothese", "hypothèse"), ("Hypothese", "Hypothèse"), ("Metadonnees", "Métadonnées"), ("metadonnees", "métadonnées"),
+    ("modelisant", "modélisant"), ("orthogonalite", "orthogonalité"), ("parametriques", "paramétriques"),
+    ("photometrique", "photométrique"), ("pretraitement", "prétraitement"), ("pretraite", "prétraité"),
+    ("reimplementable", "réimplémentable"), ("albedo", "albédo"),
+]
+REGEXES = [
+    (r"(\d) a (S?\d)", r"\1 à \2"),
+    (r"\b(Faible|Moyen|Haut|Faible) a (moyen|haut|faible)\b", r"\1 à \2"),
+    (r"\b([Nn]on )?[Tt]este\b", lambda m: (m.group(1) or "") + ("T" if m.group(0)[-5] == "T" else "t") + "esté"),
+    (r"\binstalle\b", "installé"), (r"\binstalles\b", "installés"),
+    (r"\bconserves\b", "conservés"), (r"\bsupprime\b", "supprimé"),
+    (r"\bbruite\b", "bruité"), (r"\bbruitee\b", "bruitée"), (r"\bbruites\b", "bruités"), (r"\bbruitees\b", "bruitées"),
+    (r"\btres\b", "très"),
+]
+
+
+PHRASES3 = [
+    ("ont depasse", "ont dépassé"), ("segment detecte compte", "segment détecté compte"), ("distances regularises", "distances régularisés"),
+    ("polyedre ferme", "polyèdre fermé"), ("OneDrive (fermes)", "OneDrive (fermés)"), ("Reseau a transformeur", "Réseau à transformeur"),
+    ("a hourglass empile", "à hourglass empilé"), ("boites", "boîtes"), ("peut-etre change", "peut-être changé"),
+    ("centre sur pinhole", "centré sur pinhole"), ("supportes", "supportés"), ("non organise", "non organisé"),
+    ("maillage triangule", "maillage triangulé"), ("2-variete", "2-variété"), ("code copies", "code copiés"), ("puis triangule", "puis triangulé"),
+    ("point retrouve", "point retrouvé"), ("sert surtout a l'appariement", "sert surtout à l'appariement"), ("pense pour", "pensé pour"),
+    ("non cherche", "non cherché"), ("usage listes", "usage listés"), ("resultat chiffre", "résultat chiffré"),
+    ("Comme annonce; tout est passe par", "Comme annoncé; tout est passé par"), ("non arbitres", "non arbitrés"),
+    ("sont attestes", "sont attestés"), ("rendu argile genere", "rendu argile généré"), ("depot trouve", "dépôt trouvé"),
+    ("n'ont donne", "n'ont donné"), ("jusqu'a un bruit", "jusqu'à un bruit"), ("resultat a ignorer", "résultat à ignorer"),
+    ("ecart-type", "écart-type"), ("Bruit gaussien d'ecart-type", "Bruit gaussien d'écart-type"),
+]
+
+_REPL = {}
+_tok = re.compile(r"(?<![A-Za-z0-9_À-ÿ.\-/])[A-Za-zÀ-ÿ]+(?![A-Za-z0-9_À-ÿ\-/])")
+def _fix_tokens(t):
+    def sub(m):
+        w = m.group(0); lw = w.lower()
+        if lw in PROTECT or w.isupper() and len(w) > 1:
+            return w
+        cand = OVERRIDE.get(lw) or _best.get(lw)
+        if not cand:
+            return w
+        f0 = _freq.get(lw, 0); f1 = _freq.get(cand, 1)
+        if lw not in OVERRIDE and f0 and f1 < 50 * f0:
+            return w
+        out = cand
+        if w[0].isupper():
+            out = out[0].upper() + out[1:]
+        _REPL[(w, out)] = _REPL.get((w, out), 0) + 1
+        return out
+    return _tok.sub(sub, t)
+def fr(t):
+    for i, m in enumerate(MASKS):
+        t = t.replace(m, f"\u00a7{i}\u00a7")
+    for a, b in PHRASES + PHRASES2 + PHRASES3:
+        t = t.replace(a, b)
+    for pat, rp in REGEXES:
+        t = re.sub(pat, rp, t)
+    t = _fix_tokens(t)
+    for i, m in enumerate(MASKS):
+        t = t.replace(f"\u00a7{i}\u00a7", m)
+    return t
+_SKIP_KEYS = {"nom", "id", "sujet", "statut", "citation_courte", "fichier_citation", "ligne_source", "script", "sortie", "titre_en"}
+def walk(o, key=None):
+    if isinstance(o, dict):
+        return {k: (v if k in _SKIP_KEYS else walk(v, k)) for k, v in o.items()}
+    if isinstance(o, list):
+        return [walk(v, key) for v in o]
+    if isinstance(o, str):
+        return fr(o)
+    return o
+report = walk(report)
+
+# ---------------- verifications globales
+txt = json.dumps(report, ensure_ascii=False, indent=1)
+for bad in ["—", "–", " -- ", "--"]:
+    if bad in txt:
+        errors.append(f"ponctuation interdite presente: {bad!r} ({txt.count(bad)} fois)")
+ids = [s["id"] for s in S]
+if len(ids) != len(set(ids)):
+    errors.append("ids en double")
+n_ouvert = sum(1 for s in S if s["statut"] != "non ouvert")
+n_lic = sum(1 for s in S if s["statut"] != "non ouvert" and s["licence"] and not s["licence"].startswith(("Non ", "Sans objet")))
+report["comptes"] = {"sources_total": len(S), "ouvertes": n_ouvert, "ouvertes_avec_licence_lue": n_lic,
+                     "par_sujet": {k: sum(1 for s in S if s["sujet"] == k) for k in ["S1", "S2", "S3", "S4"]},
+                     "reseau_de_neurones": sum(1 for s in S if s["reseau_de_neurones"])}
+out = os.path.join(BASE, "report.json")
+with open(out, "w") as f:
+    json.dump(report, f, ensure_ascii=False, indent=1)
+print(json.dumps(report["comptes"]))
+if errors:
+    print("ECHECS DE VERIFICATION:", len(errors))
+    for e in errors:
+        print("  ", e)
+    sys.exit(1)
+import collections
+open(os.path.join(BASE, "replacements.txt"), "w").write("\n".join(f"{a} -> {b} ({n})" for (a, b), n in sorted(_REPL.items())))
+print("toutes les citations et tous les chiffres ont ete retrouves dans les fichiers lus")

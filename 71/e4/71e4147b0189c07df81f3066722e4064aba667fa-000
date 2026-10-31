@@ -1,0 +1,86 @@
+# Diagnostic de ZrlTutteFill.fill4 sur l'arche et le lys (30 October 2026)
+
+Lecture seule du projet : ZrlTutteFill.py, ZrlAutoPatch.py, ZrlAny.py, ZrlQuadStats.py, ZrlTopoJudge.py n'ont pas été modifiés. Mes outils de mesure (copie instrumentée de fill4 avec options, appelée par import) sont dans /Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/tutte_diag_tools/ (diag.py est le cœur ; aussi matrix.py, matrix2.py, snaptest.py, where.py, ratio.py, defect.py, ncorners.py, jacmeasure.py, subdiv.py) ; les sorties du lancement de l'en-tête sont dans le scratchpad de la session (/private/tmp/claude-501/-Users-zenray--claude-Memory1/09d15ec8-88ad-4965-a2f0-80b68515e880/scratchpad/tf/{arch,lily}/). Commandes : PYTHONDONTWRITEBYTECODE=1 /Users/zenray/.venvs/zenray-meshes/bin/python -I tutte_diag_tools/diag.py <obj> <edge> k=300 relax=0 snap=1 sag=0.001 [poly=cyc] [w=cot|uniform] [dims=jac]. Statut : [MESURÉ] partout (mêmes zones que le moteur : ANY.segment avec zone-deg 25, merge-deg 35).
+
+## 0. Reproduction du lancement de l'en-tête [MESURÉ]
+
+| Maillage | Zones / patchées | Quads | Pliés (juge) | Écrasés (juge) | Échecs |
+|---|---|---|---|---|---|
+| arch_hard.obj, --edge 0.07 | 117 / 92 | 11 644 | 2 877 = 24,7 % | 9 176 = 78,8 % | 25 zones « loops 2 (not a disk) » |
+| lily_plant.obj, --edge 0.0066 | 70 / 70 | 41 396 | 1 025 = 2,5 % | 24 550 = 59,3 % | aucun |
+Le chiffre de 12 % de plis sur l'arche n'est pas reproduit par la commande de l'en-tête (24,7 %) ; il correspond au cas sans relax (11,3 %, section 3 ligne relax 0). Le lys (2,5 % et 59 %) est reproduit à l'unité près.
+
+## 1. Cause principale des écrasés : des « coins » qui ne sont pas des coins [MESURÉ]
+
+Pour chaque zone, les 4 coins retenus par AP.corners ont un virage mesuré (angle entre tangente entrante et sortante, 0 = droit). Un coin « faux » est un coin de virage inférieur à 35 degrés, ajouté par complétion (boîte orientée de la zone) faute de 4 vrais coins. Résultats avec les corrections de la section 3 déjà appliquées (snap + sag, sans relax) pour isoler l'effet :
+
+| Nombre de coins faux | Arche : zones / quads / pliés / écrasés | Lys : zones / quads / pliés / écrasés |
+|---|---|---|
+| 0 | 57 / 1 207 / 0,0 % / 0,0 % | 23 / 11 052 / 1,0 % / 3,6 % |
+| 1 | 8 / 52 / 3,8 % / 42,3 % | 25 / 4 435 / 0,0 % / 21,2 % |
+| 2 | 27 / 10 368 / 12,0 % / 88,5 % | 22 / 25 822 / 1,2 % / 87,0 % |
+Autrement dit : 89 % des quads de l'arche et 62 % de ceux du lys sont dans des zones à deux coins faux, et ces zones sont écrasées à 87-89 %, alors que les zones qui ont leurs 4 vrais coins ne sont pas écrasées (0 % sur l'arche, 3,6 % sur le lys). Le comptage des vrais coins (virage >= 35 degrés, jusqu'à 8 cherchés) : arche : 2 coins : 27 zones, 3 : 8, 4 : 47, 5 : 8, 6 : 2, plus 25 zones à 2 boucles (anneaux) ; lys : 2 coins : 22 zones, 3 : 25, 4 : 7, 5 : 14, 6 : 2. Un rectangle imposé à une zone qui est en réalité une bande (2 coins), un triangle ou une lentille (3 coins) force un coin droit sur un sommet presque plat : les cellules du réseau se cisaillent sur toute la zone. Exemple : arche, zone 0 (48 triangles, aire 0,218 m2, contour 10,5 m) : virages aux coins 108,7, 112,7, 6,4 et 6,8 degrés ; côtés 5,18, 1,80, 1,76 et 1,80 m ; le réseau 50 x 26 a une aire de cellules 30 fois trop petite (rapport aire / (n0 n1 edge2) = 0,034) ; angle de coin minimal médian des quads : 2,9 degrés.
+Corrélation secondaire : le rapport aire de zone / (n0 n1 edge2) classe pareil : arche, rapport < 0,1 : 12 zones, 7 402 quads, 85 % d'écrasés, 16,7 % de pliés ; rapport entre 0,8 et 1,25 : 15 zones, 10,7 % d'écrasés ; lys : rapport < 0,1 : 8 zones, 22 713 quads (55 %), 96 % d'écrasés ; rapport entre 0,8 et 1,25 : 5,8 %. Remplacer n0 et n1 (moyennes de côtés opposés) par la longueur moyenne des directions u et v du Jacobien du plongement (dims=jac) fait bien tomber le nombre de quads (arche 11 474 -> 7 857 sur le maillage subdivisé) mais pas la part d'écrasés (79,1 % -> 75,7 %) : la dimension du réseau n'est pas la cause, la forme du domaine l'est.
+
+## 2. Cause principale des plis : le « relax » final [MESURÉ]
+
+| Réglage | Arche : pliés / écrasés | Lys : pliés / écrasés |
+|---|---|---|
+| fourni (relax 150, k = 24) | 2 905 / 9 176 | 1 054 / 24 552 |
+| relax = 0 (réseau relevé tel quel, k = 300) | 1 314 / 9 436 | 610 / 24 077 |
+Le relax (lissage laplacien tangentiel et projection au plus proche point toutes les 5 itérations) plie 1 591 quads de plus sur l'arche (x 2,2) et 444 de plus sur le lys (x 1,7) : ce sont les plis de l'extrinsèque que le plongement évitait. Cause : les zones sont des surfaces peu maillées (médiane de 6 triangles sur l'arche, 137 sur le lys), la projection au plus proche point de ref.closest saute d'un triangle à l'autre et défait l'ordre. Le relax n'apporte aucun gain de cisaillement visible (écrasés quasi identiques).
+
+## 3. Les causes demandées (a) à (f), une par une [MESURÉ]
+
+(a) Triangles retournés dans le plan avant relèvement : arche 35 triangles (tous d'aire nulle, pas de vrai retournement), lys 182 ; avec une sagitta de 1e-3 sur le polygone : 0 sur les deux. Plongement valide : la garantie de Tutte tient. Effet sur les quads : nul (1 314 -> 1 324 plis sur l'arche), c'est une hygiène, pas la cause.
+(b) Points de grille non localisés (bad) : arche 747 (672 avec k = 300 : le nombre de candidats n'y est pour rien), lys 786. Cause : le bord de la région est une chaîne de sommets, les coins du rectangle ne tombent pas sur un sommet de bord ; la corde entre le dernier sommet du côté q-1 et le premier du côté q coupe le coin du rectangle, donc les points du réseau au voisinage des 4 coins ne sont dans aucun triangle ; le code les envoie au centre d'un triangle voisin (erreur grossière). Remède : accrocher chaque coin au sommet de bord le plus proche en abscisse curviligne (option snap) : arche 672 -> 44, lys 786 -> 0 ; avec le polygone cyclique : 0 aussi sur l'arche. Effet : plis arche 1 314 -> 1 242, lys 610 -> 455.
+(c) Plis dus à la traversée d'une arête vive de la région (écart entre normales des 4 sommets > 25 degrés) : arche 16 sur 2 905 (0,6 %), lys 121 sur 1 054 (11,5 %) avec relax, 26 sur 455 (5,7 %) après snap. Ce n'est donc pas la cause principale. Le juge ZrlTopoJudge (normale du coin 0) contre la normale de surface (moyenne des normales des triangles où tombent les 4 sommets) : arche snap : 1 242 plis (juge) contre 1 027 (surface), soit 17 % de faux plis dus à la normale du coin 0 sur des quads gauches ; lys 455 contre 425 (6,6 %).
+(d) Sagitta : supprime les triangles à aire nulle (35 -> 0, 182 -> 0) ; effet sur les plis et les écrasés : inférieur à 1 point.
+(e) Polygone cyclique (côtés proportionnels aux longueurs de côtés de la zone, réseau par application bilinéaire de [0, n0] x [0, n1]) à la place du rectangle : arche (snap + sag) plis 1 249 -> 976 (10,7 % -> 8,4 %), écrasés 9 198 -> 9 600 (79,1 % -> 82,6 %) ; lys : plis 429 -> 426, écrasés 23 794 -> 23 518. Un petit gain de plis, aucun gain d'écrasés : le défaut vient des coins faux, pas de la forme du polygone.
+(f) Poids : sur les maillages d'origine (zones sans sommet intérieur : 50 sommets, 50 de bord sur la zone 0) les poids cotangentes positifs, uniformes et valeur moyenne donnent des résultats IDENTIQUES au chiffre près, parce qu'il n'y a pas d'inconnue. Sur le maillage subdivisé deux fois (arch_s2.obj, 768 triangles par zone) : valeur moyenne 1 038 plis (9,0 %) et 9 079 écrasés (79,1 %) ; cotangentes positifs 1 148 (10,0 %) et 9 135 (79,6 %) ; uniformes 1 237 (10,8 %) et 9 335 (81,4 %). La valeur moyenne est la meilleure mais l'écart est inférieur à 2 points : les poids ne sont pas la cause du cisaillement.
+Mesure du Jacobien : ZrlQuadStats.stats utilise la normale n0 = (P1 - P0) x (P3 - P0), celle du coin 0, pour les quatre coins ; sur un quad gauche cela fausse les trois autres. Avec la normale des diagonales (P2 - P0) x (P3 - P1) : arche (snap + sag) 862 plis contre 1 249 (juge) et 1 029 (normale de surface) ; lys 413 contre 429 ; sur le code fourni : arche 2 848 contre 2 905, lys 958 contre 1 015. Les écrasés sont insensibles au choix (9 198 / 9 198 / 9 200 sur l'arche). La mesure n'est donc responsable que d'environ 20-30 % des plis restants de l'arche et d'environ 4 % du lys.
+
+## 4. Verdict, causes classées
+
+1. Plis (arche 24,7 %, lys 2,5 %) : (i) le relax, qui double les plis (arche 1 314 -> 2 905) ; (ii) les points non localisés aux coins (672 et 786 points) ; (iii) le reste vient des zones à coins faux (12 % des quads de ces zones sur l'arche) ; (iv) la mesure du juge compte 17 % de faux plis sur l'arche (quads gauches), 4 % sur le lys.
+2. Écrasés (79 % et 59 %) : une seule cause : un patch rectangulaire imposé à des zones qui n'ont pas 4 vrais coins (bandes, lentilles, triangles, pentagones) ; 0 % d'écrasés sur l'arche et 3,6 % sur le lys dans les zones à 4 vrais coins.
+3. Non coupables : les poids (valeur moyenne, cotangentes, uniformes), la sagitta, le nombre de candidats de la localisation, la traversée d'arêtes vives (0,6 % et 11 %), la nature du bord.
+
+## 5. Correctif précis (diff en texte, NON appliqué) pour /Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines/ZrlTutteFill.py
+
+```diff
+@@ def fill4(m, Z, edge, prm=AP.PARAMS):
+-    prm4 = dict(prm, max_corners=4); C, turn = AP.corners(X, total, normal, prm4)
+-    if len(C) != 4: return None, None, "corners %d" % len(C)
++    prm4 = dict(prm, max_corners=4); C, turn = AP.corners(X, total, normal, prm4)
++    if len(C) != 4: return None, None, "corners %d" % len(C)
++    fake = [k for k in range(4) if turn[C[k]] < 35.0]                          # a straight vertex completed into a corner by the oriented box
++    if fake: return None, None, "fake corners %d (zone is a %d sided region, use the N sided fill)" % (len(fake), 4 - len(fake))
+@@
+-    side_len = [((sC[(k + 1) % 4] - sC[k]) % Ltot) for k in range(4)]; ...
++    sC = [float(cum[int(np.argmin(np.abs(cum[:-1] - s0)))]) for s0 in sC]     # snap every corner to a boundary vertex : the rectangle corners are images of vertices
++    side_len = [((sC[(k + 1) % 4] - sC[k]) % Ltot) for k in range(4)]; ...
+@@  (boundary onto the rectangle)
+-        uv[int(v)] = [(t * w, 0.0), (w, t * h), (w - t * w, h), (0.0, h - t * h)][k]
++        p0 = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)][k]; p1 = [(w, 0.0), (w, h), (0.0, h), (0.0, 0.0)][k]; d = np.subtract(p1, p0); nrm = np.array([d[1], -d[0]]) / max(np.linalg.norm(d), 1e-30)
++        uv[int(v)] = tuple(np.add(p0, t * d) + SAG * np.linalg.norm(d) * 4 * t * (1 - t) * nrm)      # SAG = 1e-3 : a strictly convex target, no zero area triangle
+@@
+-    _, cand = tree.query(Q2, k=min(24, len(T2)))
++    _, cand = tree.query(Q2, k=min(64, len(T2)))                               # 64 is plenty once the corners are snapped
+@@
+-    P3 = relax(P3, Qd, n0, n1, m["P"][F], iters=int(prm.get("tutte_relax", 150)))
++    # no relax : the lifted lattice is already on the surface and fold free in the plane ; if smoothing is wanted, do it in the UV plane (smooth the lattice coordinates there, relift) and keep the surface projection out of the loop
++    P3 = relax(P3, Qd, n0, n1, m["P"][F], iters=int(prm.get("tutte_relax", 0)))
+```
+Et dans ZrlQuadStats.stats (mesure, facultatif) :
+```diff
+-    n0 = np.cross(P[:, 1] - P[:, 0], P[:, 3] - P[:, 0]); nm = n0 / ...
++    n0 = np.cross(P[:, 2] - P[:, 0], P[:, 3] - P[:, 1]); nm = n0 / ...      # the diagonals' normal : stable for warped quads (the corner 0 normal is not)
+```
+Où va le travail réel : le tronçon « coins faux » exige la voie N côtés : pour un patch à 2 coins (bande), n1 = max(1, round(largeur / edge)) avec largeur = aire / moyenne des deux grands côtés ; pour 3 à 8 coins : polygone cyclique à côtés proportionnels (formules de intrinsic_patch_fill_30-October-2026.md), motifs de Takayama (takayama_validation_and_tables_30-October-2026.md) et relèvement barycentrique ; les zones annulaires (2 boucles, 25 sur l'arche) doivent être coupées par un chemin avant le plongement.
+
+## 6. Ce que le résultat devrait devenir [MESURÉ pour les zones à 4 vrais coins, ESTIMÉ pour le reste]
+
+- Zones à 4 vrais coins après correction (snap, sag, sans relax) : arche 57 zones, 1 207 quads, 0 pli, 0 écrasé ; lys 23 zones, 11 052 quads, 1,0 % de plis, 3,6 % d'écrasés.
+- Ces zones valides ne couvrent que 10 % des quads de l'arche et 27 % du lys : le gros du volume (zones à 2 ou 3 coins) ne sera propre qu'avec le remplissage à N côtés ; on peut s'attendre à des zones à 3 à 6 vrais coins (arche : 3 : 8, 5 : 8, 6 : 2 zones ; lys : 3 : 25, 5 : 14, 6 : 2) traitées par les motifs de Takayama avec 0 pli (tests de la passe 3 : 0 pli sur 4 cas courbes) et des zones à 2 coins (bandes) en lignes de quads.
+- Avec les seules corrections du diff (snap, sag, pas de relax, refus des coins faux), les plis du code existant passeraient de 24,7 % à environ 0 % sur l'arche pour les zones traitées et de 2,5 % à 1,0 % sur le lys ; les écrasés de 78,8 % et 59,3 % à environ 0 % et 3,6 % sur les zones traitées, les autres zones étant refusées (rapportées comme « fake corners ») et non plus écrasées.

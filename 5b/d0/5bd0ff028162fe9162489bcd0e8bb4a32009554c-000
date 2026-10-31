@@ -1,0 +1,42 @@
+"""Q9, mesure 4 : coques épaisses. Pour chaque face, cherche une face partenaire de la même pièce derrière (couche extérieure)
+ou devant (couche intérieure) dans un rayon de 25 mm : donne la couche, l'épaisseur et les faces de peau extérieure."""
+import sys, json
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+layer = np.zeros(len(Q), int)      # +1 : solide derrière (extérieure, normale vers l'extérieur) ; -1 : partenaire devant (intérieure) ; 0 : feuille simple
+thick = np.full(len(Q), np.nan)
+for gi, nm in enumerate(names):
+    idx = np.where(Gq == gi)[0]
+    if len(idx) < 4: continue
+    tr = cKDTree(C[idx])
+    nbrs = tr.query_ball_point(C[idx], 0.03)
+    for j, nb in enumerate(nbrs):
+        i = idx[j]
+        d = C[idx[nb]] - C[i]
+        s = d @ N[i]                                   # distance signée le long de la normale
+        lat = np.linalg.norm(d - s[:, None] * N[i], axis=1)
+        opp = (N[idx[nb]] @ N[i]) < -0.5               # partenaire de normale opposée
+        cand = opp & (lat < 0.012) & (np.abs(s) > 0.0005)
+        if cand.any():
+            k = np.argmin(np.abs(s[cand]))
+            sv = s[cand][k]
+            layer[i] = 1 if sv < 0 else -1
+            thick[i] = abs(sv)
+print("faces : extérieures", int((layer == 1).sum()), "intérieures", int((layer == -1).sum()), "feuille simple", int((layer == 0).sum()))
+rows = []
+for gi, nm in enumerate(names):
+    m = Gq == gi
+    if m.sum() == 0: continue
+    t = thick[m & (layer != 0)]
+    rows.append({"name": nm, "quads": int(m.sum()), "outer": int((m & (layer == 1)).sum()), "inner": int((m & (layer == -1)).sum()),
+                 "single": int((m & (layer == 0)).sum()), "thickness_mm_median": float(np.nanmedian(t) * 1000) if len(t) else None})
+np.savez("out/v752_layers.npz", layer=layer, thick=thick)
+json.dump(rows, open("out/q9_layers.json", "w"), indent=1)
+for r in sorted(rows, key=lambda r: -r["quads"])[:30]:
+    print(f"{r['name']:32s} q {r['quads']:6d} ext {r['outer']:6d} int {r['inner']:6d} simple {r['single']:6d} épaisseur médiane {r['thickness_mm_median']}")

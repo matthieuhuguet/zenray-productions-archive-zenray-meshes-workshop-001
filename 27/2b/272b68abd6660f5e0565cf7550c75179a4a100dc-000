@@ -1,0 +1,50 @@
+"""30 October 2026 : assemble the CAR from QuadWild mechanical part by part (QwParts.py output) with the current hybrid part as fallback, and compare every part with the current hybrid choice.
+    python -I QwCarAssemble.py qw_dir hybrid_car.obj hybrid_car.obj.parts.json out.obj [--mode qw|best] [--report report.json]
+mode qw : QuadWild mechanical wherever it produced quads, the hybrid part elsewhere. mode best : per part the one with fewer folded + squashed quads (ties : more quads of valence 4 not measured, QuadWild).
+FR : voiture assemblee depuis QuadWild mechanical piece par piece, repli sur la piece actuelle ; comparaison piece par piece."""
+import argparse, collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlQuadStats as QS
+
+
+def load(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+def part_stats(V, F):
+    Q = np.array([f for f in F if len(f) == 4], np.int64)
+    if not len(Q): return None
+    _, _, j, _ = QS.stats(V, Q); return {"quads": len(Q), "tris": sum(1 for f in F if len(f) == 3), "folded": int((j < 0).sum()), "squashed": int((j < 0.3).sum()), "jac": float(j.mean())}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("qw_dir"); ap.add_argument("hybrid"); ap.add_argument("parts"); ap.add_argument("out"); ap.add_argument("--mode", default="qw"); ap.add_argument("--report"); ap.add_argument("--tri-ratio", type=float, default=0.02); a = ap.parse_args()
+    HV, HF = load(a.hybrid); names = json.load(open(a.parts)); byp = collections.defaultdict(list)
+    for fi, n in enumerate(names): byp[n].append(HF[fi])
+    OV = []; OF = []; OG = []; rep = {}
+    for part in sorted(byp):
+        hf = byp[part]; used = sorted({v for f in hf for v in f}); remap = {v: i for i, v in enumerate(used)}; hv = HV[used]; hfl = [[remap[v] for v in f] for f in hf]; hs = part_stats(hv, hfl); qp = os.path.join(a.qw_dir, part, "qw_mechanical.obj"); qs = None; qv = qf = None
+        if os.path.exists(qp):
+            qv, qf = load(qp); qs = part_stats(qv, qf)
+            if qs and qs["tris"] > a.tri_ratio * (qs["quads"] + qs["tris"]): qs = None                  # a QuadWild part with many triangles is not a quad part
+        pick = "hybrid"
+        if qs and a.mode == "qw": pick = "qw"
+        elif qs and a.mode == "best": pick = "qw" if (qs["folded"] + qs["squashed"], 0) <= ((hs["folded"] + hs["squashed"]) if hs else 1e9, 0) else "hybrid"
+        rep[part] = {"pick": pick, "hybrid": hs, "qw": qs}
+        V, F = (qv, qf) if pick == "qw" else (hv, hfl); base = len(OV); OV += V.tolist(); OF += [[base + int(i) for i in f] for f in F]; OG += [part] * len(F)
+    with open(a.out, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in OV)); f.write("".join("f " + " ".join(str(i + 1) for i in q) + "\n" for q in OF))
+    json.dump(OG, open(a.out + ".parts.json", "w"))
+    n_qw = sum(1 for r in rep.values() if r["pick"] == "qw"); tot = lambda k, key: sum((r[k] or {}).get(key, 0) for r in rep.values() if r["pick"] == ("qw" if k == "qw" else "hybrid"))
+    print("parts %d, QuadWild picked %d, fallback %d ; faces %d" % (len(rep), n_qw, len(rep) - n_qw, len(OF)))
+    both = [r for r in rep.values() if r["qw"] and r["hybrid"]]
+    print("parts with both : %d ; folded QW %d vs hybrid %d ; squashed QW %d vs hybrid %d ; quads QW %d vs hybrid %d" % (len(both), sum(r["qw"]["folded"] for r in both), sum(r["hybrid"]["folded"] for r in both), sum(r["qw"]["squashed"] for r in both), sum(r["hybrid"]["squashed"] for r in both), sum(r["qw"]["quads"] for r in both), sum(r["hybrid"]["quads"] for r in both)))
+    if a.report: json.dump(rep, open(a.report, "w"), indent=1)
+
+
+if __name__ == "__main__": main()

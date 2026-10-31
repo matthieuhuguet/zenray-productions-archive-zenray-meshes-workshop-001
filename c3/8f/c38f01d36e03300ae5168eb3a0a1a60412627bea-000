@@ -1,0 +1,18 @@
+"""31 October 2026 : wheel vs reference, same scale and same centre : the reference crop (391.8 px per metre, wheel centre at pixel 443,180 of the 960 x 524 crop) next to the model rendered orthographically from the side (axis Z toward the camera) with the same Lambert grey as the sheet.
+    python -I CompareWheel.py model.obj out.png"""
+import sys, os
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts")
+import numpy as np, trimesh, Raster
+from PIL import Image, ImageDraw
+mesh = trimesh.load(sys.argv[1], force="mesh", process=False); mr = Raster.Renderer(mesh.vertices, mesh.faces)
+s = 391.8; R = 1400; cx, cy = 443, 180
+c = np.array([(R / 2 - cx) / s, (cy - R / 2) / s, 0.0]) * np.array([1, 1, 1])      # world point at the image centre
+c[1] = -(cy - R / 2) / s * -1
+M, D, N, F = mr.render(c.tolist(), s, ([1, 0, 0], [0, 1, 0], [0, 0, 1]), R)
+key = np.array([-0.4, 0.55, 0.73]); key /= np.linalg.norm(key); val = np.clip(0.3 + 0.6 * np.clip((N * key).sum(-1), 0, 1) + 0.1 * N[..., 2], 0, 1)
+dm = D[M]; dn = np.zeros_like(D); dn[M] = (D[M] - dm.min()) / max(dm.max() - dm.min(), 1e-6)         # depth cue : what is far from the camera is darker, like the ambient occlusion of the reference
+val = val * (0.55 + 0.45 * dn)
+img = np.where(M, val * 255, 118).astype(np.uint8)[:524, :960]
+ref = np.asarray(Image.open("/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/car/wheel_ref_front.png").convert("L"))
+tiles = [np.stack([ref] * 3, -1), np.stack([img] * 3, -1)]
+out = Image.fromarray(np.hstack(tiles).astype(np.uint8)); d = ImageDraw.Draw(out); d.text((8, 8), "reference | model (same scale, same centre)", fill=(255, 255, 0)); out.save(sys.argv[2]); print("ok", out.size)

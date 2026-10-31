@@ -1,0 +1,217 @@
+"""Pass 8 : the hybrid on a QuadWild layout. Written 30 October 2026.
+Usage : python3 -I zr8_hybrid.py prefix=PATH/name_rem_p0 out=OUT.obj [scale=3.0] [counts=milp|qw] [dump=PATH quad=PATH] [mirror=x|y|z]
+Steps : read layout -> elementary arcs -> counts (global MILP, or the counts of QuadWild recovered from its quads) ->
+Tutte fill of every patch -> exact weld -> judge. Prints one JSON line.
+FR : l'hybride sur un layout de QuadWild : arcs elementaires, comptes (MILP global ou comptes de QuadWild), remplissage de Tutte
+de chaque patch, soudure exacte, juge."""
+import sys, json, time, collections
+sys.path.insert(0, ".")
+import numpy as np
+from scipy.spatial import cKDTree
+import zr8_io as IO, zr8_layout as L, zr8_counts as C, zr8_fill as Fm, zr8_judge as J
+import layout_probe as LP
+
+
+def mean_edge(V, F):
+    F = np.asarray(F)
+    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]])
+    return float(np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1).mean())
+
+
+def qw_arc_counts(lay, arcs, quad_path, dump):
+    """Recover the integer count of every elementary arc from the (unsmoothed) quads of QuadWild : the quad edges lying on a
+    patch boundary have their midpoint on the polyline of exactly one arc."""
+    Vq, Q = IO.read_obj(quad_path); Vq = np.array(Vq); Q = np.array(Q)
+    part = np.zeros(len(Q), int)
+    for p, fl in enumerate(dump["qpart"]):
+        part[fl] = p
+    owner = collections.defaultdict(set)
+    for fi, q in enumerate(Q):
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4])
+            owner[(a, b) if a < b else (b, a)].add(int(part[fi]))
+    bnd = [e for e, s in owner.items() if len(s) == 1 or len(s) > 1]
+    # an edge is on a patch boundary if it belongs to quads of two patches, or to one quad only
+    ecount = collections.Counter()
+    for fi, q in enumerate(Q):
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); ecount[(a, b) if a < b else (b, a)] += 1
+    bnd = [e for e in owner if len(owner[e]) > 1 or ecount[e] == 1]
+    samples = []; owner_arc = []
+    keys = list(arcs.keys())
+    for ki, k in enumerate(keys):
+        pts = Fm.arc_points(lay.V, k, max(4 * len(k), 8))
+        samples.append(pts); owner_arc += [ki] * len(pts)
+    tree = cKDTree(np.vstack(samples)); owner_arc = np.array(owner_arc)
+    mids = np.array([0.5 * (Vq[a] + Vq[b]) for a, b in bnd])
+    d, idx = tree.query(mids)
+    cnt = collections.Counter(owner_arc[idx].tolist())
+    return {k: int(cnt.get(ki, 0)) for ki, k in enumerate(keys)}, float(np.median(d))
+
+
+def detect_mirror_pairs(lay, arcs, axis, tol_frac=0.002):
+    """Pairs of arcs that are mirror images through the plane axis = 0 (axis in x, y, z) : same polyline reflected, tolerance as a
+    fraction of the mesh diagonal."""
+    ax = "xyz".index(axis); V = lay.V; diag = np.linalg.norm(V.max(0) - V.min(0))
+    keys = list(arcs.keys()); S = {}
+    for k in keys:
+        S[k] = Fm.arc_points(V, k, 8)
+    cent = np.array([S[k].mean(axis=0) for k in keys]); refl = cent.copy(); refl[:, ax] *= -1
+    tree = cKDTree(cent); pairs = []; used = set()
+    for i, k in enumerate(keys):
+        if k in used: continue
+        d, j = tree.query(refl[i])
+        if j == i or keys[j] in used: continue
+        R = S[k].copy(); R[:, ax] *= -1
+        if min(np.abs(R - S[keys[j]]).max(), np.abs(R[::-1] - S[keys[j]]).max()) < tol_frac * diag:
+            pairs.append((k, keys[j])); used.add(k); used.add(keys[j])
+    return pairs
+
+
+def build(a):
+    t0 = time.time()
+    lay = a["layout"] if "layout" in a else L.Layout(a["prefix"]); arcs, sides = lay.arcs()
+    scale = float(a.get("scale", 1.0)); h = mean_edge(lay.V, lay.F) * scale
+    mode = a.get("counts", "milp")
+    mirror = []
+    if "mirror" in a:
+        mirror = detect_mirror_pairs(lay, arcs, a["mirror"])
+    tri = lay.V[lay.F]; area = float(0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1).sum())
+    info = {"patches": lay.npatch, "arcs": len(arcs), "edge": h, "mirror_pairs": len(mirror), "target_quads_area_over_h2": round(area / h ** 2, 1)}
+    if mode == "qw":
+        dump = LP.read_dump(a["dump"]); counts, med = qw_arc_counts(lay, arcs, a["quad"], dump)
+        if a.get("exact") == "1":
+            Pq, Qq = IO.read_obj_tri_or_quad(a["quad"]); cx, amb = qw_arc_counts_exact(lay, arcs, sides, np.array(Pq), np.array(Qq), dump)
+            info["exact_counts_found"] = len(cx); info["exact_counts_ambiguous"] = amb
+            counts = {k: cx.get(k, counts[k]) for k in counts}
+        info["qw_count_match_median_dist"] = med
+        sol = {"counts": counts}
+        e_all = {p: [int(sum(counts[k] for k, _ in sides[p][i])) for i in range(len(sides[p]))] for p in sides if sides[p]}
+        info["qw_counts_tarini_ok"] = int(sum(1 for e in e_all.values() if C.check_tarini(e) is True)); info["qw_counts_tarini_testable"] = int(sum(1 for e in e_all.values() if C.check_tarini(e) is not None))
+        # s from the MILP restricted to these counts (fix counts through targets and heavy weights)
+        sol2 = C.solve_counts(arcs, sides, edge=h, fixed_counts=counts)
+        sol = sol2
+    else:
+        sol = C.solve_counts(arcs, sides, edge=h, mirror_pairs=mirror)
+    if not sol.get("ok"):
+        return {"ok": False, "stage": "counts", "info": info, "msg": sol.get("message")}
+    info.update(milp_status=sol["status"], milp_abs_dev=sol["abs_dev"], milp_violations=len(sol["violations"]), counts_sum=sol["total_counts"])
+    counts = sol["counts"]
+    parts = []; fails = []; uv_bad = 0; miss = 0
+    charts = {}; filled_ids = set()
+    if a.get("prims") == "1":
+        import zr8_prims as PR
+        cls = PR.classify_patches(lay, float(a.get("prim_tol", 0.2)) * mean_edge(lay.V, lay.F))
+        charts = {p: c for p, (c, kind, r) in cls.items() if c is not None}
+        info["primitive_patches"] = dict(collections.Counter(kind for (c, kind, r) in cls.values()))
+    for p in range(lay.npatch):
+        if sides.get(p) is None or p not in sol["s"]:
+            fails.append(p); continue
+        try:
+            if p in charts:
+                r = Fm.fill_patch_analytic(lay, p, sides[p], counts, sol["s"][p], charts[p])
+            else:
+                r = Fm.fill_patch(lay, p, sides[p], counts, sol["s"][p], None or {})
+        except Exception as ex:
+            fails.append((p, repr(ex)[:80])); continue
+        parts.append(r); filled_ids.add(p); uv_bad += int(not r["uv_ok"]); miss += r["missed"]
+    nfall = 0; nfall_fail = 0
+    if a.get("fallback") == "1" and mode == "qw":
+        filled = filled_ids
+        if "Pq" not in info:
+            Pq_, Qq_ = IO.read_obj_tri_or_quad(a["quad"]); Pq_ = np.array(Pq_); Qq_ = np.array(Qq_)
+        for p in range(lay.npatch):
+            if p in filled or sides.get(p) is None: continue
+            pr_ = qw_part(lay, p, sides[p], counts, Pq_, Qq_, dump, h)
+            if pr_ is None: nfall_fail += 1
+            else: parts.append(pr_); nfall += 1
+    info["patches_taken_from_quadwild"] = nfall; info["patches_still_missing"] = nfall_fail
+    P, Q, vkeys = Fm.weld(parts)
+    ref = (lay.V, lay.F)
+    res = J.judge(P, Q, ref_tris=ref)
+    info.update(failed_patches=len(fails), uv_not_injective_patches=uv_bad, located_by_fallback=miss, seconds=round(time.time() - t0, 1))
+    if "out" in a:
+        IO.write_obj(a["out"], P, Q)
+    return {"ok": True, "info": info, "judge": res, "P": P, "Q": Q, "vkeys": vkeys, "lay": lay, "arcs": arcs, "sides": sides, "sol": sol, "parts": parts, "ref": ref}
+
+
+def main(a):
+    r = build(a)
+    r = {k: v for k, v in r.items() if k in ("ok", "info", "judge", "stage", "msg")}
+    print(json.dumps(r))
+
+
+if __name__ == "__main__":
+    main(dict(kv.split("=", 1) for kv in sys.argv[1:]))
+
+
+def qw_arc_counts_exact(lay, arcs, sides, Pq, Qq, dump):
+    """Exact integer count of every elementary arc from the quad mesh of QuadWild : the boundary loop of the quads of each patch is cut at the quad
+    vertices that sit exactly on a layout node (corners and T junction nodes are quad vertices placed on the mesh vertices), and the number of quad edges
+    between two consecutive node vertices is the count of the arc joining those two nodes in that patch. Returns (counts, n_patches_ambiguous)."""
+    node_pos = {}
+    for cs in lay.corners:
+        for c in cs: node_pos[int(c)] = lay.V[int(c)]
+    ids = list(node_pos.keys()); tree = cKDTree(np.array([node_pos[i] for i in ids]))
+    counts = {}; amb = 0
+    for p, qf in enumerate(dump["qpart"]):
+        if sides.get(p) is None: continue
+        cnt = collections.defaultdict(int); he = {}
+        for f in qf:
+            q = Qq[f]
+            for k in range(4):
+                a, b = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(a, b), max(a, b))] += 1; he[(a, b)] = 1
+        nxt = {}
+        for (a, b) in he:
+            if cnt[(min(a, b), max(a, b))] == 1: nxt[a] = b
+        if not nxt: continue
+        start = next(iter(nxt)); loop = [start]; cur = nxt[start]
+        while cur != start and len(loop) < len(nxt) + 2:
+            loop.append(cur); cur = nxt[cur]
+        d, ix = tree.query(Pq[loop])
+        isnode = d < 1e-7
+        nodes_on_loop = [(t, ids[ix[t]]) for t in range(len(loop)) if isnode[t]]
+        patch_arcs = {}
+        for side in sides[p]:
+            for key, fwd in side: patch_arcs.setdefault((min(key[0], key[-1]), max(key[0], key[-1])), []).append(key)
+        for (t0, n0), (t1, n1) in zip(nodes_on_loop, nodes_on_loop[1:] + [(nodes_on_loop[0][0] + len(loop), nodes_on_loop[0][1])]):
+            c = (t1 - t0) % len(loop) or len(loop)
+            cand = patch_arcs.get((min(n0, n1), max(n0, n1)), [])
+            if len(cand) == 1: counts[cand[0]] = c
+            elif len(cand) > 1: amb += 1
+    return counts, amb
+
+
+def qw_part(lay, p, sides_p, counts, Pq, Qq, dump, edge):
+    """Take the quads that QuadWild produced for patch p (used when the closed form of Tarini does not hold for p, so the single pole fill cannot be
+    built). Boundary quad vertices are matched to the boundary keys (node or arc rank) computed from the counts, so that the weld stays exact.
+    Returns a part dict or None when the boundary does not match one to one."""
+    qf = dump["qpart"][p]; Q = Qq[qf]
+    used = np.unique(Q); loc = {int(v): i for i, v in enumerate(used)}
+    cnt = collections.Counter()
+    for q in Q:
+        for k in range(4):
+            a, b = int(q[k]), int(q[(k + 1) % 4]); cnt[(min(a, b), max(a, b))] += 1
+    bverts = sorted({v for (a, b), c in cnt.items() if c == 1 for v in (a, b)})
+    keys = []; pos = []
+    for i, side in enumerate(sides_p):
+        for key, fwd in side:
+            n = counts[key]; pts = Fm.arc_points(lay.V, key, n)
+            for j in range(n + 1):
+                jj = j if fwd else n - j
+                if jj == 0: k = ("node", int(key[0])); pt = lay.V[key[0]]
+                elif jj == n: k = ("node", int(key[-1])); pt = lay.V[key[-1]]
+                else: k = ("arc", key, jj); pt = pts[jj]
+                keys.append(k); pos.append(pt)
+    uniq = {}
+    for k, pt in zip(keys, pos): uniq[k] = pt
+    kl = list(uniq.keys()); kp = np.array([uniq[k] for k in kl])
+    if len(kl) != len(bverts): return None
+    d, ix = cKDTree(kp).query(Pq[bverts])
+    if d.max() > 0.3 * edge or len(set(ix.tolist())) != len(bverts): return None
+    gk = [None] * len(used); P3 = Pq[used].copy()
+    for v, t in zip(bverts, ix):
+        gk[loc[v]] = kl[t]; P3[loc[v]] = kp[t]
+    for v in used:
+        if gk[loc[int(v)]] is None: gk[loc[int(v)]] = ("qint", p, int(v))
+    return {"gkeys": gk, "P3": P3, "quads": np.vectorize(lambda x: loc[int(x)])(Q), "uv_ok": True, "missed": 0, "e": None}

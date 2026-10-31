@@ -1,0 +1,58 @@
+"""Outils communs de la recherche voiture (30 October 2026) : lecture OBJ avec groupes, géométrie de maillage de quads.
+numpy et scipy seulement. Aucune dépendance sous licence incompatible."""
+import numpy as np
+from collections import defaultdict
+
+def load_obj(path):
+    """Lit un OBJ (v, f, g). Retourne V (n,3), faces (liste d'index), group_of_face (liste d'indices), group_names."""
+    V = []
+    F = []
+    G = []
+    names = []
+    cur = -1
+    with open(path, "r") as fh:
+        for line in fh:
+            if line.startswith("v "):
+                V.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith("g "):
+                nm = line[2:].strip()
+                names.append(nm)
+                cur = len(names) - 1
+            elif line.startswith("f "):
+                idx = [int(tok.split("/")[0]) for tok in line.split()[1:]]
+                idx = [i - 1 if i > 0 else len(V) + i for i in idx]
+                F.append(idx)
+                G.append(cur)
+    return np.array(V, float), F, np.array(G, int), names
+
+def quads_to_array(F):
+    """Garde les quads (4 sommets) ; renvoie (m,4) et le masque des faces gardées."""
+    keep = np.array([len(f) == 4 for f in F])
+    Q = np.array([f for f in F if len(f) == 4], int)
+    return Q, keep
+
+def face_geom(V, Q):
+    """Normale unitaire, aire et centre de chaque quad (aire = somme de deux triangles)."""
+    a, b, c, d = V[Q[:, 0]], V[Q[:, 1]], V[Q[:, 2]], V[Q[:, 3]]
+    n1 = np.cross(b - a, c - a)
+    n2 = np.cross(c - a, d - a)
+    n = n1 + n2
+    area = 0.5 * (np.linalg.norm(n1, axis=1) + np.linalg.norm(n2, axis=1))
+    nn = np.linalg.norm(n, axis=1)
+    nn[nn == 0] = 1.0
+    return n / nn[:, None], area, (a + b + c + d) / 4.0
+
+def edge_table(Q):
+    """Dictionnaire arête (min,max) -> liste de faces ; l'ordre des sommets importe peu ici."""
+    ed = defaultdict(list)
+    for fi, q in enumerate(Q):
+        for k in range(4):
+            u, v = int(q[k]), int(q[(k + 1) % 4])
+            ed[(min(u, v), max(u, v))].append(fi)
+    return ed
+
+def weld(V, tol=1e-6):
+    """Soude les sommets confondus (arrondi à tol) ; renvoie V2 et la table d'index."""
+    key = np.round(V / tol).astype(np.int64)
+    _, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    return V[first], inv.reshape(-1)

@@ -1,0 +1,27 @@
+"""Pass 8 : judge QuadWild (raw and smoothed) and the hybrid variants on the same layout. Usage : python3 -I compare_run.py dir=WORK name=sphere scale=2.0
+FR : compare QuadWild brut, QuadWild lisse, hybride (comptes MILP) et hybride (comptes de QuadWild) avec le meme juge."""
+import sys, json, subprocess
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_io as IO, zr8_judge as J, zr8_layout as L
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:])
+d = a["dir"]; n = a["name"]; scale = a.get("scale", "2.0")
+Vr, Fr = IO.read_obj_tri_or_quad(d + "/%s_rem_p0.obj" % n)
+rows = []
+for label, path in (("QW raw", d + "/%s_rem_p0_123_quadrangulation.obj" % n), ("QW smooth", d + "/%s_rem_p0_123_quadrangulation_smooth.obj" % n)):
+    V, Q = IO.read_obj_tri_or_quad(path)
+    rows.append((label, J.judge(V, Q, ref_tris=(Vr, Fr))))
+for label, extra in (("hyb milp", ["counts=milp"]), ("hyb qwcounts", ["counts=qw", "dump=%s/%s_rem_p0_123_dump.txt" % (d, n), "quad=%s/%s_rem_p0_123_quadrangulation.obj" % (d, n)])):
+    out = "%s/%s_%s.obj" % (d, n, label.replace(" ", "_"))
+    r = subprocess.run(["python3", "-I", "zr8_hybrid.py", "prefix=%s/%s_rem_p0" % (d, n), "scale=" + scale, "out=" + out] + extra + (["mirror=" + a["mirror"]] if "mirror" in a else []), capture_output=True, text=True)
+    try:
+        j = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        print(label, "FAILED", r.stderr[-400:]); continue
+    if not j.get("ok"):
+        print(label, j); continue
+    rows.append((label, j["judge"])); print("  info", label, json.dumps(j["info"]))
+print("%-14s %6s %7s %7s %6s %6s %6s %6s %6s %6s" % ("method", "quads", "fold%", "squash%", "jacM", "<.5%", "edgeCV", "areaCV", "pole/k", "euler"))
+for label, r in rows:
+    print("%-14s %6d %7.2f %7.2f %6.3f %6.2f %6.3f %6.3f %6.1f %6d" % (label, r["quads"], 100 * r["folded_frac"], 100 * r["squashed_frac"], r["jac_mean"], 100 * r["jac_below_05_frac"], r["edge_cv"], r["area_cv"], r["poles_per_1000_quads"], r["euler"]))

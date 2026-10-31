@@ -1,0 +1,47 @@
+# Transfert de topologie et gabarits paramétriques (30 October 2026)
+
+Statuts : [DOC] lu pendant la passe ; [ESTIMÉ] déduction (les formules d'Euler des primitives sont vérifiées à la main, marquées [CALCULÉ]) ; "non trouvé". Aucun jeu de données téléchargé.
+
+## 1. Recalage non rigide d'un gabarit à topologie d'artiste sur un maillage quelconque
+
+| Méthode | Principe | Réglages et exigences | Ce qui échoue | Source |
+|---|---|---|---|---|
+| Optimal Step Nonrigid ICP (Amberg, Romdhani, Vetter, CVPR 2007) | ICP non rigide à affinité locale : solution exacte et rapide pour correspondances et raideur fixes ; boucle sur des poids de raideur décroissants ; gère les données manquantes | raideur (stiffness) variable ; points de repère possibles | pas de liste d'échecs trouvée dans la page lue ; ICP simple : erreurs cumulées, résultats valides seulement sur certaines séquences DFAUST (recherche) | https://shapemodelling.cs.unibas.ch/gravis-literature/publications/2007/CVPR07_Amberg.pdf ; implémentation MIT https://www.github.com/saikiran321/nonrigid_icp (open3d + scikit-sparse), inspirée de https://github.com/charlienash/nricp |
+| Houdini Topo Transfer SOP (+ Topo Landmark) | déforme non rigidement un gabarit pour coller à la cible, du réduit au fin ; points de repère appariés (3e et 4e entrées, attribut de chaîne) ; contraintes géométriques pour îlots disjoints | itérations, niveaux réduits, poids rigides (élevés d'abord puis réduits), poids de repères, masque rigide, tolérances de distance et de normale, solveur non linéaire (grandes rotations) ou linéaire (rapide), 1 seul repère valide minimum ; gabarit manifold ; gabarit et cible proches et de même échelle | trop de repères sur-contraignent et dégradent ; îlots disjoints (dents, yeux) = erreur sans contraintes géométriques ; grandes différences de pose = solveur non linéaire + repères ; résultat variable selon le CPU (MKL) | [DOC] https://www.sidefx.com/docs/houdini/nodes/sop/topotransfer.html ; https://www.sidefx.com/docs/houdini/examples/nodes/sop/topolandmark/TopoLandmarkBasic.html ; forum https://www.sidefx.com/forum/topic/98207/?page=1 |
+| R3DS Wrap / WrapX | recalage par points de correspondance (post-2014) ; fonction non rigid registration avec rigidité et lissage ; Python API | base mesh manifold et raisonnablement petit ; petites parties séparées (yeux) donnent de mauvais résultats ; base plus raide = plus dure à déformer ; cible bruitée demande une rigidité initiale plus haute | pièces séparées, cible bruitée | https://www.cgchannel.com/?p=61303 ; la page WrapX https://russian3dscanner.com/docs/WrapX/wrap.nonRigidRegistration.html n'a pas pu être relue (connexion refusée), contenu rapporté par la recherche |
+| BWrap (add-on Blender) | template + target, points normaux et EdgeLoop Points (boucles de mêmes éléments, sommets en nombres différents permis), symétrie auto, qualité Fast, Balanced, Best, Conform Strength de 0 à 1, sortie en shape key | repères significatifs plutôt qu'en grand nombre ; protections Exclude / Keep Shape / Lock in Place ; Snap Open Edges | une qualité plus haute ne répare pas de mauvaises correspondances ; mesh échangés, orientation fausse, paires gauche-droite ou avant-arrière inversées ; torsion ou glissement par paires contradictoires ; perte de volume locale ; bords ouverts qui dérivent | [DOC] https://superhivemarket.com/products/bwrap/docs (licence listée GPL ; version Free limitée) |
+| MeshMorpher | non trouvé dans cette passe (aucune page trouvée) | | | non trouvé |
+| Registration SMPL (FAUST, DFAUST) | gabarit SMPL recalé sur scans (Amberg avec gestion des trous) | | scans avec trous, bruit, auto-intersections, genre élevé dû aux fusions d'intersections ; les méthodes existantes ont du mal avec les scans réels (FAUST, CVPR 2014) | https://ps.is.tuebingen.mpg.de/publications/bogo-cvpr-2014 (résumé de recherche) |
+| RigNet (Xu et al. 2020) | prédit squelette et poids de peau d'un personnage quelconque, sans hypothèse de classe | entraîné sur modèles riggés ; code et données sur la page du projet | ne transfère PAS de topologie ; utile seulement pour obtenir un squelette (pour nos tubes) | https://arxiv.org/pdf/2005.00559 |
+
+Synthèse des échecs communs [DOC] : mauvaises correspondances (la qualité du solveur n'y change rien), parties séparées non traitées à part (yeux, dents, ongles), poses très différentes, trop de repères contradictoires, perte de volume, bords ouverts. Pour ZenRay Lines : ne transférer que des maillages fermés et connexes, traiter les îlots à part avec des contraintes géométriques, commencer par peu de repères (articulations, bout des doigts, coins des yeux et de la bouche) puis lancer un wrap rapide pour détecter les mauvais appariements.
+
+## 2. Gabarits paramétriques par famille et topologie quad standard
+
+Toutes les formules ci-dessous sont [CALCULÉ] à la main avec V - E + F = 2 (genre 0) ou 0 (tore) ; elles ne viennent pas d'une source citée, mais les types de primitives et leurs défauts viennent de https://en.wikipedia.org/wiki/Quadrilateralized_spherical_cube , https://blogs.solidworks.com/solidworksblog/2017/07/globe-quadball-question.html , https://blog.turbosquid.com/?p=6237 (quad sphere : huit pôles bien répartis, grille de quads régulière ; sphère UV : triangles aux pôles ; le layout du quad sphere est assez rigide) [DOC via recherche].
+
+| Famille | Paramètres | Topologie quad | Sommets / faces | Pôles |
+|---|---|---|---|---|
+| Anneau (tore) | n segments, m segments de section | grille n x m bouclée dans les deux sens | V = n m, F = n m | aucun (toutes valences 4) |
+| Tube ouvert / membre | n segments (anneau), r anneaux | grille cyclique | V = n (r + 1), F = n r | aucun ; 2 boucles de bord de n arêtes |
+| Tube fermé à calottes en grille | n = 4k, r anneaux | tube + chaque calotte = grille de k x k quads dont le bord est l'anneau (bord de la grille : 4k sommets) | V = n (r + 1) + 2 (k - 1)^2, F = n r + 2 k^2 (k = 2, n = 8 : V = 8 r + 10, F = 8 r + 8, vérifié Euler) | 4 sommets de valence 3 par calotte (les coins de la grille), soit 8 |
+| Calotte pour n pas multiple de 4 | n = 2 (a + b) | un patch à 4 côtés (a, b, a, b), a + b = n/2, ou patch de Takayama à 3 à 6 côtés | | quatre coins de valence 3 ; ou un pôle de Tarini en 5 ou 6 côtés (voir patch_conditions et takayama) |
+| Tronc de cône | n, r, rayons haut et bas (loi de rayon) | tube dont l'anneau varie en rayon | identique au tube | identique |
+| Surface de révolution | profil (courbe), n segments | rotation du profil, grille r x n | V = n (r + 1) ouverte | aucun si ouverte ; aux axes : valence n si le profil touche l'axe (à éviter : calotte en grille) |
+| Boîte subdivisée | (a, b, c) divisions | grille sur chaque face | F = 2 (ab + bc + ac), V = F + 2 | 8 coins de valence 3 |
+| Cube-sphère (quad sphere, quadball) | n divisions par arête | cube projeté, 6 faces de n x n | V = 6 n^2 + 2, F = 6 n^2, E = 12 n^2 | 8 sommets de valence 3 (aux coins du cube) |
+| Sphère UV | m méridiens, p parallèles | grille bouclée + éventails aux pôles | | 2 pôles de valence m (triangles si éventail) ; à éviter pour de la topologie propre |
+| Disque en grille (calotte) | n = 4k | carré arrondi (squircle) de k x k quads | | 4 coins de valence 3 si attaché à un bord |
+| Tube chanfreiné (bevelled tube) | n, r, chanfrein c, largeur w | tube + paire d'anneaux de soutien à chaque extrémité (c rangées) | V et F ajoutent 2 c n | aucun ajouté |
+
+Règles de choix pour ZenRay Lines [ESTIMÉ] :
+1. Doigts et pouce : tubes de 16 arêtes (valeur MESURÉE sur notre Manny, voir manny_topology_stats) avec calotte en grille k = 4 (16 = 4 x 4), 4 pôles de valence 3 au bout.
+2. Bras, jambes : 26 arêtes mesurées : 26 n'est pas multiple de 4 ; pour la calotte, utiliser un patch (a, b, a, b) avec a + b = 13 ou changer à 24 ou 28 (multiples de 4) pour garder une calotte en grille ; à décider selon la jonction avec l'épaule.
+3. Anneaux de tronc : 58 arêtes mesurées ; 58 = 2 x 29 : seulement des patchs à 4 côtés (a, b, a, b) avec a + b = 29 ; non multiple de 4 : jonctions par patchs de Takayama.
+4. Têtes et sphères : cube-sphère plutôt que sphère UV.
+5. Anneaux : paramètres (n, m) seulement ; aucun pôle.
+6. Toute primitive est un HDA : paramètres = n (divisible par 4 si possible), nombre d'anneaux, loi de rayon, chanfrein ; défauts = valeurs mesurées de Manny.
+
+## 3. Pas de source trouvée pour
+
+MeshMorpher ; transfert de topologie sur objets non humains (véhicule, arbre) ; comparaison chiffrée Wrap contre Topo Transfer contre nonrigid ICP ; liste d'échecs de SMPL registration pour mains et auto-contact (non trouvée).

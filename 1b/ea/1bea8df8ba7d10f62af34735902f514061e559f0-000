@@ -1,0 +1,92 @@
+"""Pass 8 : probe the layout files of a QuadWild run. Usage : python3 -I layout_probe.py prefix=PATH_TO/name_rem_p0 [dump=PATH]
+FR : sonde du layout (formats, disques, coins, arcs) et, si le dump existe, comparaison avec les comptes de cotes des quads."""
+import sys, json, collections
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_layout as L
+
+
+def read_dump(path):
+    tok = open(path).read().split("\n")
+    d = {}
+    ilp = tok[0].split(); d["ilp"] = [int(x) for x in ilp[2:]]
+    nq = int(tok[1].split()[1]); npart = int(tok[2].split()[1])
+    d["qpart"] = [[int(x) for x in tok[3 + i].split()[1:]] for i in range(npart)]
+    j = 3 + npart; nc = int(tok[j].split()[1])
+    d["qcorners"] = [[int(x) for x in tok[j + 1 + i].split()[1:]] for i in range(nc)]
+    d["nq"] = nq
+    return d
+
+
+def tarini_ok(e):
+    """Closed form conditions of Tarini 2021 (single pole), strict version, for N = 2..6 (7 and 8 not tested here)."""
+    n = len(e)
+    if sum(e) % 2:
+        return False
+    if n == 2: return e[0] % 2 == 0 and e[1] % 2 == 0
+    if n == 3: return all(e[(i - 1) % 3] + e[(i + 1) % 3] > e[i] for i in range(3))
+    if n == 4: return e[0] == e[2] and e[1] == e[3]
+    if n == 5: return all(e[i] + e[(i + 1) % 5] + e[(i + 2) % 5] > e[(i + 3) % 5] + e[(i + 4) % 5] for i in range(5))
+    if n == 6:
+        ev, od = [e[0], e[2], e[4]], [e[1], e[3], e[5]]
+        return all(2 * x < sum(ev) for x in ev) and all(2 * x < sum(od) for x in od) and sum(ev) % 2 == 0 and sum(od) % 2 == 0
+    return None
+
+
+def quad_side_counts(qfaces, dump):
+    """For each patch : the sorted corner positions on the quad boundary loop and e_i = number of quad edges between consecutive corners.
+    The loop of patch p is made of the quad edges used by exactly one quad of p."""
+    res = {}
+    for p, (qf, qc) in enumerate(zip(dump["qpart"], dump["qcorners"])):
+        cnt = collections.defaultdict(int); he = {}
+        for f in qf:
+            q = qfaces[f]
+            for k in range(4):
+                a, b = int(q[k]), int(q[(k + 1) % 4])
+                cnt[(a, b) if a < b else (b, a)] += 1; he[(a, b)] = 1
+        nxt = collections.defaultdict(list)
+        for (a, b) in he:
+            if cnt[(a, b) if a < b else (b, a)] == 1:
+                nxt[a].append(b)
+        if not nxt:
+            res[p] = None; continue
+        start = next(iter(nxt)); loop = [start]; cur = nxt[start][0]
+        seen = 0
+        while cur != start and seen < 10 ** 7:
+            loop.append(cur); cur = nxt[cur][0]; seen += 1
+        n = len(loop)
+        if n != sum(len(v) for v in nxt.values()) or len(set(loop)) != n:
+            res[p] = {"multi_loop": True, "len": n}; continue
+        pos = {v: i for i, v in enumerate(loop)}
+        cpos = sorted(pos[c] for c in qc if c in pos)
+        if len(cpos) != len(set(qc)):
+            res[p] = {"corner_missing": True}; continue
+        e = [((cpos[(i + 1) % len(cpos)] - cpos[i]) % n) or n for i in range(len(cpos))]
+        res[p] = {"e": e, "loop_len": n}
+    return res
+
+
+if __name__ == "__main__":
+    a = dict(kv.split("=", 1) for kv in sys.argv[1:])
+    lay = L.Layout(a["prefix"])
+    rep = lay.report()
+    arcs, sides = lay.arcs()
+    rep["arcs"] = len(arcs)
+    rep["arc_patch_use"] = dict(sorted(collections.Counter(len(v["patches"]) for v in arcs.values()).items()))
+    rep["feature_arcs"] = int(sum(1 for v in arcs.values() if v["feature"]))
+    print(json.dumps(rep))
+    if "dump" in a:
+        import zr8_io as IO
+        d = read_dump(a["dump"])
+        V, Q = IO.read_obj(a["quad"])
+        qs = quad_side_counts(Q, d)
+        n_t = 0; n_ok = 0; rows = []
+        for p, r in qs.items():
+            if not r or "e" not in r:
+                continue
+            ok = tarini_ok(r["e"])
+            if ok is not None:
+                n_t += 1; n_ok += int(ok)
+            rows.append((len(r["e"]), r["e"], ok))
+        print(json.dumps({"patches_with_sides": len(rows), "tarini_testable": n_t, "tarini_satisfied": n_ok,
+                          "side_count_samples": [(k, e, ok) for k, e, ok in rows[:6]]}))

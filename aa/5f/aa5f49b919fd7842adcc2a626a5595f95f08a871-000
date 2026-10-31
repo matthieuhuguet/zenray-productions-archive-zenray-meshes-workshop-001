@@ -1,0 +1,102 @@
+"""Pass 9 : local topological repair run on the REAL arch (handed off by the main thread) and global barrier after it. Written 30 October 2026.
+Usage : python3 -I run_real_arch.py arch=DIR out=res.json    (DIR holds part_rem_p0.* of the rerun and the dump).
+Variants for each of raw and smoothed QuadWild quads : original ; barrier only ; repair only ; repair then barrier.
+FR : reparation locale sur l'arche reelle puis barriere globale, metriques avant et apres."""
+import sys, json, time, collections
+sys.path.insert(0, ".")
+import numpy as np
+from scipy.spatial import cKDTree
+import zr8_io as IO, layout_probe as LP, zr8_layout as L, zr8_judge as J, zr8_straighten as S, zr8_localrepair as LR, zr8_fill as Fm
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:]); D = a["arch"]; pre = D + "/rerun/part_rem_p0"
+lay = L.Layout(pre); arcs, sides = lay.arcs(); dump = LP.read_dump(pre + "_123_dump.txt")
+Vr, Fr = IO.read_obj_tri_or_quad(pre + ".obj"); ref = S.Surface(Vr, Fr)
+P0, Q0 = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation.obj"); P0 = np.array(P0); Q0 = np.array(Q0)
+Ps, Qs = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation_smooth.obj"); Ps = np.array(Ps)
+h = float(np.mean([np.linalg.norm(P0[Q0[:, k]] - P0[Q0[:, (k + 1) % 4]], axis=1).mean() for k in range(4)]))
+diag = float(np.linalg.norm(Vr.max(0) - Vr.min(0)))
+# feature samples (triangle level creases)
+feat = {(min(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3])), max(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3]))) for f, e in lay.features}
+crease_pts = []
+for (x, y) in feat:
+    A, B = lay.V[x], lay.V[y]; m = max(2, int(np.ceil(np.linalg.norm(B - A) / (0.25 * h))))
+    crease_pts += [A + (B - A) * t / m for t in range(m + 1)]
+crease_pts = np.array(crease_pts)
+
+
+def edge_samples(P, Q, m=8):
+    E = set()
+    for q in Q:
+        for k in range(4):
+            x, y = int(q[k]), int(q[(k + 1) % 4]); E.add((min(x, y), max(x, y)))
+    E = np.array(sorted(E)); t = (np.arange(m + 1) / m)[None, :, None]
+    return (P[E[:, 0]][:, None, :] * (1 - t) + P[E[:, 1]][:, None, :] * t).reshape(-1, 3)
+
+
+def crease_dev(P, Q):
+    d, _ = cKDTree(edge_samples(P, Q)).query(crease_pts)
+    return float(d.max() / h), float(d.mean() / h)
+
+
+def report(P, Q):
+    j = J.judge_plus(P, Q, ref_tris=(Vr, Fr)); Jm = J.corner_jacobians(P, Q).min(axis=1)
+    cm, cmean = crease_dev(P, Q)
+    return {"quads": int(len(Q)), "folded": int((Jm < 0).sum()), "folded_pct": round(100 * float((Jm < 0).mean()), 3), "squashed_lt03": int((Jm < 0.3).sum()), "jac_mean": round(j["jac_mean"], 4),
+            "angle_dev_mean": round(j["angle_dev_mean_deg"], 2), "angle_dev_p99": round(j["angle_dev_p99_deg"], 1), "turn_iso_mean": round(j["loop_turn_iso_mean_deg"], 2),
+            "turn_iso_p90": round(j["loop_turn_iso_p90_deg"], 2), "boundary_edges": j["boundary_edges"], "nonmanifold_edges": j["nonmanifold_edges"], "euler": j["euler"],
+            "crease_dev_max_over_h": round(cm, 3), "crease_dev_mean_over_h": round(cmean, 4), "dist_to_ref_mean_frac_diag": j["dist_mean_frac_diag"]}
+
+
+def classify(P, Q):
+    """kind per quad vertex: 2 fixed (quad vertex exactly on a layout node that touches a feature edge), 1 slide (on a feature arc), 0 free."""
+    feat_vert = {v for e in feat for v in e}
+    nodes = sorted({int(c) for cs in lay.corners for c in cs if int(c) in feat_vert}); tree = cKDTree(lay.V[nodes])
+    U = np.unique(Q); kind = np.zeros(len(P), int); arc_of = np.full(len(P), -1)
+    dn, _ = tree.query(P[U]); kind[U[dn < 1e-7 * max(diag, 1.0) + 1e-9]] = 2
+    fa = [k for k, v in arcs.items() if v["feature"]]
+    samples = []; owner = []
+    for ai, k in enumerate(fa):
+        pts = Fm.arc_points(lay.V, k, max(6 * len(k), 12)); samples.append(pts); owner += [ai] * len(pts)
+    samples = np.vstack(samples); owner = np.array(owner); st = cKDTree(samples)
+    d, ix = st.query(P[U]); tol = 0.02 * h
+    for u, dd, i in zip(U, d, ix):
+        if kind[u] == 2 or dd > tol: continue
+        kind[u] = 1; arc_of[u] = owner[i]
+    return kind, arc_of, ArcSet_for(fa)
+
+
+def ArcSet_for(fa):
+    return S.ArcSet([lay.V[list(k)] for k in fa])
+
+
+def barrier_run(P, Q):
+    kind, arc_of, arcset = classify(P, Q)
+    groups = np.zeros(len(Q), int)
+    X, hist = S.barrier(P, Q, ref, outer=8, inner=60, theta=1.0 / 8, size="keep", kind=kind, arc_of=arc_of, arcs=arcset)
+    return X, {"fixed": int((kind == 2).sum()), "slide": int((kind == 1).sum()), "free": int((kind == 0).sum()) - int((~np.isin(np.arange(len(P)), np.unique(Q))).sum())}
+
+
+def main():
+    out = {"h": h, "diag": diag}
+    for label, P in (("raw", P0), ("smooth", Ps)):
+        res = {}
+        res["original"] = report(P, Q0)
+        LR.DIAG.clear()
+        t = time.time(); P1, Q1, log = LR.repair_mesh(P, Q0, dump["qpart"], dump["qcorners"], ref, h)
+        res["repair_seconds"] = round(time.time() - t, 1); res["repair_log"] = dict(collections.Counter(l[0] for l in log)); res["repair_diag"] = dict(LR.DIAG)
+        res["repair_only"] = report(P1, Q1)
+        t = time.time(); Xb, info = barrier_run(P, Q0); res["barrier_only"] = report(Xb, Q0); res["barrier_only"]["seconds"] = round(time.time() - t, 1); res["barrier_only"]["kinds"] = info
+        t = time.time(); Xr, info2 = barrier_run(P1, Q1); res["repair_then_barrier"] = report(Xr, Q1); res["repair_then_barrier"]["seconds"] = round(time.time() - t, 1); res["repair_then_barrier"]["kinds"] = info2
+        out[label] = res
+        IO.write_obj(a["out"].replace(".json", "_%s_repaired.obj" % label), P1, Q1)
+        print(label, "done", flush=True)
+    json.dump(out, open(a["out"], "w"), indent=1)
+    for label in ("raw", "smooth"):
+        print("==", label, "repair", out[label]["repair_log"], "seconds", out[label]["repair_seconds"])
+        for var in ("original", "repair_only", "barrier_only", "repair_then_barrier"):
+            r = out[label][var]
+            print("  %-20s quads %5d folded %3d (%.2f%%) squashed %4d jacM %.4f angdev %5.2f turnIso %.2f p90 %.2f boundary %d nonmanifold %d euler %d creaseDev max %.3f h mean %.4f h" % (var, r["quads"], r["folded"], r["folded_pct"], r["squashed_lt03"], r["jac_mean"], r["angle_dev_mean"], r["turn_iso_mean"], r["turn_iso_p90"], r["boundary_edges"], r["nonmanifold_edges"], r["euler"], r["crease_dev_max_over_h"], r["crease_dev_mean_over_h"]))
+
+
+if __name__ == "__main__":
+    main()

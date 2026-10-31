@@ -1,0 +1,28 @@
+"""Q9, mesure 8 : pièces empilées. Part des faces extérieures qui ont, dans une AUTRE pièce, une face à moins de d (3 mm) dont la normale
+est quasi parallèle (coplanaires : scintillement) ou qui traverse (distance signée proche de 0 avec normales quelconques)."""
+import sys, json, collections
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]
+tr = cKDTree(C)
+vi = np.where(vis)[0]
+pairs = tr.query_ball_point(C[vi], 0.003)
+near_other = np.zeros(len(Q), bool); coplanar = np.zeros(len(Q), bool)
+cnt = collections.Counter()
+for j, nb in zip(vi, pairs):
+    for k in nb:
+        if Gq[k] != Gq[j]:
+            near_other[j] = True
+            if abs(N[k] @ N[j]) > 0.9:
+                coplanar[j] = True; cnt[(names[Gq[j]], names[Gq[k]])] += 1
+print("faces extérieures", len(vi), " ayant une face d'une autre pièce à moins de 3 mm :", int(near_other[vi].sum()), f"({100*near_other[vi].mean():.1f} %), aire m2", A[near_other & vis].sum())
+print("dont quasi coplanaires :", int(coplanar[vi].sum()), "aire m2", A[coplanar & vis].sum())
+for (a, b), n in cnt.most_common(14): print(f"  {a:30s} x {b:30s} {n}")
+json.dump({"exterior_faces": int(len(vi)), "near_other_component_3mm": int(near_other[vi].sum()), "coplanar": int(coplanar[vi].sum()),
+           "pairs": [{"a": a, "b": b, "faces": n} for (a, b), n in cnt.most_common(40)]}, open("out/q9_overlap.json", "w"), indent=1)

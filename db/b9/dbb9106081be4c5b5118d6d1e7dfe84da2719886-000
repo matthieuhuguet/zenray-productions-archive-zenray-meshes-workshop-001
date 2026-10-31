@@ -1,0 +1,34 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH : panel gap report. For every pair of different body parts, the distance from the vertices of one part to the surface of the other where it is under --max-mm (a gap) and over --min-mm (not welded), summarised per pair : median, spread (coefficient of variation) and count. A uniform panel gap has a small spread.
+    python -I CarPanelGaps.py car.obj [--max-mm 25] [--min-mm 0.5] [--pairs 12] [--parts body_]
+FR : jeux entre panneaux : pour chaque paire de pieces, mediane et dispersion de l'ecart la ou il est sous 25 mm."""
+import argparse, collections, re
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("--max-mm", type=float, default=25.0); ap.add_argument("--min-mm", type=float, default=0.5); ap.add_argument("--pairs", type=int, default=14); ap.add_argument("--parts", default="body_"); a = ap.parse_args()
+    V = []; cur = None; G = collections.OrderedDict(); F = collections.defaultdict(list)
+    for l in open(a.inp):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("g "): cur = l[2:].strip(); G.setdefault(cur, set())
+        elif l.startswith("f ") and cur: f = [int(x.split("/")[0]) - 1 for x in l.split()[1:]]; G[cur].update(f); F[cur].append(f)
+    V = np.array(V); rx = re.compile(a.parts); names = [g for g in G if rx.search(g) and len(F[g]) > 30]; samples = {}; trees = {}
+    for g in names:
+        Q = np.array([f for f in F[g] if len(f) == 4]);
+        if not len(Q): continue
+        pts = np.vstack([V[Q].mean(1), V[Q[:, :2]].mean(1), V[Q[:, 1:3]].mean(1), V[sorted(G[g])]]); samples[g] = pts; trees[g] = cKDTree(pts)
+    res = []
+    for i, A in enumerate(names):
+        if A not in samples: continue
+        PA = V[sorted(G[A])]
+        for B in names[i + 1:]:
+            if B not in trees: continue
+            d, _ = trees[B].query(PA, distance_upper_bound=a.max_mm / 1000.0); d = d[np.isfinite(d)] * 1000; d = d[d > a.min_mm]
+            if len(d) >= 40: res.append((len(d), A, B, float(np.median(d)), float(d.std() / max(d.mean(), 1e-9)), float(np.percentile(d, 10)), float(np.percentile(d, 90))))
+    res.sort(reverse=True)
+    print("%-26s %-26s %6s %8s %6s %6s %6s" % ("part A", "part B", "n", "median", "CV", "p10", "p90"))
+    for n, A, B, m, cv, p10, p90 in res[: a.pairs]: print("%-26s %-26s %6d %6.1f mm %5.2f %5.1f %5.1f" % (A, B, n, m, cv, p10, p90))
+
+
+if __name__ == "__main__": main()

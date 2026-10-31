@@ -1,0 +1,51 @@
+"""30 October 2026 : ZenRay Meshes, close the small open loops of chosen parts with quads (a loop of 2k edges becomes k quads around a new centre vertex ; an odd loop gets one triangle), written as new group(s) CAR_cap_<part>, nothing else touched.
+    python -I CarCloseHoles.py in.obj out.obj [--parts rocker] [--max-edges 12]
+FR : ferme les petites boucles ouvertes des pieces choisies avec des quads (centre + paires d'aretes), nouveau groupe CAR_cap_<piece>."""
+import argparse, collections, re
+import numpy as np
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--parts", default="rocker"); ap.add_argument("--max-edges", type=int, default=12); a = ap.parse_args()
+    lines = open(a.inp).read().split("\n"); V = []; cur = None; groups = collections.OrderedDict(); last_v = -1
+    for i, l in enumerate(lines):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]]); last_v = i
+        elif l.startswith("g "): cur = l[2:].strip(); groups.setdefault(cur, [])
+        elif l.startswith("f ") and cur is not None: groups[cur].append([int(x.split("/")[0]) - 1 for x in l.split()[1:]])
+    rx = re.compile(a.parts); newv = []; newf = []; n0 = len(V); report = []
+    for g, F in groups.items():
+        if not rx.search(g): continue
+        ec = collections.Counter(); dirn = {}
+        for f in F:
+            for k in range(len(f)): u, w = f[k], f[(k + 1) % len(f)]; ec[(min(u, w), max(u, w))] += 1; dirn[(u, w)] = True
+        nxt = collections.defaultdict(list)
+        for (u, w), c in ec.items():
+            if c == 1: (nxt[w].append(u) if (u, w) in dirn else nxt[u].append(w))   # open edge a->b in face order : cap runs the other way, so link b -> a
+        loops = []; rem = {u: list(w) for u, w in nxt.items()}                                   # directed open edges u -> w ; walk, and cut a loop each time the path meets itself (a pinched loop has a vertex of degree 4)
+        for s0 in list(rem):
+            while rem.get(s0):
+                path = [s0]; pos = {s0: 0}; c = s0
+                while rem.get(c):
+                    n = rem[c].pop(0)
+                    if n in pos:
+                        loop = path[pos[n]:]
+                        if 3 <= len(loop) <= a.max_edges: loops.append(loop)
+                        for x in path[pos[n] + 1:]: pos.pop(x, None)
+                        path = path[: pos[n] + 1]; c = n
+                    else: path.append(n); pos[n] = len(path) - 1; c = n
+                break
+        for loop in loops:
+            P = np.array([V[i] for i in loop]); ctr = len(V) + len(newv); newv.append(P.mean(0).tolist()); n = len(loop)
+            if n % 2 == 0:
+                for k in range(0, n, 2): newf.append([ctr, loop[k], loop[(k + 1) % n], loop[(k + 2) % n]])
+            else:
+                for k in range(n): newf.append([ctr, loop[k], loop[(k + 1) % n]])
+        report.append((g, len(loops)))
+    out = lines[: last_v + 1] + ["v %.6f %.6f %.6f" % tuple(p) for p in newv] + lines[last_v + 1:]
+    while out and out[-1] == "": out.pop()
+    if newf: out += ["g CAR_cap_holes"] + ["f " + " ".join(str(i + 1) for i in f) for f in newf]
+    open(a.out, "w").write("\n".join(out) + "\n")
+    print("loops closed:", [(g, n) for g, n in report if n], "; new vertices %d, new faces %d" % (len(newv), len(newf)))
+
+
+if __name__ == "__main__": main()

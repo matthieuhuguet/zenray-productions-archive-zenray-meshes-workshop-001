@@ -1,0 +1,77 @@
+"""30 October 2026 : DRACARD episodes 5 (Wings and Details) and 6 (Procedural Clothing) rebuilt in two geo objects /obj/Mad_Villain_Wings and /obj/Mad_Villain_Clothing, from notes/ep05_ep06.md. The tutorial's reference bgeo files are replaced by Object Merge nodes on /obj/Mad_Villain. exec inside Houdini after Ep03.py and Ep04.py."""
+import hou
+obj = hou.node("/obj"); MISSING = []; RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25))
+def geo(name):
+    o = obj.node(name)
+    if o: o.destroy()
+    return obj.createNode("geo", name)
+def mkin(net):
+    def mk(t, name, *inputs, **parms):
+        try: n = net.createNode(t, name)
+        except Exception as e: MISSING.append((t, name, str(e)[:50])); return None
+        for i, x in enumerate(inputs):
+            if x is not None: n.setInput(i, x)
+        for k, v in parms.items():
+            p = n.parm(k)
+            if p is None: MISSING.append(("parm", name + "." + k, "absent")); continue
+            try: p.set(v)
+            except Exception as e: MISSING.append(("parm", name + "." + k, str(e)[:30]))
+        return n
+    return mk
+def polyline(mk, name, pts):
+    n = mk("add", name, keep=0); n.parm("points").set(len(pts))
+    for i, p in enumerate(pts):
+        for k, ax in enumerate("xyz"): n.parm("pt%d%s" % (i, ax)).set(p[k])
+    n.parm("prims").set(1); n.parm("prim0").set("0-%d" % (len(pts) - 1)); n.parm("closed0").set(0); return n
+# ------------------------------------------------------------------ EP05
+W = geo("Mad_Villain_Wings"); mk = mkin(W)
+ref = mk("object_merge", "Mad_Villain_Reference", objpath1="/obj/Mad_Villain/merge5", xformtype=1); ref.setColor(GREEN)
+blast10 = mk("blast", "blast10", ref, grouptype=4, group="0-3", negate=0) if False else mk("null", "blast10", ref)
+clip1 = mk("clip", "clip1", blast10)
+# skeleton1 : the Skeleton SOP is drawn by clicks in the tutorial : two wing arm polylines stand in
+arm = polyline(mk, "skeleton1", [(0.05, 1.45, -0.05), (0.35, 1.7, -0.15), (0.75, 1.75, -0.3), (1.15, 1.5, -0.45)])
+null1 = mk("null", "null1", arm); ad6 = mk("attribdelete", "attribdelete6", null1, ptdel="* ^P", primdel="*", vtxdel="*", dtldel="*")
+pp13 = mk("polypath", "polypath13", ad6); rs17 = mk("resample", "resample17", pp13, length=0.03)
+sw14 = mk("sweep::2.0", "sweep14", rs17, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=0.025, cols=16, applyscale=1)
+sp4 = mk("split", "split4", sw14); s21 = mk("sculpt", "sculpt21", sp4); s21.setColor(RED)
+finger2 = polyline(mk, "skeleton2", [(0.75, 1.75, -0.3), (0.95, 1.55, -0.55), (1.05, 1.3, -0.7)]); rsF = mk("resample", "resample_finger", finger2, length=0.03)
+swF = mk("sweep::2.0", "sweep_finger_wing", rsF, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=0.015, cols=12, applyscale=1)
+mrg27 = mk("merge", "merge27", s21, swF)
+skin = mk("skin", "skin1", mrg27) ; sub = mk("subdivide", "subdivide_wing", skin, iterations=1); rs2 = mk("resample", "resample_wing", sub, length=0.04)
+s22 = mk("sculpt", "sculpt22", rs2); s22.setColor(RED); pe = mk("polyextrude::2.0", "polyextrude_wing", s22, dist=0.01)
+mir20 = mk("mirror", "mirror20", pe, dirx=1, diry=0, dirz=0, keeporiginal=1) if False else mk("mirror", "mirror20", pe, dirx=1, diry=0, dirz=0)
+out_wing = mk("null", "OUT_WINGS", mir20)
+# dorsal plates : curve -> resample -> subdivide curve -> ray onto the body -> match size -> sweep -> transform -> attribremap
+spine_curve = polyline(mk, "curve1", [(0, 1.5, 0.05), (0, 1.35, -0.02), (0, 1.18, -0.05), (0, 1.0, -0.05), (0, 0.9, -0.4), (0, 0.75, -0.9), (0, 0.6, -1.5)])
+rs25 = mk("resample", "resample25", spine_curve, length=0.1); ray = mk("ray", "ray1", rs25, ref); ray.parm("method").set(0) if ray and ray.parm("method") else None
+plate = mk("box", "box_plate", sizex=0.04, sizey=0.12, sizez=0.04); ms2 = mk("matchsize", "matchsize2", plate)
+cp = mk("copytopoints::2.0", "copytopoints_plates", ms2, ray); ar = mk("attribremap", "attribremap", ray)
+sw17 = mk("sweep::2.0", "sweep17", rs25, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=0.01, cols=8, applyscale=1)
+merge21 = mk("merge", "merge21", ref, out_wing, cp, sw17); merge21.setDisplayFlag(True); merge21.setRenderFlag(True); W.layoutChildren()
+# ------------------------------------------------------------------ EP06
+C = geo("Mad_Villain_Clothing"); mk = mkin(C)
+file1 = mk("object_merge", "file1", objpath1="/obj/Mad_Villain/merge16", xformtype=1); file1.setColor(GREEN)
+split1 = mk("split", "split1", file1); blast1 = mk("null", "blast1", split1); split2 = mk("split", "split2", split1)
+box_clip = mk("clip", "box_clip", blast1, dist=0.0)
+clips = [box_clip]
+for i, z in enumerate((1.45, 1.25, 1.05), 1):
+    clips.append(mk("clip", "clip%d" % (i + 1), clips[-1], origy=z))
+qr = mk("quadremesh", "quadremesh1", clips[-1], targetquadcount=5000); qr.bypass(True)    # the tutorial warns that the quad remesher misbehaves on the clipped open jacket : it hung Houdini for 10 minutes here, so it stays bypassed until the clip is closed and the count lowered
+grp1 = mk("group", "group1", qr); col1 = mk("color", "color1", grp1)
+boolean1 = mk("boolean::2.0", "boolean1", col1, split2); boolean2 = mk("boolean::2.0", "boolean2", boolean1, split2); merge2 = mk("merge", "merge2", boolean2)
+circle1 = mk("circle", "circle1", type=1, rad1=0.18, rad2=0.18) if False else mk("circle", "circle1")
+tfs = []; prev = circle1
+for i in range(1, 5):
+    prev = mk("xform", "transform_from_centroid%d" % i, prev, scale=1.0 + 0.1 * i); tfs.append(prev)
+sub1 = mk("subdivide", "subdivide1", prev, iterations=2); add1 = mk("add", "add1", keep=0, points=1)
+sub2 = mk("subdivide", "subdivide2", sub1, iterations=1); thick = mk("thicken", "thicken1", sub2); nor = mk("normal", "normal1", thick); bev = mk("polybevel::3.0", "polybevel1", nor)
+ms1 = mk("matchsize", "matchsize1", bev); tr2 = mk("xform", "transform2", ms1); ray1 = mk("ray", "ray1", add1, file1); cp1 = mk("copytopoints::2.0", "copytopoints1", tr2, ray1)
+sc = mk("sculpt", "sculpt1", cp1); sc.setColor(RED); out_jacket = mk("null", "out_jacket", qr); out_char = mk("null", "out_character", file1); merge1 = mk("merge", "merge1", out_char, out_jacket, sc)
+merge1.setDisplayFlag(True); merge1.setRenderFlag(True); C.layoutChildren()
+for n in obj.children(): n.setDisplayFlag(n.name() in ("Mad_Villain_Clothing",))
+report = {}
+for net in (W, C):
+    for n in net.children():
+        try: n.cook(force=True); g = n.geometry(); report[net.name() + "/" + n.name()] = (len(g.points()), len(g.prims()), [e[:70] for e in n.errors()][:1])
+        except Exception as e: report[net.name() + "/" + n.name()] = str(e)[:70]
+RESULT = {"missing": MISSING, "report": report}

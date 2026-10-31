@@ -1,0 +1,58 @@
+import cv2, numpy as np, json, sys
+rng = np.random.default_rng(0)
+H, W = 512, 768
+# facettes planes: polygones a niveaux de gris constants (ombrage lambertien idealise)
+polys = [
+ ([(60,380),(180,300),(330,260),(560,270),(700,360),(700,420),(60,420)], 150),
+ ([(180,300),(330,260),(330,330),(140,340)], 205),
+ ([(330,260),(560,270),(600,340),(330,330)], 175),
+ ([(560,270),(700,360),(640,360),(600,340)], 120),
+ ([(60,380),(140,340),(330,330),(600,340),(640,360),(700,360),(700,420),(60,420)], 100),
+]
+img = np.full((H,W), 235, np.uint8)
+for pts, g in polys:
+    cv2.fillPoly(img, [np.array(pts, np.int32)], g)
+# roues non facettees (cercles) pour tester les faux positifs courbes
+cv2.circle(img, (200,425), 45, 40, -1); cv2.circle(img, (560,425), 45, 40, -1)
+# verite terrain: aretes de polygones, retenues si contraste de chaque cote > 15 niveaux
+gt = []
+for pts, g in polys:
+    for i in range(len(pts)):
+        gt.append((pts[i], pts[(i+1)%len(pts)]))
+def seg_dist(p, a, b):
+    a=np.array(a,float); b=np.array(b,float); p=np.array(p,float)
+    ab=b-a; t=np.clip(np.dot(p-a,ab)/np.dot(ab,ab),0,1); return np.linalg.norm(p-(a+t*ab))
+def match(det, gt, tol=3.0, ang=6.0):
+    hit=0
+    for a,b in gt:
+        a=np.array(a,float); b=np.array(b,float); L=np.linalg.norm(b-a)
+        if L<40: continue
+        ok=False
+        for d in det:
+            p=d[:2]; q=d[2:4]
+            v=q-p; u=b-a
+            cosang=abs(np.dot(v,u))/(np.linalg.norm(v)*np.linalg.norm(u)+1e-9)
+            if np.degrees(np.arccos(np.clip(cosang,0,1)))>ang: continue
+            if seg_dist(p,a,b)<tol and seg_dist(q,a,b)<tol: ok=True;break
+        hit+=ok
+    return hit, sum(1 for a,b in gt if np.linalg.norm(np.array(b)-np.array(a))>=40)
+out=[]
+for sigma in [0,5,10,20]:
+    noisy = np.clip(img.astype(np.float32)+rng.normal(0,sigma,img.shape),0,255).astype(np.uint8)
+    for refine,name in [(cv2.LSD_REFINE_NONE,'NONE'),(cv2.LSD_REFINE_STD,'STD'),(cv2.LSD_REFINE_ADV,'ADV')]:
+        lsd = cv2.createLineSegmentDetector(refine)
+        res = lsd.detect(noisy)
+        lines = res[0]
+        det = lines.reshape(-1,4) if lines is not None else np.zeros((0,4))
+        h,n = match(det,gt)
+        out.append(dict(noise_sigma=sigma, refine=name, n_segments=int(len(det)), gt_edges_ge40px_matched=int(h), gt_edges_ge40px_total=int(n)))
+print(json.dumps(out))
+# variante pre-lissee
+for sigma in [10,20]:
+    noisy = np.clip(img.astype(np.float32)+rng.normal(0,sigma,img.shape),0,255).astype(np.uint8)
+    sm = cv2.GaussianBlur(noisy,(0,0),2.0)
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+    lines = lsd.detect(sm)[0]
+    det = lines.reshape(-1,4) if lines is not None else np.zeros((0,4))
+    h,n = match(det,gt)
+    print('smoothed2px', sigma, len(det), h, n)

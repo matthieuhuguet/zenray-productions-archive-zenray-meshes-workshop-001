@@ -1,0 +1,34 @@
+"""Q9, mesure 10 : ondulation des grands panneaux. Faces de la couche extérieure d'un panneau (normale dans le cône de 25 degrés de la normale dominante),
+bande de bord de 6 cm retirée ; RMS à un plan, à une quadrique (bombé voulu), et résidu de quadrique en millimètres ; écart-type de l'angle de normale. 30 October 2026."""
+import sys, json
+import numpy as np
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = sys.argv[1]
+V, F, G, names = load_obj(P); Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]; sgn = ext["sign"]; N = N * sgn[:, None]
+out = []
+for nm in ("CAR_body_hood_C", "CAR_body_roof_C", "CAR_body_door_L", "CAR_body_glass_windshield_C", "CAR_body_glass_rear_C", "CAR_body_decklid_C", "CAR_body_quarter_L", "CAR_body_shoulder_L"):
+    gi = names.index(nm); m = (Gq == gi) & vis
+    if m.sum() < 50: continue
+    nd = (N[m] * A[m][:, None]).sum(0); nd /= np.linalg.norm(nd)
+    sel = np.where(m)[0][(N[m] @ nd) > np.cos(np.radians(25))]
+    c0 = C[sel].mean(0); u_, s_, vt = np.linalg.svd(C[sel] - c0, full_matrices=False)
+    uv = (C[sel] - c0) @ vt[:2].T; h = (C[sel] - c0) @ vt[2]
+    inner = (uv[:, 0] > uv[:, 0].min() + .06) & (uv[:, 0] < uv[:, 0].max() - .06) & (uv[:, 1] > uv[:, 1].min() + .06) & (uv[:, 1] < uv[:, 1].max() - .06)
+    if inner.sum() < 30: continue
+    w = A[sel][inner]; uvi = uv[inner]; hi = h[inner]
+    X1 = np.c_[uvi, np.ones(len(uvi))]; c1, *_ = np.linalg.lstsq(X1 * np.sqrt(w)[:, None], hi * np.sqrt(w), rcond=None)
+    r1 = hi - X1 @ c1
+    X2 = np.c_[uvi[:, 0] ** 2, uvi[:, 0] * uvi[:, 1], uvi[:, 1] ** 2, uvi, np.ones(len(uvi))]; c2, *_ = np.linalg.lstsq(X2 * np.sqrt(w)[:, None], hi * np.sqrt(w), rcond=None)
+    r2 = hi - X2 @ c2
+    X3 = np.c_[uvi[:, 0] ** 3, uvi[:, 0] ** 2 * uvi[:, 1], uvi[:, 0] * uvi[:, 1] ** 2, uvi[:, 1] ** 3, X2]; c3, *_ = np.linalg.lstsq(X3 * np.sqrt(w)[:, None], hi * np.sqrt(w), rcond=None)
+    r3 = hi - X3 @ c3
+    ang = np.degrees(np.arccos(np.clip(N[sel][inner] @ nd, -1, 1)))
+    rms = lambda r: float(np.sqrt((w * r ** 2).sum() / w.sum()) * 1000)
+    d = {"name": nm, "faces": int(inner.sum()), "extent_m": [float(np.ptp(uv[:, 0])), float(np.ptp(uv[:, 1]))], "plane_rms_mm": rms(r1), "plane_max_mm": float(np.abs(r1).max() * 1000),
+         "quadric_rms_mm": rms(r2), "quadric_max_mm": float(np.abs(r2).max() * 1000), "cubic_rms_mm": rms(r3), "normal_angle_std_deg": float(ang.std()), "normal_angle_p95_deg": float(np.percentile(ang, 95))}
+    out.append(d)
+    print(f"{nm:30s} faces {d['faces']:5d} etendue {d['extent_m'][0]:.2f}x{d['extent_m'][1]:.2f} m | plan {d['plane_rms_mm']:5.2f} mm (max {d['plane_max_mm']:5.1f}) | quadrique {d['quadric_rms_mm']:4.2f} (max {d['quadric_max_mm']:4.1f}) | cubique {d['cubic_rms_mm']:4.2f} | normales std {d['normal_angle_std_deg']:.2f} deg p95 {d['normal_angle_p95_deg']:.2f}")
+pass

@@ -1,0 +1,178 @@
+"""Pass 8 : the QuadWild layout as ZenRay data structures. Written 30 October 2026.
+Reads <prefix>_p0.obj / .patch / .corners / .feature / .c_feature, builds patch boundary loops, checks that they are disks,
+orders the corners cyclically, cuts the boundary into elementary arcs (cut at the corners of ALL patches) and records which
+patches use each arc. FR : le layout de QuadWild lu comme structures ZenRay (patchs, boucles, coins, arcs elementaires)."""
+import collections
+import numpy as np
+import zr8_io as IO
+
+
+def undirected(a, b):
+    return (a, b) if a < b else (b, a)
+
+
+class Layout:
+    def __init__(self, prefix):
+        self.V, F = IO.read_obj(prefix + ".obj")
+        self.F = np.array(F, int)
+        assert self.F.shape[1] == 3, "layout mesh must be a triangle mesh"
+        self.pid = IO.read_patch(prefix + ".patch")
+        assert len(self.pid) == len(self.F)
+        self.npatch = int(self.pid.max()) + 1
+        self.corners = IO.read_corners(prefix + ".corners")
+        assert len(self.corners) == self.npatch
+        try:
+            self.features = IO.read_feature(prefix + ".feature")
+            self.c_features = IO.read_c_feature(prefix + ".c_feature")
+        except Exception:
+            self.features, self.c_features = [], []
+        self._topology()
+
+    @classmethod
+    def from_arrays(cls, V, F, pid, corners):
+        """Layout from in memory arrays (no files) : V (n,3), F (m,3), pid (m,), corners = list of vertex id lists per patch."""
+        lay = cls.__new__(cls)
+        lay.V = np.asarray(V, float); lay.F = np.asarray(F, int); lay.pid = np.asarray(pid, int); lay.npatch = int(lay.pid.max()) + 1
+        lay.corners = [list(c) for c in corners]; lay.features = []; lay.c_features = []
+        lay._topology()
+        return lay
+
+    # ==== topology ===========================================================================================
+    def _topology(self):
+        F = self.F
+        self.edge_faces = collections.defaultdict(list)
+        for fi, t in enumerate(F):
+            for k in range(3):
+                self.edge_faces[undirected(int(t[k]), int(t[(k + 1) % 3]))].append(fi)
+        self.faces_of_patch = [np.where(self.pid == p)[0] for p in range(self.npatch)]
+        # directed boundary half edges of each patch, interior on the left (the face winding gives the direction)
+        self.bhe = [[] for _ in range(self.npatch)]
+        self.edge_patches = {}
+        for e, fl in self.edge_faces.items():
+            ps = sorted({int(self.pid[f]) for f in fl})
+            self.edge_patches[e] = tuple(ps)
+        for fi, t in enumerate(F):
+            p = int(self.pid[fi])
+            for k in range(3):
+                a, b = int(t[k]), int(t[(k + 1) % 3])
+                e = undirected(a, b)
+                other = [f for f in self.edge_faces[e] if f != fi]
+                if not other or int(self.pid[other[0]]) != p:
+                    self.bhe[p].append((a, b))
+        self.loops = [self._chain(h) for h in self.bhe]
+
+    @staticmethod
+    def _chain(hes):
+        nxt = collections.defaultdict(list)
+        for a, b in hes:
+            nxt[a].append(b)
+        used = set(); loops = []
+        for a, b in hes:
+            if (a, b) in used:
+                continue
+            loop = [a]; cur = (a, b)
+            while cur not in used:
+                used.add(cur); loop.append(cur[1])
+                cands = [x for x in nxt[cur[1]] if (cur[1], x) not in used]
+                if not cands:
+                    break
+                cur = (cur[1], cands[0])
+            if loop[0] == loop[-1]:
+                loop = loop[:-1]
+            loops.append(loop)
+        return loops
+
+    # ==== checks =============================================================================================
+    def patch_euler(self, p):
+        fs = self.faces_of_patch[p]
+        verts = set(self.F[fs].ravel().tolist())
+        edges = set()
+        for f in fs:
+            t = self.F[f]
+            for k in range(3):
+                edges.add(undirected(int(t[k]), int(t[(k + 1) % 3])))
+        return len(verts) - len(edges) + len(fs)
+
+    def report(self):
+        r = {"patches": self.npatch, "triangles": int(len(self.F)), "vertices": int(len(self.V))}
+        r["corner_histogram"] = dict(sorted(collections.Counter(len(c) for c in self.corners).items()))
+        r["loops_per_patch"] = dict(sorted(collections.Counter(len(l) for l in self.loops).items()))
+        r["euler_histogram"] = dict(sorted(collections.Counter(self.patch_euler(p) for p in range(self.npatch)).items()))
+        r["not_disk"] = int(sum(1 for p in range(self.npatch) if len(self.loops[p]) != 1 or self.patch_euler(p) != 1))
+        # corners on the loop, cyclic order agreement
+        bad_order = 0; not_on_loop = 0; dup = 0
+        for p in range(self.npatch):
+            if len(self.loops[p]) != 1:
+                continue
+            lp = self.loops[p][0]; pos = {v: i for i, v in enumerate(lp)}
+            cs = self.corners[p]
+            if len(set(cs)) != len(cs):
+                dup += 1
+            if any(c not in pos for c in cs):
+                not_on_loop += 1; continue
+            idx = [pos[c] for c in cs]
+            # cyclic order : indices must be monotone modulo the loop length, in one of the two directions
+            n = len(lp)
+            inc = sum(1 for i in range(len(idx)) if (idx[(i + 1) % len(idx)] - idx[i]) % n < n) and \
+                  sum((idx[(i + 1) % len(idx)] - idx[i]) % n for i in range(len(idx))) == n
+            dec = sum((idx[i] - idx[(i + 1) % len(idx)]) % n for i in range(len(idx))) == n
+            if not (inc or dec):
+                bad_order += 1
+        r["corners_bad_cyclic_order"] = bad_order; r["corners_not_on_loop"] = not_on_loop; r["corners_duplicated"] = dup
+        # junction vertices : vertices touched by 3 or more patches ; each must be a corner of some patch
+        vp = collections.defaultdict(set)
+        for fi, t in enumerate(self.F):
+            for v in t:
+                vp[int(v)].add(int(self.pid[fi]))
+        allc = {c for cs in self.corners for c in cs}
+        junc = [v for v, s in vp.items() if len(s) >= 3]
+        r["junction_vertices"] = len(junc); r["junction_not_corner"] = int(sum(1 for v in junc if v not in allc))
+        # T junctions : a node (corner of some patch) lying in the middle of a side of another patch
+        tj = 0
+        for p in range(self.npatch):
+            if len(self.loops[p]) != 1:
+                continue
+            own = set(self.corners[p])
+            for v in self.loops[p][0]:
+                if v not in own and v in allc:
+                    tj += 1
+        r["t_junction_incidences"] = tj
+        r["mesh_border_edges"] = int(sum(1 for fl in self.edge_faces.values() if len(fl) == 1))
+        return r
+
+    # ==== elementary arcs ====================================================================================
+    def arcs(self):
+        """Cut every patch boundary loop at every node (corner of any patch). Returns
+        arcs : dict key(tuple of vertex ids, canonical direction) -> {'verts': list, 'len': float, 'patches': [patch ids], 'feature': bool}
+        sides : per patch, a list of K sides, each a list of (arc key, forward flag) in the loop direction.
+        """
+        nodes = {c for cs in self.corners for c in cs}
+        arcs = {}; sides = {}
+        feat = {undirected(int(self.F[f][e]), int(self.F[f][(e + 1) % 3])) for f, e in self.features}
+        for p in range(self.npatch):
+            if len(self.loops[p]) != 1:
+                sides[p] = None; continue
+            lp = self.loops[p][0]; n = len(lp)
+            cpos = sorted(lp.index(c) for c in self.corners[p] if c in lp)
+            if not cpos:
+                sides[p] = None; continue
+            sp = []
+            for ci in range(len(cpos)):
+                a = cpos[ci]; b = cpos[(ci + 1) % len(cpos)]
+                span = (b - a) % n or n
+                chain = [lp[(a + t) % n] for t in range(span + 1)]
+                # split the side at foreign nodes (T junction vertices)
+                cuts = [0] + [t for t in range(1, len(chain) - 1) if chain[t] in nodes] + [len(chain) - 1]
+                pieces = []
+                for u, v in zip(cuts[:-1], cuts[1:]):
+                    seq = chain[u:v + 1]
+                    key = min(tuple(seq), tuple(seq[::-1])); fwd = tuple(seq) == key
+                    if key not in arcs:
+                        pts = self.V[list(key)]
+                        arcs[key] = {"verts": list(key), "len": float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum()), "patches": [],
+                                     "feature": all(undirected(key[i], key[i + 1]) in feat for i in range(len(key) - 1))}
+                    arcs[key]["patches"].append(p)
+                    pieces.append((key, fwd))
+                sp.append(pieces)
+            sides[p] = sp
+        return arcs, sides

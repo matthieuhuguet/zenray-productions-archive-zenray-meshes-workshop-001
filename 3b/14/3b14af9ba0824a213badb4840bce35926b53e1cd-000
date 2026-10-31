@@ -1,0 +1,55 @@
+"""E3 diagnostic : ambiguité d'appariement des segments LSD entre vues orthographiques sur la voiture facettée (instance 0, rendu propre). 30 October 2026."""
+import sys, json
+import numpy as np
+sys.path.insert(0, ".")
+import e3_lines as E
+from e2_common import *
+from e2b_shading import hull_buffers
+from scipy.spatial import cKDTree
+case = make_case(); hull = visual_hull(case, 1.5)
+TE = E.truth_edges(case, 0.01); tr = cKDTree(TE)
+segs = E.detect(case); maps = E.support_maps(case, segs); hb = hull_buffers(hull, case)
+frames = {nm: view_frame(case["views"][nm]) for nm in VIEWS6}
+planes = {nm: [E.backproject_plane(case, nm, s) for s in segs[nm]] for nm in VIEWS6}
+tot = 0; stats = []
+for i, A in enumerate(VIEWS6):
+    for B in VIEWS6[i + 1:]:
+        if abs(frames[A][2] @ frames[B][2]) > 0.99: continue
+        for pa in planes[A]:
+            for pb in planes[B]:
+                if pa is None or pb is None: continue
+                dl = np.cross(pa[0], pb[0]); nL = np.linalg.norm(dl)
+                if nL < 0.2: continue
+                dl /= nL; M = np.array([pa[0], pb[0], dl]); x = np.linalg.solve(M, [pa[1], pb[1], 0.0])
+                ts = []
+                for p in (pa, pb):
+                    d = p[6]; w = dl - (dl @ d) * d
+                    if np.linalg.norm(w) < 1e-6: ts = None; break
+                    tt = [((q - (x - (x @ d) * d)) @ w) / (w @ w) for q in (p[2] - (p[2] @ d) * d, p[3] - (p[3] @ d) * d)]
+                    ts.append((min(tt), max(tt)))
+                if ts is None: continue
+                lo = max(ts[0][0], ts[1][0]); hi = min(ts[0][1], ts[1][1])
+                if hi - lo < 0.04: continue
+                tot += 1
+                X = x[None, :] + np.linspace(lo, hi, 14)[:, None] * dl[None, :]
+                is_true = np.median(tr.query(X)[0]) < 0.006
+                nvis = 0; best = 0.0
+                for C in VIEWS6:
+                    if C in (A, B): continue
+                    a, b, d, x0, y1, px, H, W = frames[C]
+                    c = np.floor((X @ a - x0) / px).astype(int); r = np.floor((y1 - X @ b) / px).astype(int)
+                    ok = (c >= 0) & (c < W) & (r >= 0) & (r < H)
+                    if ok.sum() < 14: continue
+                    vis = hb[C]["mask"][r, c] & (np.abs(hb[C]["z"][r, c] - X @ d) < 0.03)
+                    if vis.sum() < 10: continue
+                    sup = maps[C][r, c] <= 1.6
+                    nvis += 1; best = max(best, float(sup[vis].mean()))
+                stats.append((float(is_true), nvis, best))
+st = np.array(stats)
+out = {"segments_per_view": {nm: int(len(segs[nm])) for nm in VIEWS6}, "candidates": int(tot), "true_candidates": int(st[:, 0].sum())}
+for key, t in (("true", 1.0), ("false", 0.0)):
+    m = st[:, 0] == t
+    out[key] = {"count": int(m.sum()), "no_third_view_sees_it": int((st[m, 1] == 0).sum()), "third_view_sees_it": int((st[m, 1] >= 1).sum()), "kept_by_validation_score_ge_0.85": int(((st[m, 1] >= 1) & (st[m, 2] >= 0.85)).sum())}
+tm = np.mean([np.mean(np.array([s for s in [0]]))]) if False else None
+print(json.dumps(out, indent=1))
+json.dump(out, open("out/e3_candidate_diagnosis.json", "w"), indent=1)

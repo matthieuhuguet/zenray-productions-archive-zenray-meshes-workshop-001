@@ -1,0 +1,42 @@
+"""30 October 2026 : ZenRay Meshes, CAR FINISH : tangential relaxation of the FLAT vertices of a welded quad mesh. A vertex whose surrounding faces all lie within --flat-deg of each other slides to the mean of its neighbours inside its tangent plane (no change of shape), joins and frozen parts stay, a quad that gets worse is put back. Repairs the corner angles the facet filter cost.
+    python -I CarQuadRelax.py in.obj out.obj [--iters 20] [--lam 0.5] [--flat-deg 6]
+FR : relaxation tangentielle des sommets plats : les sommets glissent vers la moyenne de leurs voisins dans leur plan, sans changer la forme."""
+import argparse, collections, os, sys, time
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "lines"))
+import CarFacetFilter as CF
+import ZrlQuadStraighten as QS
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--iters", type=int, default=20); ap.add_argument("--lam", type=float, default=0.5); ap.add_argument("--flat-deg", type=float, default=6.0); ap.add_argument("--freeze", default=CF.FREEZE_DEFAULT); a = ap.parse_args(); t0 = time.time()
+    lines = open(a.inp).read().split("\n"); V, F = CF.load_obj(a.inp); Q = np.array([f for f in F if len(f) == 4], np.int64); adj, fixed = CF.face_adjacency(Q); n = len(V); fixed = np.concatenate([fixed, np.zeros(n - len(fixed), bool)]) | CF.frozen_vertices(a.inp, a.freeze, n)
+    used = np.zeros(n, bool); used[Q.ravel()] = True; cid, ncl = CF.contact_clusters(V, used); fc = np.zeros(ncl, bool); fc[cid[fixed]] = True; fixed = fc[cid]
+    nb = [set() for _ in range(n)]
+    for q in Q:
+        for k in range(4): nb[q[k]].add(int(q[(k + 1) % 4])); nb[q[k]].add(int(q[(k - 1) % 4]))
+    P = V.copy(); j0 = QS.quad_jmin(V, Q); cos_flat = np.cos(np.radians(a.flat_deg))
+    vq = collections.defaultdict(list)
+    for i, q in enumerate(Q):
+        for v in q: vq[int(v)].append(i)
+    cnt = np.bincount(cid, minlength=ncl).astype(float); moved = 0
+    for it in range(a.iters):
+        nf, A, C = CF.quad_geom(P, Q); step = np.zeros_like(P)
+        for v in np.flatnonzero(used & ~fixed):
+            fs = vq[v]
+            if len(fs) < 3: continue
+            nn = nf[fs]; m = nn.mean(0); ln = np.linalg.norm(m)
+            if ln < 1e-9 or (nn @ (m / ln)).min() < cos_flat: continue
+            tgt = P[list(nb[v])].mean(0) - P[v]; m /= ln; step[v] = a.lam * (tgt - (tgt @ m) * m)
+        sm = np.zeros((ncl, 3)); np.add.at(sm, cid, step); step = (sm / cnt[:, None])[cid]; step[fixed] = 0; P = P + step
+        jn = QS.quad_jmin(P, Q); bad = np.flatnonzero(jn < np.minimum(j0, 0.3) - 1e-9)
+        for q in Q[bad]: mem = np.flatnonzero(np.isin(cid, cid[q])); P[mem] = V[mem]; moved += 1
+    it = iter(P); out = []
+    for l in lines:
+        if l.startswith("v "): out.append("v %.6f %.6f %.6f" % tuple(next(it)))
+        else: out.append(l)
+    open(a.out, "w").write("\n".join(out)); d = np.linalg.norm(P - V, axis=1) * 1000
+    print("relaxed : moved mean %.2f mm max %.1f mm, put back %d quads, %.0f s" % (d.mean(), d.max(), moved, time.time() - t0))
+
+
+if __name__ == "__main__": main()

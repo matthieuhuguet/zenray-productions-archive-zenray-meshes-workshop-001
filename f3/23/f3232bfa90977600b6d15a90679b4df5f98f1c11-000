@@ -1,0 +1,44 @@
+"""M07 (budget de déplacement) : combien de plans faut-il pour approcher chaque grand panneau extérieur de v752, et de combien ses sommets bougeraient-ils ?
+K-plans (Lloyd : affectation au plan le plus proche, réajustement par PCA), initialisation déterministe par k-moyennes sur (normale, position). 30 October 2026."""
+import sys, json
+import numpy as np
+from scipy.cluster.vq import kmeans2
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P); Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]; N = N * ext["sign"][:, None]
+def fit_planes(Pts, W, k, iters=25, seed=0):
+    rng = np.random.default_rng(seed)
+    feat = np.c_[Pts[:, :3]]
+    cent, lab = kmeans2(feat, k, minit="++", seed=seed)
+    for _ in range(iters):
+        pl = []
+        for j in range(k):
+            m = lab == j
+            if m.sum() < 5: pl.append(None); continue
+            c = np.average(Pts[m], axis=0, weights=W[m]); u, s, vt = np.linalg.svd((Pts[m] - c) * np.sqrt(W[m])[:, None], full_matrices=False)
+            pl.append((c, vt[2]))
+        D = np.full((len(Pts), k), np.inf)
+        for j, p in enumerate(pl):
+            if p is not None: D[:, j] = np.abs((Pts - p[0]) @ p[1])
+        new = D.argmin(1)
+        if (new == lab).all(): break
+        lab = new
+    d = D[np.arange(len(Pts)), lab]
+    return d, lab
+res = {}
+for nm in ("CAR_body_hood_C", "CAR_body_roof_C", "CAR_body_door_L", "CAR_body_glass_windshield_C", "CAR_body_glass_rear_C", "CAR_body_quarter_L", "CAR_body_shoulder_L", "CAR_body_fender_front_L", "CAR_body_rocker_L"):
+    gi = names.index(nm); m = (Gq == gi) & vis
+    if m.sum() < 100: continue
+    nd = (N[m] * A[m][:, None]).sum(0); nd /= np.linalg.norm(nd)
+    sel = np.where(m)[0][(N[m] @ nd) > np.cos(np.radians(40))]
+    vs = np.unique(Q[sel].ravel()); Pts = V[vs]; W = np.ones(len(vs))
+    row = {}
+    for k in (1, 2, 3, 4, 6, 8):
+        d, lab = fit_planes(Pts, W, k)
+        row[k] = {"rms_mm": float(np.sqrt((d ** 2).mean()) * 1000), "p95_mm": float(np.percentile(d, 95) * 1000), "max_mm": float(d.max() * 1000)}
+    res[nm] = {"vertices": int(len(vs)), "planes": row}
+    print(f"{nm:30s} sommets {len(vs):5d} | " + " | ".join(f"k={k}: rms {row[k]['rms_mm']:5.1f} max {row[k]['max_mm']:6.1f}" for k in (1, 2, 4, 8)))
+json.dump(res, open("out/m07_planes_v752.json", "w"), indent=1)

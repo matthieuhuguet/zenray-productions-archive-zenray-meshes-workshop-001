@@ -1,0 +1,277 @@
+"""Pass 7 research copy of ZrlTutteFill.fillN (30 October 2026) : embedding variants, cap rules, annuli, shared counts. FR : copie de recherche du remplissage Tutte.
+Imports the project modules read-only from Scripts/lines. Never writes there."""
+import collections, json, os, sys
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/lines")
+import numpy as np, scipy.sparse as sps
+from scipy.sparse.linalg import spsolve
+from scipy.sparse.csgraph import dijkstra
+from scipy.spatial import cKDTree
+import ZrlAutoPatch as AP, ZrlAny as ANY, ZrlCorners as CR, ZrlCounts as CT, ZrlQuadStats as QS
+import TF0
+cyclic_polygon, coons, mvc_weights = TF0.cyclic_polygon, TF0.coons, TF0.mvc_weights
+OPTS = dict(embed="mvc", cap="dd", relax=0)
+
+
+def cot_weights(P, F, vid, clamp=1e-3):
+    """symmetric positive cotangent weights w_ij = 0.5 (cot a + cot b), negatives clamped to `clamp` (so the Laplacian stays an M matrix : a Tutte like embedding)."""
+    n = len(vid); rows = []; cols = []; vals = []
+    for t in F:
+        for k in range(3):
+            i, j, l = t[k], t[(k + 1) % 3], t[(k + 2) % 3]                       # angle at l, opposite the edge (i, j)
+            a = P[i] - P[l]; b = P[j] - P[l]; cr = np.linalg.norm(np.cross(a, b)); cot = (a @ b) / max(cr, 1e-20)
+            rows += [vid[i], vid[j]]; cols += [vid[j], vid[i]]; vals += [0.5 * cot, 0.5 * cot]
+    W = sps.coo_matrix((vals, (rows, cols)), shape=(n, n)).tocsr(); W.data = np.maximum(W.data, clamp); return W
+
+
+def cap_corners(Pb, cum, Ltot, nB, t0, t1, edge, opts):
+    """the four corners of a strip whose two true corners (tips) are at the arc parameters t0 < t1. returns (ci, None) with the corner vertex indices, or (None, C) with arc parameters to snap.
+    cap = narrow : the cap is the narrowest cross section near each tip (boundary vertices i before and j after the tip vertex, chord shortest) : the two long sides start face to face ; falls back to dd when the loop is too short.
+    cap = dd (default) : the tip +- dd (dd = half an edge) ; cap = fallback / vertex : see prep."""
+    la = (t1 - t0) * Ltot; lb = Ltot - la
+    if opts.get("cap") == "narrow":
+        nbm = max(1, min(int(opts.get("narrow_nb", 6)), nB // 4 - 1)); ci_ = []; ok = nB >= 8
+        for t in (t0, t1):
+            a = int(np.argmin(np.abs(cum[:-1] - t * Ltot))); best = None
+            for i in range(1, nbm + 1):
+                for j in range(1, nbm + 1):
+                    cap_len = cum[(a - i) % nB] - cum[(a + j) % nB]; cap_len = (cum[(a + j) % nB] - cum[(a - i) % nB]) % Ltot
+                    c_ = float(np.linalg.norm(Pb[(a - i) % nB] - Pb[(a + j) % nB])) + float(opts.get("narrow_w", 0.5)) * cap_len
+                    if best is None or c_ < best[0]: best = (c_, (a - i) % nB, (a + j) % nB)
+            ci_ += [best[1], best[2]]
+        ci = sorted(set(ci_))
+        if ok and len(ci) == 4 and ci_[1] != ci_[2] and ((ci_[1] - ci_[0]) % nB) < ((ci_[2] - ci_[0]) % nB): return ci, None
+    dd = min(0.5 * edge, 0.1 * min(la, lb)) / Ltot; return None, [(t0 + dd) % 1.0, (t1 - dd) % 1.0, (t1 + dd) % 1.0, (t0 - dd) % 1.0]
+
+
+def tip_idx(cum, Ltot, tips): return [int(np.argmin(np.abs(cum[:-1] - t * Ltot))) for t in tips]
+
+
+def prep(m, Z, edge, opts=OPTS, prm=AP.PARAMS):
+    """everything before the embedding : boundary loop, true corners (strip promotion, cap rule), corner vertices, counts by the MILP. returns dict or {"fail": reason}."""
+    Ls, ln = AP.loops(m, Z)
+    if len(Ls) != 1: return {"fail": "loops %d (not a disk)" % len(Ls)}
+    B = np.asarray(Ls[0], np.int64); Pb = m["P"][B]; normal = m["N"][Z].mean(0); normal /= max(np.linalg.norm(normal), 1e-9)
+    cum = np.r_[0, np.cumsum(np.linalg.norm(np.diff(np.vstack([Pb, Pb[:1]]), axis=0), axis=1))]; Ltot = cum[-1]
+    if opts.get("ci_fixed"):                                                              # corners given by the caller (annulus cut : the four ends of the cut)
+        ci = sorted(opts["ci_fixed"]); K = len(ci); nB = len(B); sl = [(cum[ci[(k + 1) % K]] - cum[ci[k]]) % Ltot for k in range(K)]
+        lay = {"arcs": {"a%d" % k: float(sl[k]) for k in range(K)}, "mirror": [], "patches": [{"name": "P", "sides": [["a%d" % k] for k in range(K)]}]}; sol = CT.solve(lay, edge)
+        if not sol.get("ok"): return {"fail": "counts infeasible"}
+        e = [int(sol["counts"]["a%d" % k]) for k in range(K)]; sp = sol["tarini"].get("P") if K != 4 else None; F = m["F"][Z]; used = np.unique(F); vid = {int(v): i for i, v in enumerate(used)}
+        return dict(B=B, cum=cum, Ltot=Ltot, ci=ci, K=K, sl=sl, e=e, sp=sp, normal=normal, F=F, used=used, vid=vid, strip=False, raw=K, Z=Z, nB=nB)
+    Cr, _, Xr, per = CR.detect(Pb, CR.vertex_normals_on_loop(m, Z, B)); C = [float(c) / CR.PARAMS["n"] for c in Cr]; raw = len(C); strip = False; nB = len(B); tips = []
+    if len(C) == 2:
+        strip = True; t0, t1 = sorted(C); tips = [t0, t1]; ci_f, C = cap_corners(Pb, cum, Ltot, nB, t0, t1, edge, opts)
+        if ci_f is not None: C = None; ci = ci_f
+    if C is not None and len(C) <= 1 and opts.get("round"):                              # a round zone (no or one true corner) : four corners evenly spaced by arc length, the first at the true corner or at the boundary point farthest from the centre
+        if opts.get("round") == "diam":                                                  # the two boundary points farthest apart are the tips of a strip
+            D = np.linalg.norm(Pb[:, None, :] - Pb[None, :, :], axis=2); a_, b_ = np.unravel_index(np.argmax(D), D.shape); t0, t1 = sorted([float(cum[a_] / Ltot), float(cum[b_] / Ltot)]); strip = True; tips = [t0, t1]; ci_f, C = cap_corners(Pb, cum, Ltot, nB, t0, t1, edge, opts)
+            if ci_f is not None: C = None; ci = ci_f
+        else:
+            t0 = C[0] if C else float(cum[int(np.argmax(np.linalg.norm(Pb - Pb.mean(0), axis=1)))] / Ltot); C = [(t0 + q / 4.0) % 1.0 for q in range(4)]
+    if C is not None:
+        if not 3 <= len(C) <= 8: return {"fail": "true corners %d" % len(C)}
+        ci = sorted({int(np.argmin(np.abs(cum[:-1] - C[k] * Ltot))) for k in range(len(C))})
+        if len(ci) != len(C):
+            if 3 <= nB <= 8: ci = list(range(nB))
+            elif strip and opts.get("cap") in ("fallback", "narrow"):                                   # the cap corners fell on the same boundary vertex : take the vertices before and after each tip vertex
+                ci_ = []
+                for t in (t0, t1):
+                    a = int(np.argmin(np.abs(cum[:-1] - t * Ltot))); ci_ += [(a - 1) % nB, (a + 1) % nB]
+                ci = sorted(set(ci_))
+                if len(ci) != 4: return {"fail": "corners snap together (tiny strip)"}
+            elif opts.get("cap") == "vertex" and strip: return {"fail": "corners snap together"}
+            elif opts.get("merge"):                                                      # a rule : merge corners that snap together if at least 3 stay
+                pass
+            else: return {"fail": "corners snap together"}
+    K = len(ci)
+    if not 3 <= K <= 8: return {"fail": "true corners %d after snap" % K}
+    sl = [(cum[ci[(k + 1) % K]] - cum[ci[k]]) % Ltot for k in range(K)]
+    F = m["F"][Z]; used = np.unique(F); vid = {int(v): i for i, v in enumerate(used)}
+    target = list(sl); cap_chord = {}
+    if strip and K == 4 and opts.get("cap") == "narrow" and opts.get("cap_count", "chord") == "chord":              # the count of a cap follows its CHORD (the true width of the strip), not the length of the boundary run between its two corner vertices
+        for k in range(4):
+            a_, b_ = ci[k], ci[(k + 1) % 4]; chord = float(np.linalg.norm(Pb[a_] - Pb[b_])); inside = [t_ for t_ in tip_idx(cum, Ltot, tips) if (t_ - a_) % nB <= (b_ - a_) % nB]
+            if inside and chord < sl[k]: target[k] = chord; cap_chord[k] = chord
+    if opts.get("corners_only"): return dict(B=B, cum=cum, Ltot=Ltot, ci=ci, K=K, sl=sl, target=target, cap_chord=cap_chord, e=None, sp=None, normal=normal, F=F, used=used, vid=vid, strip=strip, raw=raw, Z=Z, nB=nB)      # the counts come from a global layout (shared arcs)
+    lay = {"arcs": {"a%d" % k: float(target[k]) for k in range(K)}, "mirror": [], "patches": [{"name": "P", "sides": [["a%d" % k] for k in range(K)]}]}; sol = CT.solve(lay, edge)
+    if not sol.get("ok"): return {"fail": "counts infeasible"}
+    e = [int(sol["counts"]["a%d" % k]) for k in range(K)]; sp = sol["tarini"].get("P") if K != 4 else None
+    return dict(B=B, cum=cum, Ltot=Ltot, ci=ci, K=K, sl=sl, e=e, sp=sp, normal=normal, F=F, used=used, vid=vid, strip=strip, raw=raw, Z=Z, nB=nB)
+
+
+def strip_sections(m, pr, F, vid, n):
+    """breakpoints (arc length offsets from the side start, e + 1 values) of ONE long side of a strip patch so that its lattice points face the uniform points of the other long side : the cross sections follow the harmonic coordinate x (Dirichlet on the two caps, free on the long sides). Returns {side: array}."""
+    B, cum, Ltot, ci, K, sl, e = [pr[k] for k in ("B", "cum", "Ltot", "ci", "K", "sl", "e")]; nB = len(B); e0, e1 = e[0], e[1]; long_ = (0, 2) if e0 >= e1 else (1, 3); caps = tuple(s_ for s_ in range(4) if s_ not in long_)
+    so = side_of(pr); bl = [vid[int(v)] for v in B]; capv = {c: [bl[bi] for bi in range(nB) if c in so[bi]] for c in caps}
+    Wc = cot_weights(m["P"], F, vid); Dg = np.asarray(Wc.sum(1)).ravel(); Lap = (sps.diags(Dg) - Wc).tocsr(); fx = {}
+    for v in capv[caps[0]]: fx[v] = 0.0
+    for v in capv[caps[1]]: fx[v] = 1.0
+    fidx = np.array(sorted(fx)); fv = np.array([fx[i] for i in fidx]); free = np.setdiff1d(np.arange(n), fidx); x = np.zeros(n); x[fidx] = fv; x[free] = spsolve(Lap[free][:, free].tocsc(), -(Lap[free][:, fidx] @ fv))
+    def side_x(k):
+        idx = [(ci[k] + t) % nB for t in range((ci[(k + 1) % K] - ci[k]) % nB + 1)]; s3 = np.array([(cum[i] - cum[ci[k]]) % Ltot for i in idx]); s3[-1] = sl[k]; xs = x[[bl[i] for i in idx]]; return s3, xs
+    sA, xA = side_x(long_[0]); sB, xB = side_x(long_[1]); tt = np.arange(e[long_[0]] + 1) / e[long_[0]] * sl[long_[0]]
+    inc_a = xA[-1] >= xA[0]; xa = np.maximum.accumulate(xA) if inc_a else np.minimum.accumulate(xA); xt = np.interp(tt, sA, xa)                  # x of the uniform points of side A
+    # side B is traversed the other way round the loop : its j-th point faces the (e - j)-th point of A
+    xt_b = xt[::-1]; inc_b = xB[-1] >= xB[0]; xb = np.maximum.accumulate(xB) if inc_b else np.minimum.accumulate(xB)
+    if inc_b: sb = np.interp(xt_b, xb + 1e-12 * np.arange(len(xb)), sB)
+    else: sb = np.interp(xt_b[::-1], xb[::-1] - 1e-12 * np.arange(len(xb))[::-1], sB[::-1])[::-1]
+    sb = np.maximum.accumulate(sb); sb[0], sb[-1] = 0.0, sl[long_[1]]
+    return {long_[1]: sb}
+
+
+def side_of(pr):
+    """side index (or two, at the corners) of every boundary vertex index."""
+    ci, nB, K = pr["ci"], pr["nB"], pr["K"]; out = []
+    for bi in range(nB):
+        s = []
+        for k in range(K):
+            span = (ci[(k + 1) % K] - ci[k]) % nB
+            if span == 0: span = nB
+            if (bi - ci[k]) % nB <= span: s.append(k)
+        out.append(s)
+    return out
+
+
+def lscm(P, T, pins):
+    """least squares conformal map (Levy 2002) of the triangles T (indices into P), free boundary, pins = {vertex: (x, y)} ; returns (n, 2)."""
+    n = len(P); rows = []; cols = []; vals = []; r = 0
+    for t in T:
+        a, b, c = P[t[0]], P[t[1]], P[t[2]]; e1 = b - a; l1 = np.linalg.norm(e1); x1 = e1 / max(l1, 1e-20); nn = np.cross(e1, c - a); A2 = np.linalg.norm(nn)
+        if A2 < 1e-20: continue
+        y1 = np.cross(nn / A2, x1); X = [(0.0, 0.0), (l1, 0.0), ((c - a) @ x1, (c - a) @ y1)]; w = np.sqrt(A2 / 2)
+        for j in range(3):
+            d = complex(X[(j + 2) % 3][0] - X[(j + 1) % 3][0], X[(j + 2) % 3][1] - X[(j + 1) % 3][1]) * w / A2 * 2
+            vj = t[j]                                                                  # re: dr u - di v ; im: di u + dr v
+            rows += [r, r, r + 1, r + 1]; cols += [vj, n + vj, vj, n + vj]; vals += [d.real, -d.imag, d.imag, d.real]
+        r += 2
+    M = sps.coo_matrix((vals, (rows, cols)), shape=(r, 2 * n)).tocsc(); fixed = sorted(pins); fidx = np.array(fixed + [n + f for f in fixed]); xfix = np.array([pins[f][0] for f in fixed] + [pins[f][1] for f in fixed])
+    free = np.setdiff1d(np.arange(2 * n), fidx); A = M[:, free]; b = -M[:, fidx] @ xfix
+    sol = spsolve((A.T @ A).tocsc() + 1e-12 * sps.identity(len(free), format="csc"), A.T @ b); X = np.zeros(2 * n); X[free] = sol; X[fidx] = xfix; return np.stack([X[:n], X[n:]], 1)
+
+
+def locate_lift(U, T2, Pl, Q2, k=24):
+    """barycentric lift of the planar points Q2 through the flattened triangles (U, T2) to the 3D vertices Pl : (P3 (m,3), unlocated count)."""
+    cen = U[T2].mean(1); tree = cKDTree(cen); P3 = np.zeros((len(Q2), 3)); bad = 0; _, cand = tree.query(Q2, k=min(k, len(T2)))
+    for qi, q in enumerate(Q2):
+        found = False
+        for t in np.atleast_1d(cand[qi]):
+            a, b, c = U[T2[t]]; M = np.array([[b[0] - a[0], c[0] - a[0]], [b[1] - a[1], c[1] - a[1]]])
+            if abs(np.linalg.det(M)) < 1e-18: continue
+            l1, l2 = np.linalg.solve(M, q - a)
+            if l1 >= -1e-6 and l2 >= -1e-6 and l1 + l2 <= 1 + 1e-6: P3[qi] = (1 - l1 - l2) * Pl[T2[t, 0]] + l1 * Pl[T2[t, 1]] + l2 * Pl[T2[t, 2]]; found = True; break
+        if not found: t = int(np.atleast_1d(cand[qi])[0]); P3[qi] = Pl[T2[t]].mean(0); bad += 1
+    return P3, bad
+
+
+def fill(m, Z, edge, opts=OPTS, pr=None):
+    """one patch of the region Z : (P3, Q, report) or (None, None, {"fail": ..}). embed : mvc (current), cot, neumann, dist, lscm."""
+    pr = pr or prep(m, Z, edge, opts)
+    if "fail" in pr: return None, None, pr
+    B, cum, Ltot, ci, K, sl, e, sp, normal, F, used, vid = [pr[k] for k in ("B", "cum", "Ltot", "ci", "K", "sl", "e", "sp", "normal", "F", "used", "vid")]
+    Pl = m["P"][used]; T2 = np.array([[vid[int(a)] for a in t] for t in F]); embed = opts.get("embed", "mvc"); nB = len(B); n = len(used)
+    if K != 4 and embed not in ("mvc", "cot"): embed = "mvc"
+    if embed in ("sect", "neumann", "dist", "lscm") and not pr["strip"] and not opts.get("all_k4"): embed = "mvc"
+    V = cyclic_polygon(e); S2 = [V[k] + (V[(k + 1) % K] - V[k]) * (np.arange(e[k] + 1) / e[k])[:, None] for k in range(K)]
+    if embed in ("mvc", "cot", "sect"):
+        bps = dict(pr.get("bps") or {})
+        if embed == "sect" and K == 4 and not bps: bps = strip_sections(m, pr, F, vid, n)
+        uv = {}
+        for bi, v in enumerate(B):
+            for k in range(K):
+                d = (cum[bi] - cum[ci[k]]) % Ltot
+                if d <= sl[k] + 1e-9:
+                    t = float(np.clip(d / max(sl[k], 1e-12), 0, 1))
+                    if k in bps: t = float(np.interp(d, bps[k], np.arange(e[k] + 1) / e[k]))                  # the side carries its own breakpoints (shared arc partition)
+                    uv[int(v)] = V[k] + (V[(k + 1) % K] - V[k]) * t; break
+        W = mvc_weights(m["P"], F, vid) if embed in ("mvc", "sect") else cot_weights(m["P"], F, vid)
+        U = np.zeros((n, 2)); inner = [int(v) for v in used if int(v) not in uv]
+        for v, p in uv.items(): U[vid[v]] = p
+        if inner:
+            ii = np.array([vid[v] for v in inner]); bi_ = np.array([vid[v] for v in uv]); Dg = np.asarray(W.sum(1)).ravel(); Lap = (sps.diags(Dg) - W).tocsr()
+            U[ii] = spsolve(Lap[ii][:, ii].tocsc(), -(Lap[ii][:, bi_] @ U[bi_])).reshape(len(ii), 2)
+    elif embed in ("neumann", "dist"):
+        e0, e1 = float(V[1][0] - V[0][0]) if K == 4 else 0, float(V[2][1] - V[1][1])                          # rectangle e0 x e1 (sides 0 and 2 have e[0] edges, sides 1 and 3 e[1])
+        e0, e1 = float(e[0]), float(e[1]); long_ = (0, 2) if e0 >= e1 else (1, 3); caps = tuple(s for s in range(4) if s not in long_)
+        so = side_of(pr); bl = [vid[int(v)] for v in B]
+        capv = {c: [bl[bi] for bi in range(nB) if c in so[bi]] for c in caps}; lonv = {c: [bl[bi] for bi in range(nB) if c in so[bi]] for c in long_}
+        # coordinates : along the long axis x (0 at cap caps[0]), across y (0 at long side long_[0]) ; the rectangle is e[long] x e[cap]
+        Lx = float(e[long_[0]]); Wy = float(e[caps[0]]); U = np.zeros((n, 2))
+        if embed == "neumann":
+            Wc = cot_weights(m["P"], F, vid); Dg = np.asarray(Wc.sum(1)).ravel(); Lap = (sps.diags(Dg) - Wc).tocsr()
+            def solve_with(fixed):
+                fidx = np.array(sorted(fixed)); fv = np.array([fixed[i] for i in fidx]); free = np.setdiff1d(np.arange(n), fidx); x = np.zeros(n); x[fidx] = fv
+                x[free] = spsolve(Lap[free][:, free].tocsc(), -(Lap[free][:, fidx] @ fv)); return x
+            fx = {}; [fx.__setitem__(v, 0.0) for v in capv[caps[0]]]; [fx.__setitem__(v, Lx) for v in capv[caps[1]]]
+            fy = {}; [fy.__setitem__(v, 0.0) for v in lonv[long_[0]]]; [fy.__setitem__(v, Wy) for v in lonv[long_[1]]]
+            for v in capv[caps[0]]:                                                                                       # corner vertices belong to a cap AND a long side : x of the cap, y of the long side (consistent)
+                pass
+            U[:, 0] = solve_with(fx); U[:, 1] = solve_with(fy)
+        else:
+            adj = sps.coo_matrix((np.r_[np.linalg.norm(Pl[T2[:, 0]] - Pl[T2[:, 1]], axis=1), np.linalg.norm(Pl[T2[:, 1]] - Pl[T2[:, 2]], axis=1), np.linalg.norm(Pl[T2[:, 2]] - Pl[T2[:, 0]], axis=1)],
+                                  (np.r_[T2[:, 0], T2[:, 1], T2[:, 2]], np.r_[T2[:, 1], T2[:, 2], T2[:, 0]])), shape=(n, n)).tocsr(); adj = adj.maximum(adj.T)
+            dist = lambda src: dijkstra(adj, directed=False, indices=sorted(set(src)), min_only=True)
+            dA, dB = dist(capv[caps[0]]), dist(capv[caps[1]]); d0, d1 = dist(lonv[long_[0]]), dist(lonv[long_[1]])
+            U[:, 0] = Lx * dA / np.maximum(dA + dB, 1e-12); U[:, 1] = Wy * d0 / np.maximum(d0 + d1, 1e-12)
+        Q2, Qd = _grid_arrays(np.stack(np.meshgrid(np.arange(int(Lx) + 1), np.arange(int(Wy) + 1), indexing="ij"), -1).astype(float))
+        P3, bad = locate_lift(U, T2, Pl, Q2)
+        return _finish(P3, Qd, normal, F, m, opts, dict(sides=K, counts=e, unlocated=bad, strip=pr["strip"], raw=pr["raw"], triangles=len(F)))
+    elif embed == "lscm":
+        so = side_of(pr); bl = [vid[int(v)] for v in B]; c0, c2 = bl[ci[0]], bl[ci[2]]; dpin = float(np.linalg.norm(Pl[c0] - Pl[c2]))
+        U = lscm(Pl, T2, {c0: (0.0, 0.0), c2: (dpin, 0.0)})
+        # flattened sides, subdivided by 3D arc length
+        def side_pts(k):
+            idx = [(ci[k] + t) % nB for t in range((ci[(k + 1) % K] - ci[k]) % nB + 1)]; s3 = np.array([(cum[i] - cum[ci[k]]) % Ltot for i in idx]); s3[-1] = sl[k]; pts = U[[bl[i] for i in idx]]
+            tt = np.arange(e[k] + 1) / e[k] * sl[k]; return np.stack([np.interp(tt, s3, pts[:, 0]), np.interp(tt, s3, pts[:, 1])], 1)
+        S = [side_pts(k) for k in range(4)]; G = coons(S[0], S[1], S[2][::-1], S[3][::-1])
+        Q2, Qd = _grid_arrays(G); P3, bad = locate_lift(U, T2, Pl, Q2)
+        return _finish(P3, Qd, normal, F, m, opts, dict(sides=K, counts=e, unlocated=bad, strip=pr["strip"], raw=pr["raw"], triangles=len(F)))
+    pts = {}; Qd = []
+    def vkey(p): return (int(round(p[0] * 1e6)), int(round(p[1] * 1e6)))
+    def add(G):
+        for i in range(G.shape[0] - 1):
+            for j in range(G.shape[1] - 1): Qd.append([pts.setdefault(vkey(G[a, b]), (len(pts), G[a, b]))[0] for a, b in ((i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1))])
+        for i in range(G.shape[0]):
+            for j in range(G.shape[1]): pts.setdefault(vkey(G[i, j]), (len(pts), G[i, j]))
+    if K == 4: add(coons(S2[0], S2[1], S2[2][::-1], S2[3][::-1]))
+    else:
+        P0 = V.mean(0)
+        if opts.get("pole") == "perp":                                                      # the pole where the perpendiculars to the sides at the spoke feet meet (least squares) : the three blocks are then close to rectangles
+            Ad = np.zeros((2, 2)); bd = np.zeros(2)
+            for i in range(K):
+                Eq = S2[i][sp[i - 1]]; d = (V[(i + 1) % K] - V[i]); d = d / max(np.linalg.norm(d), 1e-20); Ad += np.outer(d, d); bd += d * (Eq @ d)
+            try:
+                X = np.linalg.solve(Ad, bd); cr2 = lambda a, b: a[0] * b[1] - a[1] * b[0]; inside = all(cr2(V[(i + 1) % K] - V[i], X - V[i]) * cr2(V[(i + 1) % K] - V[i], P0 - V[i]) >= 0 for i in range(K))
+                if inside: P0 = X
+            except np.linalg.LinAlgError: pass
+        spoke = [P0 + (S2[i][sp[i - 1]] - P0) * (np.arange(sp[i] + 1) / sp[i])[:, None] for i in range(K)]
+        for i in range(K): add(coons(S2[i][:sp[i - 1] + 1], spoke[i][::-1], spoke[i - 1][::-1], S2[i - 1][sp[(i - 2) % K]:][::-1]))
+    Q2 = np.zeros((len(pts), 2))
+    for _, (k_, p_) in pts.items(): Q2[k_] = p_
+    Qd = np.array(Qd, np.int64)
+    if opts.get("uvsmooth"): Q2 = smooth_uv(Q2, Qd, opts["uvsmooth"])
+    P3, bad = locate_lift(U, T2, Pl, Q2)
+    return _finish(P3, Qd, normal, F, m, opts, dict(sides=K, counts=e, unlocated=bad, strip=pr["strip"], raw=pr["raw"], triangles=len(F)))
+
+
+def smooth_uv(Q2, Qd, iters):
+    """Laplacian smoothing of the interior lattice vertices in the (convex) uv polygon : the border (edges used by one quad) stays, so the arc length boundary is kept."""
+    ec = collections.Counter()
+    for q in Qd:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1
+    bd = {v for (a, b), c in ec.items() if c == 1 for v in (a, b)}; n = len(Q2); E = np.array(list(ec.keys()))
+    W = sps.coo_matrix((np.ones(2 * len(E)), (np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]])), shape=(n, n)).tocsr(); W = sps.diags(1.0 / np.maximum(np.asarray(W.sum(1)).ravel(), 1)) @ W
+    free = np.array([v for v in range(n) if v not in bd]); X = Q2.copy()
+    if not len(free): return X
+    for _ in range(int(iters)): X[free] = (W @ X)[free]
+    return X
+
+
+def _grid_arrays(G):
+    """(m+1, n+1, 2) grid -> points (N,2), quads (q,4) with indices i * (n + 1) + j."""
+    m1, n1 = G.shape[:2]; Qd = [[i * n1 + j, (i + 1) * n1 + j, (i + 1) * n1 + j + 1, i * n1 + j + 1] for i in range(m1 - 1) for j in range(n1 - 1)]; return G.reshape(-1, 2), np.array(Qd, np.int64)
+
+
+def _finish(P3, Qd, normal, F, m, opts, rep):
+    nq = np.cross(P3[Qd[:, 2]] - P3[Qd[:, 0]], P3[Qd[:, 3]] - P3[Qd[:, 1]]).sum(0)
+    if nq @ normal < 0: Qd = Qd[:, ::-1]
+    return P3, Qd, rep

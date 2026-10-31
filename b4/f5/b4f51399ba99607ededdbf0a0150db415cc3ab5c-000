@@ -1,0 +1,34 @@
+"""30 October 2026 : IN-PLACE straightening of a welded car (or any welded multi-part quad mesh) : the barrier energy of ZrlQuadBarrier moves the vertices ONLY, never the faces, so every component stays, every join stays closed (a vertex shared by two parts is one vertex), and the groups are written back untouched. Hard edges are read from the mesh itself (adjacent quad normals more than --feature-deg apart), hard-edge vertices slide along their edge, corners and open borders are fixed, the reference surface is the input mesh.
+    python -I QwCarBarrier.py in.obj out.obj [--ref ref.obj] [--feature-deg 35] [--outer 6] [--inner 40] [--theta 0.0078125]
+FR : redressement en place d'une voiture soudee : seuls les sommets bougent, aucune piece ne disparait, aucune jonction ne s'ouvre, les groupes sont reecrits tels quels."""
+import argparse, collections, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+import ZrlQuadBarrier as QB, ZrlQuadStraighten as QS
+
+
+def features_from_quads(V, Q, deg):
+    qn = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); qn /= np.maximum(np.linalg.norm(qn, axis=1, keepdims=True), 1e-30); ef = collections.defaultdict(list)
+    for qi, q in enumerate(Q):
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ef[(min(a, b), max(a, b))].append(qi)
+    cosf = np.cos(np.radians(deg)); segs = [(V[a], V[b]) for (a, b), f in ef.items() if len(f) == 2 and float(qn[f[0]] @ qn[f[1]]) < cosf]
+    return np.array(segs).reshape(-1, 2, 3)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--ref"); ap.add_argument("--feature-deg", type=float, default=35.0); ap.add_argument("--outer", type=int, default=6); ap.add_argument("--inner", type=int, default=40); ap.add_argument("--theta", type=float, default=1.0 / 128); ap.add_argument("--max-move-mm", type=float, default=15.0); a = ap.parse_args()
+    lines = open(a.inp).read().split("\n"); V, F = QB.load_obj(a.inp); Q = np.array([f for f in F if len(f) == 4], np.int64); Vr, Fr = QB.load_obj(a.ref or a.inp); T = [(f[0], f[k], f[k + 1]) for f in Fr for k in range(1, len(f) - 1)]
+    feats = features_from_quads(V, Q, a.feature_deg); t0 = time.time(); P, hist, kind = QB.straighten(V, Q, Vr, np.array(T, np.int64), feats, a.outer, a.inner, a.theta, "keep", 30.0, False)
+    j0 = QS.quad_jmin(V, Q); far = np.linalg.norm(P - V, axis=1) > a.max_move_mm / 1000.0; P[far] = V[far]; moved_back = int(far.sum())          # 30 October 2026 : a vertex never moves farther than --max-move-mm (a slide vertex that jumped to another crease goes back)
+    for _ in range(12):                                                                       # 30 October 2026 : never worsen a quad : revert the vertices of every quad whose Jacobian got worse and is under 0.3 (or negative), until none is left
+        jn = QS.quad_jmin(P, Q); bad = np.flatnonzero((jn < np.minimum(j0, 0.3) - 1e-9))
+        if not len(bad): break
+        for q in Q[bad]: P[q] = V[q]
+    it = iter(P); out = []
+    for l in lines:
+        if l.startswith("v "): p = next(it); out.append("v %.6f %.6f %.6f" % tuple(p))
+        else: out.append(l)
+    open(a.out, "w").write("\n".join(out)); print("reverted far moves %d ; " % moved_back, end=""); print("done in %.0f s ; vertices %d, moved mean %.3f mm, max %.1f mm" % (time.time() - t0, len(V), 1000 * np.linalg.norm(P - V, axis=1).mean(), 1000 * np.linalg.norm(P - V, axis=1).max()))
+
+
+if __name__ == "__main__": main()

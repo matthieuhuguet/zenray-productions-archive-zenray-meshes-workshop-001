@@ -1,0 +1,55 @@
+"""Q9, mesure 3 : cohérence d'orientation des quads de v752 (arêtes parcourues dans le même sens par deux faces voisines)."""
+import sys, json
+import numpy as np
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+# arêtes dirigées
+d = {}
+bad = 0; tot = 0
+from collections import defaultdict
+dirs = defaultdict(list)
+for fi, q in enumerate(Q):
+    for k in range(4):
+        u, v = int(q[k]), int(q[(k + 1) % 4])
+        dirs[(min(u, v), max(u, v))].append((fi, 1 if u < v else -1))
+inc = 0; cons = 0
+per_group_bad = defaultdict(lambda: [0, 0])
+for e, lst in dirs.items():
+    if len(lst) != 2: continue
+    (f1, d1), (f2, d2) = lst
+    tot += 1
+    ok = (d1 != d2)
+    cons += ok
+    g1, g2 = Gq[f1], Gq[f2]
+    per_group_bad[g1][1] += 1; per_group_bad[g2][1] += 1
+    if not ok:
+        per_group_bad[g1][0] += 1; per_group_bad[g2][0] += 1
+print("arêtes intérieures", tot, "cohérentes", cons, "incohérentes", tot - cons, f"{100*(tot-cons)/tot:.2f} %")
+rows = sorted(((b / max(t, 1), b, t, names[g]) for g, (b, t) in per_group_bad.items()), reverse=True)
+for fr, b, t, nm in rows[:15]:
+    print(f"{nm:32s} {b:6d}/{t:6d} {100*fr:5.1f} %")
+# nombre de composantes orientables : propagation BFS des signes
+import collections
+nf = len(Q)
+adj = [[] for _ in range(nf)]
+for e, lst in dirs.items():
+    if len(lst) == 2:
+        (f1, d1), (f2, d2) = lst
+        adj[f1].append((f2, d1 == d2)); adj[f2].append((f1, d1 == d2))   # True = doivent être de signes opposés
+sign = np.zeros(nf, int)
+ncomp = 0; conflicts = 0
+for s in range(nf):
+    if sign[s]: continue
+    ncomp += 1; sign[s] = 1; dq = collections.deque([s])
+    while dq:
+        a = dq.popleft()
+        for b, flip in adj[a]:
+            want = -sign[a] if flip else sign[a]
+            if sign[b] == 0: sign[b] = want; dq.append(b)
+            elif sign[b] != want: conflicts += 1
+print("composantes connexes", ncomp, "conflits d'orientation (non orientable si > 0):", conflicts)
+json.dump({"interior_edges": tot, "inconsistent": tot - cons, "components": ncomp, "orientation_conflicts": conflicts,
+           "faces_flipped_by_bfs": int((sign < 0).sum())}, open("out/q9_winding.json", "w"), indent=1)

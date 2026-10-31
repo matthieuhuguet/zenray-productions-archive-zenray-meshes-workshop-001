@@ -1,0 +1,233 @@
+"""Voiture facettée synthétique, paramétrique et déterministe : une définition (FacetCar), des paramètres, des instances.
+La carrosserie est une expression CSG de polytopes convexes (intersections de demi-espaces) ; la vérité 3D est exacte :
+chaque facette est un plan, chaque arête une droite. Lancer de rayons orthographique par intervalles (numpy), échantillonnage de surface,
+export en maillage triangulé. Axes : x latéral, y haut, z avant (comme v752, mètres). 30 October 2026."""
+import numpy as np
+from scipy.spatial import HalfspaceIntersection
+
+def unit(v):
+    v = np.asarray(v, float); return v / np.linalg.norm(v)
+
+class Polytope:
+    """Intersection de demi-espaces n.x <= c. name_i par plan."""
+    def __init__(self, planes, interior):
+        self.n = np.array([unit(p[0]) for p in planes]); self.c = np.array([p[1] for p in planes], float)
+        self.names = [p[2] for p in planes]
+        self.interior = np.asarray(interior, float)
+        hs = np.c_[self.n, -self.c]
+        hi = HalfspaceIntersection(hs, self.interior)
+        self.verts = hi.intersections
+        # polygone par plan : sommets sur le plan, ordonnés par angle
+        self.polys = {}
+        for i in range(len(self.n)):
+            d = np.abs(self.verts @ self.n[i] - self.c[i])
+            idx = np.where(d < 1e-7)[0]
+            if len(idx) < 3: continue
+            P = self.verts[idx]; cen = P.mean(0)
+            a = np.cross(self.n[i], [1, 0, 0]);
+            if np.linalg.norm(a) < 0.1: a = np.cross(self.n[i], [0, 1, 0])
+            a = unit(a); b = np.cross(self.n[i], a)
+            ang = np.arctan2((P - cen) @ b, (P - cen) @ a)
+            self.polys[i] = P[np.argsort(ang)]
+    def contains(self, X, tol=1e-9):
+        return np.all(X @ self.n.T <= self.c[None, :] + tol, axis=1)
+    def interval(self, O, D):
+        """Rayons O + t D (m,3). Retourne t_in, t_out, plan_in, plan_out (t_in > t_out : manqué)."""
+        m = len(O)
+        t_in = np.full(m, -1e18); t_out = np.full(m, 1e18); p_in = np.full(m, -1); p_out = np.full(m, -1)
+        for i in range(len(self.n)):
+            nd = D @ self.n[i]; no = O @ self.n[i] - self.c[i]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = -no / nd
+            enter = nd < -1e-12; leave = nd > 1e-12
+            par = ~(enter | leave)
+            miss = par & (no > 0)
+            t_in = np.where(miss, 1e19, t_in); t_out = np.where(miss, -1e19, t_out)
+            upd = enter & (t > t_in); t_in = np.where(upd, t, t_in); p_in = np.where(upd, i, p_in)
+            upd = leave & (t < t_out); t_out = np.where(upd, t, t_out); p_out = np.where(upd, i, p_out)
+        return t_in, t_out, p_in, p_out
+
+class CSG:
+    """Arbre : ('p', index) | ('u', a, b) | ('d', a, b). pieces = liste de Polytope."""
+    def __init__(self, pieces, tree):
+        self.pieces = pieces; self.tree = tree
+    def _eval(self, node, O, D, cache):
+        if node[0] == "p":
+            k = node[1]
+            if k not in cache: cache[k] = self.pieces[k].interval(O, D)
+            ti, to, pi, po = cache[k]
+            ok = ti < to
+            return [(np.where(ok, ti, np.nan), np.where(ok, to, np.nan), np.where(ok, pi, -1), np.where(ok, po, -1), np.full(len(O), k), np.full(len(O), k))]
+        raise NotImplementedError
+    def first_hit(self, O, D):
+        """Premier point d'entrée dans le solide : renvoie t, (pièce, plan). Union/différence évaluées sur des listes d'intervalles par rayon (vectorisé par boucle sur les pièces)."""
+        m = len(O)
+        # intervalles par pièce
+        iv = {}
+        for k, P in enumerate(self.pieces):
+            iv[k] = P.interval(O, D)
+        best_t = np.full(m, np.inf); best_id = np.full((m, 2), -1)
+        # on évalue l'arbre par candidats : t d'entrée de chaque pièce positive ; on garde le plus petit t qui est à l'intérieur de l'expression
+        cand = []
+        for k, (ti, to, pi, po) in iv.items():
+            ok = ti < to
+            cand.append((np.where(ok, ti, np.inf), k, pi))
+            # sorties des pièces soustraites comptent comme entrées du solide
+            cand.append((np.where(ok, to, np.inf), k, po))
+        for t, k, pl in cand:
+            valid = np.isfinite(t)
+            X = O + D * (t[:, None] + 1e-7)           # point juste après
+            ins = self._inside(self.tree, X)
+            ok = valid & ins & (t < best_t)
+            best_t = np.where(ok, t, best_t)
+            best_id[ok, 0] = k; best_id[ok, 1] = pl[ok]
+        return best_t, best_id
+    def _inside(self, node, X):
+        if node[0] == "p": return self.pieces[node[1]].contains(X)
+        a = self._inside(node[1], X); b = self._inside(node[2], X)
+        return (a | b) if node[0] == "u" else (a & ~b)
+
+# ----------------------------------------------------------------------------------------------------------------------
+def default_params():
+    return dict(L=4.50, W=1.95, floor=0.16,                   # longueur, largeur de caisse, garde au sol
+                zf=2.25, zr=-2.25,                              # nez, poupe
+                nose_h=0.42, nose_lean=18.0,                    # hauteur du bas de pare-chocs (nez), inclinaison de la face avant (deg depuis la verticale)
+                hood_y=0.62, hood_pitch=7.5, hood_end=0.85,     # hauteur du capot au nez, pente (deg), z du pied de pare-brise
+                ws_pitch=28.0, roof_y=1.25, roof_pitch=2.0,     # pare-brise : inclinaison sur l'horizontale (deg) ; toit
+                rw_pitch=24.0, deck_y=0.98, deck_z=-1.55,       # lunette arrière ; haut du coffre
+                rear_lean=12.0, rear_h=0.45,
+                tumble=10.0, cab_tumble=14.0, cab_hw=0.70,      # inclinaison des flancs (deg), des vitres ; demi-largeur de l'habitacle
+                belt_y=0.88, shoulder_chamfer=22.0, corner=35.0, chamfer_w=0.14,
+                sill=0.10, obliq=1.0)
+def build(params=None, scale=None):
+    p = default_params()
+    if params: p.update(params)
+    d2r = np.pi / 180
+    hw = p["W"] / 2
+    pl = []
+    def plane(point, normal, name):
+        n = unit(normal); pl.append((n, float(n @ np.asarray(point, float)), name))
+    # ---- caisse inférieure (tub)
+    plane((0, p["floor"], 0), (0, -1, 0), "floor")
+    a = p["nose_lean"] * d2r
+    plane((0, p["nose_h"], p["zf"]), (0, -np.sin(a) * 0 - 0.0 + np.sin(-a) * 0 + (-np.sin(a)) * 0 + 0, 1.0), "tmp")   # remplacé ci-dessous
+    pl.pop()
+    # face avant : plan incliné vers l'arrière en montant : normale (0, +sin a, cos a) tournée vers l'avant et le bas ? => légèrement vers le haut si lean>0 (nez en coin)
+    plane((0, p["nose_h"], p["zf"]), (0, -np.sin(a), np.cos(a)), "nose_face")
+    b = p["hood_pitch"] * d2r
+    plane((0, p["hood_y"], p["zf"] - 0.18), (0, np.cos(b), np.sin(b)), "hood")
+    c_ = p["rear_lean"] * d2r
+    plane((0, p["rear_h"], p["zr"]), (0, -np.sin(c_), -np.cos(c_)), "tail_face")
+    plane((0, p["deck_y"], p["deck_z"] + 0.35), (0, np.cos(3 * d2r), -np.sin(3 * d2r)), "deck")
+    t = p["tumble"] * d2r
+    for sgn, nm in ((1, "R"), (-1, "L")):
+        plane((sgn * hw, p["floor"], 0), (sgn * np.cos(t), np.sin(t), 0), f"side_{nm}")
+        # chanfrein d'épaule (bord haut du flanc) : plan oblique
+        e = p["shoulder_chamfer"] * d2r
+        plane((sgn * (hw - p["chamfer_w"]), p["belt_y"] + 0.05, 0), (sgn * np.sin(e) * 0.8, np.cos(e), 0), f"shoulder_{nm}")
+        # coins du nez et de la poupe : plans verticaux obliques (facettes obliques sur 3 axes)
+        cn = p["corner"] * d2r
+        plane((sgn * (hw - 0.12), 0.5, p["zf"] - 0.35), (sgn * np.cos(cn) * 0.9, 0.0, np.sin(cn) * 0.9 + 0.1), f"nose_corner_{nm}")
+        plane((sgn * (hw - 0.12), 0.5, p["zr"] + 0.30), (sgn * np.cos(cn) * 0.9, 0.0, -np.sin(cn) * 0.9 - 0.1), f"tail_corner_{nm}")
+        s = 0.12
+        plane((sgn * (hw - 0.10), p["floor"] + p["sill"], 0), (sgn * 0.7, -0.7, 0), f"sill_{nm}")
+    if p["obliq"]:
+        o = p["obliq"]
+        for sgn, nm in ((1, "R"), (-1, "L")):
+            # facettes obliques sur les trois axes : coins hauts du nez et de la poupe, hanches avant et arrière
+            plane((sgn * (hw - 0.42), 0.52, p["zf"] - 0.62), (sgn * 0.55, 0.60 * o, 0.58), f"nose_top_corner_{nm}")
+            plane((sgn * (hw - 0.42), 0.66, p["zr"] + 0.60), (sgn * 0.55, 0.55 * o, -0.62), f"tail_top_corner_{nm}")
+            plane((sgn * (hw - 0.16), 0.66, 1.30), (sgn * 0.80, 0.45 * o, 0.30), f"front_haunch_{nm}")
+            plane((sgn * (hw - 0.16), 0.70, -1.32), (sgn * 0.80, 0.45 * o, -0.30), f"rear_haunch_{nm}")
+    tub = Polytope(pl, interior=(0, 0.55, 0))
+    # ---- habitacle (cabin)
+    pc = []
+    def planec(point, normal, name):
+        n = unit(normal); pc.append((n, float(n @ np.asarray(point, float)), name))
+    w = p["ws_pitch"] * d2r
+    z_ws_base = p["hood_end"]
+    planec((0, p["hood_y"] - np.tan(b) * (z_ws_base - (p["zf"] - 0.18)) , z_ws_base), (0, np.sin(w), np.cos(w)), "windshield")
+    rp = p["roof_pitch"] * d2r
+    planec((0, p["roof_y"], 0), (0, np.cos(rp), -np.sin(rp)), "roof")
+    r = p["rw_pitch"] * d2r
+    planec((0, p["deck_y"], p["deck_z"]), (0, np.sin(r), -np.cos(r)), "rear_window")
+    ct = p["cab_tumble"] * d2r
+    for sgn, nm in ((1, "R"), (-1, "L")):
+        planec((sgn * p["cab_hw"], p["belt_y"], 0), (sgn * np.cos(ct), np.sin(ct), 0), f"cab_side_{nm}")
+    planec((0, p["belt_y"] - 0.20, 0), (0, -1, 0), "cab_floor")
+    if p["obliq"]:
+        for sgn, nm in ((1, "R"), (-1, "L")):
+            planec((sgn * 0.50, 1.04, 0.62), (sgn * 0.70, 0.45, 0.55), f"pillar_a_{nm}")
+            planec((sgn * 0.50, 1.02, -1.12), (sgn * 0.70, 0.45, -0.55), f"pillar_c_{nm}")
+    cab = Polytope(pc, interior=(0, 1.0, -0.25))
+    tree = ("u", ("p", 0), ("p", 1))
+    return CSG([tub, cab], tree), p
+
+def render_views(car, px=0.008, names=("front", "back", "left", "right", "top", "bottom"), margin=6, bounds=None):
+    """Rendu orthographique : retourne dict nom -> dict(depth, fid (indice global de plan), n (normales), mask, frame)."""
+    from clay_render import view_basis
+    out = {}
+    allv = np.concatenate([P.verts for P in car.pieces])
+    for nm in names:
+        a, b, d = view_basis(nm)
+        u = allv @ a; v = allv @ b
+        x0, x1, y0, y1 = u.min() - margin * px, u.max() + margin * px, v.min() - margin * px, v.max() + margin * px
+        W = int(np.ceil((x1 - x0) / px)); H = int(np.ceil((y1 - y0) / px))
+        xs = x0 + (np.arange(W) + 0.5) * px; ys = y1 - (np.arange(H) + 0.5) * px
+        UU, VV = np.meshgrid(xs, ys)
+        O = UU[..., None] * a + VV[..., None] * b + d * 20.0
+        O = O.reshape(-1, 3); D = np.tile(-d, (len(O), 1))
+        t, ids = car.first_hit(O, D)
+        hit = np.isfinite(t)
+        # normales
+        N = np.zeros((len(O), 3)); fid = np.full(len(O), -1)
+        offs = np.cumsum([0] + [len(P.n) for P in car.pieces])
+        for k, P in enumerate(car.pieces):
+            m = hit & (ids[:, 0] == k)
+            N[m] = P.n[ids[m, 1]]; fid[m] = offs[k] + ids[m, 1]
+        depth = np.where(hit, 20.0 - t, -1e9)
+        out[nm] = dict(depth=depth.reshape(H, W), fid=fid.reshape(H, W), n=N.reshape(H, W, 3), mask=hit.reshape(H, W), frame=(a, b, d, x0, y1, px))
+    return out
+
+def plane_names(car):
+    out = []
+    for k, P in enumerate(car.pieces):
+        for nm in P.names: out.append((k, nm))
+    return out
+
+def sample_surface(car, n_per_m2=4000, rng=None):
+    """Points de la surface exacte de la CSG (face visible du solide), normale et identifiant global de plan."""
+    rng = rng or np.random.default_rng(7)
+    pts = []; nrm = []; fids = []
+    offs = np.cumsum([0] + [len(P.n) for P in car.pieces])
+    for k, P in enumerate(car.pieces):
+        for i, poly in P.polys.items():
+            # triangulation en éventail
+            for j in range(1, len(poly) - 1):
+                A_, B_, C_ = poly[0], poly[j], poly[j + 1]
+                area = 0.5 * np.linalg.norm(np.cross(B_ - A_, C_ - A_))
+                m = max(1, int(area * n_per_m2))
+                r1 = np.sqrt(rng.random(m)); r2 = rng.random(m)
+                X = (1 - r1)[:, None] * A_ + (r1 * (1 - r2))[:, None] * B_ + (r1 * r2)[:, None] * C_
+                # reste sur la frontière du solide : juste dehors est vide, juste dedans est plein
+                nn = P.n[i]
+                out_ = car._inside(car.tree, X + nn * 1e-5)
+                in_ = car._inside(car.tree, X - nn * 1e-5)
+                keep = (~out_) & in_
+                pts.append(X[keep]); nrm.append(np.tile(nn, (keep.sum(), 1))); fids.append(np.full(keep.sum(), offs[k] + i))
+    return np.concatenate(pts), np.concatenate(nrm), np.concatenate(fids)
+
+def mesh_of(car, subdiv=0):
+    """Maillage triangulé des polygones visibles ; chaque polygone est recoupé par les autres pièces (approche : un échantillonnage pour test
+    uniquement) -- ici : triangles des polygones de chaque pièce dont le centroïde est sur la frontière (approximation suffisante pour les vérificateurs)."""
+    tris = []; V = []; owner = []
+    offs = np.cumsum([0] + [len(P.n) for P in car.pieces])
+    for k, P in enumerate(car.pieces):
+        for i, poly in P.polys.items():
+            for j in range(1, len(poly) - 1):
+                tri = np.array([poly[0], poly[j], poly[j + 1]])
+                cen = tri.mean(0); nn = P.n[i]
+                if car._inside(car.tree, (cen + nn * 1e-5)[None])[0] or not car._inside(car.tree, (cen - nn * 1e-5)[None])[0]:
+                    continue
+                V.extend(tri); tris.append([len(V) - 3, len(V) - 2, len(V) - 1]); owner.append(offs[k] + i)
+    return np.array(V), np.array(tris), np.array(owner)

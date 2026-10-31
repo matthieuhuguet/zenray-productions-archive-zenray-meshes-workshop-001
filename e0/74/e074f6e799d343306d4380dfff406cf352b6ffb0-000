@@ -1,0 +1,93 @@
+"""30 October 2026 : ZenRay Retopology, LAYOUT AWARE BARRIER : the straightener of ZrlQuadBarrier with the vertex classification of the cloud research (pass 9, measured on the real arch : barrier alone 15 folded quads of 5,202 against 66 for the crease-only classification of ZrlQuadBarrier).
+EN: the QuadWild layout files of the remeshed input (`<prefix>.obj .patch .corners .feature .c_feature`) say which quad vertices are NODES touching a hard edge (fixed), which lie on a hard-edge ARC (slide along that very arc, tangent of the arc), and which are free on the surface. Only layout nodes are fixed, a crease vertex that is not a node slides : far fewer fixed vertices (856 nodes) than the 1,535 of the crease-only rule.
+    python -I ZrlLayoutBarrier.py <prefix> quads.obj out.obj [--ref reference.obj] [--outer 8 --inner 60 --theta 0.125] [--json]
+FR : barriere consciente du layout : seuls les noeuds du layout touchant une arete vive sont fixes, les sommets d'un arc vif glissent le long de leur arc, le reste est libre."""
+import argparse, collections, json, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.join(HERE, "cloud8"))
+import numpy as np
+from scipy.spatial import cKDTree
+import zr8_layout as L
+import ZrlBarrierCore as BC, ZrlQuadBarrier as QB
+
+
+def arc_points(V, key, n):
+    P = V[list(key)]; seg = np.linalg.norm(np.diff(P, axis=0), axis=1); cum = np.concatenate([[0], np.cumsum(seg)]); tt = cum[-1] * np.arange(n + 1) / n
+    idx = np.clip(np.searchsorted(cum, tt, side="right") - 1, 0, len(seg) - 1); f = (tt - cum[idx]) / np.maximum(seg[idx], 1e-30); out = P[idx] + (P[idx + 1] - P[idx]) * f[:, None]; out[0] = P[0]; out[-1] = P[-1]; return out
+
+
+def feature_chains(lay, fa, feat, slide_deg):
+    """30 October 2026 (F3) : arcs of one hard-edge curve joined through the PASS THROUGH layout nodes : a node with exactly two feature edges that continue each other within slide_deg degrees (and that is not a sharp corner vertex of QuadWild) is not a corner of the curve, it may slide along it. Returns (chains, slidable nodes) ; a chain is a vertex tuple."""
+    inc = collections.defaultdict(list)
+    for e in feat:
+        for v in e: inc[v].append(e[0] if e[1] == v else e[1])
+    cfe = set(int(c) for c in lay.c_features); slid = set()
+    for v, ns in inc.items():
+        if v in cfe or len(ns) != 2: continue
+        a = lay.V[ns[0]] - lay.V[v]; b = lay.V[ns[1]] - lay.V[v]; c = float(a @ b / max(np.linalg.norm(a) * np.linalg.norm(b), 1e-30))
+        if c < -np.cos(np.radians(slide_deg)): slid.add(v)
+    at = collections.defaultdict(list)
+    for i, k in enumerate(fa): at[k[0]].append(i); at[k[-1]].append(i)
+    used = set(); chains = []
+    for i in range(len(fa)):
+        if i in used: continue
+        used.add(i); seq = list(fa[i]); grew = True
+        while grew:
+            grew = False
+            for end in (0, 1):
+                v = seq[-1] if end == 1 else seq[0]
+                if v not in slid: continue
+                nxt = [j for j in at[v] if j not in used]
+                if len(nxt) != 1: continue
+                j = nxt[0]; used.add(j); other = list(fa[j])
+                if end == 1: seq = seq + (other[1:] if other[0] == v else other[::-1][1:])
+                else: seq = (other[::-1][:-1] if other[0] == v else other[:-1]) + seq
+                grew = True
+        chains.append(tuple(seq))
+    return chains, slid
+
+
+def classify(lay, arcs, P, Q, h, diag, tol_frac=0.02, slide_deg=0.0):
+    """kind per vertex : 2 fixed (exactly on a layout node that is a CORNER of a hard edge curve), 1 slides on a hard-edge curve (arcs joined through pass through nodes), 0 free."""
+    feat = {(min(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3])), max(int(lay.F[f][e]), int(lay.F[f][(e + 1) % 3]))) for f, e in lay.features}; feat_vert = {v for e in feat for v in e}
+    fa = [k for k, v in arcs.items() if v["feature"]]; chains, slid = feature_chains(lay, fa, feat, slide_deg) if slide_deg > 0 else ([tuple(k) for k in fa], set())
+    nodes = sorted({int(c) for cs in lay.corners for c in cs if int(c) in feat_vert and int(c) not in slid}); kind = np.zeros(len(P), int); arc_of = np.full(len(P), -1); U = np.unique(Q)
+    if nodes: dn, _ = cKDTree(lay.V[nodes]).query(P[U]); kind[U[dn < 1e-7 * max(diag, 1.0) + 1e-9]] = 2
+    samples = []; owner = []
+    for ai, k in enumerate(chains): pts = arc_points(lay.V, k, max(6 * len(k), 12)); samples.append(pts); owner += [ai] * len(pts)
+    if chains:
+        d, ix = cKDTree(np.vstack(samples)).query(P[U]); owner = np.array(owner)
+        for u, dd, i in zip(U, d, ix):
+            if kind[u] == 2 or dd > tol_frac * h: continue
+            kind[u] = 1; arc_of[u] = owner[i]
+    return kind, arc_of, BC.ArcSet([lay.V[list(k)] for k in chains])
+
+
+def taubin(V, T, iters, lam=0.5, mu=-0.53):
+    """30 October 2026 : Taubin low pass smoothing of the reference triangles (no shrinkage) : the projection target of the barrier on a noisy scan (skin pores, wrinkles) would otherwise put the noise into the quad lines (straightness)."""
+    import scipy.sparse as sp
+    n = len(V); e = np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]); A = sp.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)); A = ((A + A.T) > 0).astype(float).tocsr(); deg = np.asarray(A.sum(1)).ravel(); D = sp.diags(1.0 / np.maximum(deg, 1)); W = D @ A; X = V.copy()
+    for k in range(iters):
+        f = lam if k % 2 == 0 else mu; X = X + f * (W @ X - X)
+    return X
+
+
+def straighten(prefix, V, Q, outer=8, inner=60, theta=1.0 / 8, size="keep", log=print, fair=0.0, pin=None, slide_deg=0.0, ref_smooth=0, fair_angles=0.0):
+    lay = L.Layout(prefix); arcs, _ = lay.arcs(); Vr, Fr = QB.load_obj(prefix + ".obj"); T = np.array([(f[0], f[k], f[k + 1]) for f in Fr for k in range(1, len(f) - 1)], np.int64)
+    h = float(np.mean([np.linalg.norm(V[Q[:, k]] - V[Q[:, (k + 1) % 4]], axis=1).mean() for k in range(4)])); diag = float(np.linalg.norm(Vr.max(0) - Vr.min(0)))
+    kind, arc_of, arcset = classify(lay, arcs, V, Q, h, diag, slide_deg=slide_deg)
+    if pin is not None:                                                                    # 30 October 2026 : pin = (axis, plane value, tolerance) : free vertices on the mirror plane stay on it (a half that will be mirrored)
+        ax, c, tol = pin; kind[(np.abs(V[:, ax] - c) < tol) & (kind == 0)] = 2
+    log("layout barrier : %d vertices : %d free, %d slide on a hard-edge arc, %d fixed layout nodes ; %d quads" % (len(V), int((kind == 0).sum()), int((kind == 1).sum()), int((kind == 2).sum()), len(Q)))
+    P, hist = BC.barrier(V, Q, BC.Surface(taubin(Vr, T, ref_smooth) if ref_smooth > 0 else Vr, T), outer=outer, inner=inner, theta=theta, size=size, kind=kind, arc_of=arc_of, arcs=arcset, fair=fair, fair_angles=fair_angles); return P, kind
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("prefix"); ap.add_argument("quads"); ap.add_argument("out"); ap.add_argument("--ref"); ap.add_argument("--outer", type=int, default=8); ap.add_argument("--inner", type=int, default=60); ap.add_argument("--theta", type=float, default=0.125); ap.add_argument("--size", default="keep"); ap.add_argument("--fair", type=float, default=0.0); ap.add_argument("--slide", type=float, default=0.0); ap.add_argument("--ref-smooth", type=int, default=0); ap.add_argument("--fair-angles", type=float, default=0.0); ap.add_argument("--json", action="store_true"); a = ap.parse_args()
+    import ZrlTopoJudge as TJ
+    V, F = QB.load_obj(a.quads); Q = np.array([f for f in F if len(f) == 4], np.int64); t0 = time.time(); P, kind = straighten(a.prefix, V, Q, a.outer, a.inner, a.theta, a.size, log=(lambda s: None) if a.json else print, fair=a.fair, slide_deg=a.slide, ref_smooth=a.ref_smooth, fair_angles=a.fair_angles); QB.save_obj(a.out, P, [list(q) for q in Q])
+    ref = a.ref or a.prefix + ".obj"; keys = ("quads", "folded", "folded_share", "squashed", "squashed_share", "jac_mean", "angle_dev_mean_deg", "straight_iso_mean_deg", "straight_iso_p90_deg", "dev_mean_mm", "boundary_edges", "euler")
+    b = TJ.judge(a.quads, ref); c = TJ.judge(a.out, ref); rep = {"seconds": round(time.time() - t0, 1), "fixed": int((kind == 2).sum()), "slide": int((kind == 1).sum()), "before": {k: b.get(k) for k in keys}, "after": {k: c.get(k) for k in keys}}
+    print(json.dumps(rep) if a.json else "\n".join("%-24s %10s -> %10s" % (k, b.get(k), c.get(k)) for k in keys) + "\nseconds %s" % rep["seconds"])
+
+
+if __name__ == "__main__": main()

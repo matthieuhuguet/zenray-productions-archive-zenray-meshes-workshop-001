@@ -1,0 +1,46 @@
+"""Pass 8 : run QuadWild Bi-MDF (steps 1-2 then quad_from_patches) on one mesh. Written 30 October 2026.
+Usage : python3 -I qw_run.py mesh=PATH workdir=DIR mode=organic|mechanical|basic [scale=1.0] [qwroot=PATH] [sharp=NUM] [flow=NAME]
+Outputs are written next to a copy of the mesh in workdir. Prints a JSON line with file names and timings.
+FR : lance QuadWild (etapes 1-2 puis quad_from_patches) ; scale est scaleFact du fichier de flux (arete cible = arete moyenne x scale)."""
+import sys, os, shutil, subprocess, time, json, re
+
+DEF = {"qwroot": "/home/user/cgg-bern/quadwild-bimdf", "mode": "organic", "scale": "1.0", "sharp": None, "flow": "flow_noalign_lemon"}
+
+
+def run(args):
+    a = dict(DEF); a.update(args)
+    root = a["qwroot"]; wd = a["workdir"]; os.makedirs(wd, exist_ok=True)
+    name = os.path.splitext(os.path.basename(a["mesh"]))[0]
+    mesh = os.path.join(wd, name + ".obj")
+    if os.path.abspath(a["mesh"]) != os.path.abspath(mesh):
+        shutil.copy(a["mesh"], mesh)
+    prep_src = {"organic": "basic_setup_Organic.txt", "mechanical": "basic_setup_Mechanical.txt", "basic": "basic_setup.txt"}[a["mode"]]
+    prep = open(os.path.join(root, "config/prep_config", prep_src)).read()
+    if a["sharp"] is not None:
+        prep = re.sub(r"sharp_feature_thr\s+\S+", "sharp_feature_thr %s" % a["sharp"], prep)
+    prep_path = os.path.join(wd, name + "_prep.txt"); open(prep_path, "w").write(prep)
+    flow = open(os.path.join(root, "config/main_config", a["flow"] + ".txt")).read()
+    flow = re.sub(r"scaleFact\s+\S+", "scaleFact %s" % a["scale"], flow)
+    flow_path = os.path.join(wd, name + "_flow.txt"); open(flow_path, "w").write(flow)
+    t0 = time.time()
+    r1 = subprocess.run([os.path.join(root, "build/Build/bin/quadwild"), mesh, "2", prep_path], cwd=root, capture_output=True, text=True)
+    t1 = time.time()
+    open(os.path.join(wd, name + "_step12.log"), "w").write(r1.stdout + r1.stderr)
+    rem = os.path.join(wd, name + "_rem_p0.obj")
+    if r1.returncode != 0 or not os.path.exists(rem):
+        return {"ok": False, "stage": "steps12", "rc": r1.returncode, "tail": (r1.stdout + r1.stderr)[-400:]}
+    js = os.path.join(wd, name + "_stats.json")
+    r2 = subprocess.run([os.path.join(root, "build/Build/bin/quad_from_patches"), rem, "123", flow_path, js], cwd=root, capture_output=True, text=True)
+    t2 = time.time()
+    open(os.path.join(wd, name + "_step3.log"), "w").write(r2.stdout + r2.stderr)
+    out = {"ok": r2.returncode == 0, "name": name, "t_step12_s": round(t1 - t0, 1), "t_step3_s": round(t2 - t1, 1),
+           "rem": rem, "quad": os.path.join(wd, name + "_rem_p0_123_quadrangulation.obj"),
+           "quad_smooth": os.path.join(wd, name + "_rem_p0_123_quadrangulation_smooth.obj")}
+    if r2.returncode != 0:
+        out["tail"] = (r2.stdout + r2.stderr)[-400:]
+    return out
+
+
+if __name__ == "__main__":
+    args = dict(kv.split("=", 1) for kv in sys.argv[1:])
+    print(json.dumps(run(args)))

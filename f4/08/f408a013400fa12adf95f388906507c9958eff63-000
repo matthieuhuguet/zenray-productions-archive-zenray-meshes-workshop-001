@@ -1,0 +1,81 @@
+"""30 October 2026 : ZenRay Retopology ANY MESH : the front door of the promise "any mesh, any surface, perfect topology".
+EN: an OBJ of any shape is cut into zones by the auto patch rules (a neighbour joins while the normals differ by less than zone_deg and the part is the same), every zone gets the four sided patch of its real contour (ZrlAutoPatch.patch), the patches are meshed one by one by the engine (ZrlCarMesh.mesh_all : strips, reflex cuts, repair) and the result is judged : area covered, quads, folded, squashed, valence-4 share, deviation. A zone without contour (a closed smooth part) or a ring is listed as "template needed" : never hidden.
+    python -I ZrlAny.py mesh.obj --out work/lines/any/<name> [--zone-deg 25] [--target-quads 2500] [--min-area-frac 0.002]
+FR : n'importe quel maillage est découpé en zones, chaque zone reçoit le patch à quatre côtés de son vrai contour, puis le moteur maille chaque patch ; le jugement chiffre la couverture, les plis, les écrasés, la valence 4 et l'écart."""
+import argparse, json, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np, ZrlAutoPatch as AP, ZrlCarMesh as CM, ZrlQuadStats as QS
+
+MAXC = 8                                                                                  # 30 October 2026 : up to 8 corners per region (the patch is a 3 to 8 sided patch)
+DOC0 = {"version": 1, "date": "30 October 2026", "units": "m", "spline": {"degree": 3, "knots": "clamped uniform : n control points, n-3 spans, parameter u in [0, n-3]"}}
+
+
+def segment(m, zone_deg, min_tris, merge_deg=70.0, log=print):
+    """30 October 2026 : REGIONS of the whole mesh, none overlapping. (1) the exact smooth components : two triangles that share an edge are joined when they belong to the same part and their normals differ by less than zone_deg (union find). (2) the small regions (under min_tris triangles) are merged into the neighbour they share the longest border with, while the normals across that border differ by less than merge_deg, smallest regions first. Returns [(triangle ids, seed point)]."""
+    T = len(m["F"]); nb = m["nb"]; N = m["N"]; G = m["G"]; cosz = np.cos(np.radians(zone_deg)); parent = np.arange(T)
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for t in range(T):
+        for u in nb[t]:
+            if u > t and G[u] == G[t] and float(N[t] @ N[u]) >= cosz: parent[find(u)] = find(t)
+    lab = np.array([find(t) for t in range(T)]); cosm = np.cos(np.radians(merge_deg))
+    for _ in range(50):                                                                    # merge passes
+        ids, cnt = np.unique(lab, return_counts=True); size = dict(zip(ids.tolist(), cnt.tolist())); small = sorted([i for i in ids.tolist() if size[i] < min_tris], key=lambda i: size[i]); moved = 0
+        if not small: break
+        for r in small:
+            ts = np.flatnonzero(lab == r)
+            if len(ts) == 0 or len(ts) >= min_tris: continue
+            border = {}
+            for t in ts:
+                for u in nb[t]:
+                    if u >= 0 and lab[u] != r and G[u] == G[t] and float(N[t] @ N[u]) >= cosm: border[lab[u]] = border.get(lab[u], 0) + 1
+            if border: lab[ts] = max(border, key=border.get); moved += 1
+        if not moved: break
+    zones = []
+    for r in np.unique(lab):
+        Z = np.flatnonzero(lab == r)
+        if len(Z) >= min_tris: zones.append((Z, m["cent"][Z[len(Z) // 2]]))
+    return zones
+
+
+def build(obj, zone_deg=25.0, min_area_frac=0.002, log=print, merge_deg=70.0):
+    m = AP.mesh(os.path.abspath(obj)); tri = m["P"][m["F"]]; area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1); total = float(area.sum())
+    zones = segment(m, zone_deg, max(4, int(min_area_frac * len(m["F"]))), log=log, merge_deg=merge_deg); doc = dict(DOC0, nodes=[], arcs=[], component_seeds=[], component_options={}, components=[], model_ref=os.path.abspath(obj), mesh_unit=1.0); rep = []; covered = 0.0
+    for k, (Z, seed) in enumerate(zones):
+        za = float(area[Z].sum()); name = "ANY_%03d" % k; r = None; best = -1.0
+        for zd in [zone_deg] + [z for z in (15.0, 40.0, 60.0, 10.0) if z != zone_deg]:
+            try: q = AP.patch({"op": "patch", "p": [float(x) for x in seed], "zone_deg": zd, "max_radius_m": 1e6, "ref": os.path.abspath(obj), "max_triangles": 10 ** 9, "max_corners": MAXC, "Z": [int(x) for x in Z]})
+            except Exception as ex: q = {"ok": False, "error": str(ex)[:60]}
+            if not q.get("ok") or not 3 <= len(q.get("corners", [])) <= 8: r = r or q; continue
+            mt = min(q["report"].get("corner_turns_deg") or [0.0])
+            if mt > best: best, r = mt, q
+            if mt >= 20.0: break
+        if r is None or not r.get("ok") or not 3 <= len(r.get("corners", [])) <= 8:
+            rep.append((name, False, (r or {}).get("error", "no four corners")[:70], za)); continue
+        ids = []
+        for c in r["corners"]: doc["nodes"].append({"id": len(doc["nodes"]), "p": [round(float(x), 6) for x in c]}); ids.append(len(doc["nodes"]) - 1)
+        for j, side in enumerate(r["sides"]): doc["arcs"].append({"id": len(doc["arcs"]), "a": ids[j], "b": ids[(j + 1) % len(ids)], "closed": False, "pair": [name, name], "ctrl": [[round(float(x), 6) for x in p] for p in side], "mirror": -1})
+        doc["component_seeds"].append({"name": name, "p": [round(float(x), 6) for x in (r.get("seed") or seed)]}); doc["component_options"][name] = {"edge_scale": 1.0}; doc["components"].append(name); covered += za; rep.append((name, True, "", za))
+    return doc, rep, total, covered
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("obj"); ap.add_argument("--out", required=True); ap.add_argument("--zone-deg", type=float, default=25.0); ap.add_argument("--target-quads", type=int, default=2500); ap.add_argument("--min-area-frac", type=float, default=0.002); ap.add_argument("--merge-deg", type=float, default=70.0); a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True); t0 = time.time(); doc, rep, total, covered = build(a.obj, a.zone_deg, a.min_area_frac, merge_deg=a.merge_deg)
+    edge = float(np.sqrt(max(covered, 1e-9) / max(a.target_quads, 1))); log = lambda s: None
+    P, Q, parts, rows = CM.mesh_all(doc, a.obj, edge, log=log, reflex=True, repair=True)
+    out = {"mesh": os.path.abspath(a.obj), "zones": len(rep), "patched": sum(1 for r in rep if r[1]), "failed": [(r[0], r[2], round(r[3], 4)) for r in rep if not r[1]], "area_total_m2": round(total, 3), "area_patched_m2": round(covered, 3), "coverage": round(covered / max(total, 1e-9), 3), "edge_m": round(edge, 4), "seconds_patch": round(time.time() - t0, 1)}
+    if P is not None and len(Q):
+        _, _, jmin, _ = QS.stats(P, Q); deg = np.zeros(len(P), int); ok_v = 0
+        for q in Q:
+            for v in q: deg[v] += 1
+        out.update({"quads": int(len(Q)), "folded": int((jmin < 0).sum()), "squashed": int((jmin < 0.3).sum()), "meshed_patches": sum(1 for r in rows if r[1] == "meshed"), "unmeshed": [(r[0], r[1], r[2]) for r in rows if r[1] != "meshed"][:12]})
+        base = os.path.join(a.out, "any.obj")
+        with open(base, "w") as f:
+            f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in P)); f.write("".join("f %d %d %d %d\n" % tuple(int(x) + 1 for x in q) for q in Q))
+        json.dump(parts, open(base + ".parts.json", "w"))
+    json.dump({"doc": doc, "report": out}, open(os.path.join(a.out, "any_doc.json"), "w")); print(json.dumps(out, indent=1)); return out
+
+
+if __name__ == "__main__": main()

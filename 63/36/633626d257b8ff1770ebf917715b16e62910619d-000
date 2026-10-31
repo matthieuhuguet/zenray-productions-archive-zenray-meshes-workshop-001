@@ -1,0 +1,468 @@
+# QuadWild Bi-MDF : étude de paramètres, densité, symétrie, défauts (30 October 2026, passe 6)
+
+Statuts : [CODE] lu dans /Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf (rien modifié) ; [MESURÉ] exécuté ici avec les binaires compilés (quadwild puis quad_from_patches, juge ZrlTopoJudge.py, mêmes mesures que le thread principal) ; [ESTIMÉ] jugement. Outils et résultats bruts : /Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/pass6_tools/ (qw6.py banc, study1.py, results1.jsonl 228 essais, density*.py, q3*.py, feat.py).
+
+## 0. Méthode et réserves
+- Maillages : arch_hard, lily_plant, eucalyptus_tree, manny_character de /Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/ ; juge contre le maillage d'entrée. Configs copiées dans mon scratchpad (cfg/), le fichier de flux est réécrit à chaque essai avec les chemins json absolus de ma copie ; les configs de tools/ ne sont jamais ouvertes en écriture. Le lanceur de référence QwBench.py n'est pas modifié ; mon banc qw6.py refait les deux étapes (quadwild 2 prep.txt, puis quad_from_patches num flow.txt stats.json) avec le même cwd.
+- Un paramètre à la fois par rapport à la base (prep basic : do_remesh 1, sharp 35, scaleFact 1 ; flux flow_noalign_lemon). Les étapes 1-2 (champ, traçage) sont faites une fois par préparation et réutilisées par tous les essais d'étape 3 de cette préparation.
+- Temps : l'étude a tourné avec 12 essais en parallèle ET la charge du thread principal (charge machine de 20 à 100 sur 18 coeurs) ; les secondes des tableaux sont donc gonflées. Temps propres (machine à 12 de charge, séquentiel, mesurés ensuite) : voir section 1.5.
+- Nombres de quads, plié, écrasé, valence 4, pôles, écart, patchs : déterministes (la base arche rend bien 29 477 quads, 16,1 pôles, comme chez le thread principal).
+
+## 1. Ce que les configs commandent réellement
+
+### 1.1 Étapes 1-2 (binaire quadwild) : seulement quatre clés [CODE]
+quadwild lit un fichier de 4 lignes dans cet ordre strict (fscanf) : do_remesh, sharp_feature_thr, alpha, scaleFact (quadwild/functions.cpp, loadConfigFile). Avec l'argument d'arrêt 2 (le lanceur), seules do_remesh et sharp_feature_thr servent : alpha et scaleFact ne sont lus que par l'étape 3 interne de quadwild (argument 3), que le lanceur ne lance pas. Tout le reste est codé en dur : remesh isotrope 15 itérations, aspect 0,35, surfDistCheck, SharpFactor 6, erode-dilate 4, tracé (MinVal 3, MaxVal 5, sample_ratio 0,01, Drift 100) (functions.cpp, trace.cpp).
+- Taille d'arête du remaillage : non exposée. ExpectedEdgeL (field_computation/AutoRemesher.h l. 313-331) rend min(IdealL0, IdealL1) avec IdealL0 = racine(2,309 x A x sphéricité^2 / 2000) et IdealL1 = racine(2,309 x A / 10000) : au moins 10 000 faces, et beaucoup plus pour une pièce fine (sphéricité faible). Voir section 5.
+- Un fichier .sharp ou .rosy passé en argument remplace la détection automatique des arêtes vives (UpdateSharp = !hasFeature) ou le champ calculé (quadwild.cpp, functions.cpp).
+
+### 1.2 Mode du champ : choisi automatiquement, pas par un réglage [CODE + MESURÉ]
+Il n'existe pas de paramètre « mode 1 ou 2 » : le 2 de la ligne de commande est l'étape d'arrêt (1 champ, 2 traçage, 3 quadrangulation). Le mode du champ est choisi par AutoSetupParam (field_computation/mesh_field_smoother.h) : si longueur des arêtes vives / racine de l'aire > SharpFactor (6), champ NPoly aligné sur les arêtes ; sinon champ Comiso (MIQ, alpha_curv 0,3, aligné sur la courbure). Les journaux montrent « Using NPoly » ou « Using Comiso » : arche basic NPoly, arche organic (sharp -1) Comiso, arche noremesh organic Comiso, eucalyptus Comiso partout sauf sharp 20 (NPoly), lys et Manny NPoly dans tous les cas (les bords ouverts comptent dans la longueur). Le seul levier est donc sharp_feature_thr (et un .sharp fourni).
+
+### 1.3 Étape 3 (quad_from_patches) [CODE]
+Le fichier de flux est lu par fscanf dans un ordre strict (components/quad_from_patches/main.cpp l. 347-455) ; useFlowSolver 1 envoie à qr_flow.cpp, qui n'utilise que : alpha (l. 148, poids d'isométrie alpha, de régularité 1 - alpha), regularityNonQuadrilateralsWeight (l. 224), repeatLosingConstraintsQuads / NonQuads / Align (l. 229, 848, 906), alignSingularities (l. 728), alignSingularitiesWeight (l. 480), les json de flux et de satsuma. Les clés isometry, regularityQuadrilaterals, regularityNonQuadrilaterals, hardParityConstraint, minimumGap, gapLimit, timeLimit, callback* sont ignorées par le solveur de flux (elles servent le chemin ILP Gurobi, non compilé). [MESURÉ] : isometry 0, regularityQuadrilaterals 0, regularityNonQuadrilaterals 0 et hardParityConstraint 0 rendent exactement la même sortie que la base sur les 8 combinaisons (maillage, préparation) : aucun effet.
+- Densité : EdgeSize = avgEdge(maillage _rem_p0) x scaleFact (main.cpp l. 204), appliqué à TOUS les patchs (l. 206). Le nombre de côtés de chaque patch vaut longueur / EdgeSize.
+
+### 1.4 Résultats : tableaux complets
+Colonnes : s = secondes de l'étape 3 sous charge ; plié, écrasé = Jacobien < 0 et < 0,3 ; val4 = part de sommets intérieurs de valence 4 ; pôles pour 1 000 quads ; écart = écart moyen à la surface d'entrée en millièmes de la diagonale ; trous p99 = distance (référence vers quads) au 99e centile en millièmes de la diagonale (une valeur de 50 ou plus signale des morceaux de surface perdus).
+Essais : « prep » = préparation (basic = sharp 35, organic = sharp -1 sans arêtes vives, thr20/50/70 = seuil 20/50/70 degrés, noremesh = do_remesh 0). « scaleX » = scaleFact X. « alphaX » = alpha du flux. « cfg_X » = autre fichier de flux : flow (alignSingularities 1 plus json half), flow_noalign (identique à lemon), mst, r2even (RoundToEven), symmdc (HalfSymmetric), edgethru (EdgeFlow), nodethru, vhalf (flow_virtual_half.json), ilp (Gurobi, absent). align1 = alignSingularities 1.
+
+Les tableaux complets des 228 essais sont en section 3.
+### 1.5 Temps propres, séquentiels [MESURÉ]
+| maillage | prep | étapes 1-2 (s) | étape 3 (s) | quads |
+|---|---|---|---|---|
+| arch_hard | basic | 13,9 | 14,6 | 29 477 |
+| arch_hard | organic | 14,6 | 6,1 | 27 323 |
+| lily_plant | basic | 7,3 | 18,5 | 17 068 |
+| lily_plant | organic | 8,1 | 4,8 | 6 504 |
+| eucalyptus_tree | basic | 4,5 | 1,3 | 5 736 |
+| eucalyptus_tree | organic | 4,3 | 1,8 | 9 244 |
+| manny_character | basic | 10,8 | 20,2 | 27 268 |
+| manny_character | organic | 6,7 | 2,2 | 8 008 |
+
+### 1.6 Comparaison à densité égale (10 000 quads visés, scaleFact corrigé en 2 coups) [MESURÉ]
+| maillage | prep | quads | plié % | écrasé % | pôles/1000 | écart ‰diag |
+|---|---|---|---|---|---|---|
+| arch_hard | basic | 10039 | 0.37 | 1.78 | 47.3 | 1.27 |
+| arch_hard | organic | 11441 | 0.06 | 0.54 | 45.1 | 1.37 |
+| arch_hard | thr20 | 10229 | 0.81 | 2.77 | 47.1 | 1.27 |
+| arch_hard | thr70 | 10253 | 0.12 | 0.56 | 55.2 | 1.33 |
+| lily_plant | basic | 11812 | 0.53 | 7.64 | 47.2 | 1.37 |
+| lily_plant | organic | 9528 | 0.96 | 8.78 | 18.7 | 1.59 |
+| lily_plant | thr20 | 12450 | 0.52 | 7.45 | 45.9 | 1.21 |
+| lily_plant | thr70 | 10217 | 0.58 | 5.37 | 27.7 | 1.57 |
+| eucalyptus_tree | basic | 9776 | 0.00 | 0.00 | 4.9 | 1.25 |
+| eucalyptus_tree | organic | 10136 | 0.01 | 0.12 | 5.1 | 1.24 |
+| eucalyptus_tree | thr20 | 9684 | 0.00 | 0.00 | 5.4 | 1.19 |
+| eucalyptus_tree | thr70 | 9776 | 0.00 | 0.00 | 4.9 | 1.25 |
+| manny_character | basic | 19397 | 2.64 | 20.65 | 116.4 | 1.55 |
+| manny_character | organic | 9908 | 0.06 | 0.37 | 18.9 | 1.49 |
+| manny_character | thr20 | 40096 | 3.02 | 26.56 | 146.5 | 1.50 |
+| manny_character | thr70 | 9959 | 0.15 | 2.40 | 31.3 | 1.49 |
+Le scaleFact de la base ne compare pas honnêtement les préparations (elles donnent 4 775 à 56 156 quads) : ce tableau le fait. Manny en basic ne descend pas sous environ 17 500 quads (1 894 patchs : plancher d'environ 10 quads par patch).
+
+### 1.7 Fidélité aux arêtes vives (arche, seuil de référence 35 degrés ; part des échantillons d'arêtes vives de l'entrée à moins de 0,1 / 0,25 longueur d'arête d'une arête de quad) [MESURÉ]
+| préparation | quads | à 0,1 e | à 0,25 e |
+|---|---|---|---|
+| basic (35) | 29 477 | 98,7 % | 99,9 % |
+| thr20 | 30 312 | 99,7 % | 100 % |
+| thr50 | 27 050 | 57,6 % | 74,5 % |
+| thr70 | 28 185 | 46,0 % | 66,2 % |
+| organic (-1) | 27 323 | 4,5 % | 31,0 % |
+| noremesh (35) | 6 696 | 97,8 % | 100 % |
+Le hasard donnerait environ 20 % à 0,1 e et 50 % à 0,25 e : organic ne conserve donc pas les arêtes de l'arche. Pour du hard surface, le seuil doit rester à 35 ou moins.
+
+## 2. Meilleure configuration par famille et ce qui se dégrade
+
+### Organique (Manny, eucalyptus, lys)
+- Préparation : organic (sharp_feature_thr -1, alpha de prep sans effet). Manny : 213 patchs au lieu de 1 894, écrasé 0,41 % au lieu de 13,75 %, pôles 23 au lieu de 83, temps 5 s au lieu de 30 s ; à densité égale (10 000 quads) 0,37 % écrasé et 18,9 pôles/1000 contre 20,65 % et 116 pour basic. Eucalyptus : équivalent (basic déjà à 0 % écrasé, organic 0,12 %, 5,1 pôles). Lys : pas de gagnant net (lames fines) : à 10 000 quads organic 18,7 pôles et 8,8 % écrasé, basic 47 pôles et 7,6 %, thr70 27,7 pôles et 5,4 % (meilleur écrasé).
+- Flux : flow_noalign_lemon par défaut. Alternatives : flow_noalign_approx_symmdc donne plus de quads (+2 à +68 %) et moins de pôles (50 contre 83 sur Manny basic) mais écrasés légèrement plus élevés ; approx_mst et approx_round2even sont les plus rapides sur Manny basic (10 s contre 28 s) pour une qualité proche.
+- Alpha : 0,001 rend la base ; 0,02 à 0,05 : arche, eucalyptus et lys à +/- 5 % de quads, Manny basic -13 à -22 % ; plus haut (0,3) réduit les quads de 20 à 38 % sur Manny basic, ajoute des pôles (112 contre 83) mais réduit l'écrasé (8,3 % contre 13,8 %).
+- Ce qui se dégrade : sans arêtes vives, les zones qui se touchent à angle vif se lissent (lys : lames fines, écrasé > 5 % à toute densité ; trous de surface dès scaleFact 1,5 (organic) ou 2 (basic), 58 millièmes de diagonale) ; scaleFact élevé fait chuter la valence 4 et monte les pôles (Manny organic scale 3 : 117 pôles/1000).
+
+### Hard surface (arche)
+- Préparation : basic ou Mechanical (sharp 35, thr20 pour tenir les arêtes plus douces). Fidélité d'arêtes 98,7 % à 99,7 %, au prix de plus d'écrasés (0,84 % à 0,92 %, plié 0,16 % à 0,20 %) et 620 à 674 patchs.
+- thr70 est le meilleur compromis plié / écrasé (0,04 % / 0,16 %) mais perd la moitié des arêtes (46 % à 0,1 e). organic est le plus propre (0,02 % / 0,25 %) mais ne tient plus les arêtes (4,5 %) : à n'utiliser que pour des surfaces douces.
+- Flux : flow_noalign_lemon ; approx_mst (plié 0,08 % / écrasé 0,60 %, +2 % quads) est le meilleur sur l'arche ; approx_round2even ajoute 14 % de quads et dégrade (écrasé 1,25 %).
+- alpha 0,1 à 0,3 : écrasé 0,44 % et 0,43 % contre 0,84 %, plié 0,09 % et 0,08 % contre 0,16 %, pôles +6 % à +21 %, quads +4 %.
+- Ce qui se dégrade : do_remesh 0 (noremesh) dégrade fortement (arche 6 696 quads, 8,8 % écrasé, 75 pôles/1000 ; noremesh organic 16,1 % écrasé, écart 4 millièmes, trous 77 millièmes) : le remaillage isotrope préalable est indispensable.
+
+### Valeurs sans effet ou à éviter
+alpha 1,0 : échec dans tous les cas (« approximation result infeasible », régularité de poids 0). cfg ilp : échec (« built without Gurobi »). edgethru (EdgeFlow) : plus de 900 s (arrêté) sur lys basic, lys organic, Manny basic ; 839 s sur Manny organic ; mêmes quads que lemon sur arche et eucalyptus : à proscrire. nodethru et flow_noalign sont identiques à lemon. thr20 sur Manny : 141 s et 4 856 patchs (le pire cas du banc).
+
+## 3. Tableaux complets (228 essais)
+
+### arch_hard
+
+prep basic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 31.24 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.09 | 1.63 |
+| scale0.5 | 66.29 | 111102 | 620 | 0.04 | 0.26 | 99.6 | 4.3 | 1.26 | 3.04 | 1.57 |
+| scale0.7 | 44.13 | 57597 | 620 | 0.07 | 0.41 | 99.2 | 8.3 | 1.27 | 3.05 | 1.37 |
+| scale1.5 | 21.21 | 14028 | 620 | 0.29 | 1.23 | 96.6 | 33.9 | 1.27 | 3.04 | 1.54 |
+| scale2 | 15.27 | 8820 | 620 | 0.42 | 2.23 | 94.6 | 53.9 | 1.28 | 3.07 | 1.81 |
+| scale3 | 11.6 | 5029 | 620 | 1.01 | 3.72 | 90.6 | 95.0 | 1.27 | 3.08 | 2.53 |
+| alpha0.001 | 31.27 | 29750 | 620 | 0.17 | 0.82 | 98.4 | 16.0 | 1.27 | 3.07 | 1.63 |
+| alpha0.02 | 31.13 | 30197 | 620 | 0.13 | 0.67 | 98.4 | 16.0 | 1.27 | 3.11 | 1.64 |
+| alpha0.05 | 30.84 | 30183 | 620 | 0.13 | 0.73 | 98.4 | 16.3 | 1.26 | 3.09 | 1.64 |
+| alpha0.1 | 30.39 | 30629 | 620 | 0.09 | 0.44 | 98.3 | 17.0 | 1.27 | 3.04 | 1.65 |
+| alpha0.3 | 30.62 | 30577 | 620 | 0.08 | 0.43 | 98.0 | 19.5 | 1.27 | 3.05 | 1.64 |
+| alpha1.0 | 0.14 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 30.24 | 29440 | 620 | 0.16 | 0.87 | 98.4 | 16.1 | 1.27 | 3.09 | 1.62 |
+| cfg_flow_noalign | 29.63 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.26 | 3.02 | 1.63 |
+| cfg_mst | 28.65 | 30134 | 620 | 0.08 | 0.60 | 98.4 | 15.8 | 1.27 | 3.05 | 1.64 |
+| cfg_r2even | 29.43 | 33540 | 620 | 0.27 | 1.25 | 98.6 | 14.3 | 1.27 | 3.05 | 1.7 |
+| cfg_symmdc | 28.74 | 30156 | 620 | 0.20 | 1.16 | 98.4 | 16.0 | 1.27 | 3.04 | 1.64 |
+| cfg_edgethru | 28.3 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.09 | 1.63 |
+| cfg_nodethru | 28.2 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.07 | 1.63 |
+| cfg_vhalf | 29.51 | 29464 | 620 | 0.16 | 0.87 | 98.4 | 16.1 | 1.27 | 3.06 | 1.63 |
+| cfg_ilp | 0.16 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 28.63 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.04 | 1.63 |
+| reg_nonq0 | 29.08 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.02 | 1.63 |
+| iso0 | 28.63 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.26 | 3.10 | 1.63 |
+| parity0 | 29.0 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.05 | 1.63 |
+| align1 | 29.07 | 29429 | 620 | 0.15 | 0.74 | 98.4 | 16.1 | 1.27 | 3.05 | 1.62 |
+
+prep organic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 11.72 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.11 | 1.33 |
+| scale0.5 | 27.74 | 94432 | 580 | 0.00 | 0.14 | 99.5 | 5.5 | 1.31 | 3.10 | 1.31 |
+| scale0.7 | 17.6 | 50870 | 580 | 0.01 | 0.14 | 99.0 | 10.1 | 1.32 | 3.08 | 1.3 |
+| scale1.5 | 7.59 | 14682 | 580 | 0.05 | 0.41 | 96.5 | 35.1 | 1.35 | 3.24 | 1.41 |
+| scale2 | 6.47 | 10650 | 580 | 0.08 | 0.62 | 95.2 | 48.5 | 1.38 | 3.29 | 1.55 |
+| scale3 | 5.6 | 7640 | 580 | 0.14 | 1.03 | 93.3 | 67.1 | 1.41 | 3.49 | 1.96 |
+| alpha0.001 | 10.92 | 27562 | 580 | 0.02 | 0.25 | 98.1 | 18.7 | 1.33 | 3.07 | 1.34 |
+| alpha0.02 | 11.21 | 26324 | 580 | 0.02 | 0.25 | 98.1 | 19.4 | 1.33 | 3.16 | 1.3 |
+| alpha0.05 | 10.48 | 25290 | 580 | 0.02 | 0.26 | 98.0 | 20.1 | 1.34 | 3.14 | 1.28 |
+| alpha0.1 | 10.54 | 24412 | 580 | 0.02 | 0.25 | 98.0 | 20.3 | 1.34 | 3.19 | 1.27 |
+| alpha0.3 | 10.59 | 23728 | 580 | 0.00 | 0.17 | 97.8 | 22.4 | 1.33 | 3.14 | 1.24 |
+| alpha1.0 | 0.19 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 12.0 | 27596 | 580 | 0.03 | 0.30 | 98.1 | 18.6 | 1.33 | 3.12 | 1.33 |
+| cfg_flow_noalign | 11.65 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.10 | 1.33 |
+| cfg_mst | 11.47 | 28537 | 580 | 0.00 | 0.27 | 98.2 | 18.1 | 1.33 | 3.09 | 1.35 |
+| cfg_r2even | 11.41 | 27925 | 580 | 0.02 | 0.24 | 98.2 | 18.4 | 1.33 | 3.12 | 1.35 |
+| cfg_symmdc | 12.94 | 34560 | 580 | 0.03 | 0.43 | 98.5 | 15.0 | 1.33 | 3.12 | 1.47 |
+| cfg_edgethru | 11.28 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.17 | 1.33 |
+| cfg_nodethru | 10.88 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.34 | 3.11 | 1.33 |
+| cfg_vhalf | 11.24 | 27433 | 580 | 0.02 | 0.31 | 98.1 | 18.8 | 1.33 | 3.16 | 1.38 |
+| cfg_ilp | 0.13 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 11.11 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.11 | 1.33 |
+| reg_nonq0 | 11.51 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.34 | 3.13 | 1.33 |
+| iso0 | 11.66 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.16 | 1.33 |
+| parity0 | 11.66 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.34 | 3.08 | 1.33 |
+| align1 | 11.62 | 27210 | 580 | 0.03 | 0.31 | 98.1 | 18.9 | 1.33 | 3.15 | 1.4 |
+
+prep variants (flow de base)
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| basic | 31.24 | 29477 | 620 | 0.16 | 0.84 | 98.4 | 16.1 | 1.27 | 3.09 | 1.63 |
+| organic | 11.72 | 27323 | 580 | 0.02 | 0.25 | 98.1 | 18.9 | 1.33 | 3.11 | 1.33 |
+| thr20 | 33.35 | 30312 | 674 | 0.20 | 0.92 | 98.4 | 15.9 | 1.27 | 3.05 | 1.65 |
+| thr50 | 14.92 | 27050 | 445 | 0.16 | 0.72 | 98.1 | 18.7 | 1.30 | 3.03 | 1.51 |
+| thr70 | 14.61 | 28185 | 493 | 0.04 | 0.16 | 98.0 | 20.1 | 1.30 | 3.05 | 1.65 |
+| noremesh | 3.53 | 6696 | 644 | 2.20 | 8.83 | 92.6 | 75.0 | 1.47 | 3.23 | 2.37 |
+| noremesh_org | 1.72 | 4775 | 301 | 1.51 | 16.06 | 93.2 | 68.9 | 4.04 | 77.59 | 3.05 |
+
+### lily_plant
+
+prep basic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 37.23 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.31 | 5.77 | 2.2 |
+| scale0.5 | 59.67 | 50265 | 941 | 0.13 | 2.07 | 98.8 | 10.1 | 1.25 | 3.67 | 2.33 |
+| scale0.7 | 42.98 | 27595 | 941 | 0.24 | 3.24 | 97.8 | 18.4 | 1.29 | 3.89 | 2.78 |
+| scale1.5 | 26.27 | 10839 | 941 | 0.58 | 8.62 | 93.5 | 49.5 | 1.38 | 6.48 | 2.28 |
+| scale2 | 23.41 | 8286 | 941 | 0.76 | 10.57 | 91.7 | 62.4 | 1.31 | 58.86 | 2.16 |
+| scale3 | 18.0 | 6031 | 941 | 1.19 | 15.39 | 88.4 | 84.1 | 1.37 | 58.29 | 2.32 |
+| alpha0.001 | 33.56 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.31 | 5.82 | 2.2 |
+| alpha0.02 | 33.24 | 16909 | 941 | 0.38 | 5.01 | 96.0 | 31.4 | 1.30 | 6.15 | 2.19 |
+| alpha0.05 | 30.2 | 16321 | 941 | 0.43 | 4.82 | 95.8 | 32.7 | 1.30 | 5.91 | 2.15 |
+| alpha0.1 | 27.11 | 15549 | 941 | 0.72 | 4.94 | 95.3 | 36.1 | 1.31 | 6.01 | 2.1 |
+| alpha0.3 | 25.71 | 14679 | 941 | 1.07 | 4.86 | 94.5 | 42.3 | 1.31 | 5.98 | 2.07 |
+| alpha1.0 | 0.1 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 35.74 | 17107 | 941 | 0.39 | 5.44 | 96.0 | 31.4 | 1.30 | 6.02 | 2.19 |
+| cfg_flow_noalign | 28.13 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.32 | 5.80 | 2.2 |
+| cfg_mst | 23.37 | 17703 | 941 | 0.43 | 5.64 | 96.1 | 31.3 | 1.31 | 6.12 | 2.23 |
+| cfg_r2even | 26.66 | 23613 | 941 | 0.27 | 6.30 | 97.0 | 24.9 | 1.32 | 6.18 | 2.26 |
+| cfg_symmdc | 24.93 | 21080 | 941 | 0.46 | 6.92 | 96.9 | 25.4 | 1.31 | 5.97 | 2.44 |
+| cfg_edgethru | 900.03 | FAIL rc=-9 | | | | | | | | |
+| cfg_nodethru | 27.76 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.31 | 5.79 | 2.2 |
+| cfg_vhalf | 40.58 | 17103 | 941 | 0.40 | 5.40 | 96.0 | 31.7 | 1.31 | 6.06 | 2.19 |
+| cfg_ilp | 0.1 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 27.97 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.32 | 5.78 | 2.2 |
+| reg_nonq0 | 27.88 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.32 | 5.73 | 2.2 |
+| iso0 | 27.82 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.32 | 5.82 | 2.2 |
+| parity0 | 27.62 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.31 | 5.79 | 2.2 |
+| align1 | 26.51 | 17237 | 941 | 0.39 | 5.46 | 96.1 | 30.7 | 1.31 | 5.98 | 2.19 |
+
+prep organic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 9.15 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.60 | 6.80 | 2.69 |
+| scale0.5 | 14.75 | 23608 | 280 | 0.47 | 5.14 | 99.3 | 5.7 | 1.34 | 4.85 | 2.74 |
+| scale0.7 | 10.03 | 13044 | 280 | 0.59 | 6.20 | 98.1 | 14.1 | 1.39 | 5.79 | 2.13 |
+| scale1.5 | 4.79 | 3602 | 280 | 2.03 | 13.77 | 93.0 | 39.4 | 1.54 | 59.10 | 2.07 |
+| scale2 | 3.79 | 2442 | 280 | 3.15 | 16.63 | 91.5 | 45.0 | 1.59 | 58.40 | 1.86 |
+| scale3 | 2.8 | 1600 | 280 | 5.63 | 20.44 | 86.5 | 67.5 | 1.70 | 59.94 | 2.02 |
+| alpha0.001 | 6.67 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.60 | 6.72 | 2.69 |
+| alpha0.02 | 6.51 | 6450 | 280 | 1.26 | 10.29 | 96.7 | 21.2 | 1.60 | 6.68 | 2.68 |
+| alpha0.05 | 6.44 | 6275 | 280 | 1.34 | 9.88 | 96.8 | 20.1 | 1.60 | 6.64 | 2.64 |
+| alpha0.1 | 6.4 | 6097 | 280 | 1.43 | 9.32 | 96.2 | 24.1 | 1.60 | 6.85 | 2.61 |
+| alpha0.3 | 6.47 | 5927 | 280 | 1.05 | 9.11 | 94.0 | 36.9 | 1.60 | 6.53 | 2.59 |
+| alpha1.0 | 0.05 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 7.43 | 6359 | 280 | 1.27 | 10.50 | 96.5 | 22.3 | 1.60 | 6.60 | 2.66 |
+| cfg_flow_noalign | 6.61 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.61 | 6.48 | 2.69 |
+| cfg_mst | 6.01 | 6461 | 280 | 1.18 | 10.40 | 95.2 | 30.8 | 1.61 | 6.72 | 2.69 |
+| cfg_r2even | 6.56 | 8143 | 280 | 1.51 | 9.63 | 95.6 | 30.8 | 1.37 | 6.62 | 1.78 |
+| cfg_symmdc | 6.23 | 7084 | 280 | 1.69 | 12.27 | 96.1 | 25.8 | 1.60 | 6.45 | 2.83 |
+| cfg_edgethru | 900.03 | FAIL rc=-9 | | | | | | | | |
+| cfg_nodethru | 6.54 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.60 | 6.60 | 2.69 |
+| cfg_vhalf | 7.47 | 6420 | 280 | 1.32 | 10.26 | 96.9 | 19.9 | 1.60 | 6.79 | 2.67 |
+| cfg_ilp | 0.06 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 6.59 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.60 | 6.74 | 2.69 |
+| reg_nonq0 | 6.6 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.61 | 6.55 | 2.69 |
+| iso0 | 6.62 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.61 | 6.62 | 2.69 |
+| parity0 | 6.63 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.61 | 6.60 | 2.69 |
+| align1 | 6.68 | 6497 | 280 | 1.26 | 10.27 | 97.0 | 19.1 | 1.60 | 6.72 | 2.69 |
+
+prep variants (flow de base)
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| basic | 37.23 | 17068 | 941 | 0.38 | 5.04 | 95.9 | 32.4 | 1.31 | 5.77 | 2.2 |
+| organic | 9.15 | 6504 | 280 | 1.32 | 10.39 | 96.4 | 23.7 | 1.60 | 6.80 | 2.69 |
+| thr20 | 43.89 | 18697 | 1096 | 0.31 | 4.69 | 96.2 | 30.5 | 1.19 | 3.58 | 2.24 |
+| thr50 | 23.68 | 12944 | 651 | 0.52 | 6.63 | 95.0 | 38.2 | 1.50 | 5.84 | 3.47 |
+| thr70 | 16.7 | 10422 | 444 | 0.59 | 5.31 | 96.2 | 28.1 | 1.56 | 6.70 | 3.28 |
+| noremesh | 29.15 | 13734 | 996 | 0.23 | 6.79 | 94.8 | 40.7 | 1.37 | 6.23 | 2.19 |
+| noremesh_org | 5.81 | 4004 | 251 | 0.62 | 2.70 | 96.0 | 22.5 | 1.62 | 6.77 | 2.13 |
+
+### eucalyptus_tree
+
+prep basic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 1.77 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.87 | 1.84 |
+| scale0.5 | 4.75 | 22658 | 58 | 0.00 | 0.00 | 99.8 | 2.1 | 1.21 | 2.86 | 1.79 |
+| scale0.7 | 2.8 | 11737 | 58 | 0.00 | 0.00 | 99.6 | 4.1 | 1.24 | 2.80 | 1.75 |
+| scale1.5 | 1.07 | 2975 | 58 | 0.00 | 0.00 | 98.4 | 16.1 | 1.45 | 2.99 | 1.78 |
+| scale2 | 0.86 | 1982 | 58 | 0.05 | 0.10 | 97.6 | 24.2 | 1.64 | 3.22 | 1.94 |
+| scale3 | 0.69 | 1370 | 58 | 0.07 | 0.15 | 96.5 | 35.0 | 1.66 | 3.28 | 1.62 |
+| alpha0.001 | 1.71 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.83 | 1.84 |
+| alpha0.02 | 1.74 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.88 | 1.84 |
+| alpha0.05 | 1.75 | 5944 | 58 | 0.00 | 0.00 | 99.1 | 9.4 | 1.30 | 2.89 | 1.69 |
+| alpha0.1 | 1.74 | 5831 | 58 | 0.00 | 0.00 | 98.8 | 11.7 | 1.31 | 2.88 | 2.08 |
+| alpha0.3 | 1.83 | 6292 | 58 | 0.00 | 0.06 | 98.9 | 11.4 | 1.30 | 2.84 | 2.11 |
+| alpha1.0 | 0.04 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 1.76 | 6202 | 58 | 0.00 | 0.00 | 99.2 | 7.7 | 1.29 | 2.82 | 1.75 |
+| cfg_flow_noalign | 1.7 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.86 | 1.84 |
+| cfg_mst | 1.82 | 6243 | 58 | 0.00 | 0.00 | 99.2 | 7.7 | 1.30 | 2.87 | 1.84 |
+| cfg_r2even | 1.68 | 5799 | 58 | 0.00 | 0.00 | 99.2 | 8.3 | 1.32 | 2.85 | 1.75 |
+| cfg_symmdc | 1.86 | 6873 | 58 | 0.01 | 0.01 | 99.3 | 7.0 | 1.29 | 2.89 | 2.01 |
+| cfg_edgethru | 1.71 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.85 | 1.84 |
+| cfg_nodethru | 1.66 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.86 | 1.84 |
+| cfg_vhalf | 1.77 | 6094 | 58 | 0.00 | 0.00 | 99.2 | 7.9 | 1.30 | 2.87 | 1.73 |
+| cfg_ilp | 0.04 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 1.69 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.87 | 1.84 |
+| reg_nonq0 | 1.73 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.32 | 2.88 | 1.84 |
+| iso0 | 1.77 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.32 | 2.90 | 1.84 |
+| parity0 | 1.74 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.32 | 2.85 | 1.84 |
+| align1 | 1.72 | 6202 | 58 | 0.00 | 0.00 | 99.2 | 7.7 | 1.28 | 2.87 | 1.75 |
+
+prep organic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 2.46 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.25 | 1.59 |
+| scale0.5 | 7.07 | 34079 | 59 | 0.01 | 0.25 | 99.9 | 1.5 | 1.22 | 3.11 | 1.7 |
+| scale0.7 | 4.22 | 17902 | 59 | 0.01 | 0.12 | 99.7 | 2.9 | 1.22 | 3.17 | 1.66 |
+| scale1.5 | 1.43 | 4464 | 59 | 0.00 | 0.20 | 98.8 | 11.6 | 1.30 | 3.66 | 1.39 |
+| scale2 | 1.09 | 2888 | 59 | 0.00 | 0.55 | 98.2 | 18.0 | 1.35 | 4.37 | 1.42 |
+| scale3 | 0.86 | 1678 | 59 | 0.00 | 1.25 | 96.9 | 31.0 | 1.54 | 5.50 | 1.58 |
+| alpha0.001 | 2.4 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.26 | 3.30 | 1.59 |
+| alpha0.02 | 2.47 | 9138 | 59 | 0.02 | 0.09 | 99.4 | 5.7 | 1.25 | 3.34 | 1.63 |
+| alpha0.05 | 2.49 | 8884 | 59 | 0.02 | 0.09 | 99.4 | 5.9 | 1.26 | 3.32 | 1.72 |
+| alpha0.1 | 2.56 | 9156 | 59 | 0.02 | 0.10 | 99.4 | 6.1 | 1.25 | 3.30 | 1.44 |
+| alpha0.3 | 2.55 | 8969 | 59 | 0.00 | 0.07 | 99.3 | 6.7 | 1.26 | 3.27 | 1.37 |
+| alpha1.0 | 0.05 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 2.54 | 9430 | 59 | 0.02 | 0.12 | 99.5 | 5.5 | 1.24 | 3.31 | 1.47 |
+| cfg_flow_noalign | 2.58 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.32 | 1.59 |
+| cfg_mst | 2.56 | 9014 | 59 | 0.01 | 0.13 | 99.4 | 5.8 | 1.24 | 3.40 | 1.57 |
+| cfg_r2even | 2.53 | 9310 | 59 | 0.02 | 0.12 | 99.4 | 5.6 | 1.24 | 3.43 | 1.45 |
+| cfg_symmdc | 2.71 | 10173 | 59 | 0.01 | 0.07 | 99.5 | 5.1 | 1.24 | 3.24 | 1.45 |
+| cfg_edgethru | 2.52 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.39 | 1.59 |
+| cfg_nodethru | 2.59 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.29 | 1.59 |
+| cfg_vhalf | 3.11 | 11306 | 59 | 0.02 | 0.98 | 99.5 | 4.6 | 1.24 | 3.71 | 1.95 |
+| cfg_ilp | 0.07 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 2.59 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.31 | 1.59 |
+| reg_nonq0 | 2.64 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.25 | 1.59 |
+| iso0 | 2.69 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.36 | 1.59 |
+| parity0 | 2.63 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.26 | 3.33 | 1.59 |
+| align1 | 2.58 | 9430 | 59 | 0.02 | 0.12 | 99.5 | 5.5 | 1.24 | 3.24 | 1.47 |
+
+prep variants (flow de base)
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| basic | 1.77 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.87 | 1.84 |
+| organic | 2.46 | 9244 | 59 | 0.02 | 0.11 | 99.4 | 5.6 | 1.25 | 3.25 | 1.59 |
+| thr20 | 4.61 | 10094 | 117 | 0.00 | 0.00 | 99.5 | 5.2 | 1.19 | 2.80 | 2.05 |
+| thr50 | 1.67 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.32 | 2.88 | 1.84 |
+| thr70 | 1.78 | 5736 | 58 | 0.00 | 0.00 | 99.2 | 8.4 | 1.31 | 2.82 | 1.84 |
+| noremesh | 1.36 | 4656 | 56 | 0.00 | 0.02 | 99.0 | 10.3 | 1.37 | 3.00 | 1.8 |
+| noremesh_org | 1.54 | 5382 | 104 | 0.00 | 0.00 | 99.1 | 9.3 | 1.42 | 7.80 | 1.66 |
+
+### manny_character
+
+prep basic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 29.26 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.46 | 3.40 | 2.44 |
+| scale0.5 | 47.08 | 66808 | 1894 | 0.36 | 6.22 | 96.5 | 33.8 | 1.45 | 3.34 | 2.01 |
+| scale0.7 | 36.48 | 40426 | 1894 | 0.72 | 9.22 | 94.1 | 55.9 | 1.45 | 3.41 | 2.14 |
+| scale1.5 | 29.78 | 20983 | 1894 | 2.27 | 18.70 | 88.4 | 107.6 | 1.51 | 3.41 | 2.91 |
+| scale2 | 29.69 | 19151 | 1894 | 2.75 | 21.07 | 87.3 | 117.9 | 1.55 | 3.62 | 3.33 |
+| scale3 | 31.35 | 17574 | 1894 | 3.29 | 23.43 | 86.2 | 128.4 | 1.68 | 3.99 | 4.12 |
+| alpha0.001 | 28.88 | 27782 | 1894 | 1.37 | 13.71 | 91.3 | 81.5 | 1.46 | 3.39 | 2.44 |
+| alpha0.02 | 26.61 | 23767 | 1894 | 1.43 | 13.50 | 89.9 | 94.0 | 1.46 | 3.38 | 2.25 |
+| alpha0.05 | 23.87 | 21220 | 1894 | 1.75 | 12.72 | 88.9 | 103.1 | 1.47 | 3.40 | 2.09 |
+| alpha0.1 | 25.65 | 19142 | 1894 | 1.90 | 11.36 | 88.1 | 109.6 | 1.47 | 3.38 | 1.95 |
+| alpha0.3 | 24.0 | 17042 | 1894 | 2.33 | 8.33 | 87.8 | 112.2 | 1.47 | 3.42 | 1.86 |
+| alpha1.0 | 0.12 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 51.79 | 27313 | 1894 | 1.43 | 13.98 | 91.2 | 82.7 | 1.46 | 3.45 | 2.44 |
+| cfg_flow_noalign | 28.18 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.46 | 3.36 | 2.44 |
+| cfg_mst | 10.26 | 29464 | 1894 | 1.47 | 15.23 | 91.9 | 76.6 | 1.46 | 3.39 | 2.51 |
+| cfg_r2even | 10.21 | 28753 | 1894 | 1.28 | 13.76 | 91.6 | 78.7 | 1.46 | 3.39 | 2.48 |
+| cfg_symmdc | 13.95 | 45918 | 1894 | 1.49 | 16.21 | 94.8 | 49.6 | 1.47 | 3.39 | 2.95 |
+| cfg_edgethru | 900.03 | FAIL rc=-9 | | | | | | | | |
+| cfg_nodethru | 28.07 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.47 | 3.40 | 2.44 |
+| cfg_vhalf | 64.29 | 27167 | 1894 | 1.42 | 14.08 | 91.1 | 83.1 | 1.46 | 3.42 | 2.44 |
+| cfg_ilp | 0.09 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 29.15 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.47 | 3.39 | 2.44 |
+| reg_nonq0 | 29.22 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.47 | 3.38 | 2.44 |
+| iso0 | 29.22 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.46 | 3.37 | 2.44 |
+| parity0 | 29.02 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.47 | 3.37 | 2.44 |
+| align1 | 27.71 | 27535 | 1894 | 1.44 | 13.85 | 91.3 | 81.9 | 1.47 | 3.33 | 2.44 |
+
+prep organic
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 3.23 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.50 | 1.75 |
+| scale0.5 | 7.21 | 30767 | 213 | 0.01 | 0.05 | 99.4 | 6.1 | 1.44 | 3.34 | 1.79 |
+| scale0.7 | 4.43 | 15869 | 213 | 0.03 | 0.13 | 98.7 | 11.8 | 1.47 | 3.38 | 1.76 |
+| scale1.5 | 2.01 | 3990 | 213 | 0.40 | 1.13 | 94.3 | 46.9 | 1.61 | 3.94 | 1.85 |
+| scale2 | 1.69 | 2562 | 213 | 0.86 | 2.26 | 90.6 | 73.0 | 1.76 | 4.56 | 1.94 |
+| scale3 | 1.43 | 1601 | 213 | 1.94 | 4.50 | 83.5 | 116.8 | 2.21 | 6.66 | 2.38 |
+| alpha0.001 | 2.94 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.53 | 1.75 |
+| alpha0.02 | 2.82 | 7982 | 213 | 0.10 | 0.41 | 97.4 | 23.2 | 1.50 | 3.55 | 1.75 |
+| alpha0.05 | 2.68 | 7950 | 213 | 0.10 | 0.35 | 97.4 | 22.6 | 1.50 | 3.53 | 1.74 |
+| alpha0.1 | 2.8 | 7937 | 213 | 0.13 | 0.37 | 97.7 | 20.4 | 1.51 | 3.59 | 1.74 |
+| alpha0.3 | 2.63 | 7849 | 213 | 0.13 | 0.48 | 97.5 | 22.4 | 1.50 | 3.60 | 1.73 |
+| alpha1.0 | 0.05 | FAIL rc=1 | | | | | | | | |
+| cfg_flow | 3.9 | 7835 | 213 | 0.10 | 0.42 | 97.3 | 23.9 | 1.51 | 3.56 | 1.82 |
+| cfg_flow_noalign | 2.87 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.50 | 3.55 | 1.75 |
+| cfg_mst | 2.34 | 8256 | 213 | 0.10 | 0.50 | 97.4 | 22.7 | 1.50 | 3.61 | 1.77 |
+| cfg_r2even | 2.3 | 8248 | 213 | 0.13 | 0.50 | 97.4 | 22.7 | 1.50 | 3.57 | 1.81 |
+| cfg_symmdc | 2.48 | 9018 | 213 | 0.14 | 0.61 | 97.6 | 20.8 | 1.50 | 3.49 | 1.84 |
+| cfg_edgethru | 839.44 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.50 | 1.75 |
+| cfg_nodethru | 2.88 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.50 | 3.57 | 1.75 |
+| cfg_vhalf | 4.68 | 7719 | 213 | 0.18 | 0.60 | 97.2 | 24.2 | 1.52 | 3.63 | 1.89 |
+| cfg_ilp | 0.05 | FAIL rc=1 | | | | | | | | |
+| reg_quads0 | 2.91 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.56 | 1.75 |
+| reg_nonq0 | 2.86 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.50 | 3.51 | 1.75 |
+| iso0 | 2.83 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.56 | 1.75 |
+| parity0 | 2.87 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.54 | 1.75 |
+| align1 | 2.99 | 7943 | 213 | 0.11 | 0.42 | 97.3 | 23.5 | 1.51 | 3.56 | 1.8 |
+
+prep variants (flow de base)
+| essai | s | quads | patchs | plié % | écrasé % | val4 % | pôles/1000 | écart moy ‰diag | trous p99 ‰ | arête p99/moy |
+|---|---|---|---|---|---|---|---|---|---|---|
+| basic | 29.26 | 27268 | 1894 | 1.32 | 13.75 | 91.2 | 82.8 | 1.46 | 3.40 | 2.44 |
+| organic | 3.23 | 8008 | 213 | 0.10 | 0.41 | 97.3 | 23.4 | 1.51 | 3.50 | 1.75 |
+| thr20 | 141.4 | 56156 | 4856 | 1.45 | 17.84 | 89.1 | 104.7 | 1.43 | 3.33 | 2.41 |
+| thr50 | 8.67 | 12451 | 671 | 1.04 | 6.59 | 94.1 | 53.3 | 1.50 | 3.50 | 2.08 |
+| thr70 | 4.12 | 9424 | 334 | 0.15 | 2.56 | 96.3 | 33.1 | 1.50 | 3.48 | 1.86 |
+| noremesh | 55.94 | 37551 | 2529 | 1.20 | 13.96 | 91.0 | 85.0 | 1.55 | 3.81 | 2.22 |
+| noremesh_org | 5.73 | 16214 | 318 | 0.07 | 0.23 | 98.3 | 15.7 | 1.65 | 4.63 | 1.68 |
+
+
+## 4. Densité contrôlée (tâche 2)
+
+### 4.1 Nombre de quads cible ou taille d'arête en mètres [CODE + MESURÉ]
+- Loi : EdgeSize = avgEdge(_rem_p0.obj) x scaleFact (main.cpp l. 204) ; nombre de quads environ A / EdgeSize^2 x k avec k entre 1,0 et 1,3 pour les densités courantes (arche : k = 1,05 à scale 1, 0,99 à 0,5, 1,25 à 2 ; k = N x EdgeSize^2 / A, A = aire de l'entrée). En deçà d'environ 5 à 10 quads par patch (Manny basic, 1 894 patchs : plancher 17 574 quads), le nombre ne baisse plus.
+- Taille d'arête en mètres cible L : scaleFact = L / e0, e0 = longueur moyenne des arêtes du fichier _rem_p0.obj (une lecture de ce fichier, sans lancer l'étape 3 : vérifié égal à « Edge Size » du journal à scaleFact 1, 0,02619 sur l'arche). Les unités sont celles de l'OBJ.
+- Nombre de quads cible N : scaleFact = racine(1,1 x A / N) / e0, puis une correction (scaleFact_2 = scaleFact_1 x racine(quads_1 / N)) car quads varie en scaleFact^-1,9 environ. Résultat [MESURÉ] :
+| maillage | cible | scaleFact 1 coup | quads | erreur | scaleFact 2 coups | quads | erreur |
+|---|---|---|---|---|---|---|---|
+| arch_hard (basic) | 3000 | 3.215 | 4772 | +59.1 % | 4.055 | 3852 | +28.4 % |
+| arch_hard (basic) | 10000 | 1.761 | 10633 | +6.3 % | 1.816 | 10039 | +0.4 % |
+| arch_hard (basic) | 30000 | 1.017 | 28253 | -5.8 % | 0.987 | 30501 | +1.7 % |
+| lily_plant (organic) | 3000 | 1.591 | 3318 | +10.6 % | 1.674 | 3091 | +3.0 % |
+| lily_plant (organic) | 10000 | 0.872 | 8199 | -18.0 % | 0.789 | 9528 | -4.7 % |
+| lily_plant (organic) | 30000 | 0.503 | 23290 | -22.4 % | 0.443 | 30878 | +2.9 % |
+| eucalyptus_tree (organic) | 3000 | 1.629 | 3916 | +30.5 % | 1.862 | 3238 | +7.9 % |
+| eucalyptus_tree (organic) | 10000 | 0.892 | 11468 | +14.7 % | 0.956 | 10136 | +1.4 % |
+| eucalyptus_tree (organic) | 30000 | 0.515 | 32048 | +6.8 % | 0.533 | 30345 | +1.2 % |
+| manny_character (organic) | 3000 | 1.704 | 3305 | +10.2 % | 1.789 | 3021 | +0.7 % |
+| manny_character (organic) | 10000 | 0.933 | 9207 | -7.9 % | 0.896 | 9908 | -0.9 % |
+| manny_character (organic) | 30000 | 0.539 | 26517 | -11.6 % | 0.507 | 29695 | -1.0 % |
+
+Un coup : erreur de 5,8 à 59 % (médiane 10 %) ; deux coups : sous 8 % dans 11 cas sur 12, 28 % à la cible 3 000 sur l'arche (plancher de 620 patchs). Le coût d'un coup est de 2 à 20 s (étape 3 seule, l'étape 1-2 est faite une fois).
+- Outil : /Users/zenray/.claude/tmp/tmp-zenray-meshes/research/retopology-dataset/pass6_tools/density.py (area, mean_edge) et density_test.py (le contrôleur en 2 coups).
+- La densité cible dépend aussi de la préparation : le remaillage visé (étape 1) varie avec la forme (section 5.2), donc calculer e0 sur le _rem_p0.obj de CETTE préparation.
+
+### 4.2 Densité variable par région : ce que le code permet [CODE]
+- Par les configs seules : impossible. Le nombre de côtés d'un patch est longueur de côté / EdgeSize avec le même EdgeSize pour tous (main.cpp l. 206 : un vecteur de taille nombre de patchs rempli d'une seule valeur ; quadwild.cpp pareil). Ni la carte de poids ni un attribut de faces n'existent dans l'interface.
+- L'API le permet déjà : qfp::quadrangulationFromPatches reçoit chartEdgeLength, un vecteur par patch (quad_from_patches.cpp l. 45, 277, 304), et le solveur de flux lit une cible par patch de chaque côté d'un sous-côté (qr_flow.cpp l. 457-466 : left_target et right_target viennent chacun de leur patch ; les cibles différentes sont arbitrées par le coût d'isométrie). L'évaluation (qr_eval_quantization.cpp l. 256) lit aussi une valeur par patch.
+- Correctif minimal proposé (non appliqué, non testé : demande une copie recompilée) pour main.cpp l. 206 :
+```
+// 30 October 2026 : per-patch density. A file <mesh>.weight holds one float per triangle of _rem_p0.obj (1 = default, 2 = quads twice longer, 0.5 = twice denser) ;
+// the weight of a patch is the mean over its triangles. FR : densite par patch, un poids par triangle.
+std::vector<double> edgeFactor(trimeshPartitions.size(), EdgeSize);
+std::vector<float> w = loadFaceWeights(weightFilename);          // size = trimesh.face.size()
+for (size_t p = 0; p < trimeshPartitions.size(); ++p) { double s = 0; for (size_t f : trimeshPartitions[p]) s += w[f]; edgeFactor[p] = EdgeSize * s / trimeshPartitions[p].size(); }
+```
+La carte de poids se peint sur le maillage d'entrée (attribut Houdini), se reporte sur _rem_p0.obj par la plus proche surface. Limites attendues : les patchs sont tracés avant, donc la densité ne déplace pas les patchs ; le raccord entre patchs de densités différentes est limité par la parité (côtés pairs) ; un patch ne peut pas avoir moins de 2 par côté.
+- Palier sans recompilation : traiter des régions séparées (pièces de la voiture) avec un scaleFact par pièce ; les bords ne se raccordent pas (section 5.3).
+
+## 5. Symétrie, composants, pièces (tâche 3)
+
+### 5.1 Symétrie miroir : aucune dans le code [CODE + MESURÉ]
+Grep : ni symétrie ni miroir dans quadwild, field_computation, quadretopology, xfield_tracer (seule une inclusion de vcg symmetry.h dans patch_tracer.h, sans usage). Mesures (part des sommets de sortie qui ont un jumeau miroir à moins d'un quart / d'une demi-longueur d'arête, plan x = 0 ou axe équivalent) :
+| cas | un quart | une demi |
+|---|---|---|
+| arche basic (35), axe x | 77,8 % | 92,7 % |
+| arche organic, meilleur axe | 22,6 % | 70,2 % |
+| Manny organic | 43,6 % | 83,5 % |
+| Manny basic (35) | 40,4 % | 68,8 % |
+La sortie est « à peu près » symétrique : la structure globale suit, la grille se décale d'une fraction de quad.
+- Portes gauche et droite CAR_body_door_L et _R lancées séparément : 39 152 contre 39 330 quads, mêmes 6 patchs et 8 pôles de valence 3, mais seulement 49 % des sommets à un quart d'arête du miroir (96 % à une demi) : même layout, grille déphasée.
+- Les deux portes dans UN SEUL OBJ (deux coques disjointes) : 12 patchs, 57 136 quads dont 28 568 par coque, et la coque droite est le miroir exact de la gauche (100 % des sommets à moins de 0,012 longueur d'arête, plus grand écart 0,0117 e). Le pipeline est déterministe et équivariant au miroir quand la géométrie et l'ordre des sommets sont des images miroir et que le même passage traite les deux. Recette pour des pièces L/R : les fusionner dans un seul OBJ (coques disjointes, QuadWild les traite : 2 composantes de sortie).
+- Recette pour un corps symétrique d'un seul tenant (Manny) [MESURÉ] : couper à x = 0 (découpe de triangles exacte, couture sur le plan), quadrangulariser la moitié (15 680 triangles : 5 741 quads, 118 patchs, écrasé 0,24 %), refléter les quads et souder les sommets à |x| < 0,05 arête : le résultat (11 482 quads, écrasé 0,24 %, plié 0,03 %, écart 1,44 millième, pôles 17,2/1000) est exactement symétrique et la couture est fermée (0 arête ouverte sur le plan ; 12 arêtes non variétés restent à nettoyer à la couture). Les sommets de couture sont à moins de 0,048 arête du plan x = 0 sans contrainte (bords de maillage conservés comme patchs).
+
+### 5.2 Pièces de la voiture : densité explosive sur les coques fines [MESURÉ]
+CAR_body_roof_C (16 688 triangles, aire 3,41, coque fine fermée) : le remaillage monte à 168 802 faces (ExpectedEdgeL, sphéricité faible) et la sortie à 71 436 quads (basic) et 76 243 (organic) ; porte L : 39 152 quads. À scaleFact 3,3 le toit rend 6 681 quads (écrasé 0 %, plié 0 %, 3,3 pôles/1000, 3,7 s) ; à 5 : 3 013 quads. do_remesh 0 : 6 478 quads, 6 patchs, 1,1 s, écrasé 0 %, pôles 1,2/1000 (tient ici parce que le toit est lisse). Pour les pièces de la voiture : toujours fixer scaleFact (ou N cible, section 4) et ne pas se fier à la valeur par défaut. Qualité sur le toit et les portes : 0 % plié, 0 % écrasé, valence 4 à 99,97 %.
+
+### 5.3 Bords de composants imposés : par fichier .sharp [CODE + MESURÉ]
+- Groupes OBJ (g, usemtl) : ignorés (l'importeur OBJ de quadwild les lit sans les conserver). Les 137 groupes de ZenRayCar_v752.obj ne servent donc à rien tels quels ; les coques de la voiture sont de plus des surfaces SANS arête commune (sommets coïncidents sur 65 positions pour quarter_L / shoulder_rear_L, mais découpes différentes, aucune arête partagée après soudure : 0 arête entre groupes) : les composants voisins ne se raccordent pas, QuadWild les quadrangule en coques indépendantes aux bords ouverts (534 à 736 sommets de bord sur la paire soudée) avec des nombres de côtés indépendants.
+- Imposer des bords : fichier .sharp (une ligne « n », puis « type,face,arête, » avec type 0 concave, 1 convexe, indices de face et d'arête du maillage TRIANGULÉ dans l'ordre du fichier) passé en argument de quadwild ; il remplace toute détection automatique (UpdateSharp faux), donc il doit contenir AUSSI les arêtes vives à garder. Générateur : pass6_tools/q3.py write_sharp.
+- Test Manny (coupe à y = 1,444, 175 arêtes imposées) : part de la coupe à moins de 0,1 / 0,3 arête d'une arête de quad : forcé 40,8 % / 90,2 % (346 patchs, 8 639 quads, écrasé 1,24 %), sans fichier avec sharp 35 : 32,7 % / 76,8 %, organic : 17,3 % / 69,6 % ; le hasard donnerait 20 % / 60 %. Le gain est réel mais partiel : le lissage final et le remaillage déplacent la polyligne imposée d'une fraction d'arête.
+- Test arche (coupe à x = -0,46, 29 arêtes) : forcé 63,2 % / 87,4 % contre 70,7 % / 87,9 % pour sharp 35 automatique (la coupe y suit déjà des arêtes vives) et 7,5 % / 47,7 % en organic : imposer remplace bien l'automatique sans gain si elles coïncident.
+- Conclusion : QuadWild n'a pas de « composant imposé » exact ; il garantit les bords ouverts de maillage (conservés comme patchs) et des arêtes vives en bonne partie. Pour des composants nets : un OBJ par composant avec bords ouverts propres, soudé et coupé dans Houdini (même découpage des deux côtés), ou un .sharp complet ; la conformité entre composants voisins n'est pas garantie.
+
+## 6. Défauts rencontrés (tâche 4) [MESURÉ + CODE]
+| cas | symptôme | cause (journal) |
+|---|---|---|
+| alpha 1,0 (8 sur 8) | échec en 0,05 à 0,2 s | « fatal error: approximation result infeasible » : isométrie seule (régularité 1 - alpha = 0) ; rester dans 0,001 à 0,3 |
+| ilp_noalign (8 sur 8) | échec en 0,05 s | « built without Gurobi. Please select another solver » : useFlowSolver 0 inutilisable |
+| flow_noalign_edgethru (lys x2, Manny basic ; Manny organic 839 s) | plus de 900 s, arrêté | « refinement max deviation = 2 », raffinement du flux avec limite EdgeFlow, sans convergence ; arche et eucalyptus : 28 et 2 s |
+| Manny basic (sharp 35) | 1 894 patchs, 13,75 % écrasé, 83 pôles | le seuil 35 degrés crée des arêtes vives dans le modelé du corps ; utiliser organic |
+| Manny thr20 | 141 s, 4 856 patchs, 17,8 % écrasé | trop d'arêtes vives |
+| do_remesh 0 | arche 8,8 % écrasé ; arche organic 16,1 % écrasé et trous de surface (77 millièmes) | champ calculé sur le maillage brut |
+| lys scaleFact >= 2 | trous de surface (59 millièmes de diagonale au 99e centile) | lames fines perdues quand EdgeSize dépasse leur largeur |
+| coques fines (toit, portes) | 40 000 à 76 000 quads, remaillage à 170 000 faces | ExpectedEdgeL (sphéricité faible) ; fixer scaleFact |
+| pièces à bords ouverts | sommets de bord non raccordés entre pièces | chaque coque est quadrangulée seule |
+Aucune sortie vide ni plantage (code de sortie 139 ou autre) dans les 228 essais du banc ; aucun patch non quadrangulable déclaré. Le temps excessif est le seul risque réel (edgethru, thr20 sur Manny), à borner par un délai (le banc utilise 900 s).
+
+## 7. Réglages recommandés (à transmettre au lanceur)
+- Organique : prep organic (sharp_feature_thr -1), flux flow_noalign_lemon, alpha 0,005 à 0,05, scaleFact calculé par la section 4.
+- Hard surface : prep basic (sharp 35, 20 si les arêtes sont douces), flux flow_noalign_approx_mst si plié < 0,1 % visé, alpha 0,1 pour moins d'écrasés ; remaillage actif obligatoire.
+- Toujours : jamais edgethru, jamais alpha 1, jamais ilp ; borner à 900 s ; mesurer le scaleFact par e0 du _rem_p0.obj.

@@ -1,0 +1,34 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.dont_write_bytecode=True
+import diag, numpy as np
+rng=np.random.default_rng(0)
+# 1. identity : Verdict principal axes normal = 2 * diagonals normal
+P=rng.normal(size=(1000,4,3)); e=[P[:,(k+1)%4]-P[:,k] for k in range(4)]; p0=e[0]-e[2]; p1=e[1]-e[3]; nV=np.cross(p0,p1); nD=np.cross(P[:,2]-P[:,0],P[:,3]-P[:,1])
+print('Verdict center normal / diagonal normal ratio (should be 2):',np.round(np.linalg.norm(nV,axis=1)/np.linalg.norm(nD,axis=1),6)[:3],'max deviation from 2:',float(np.abs(np.linalg.norm(nV,axis=1)/np.linalg.norm(nD,axis=1)-2).max()),'| parallel:',bool(np.allclose(np.cross(nV,nD),0,atol=1e-9)))
+# 2. sum of the four unnormalised corner cross products e3 x e0 + e0 x e1 + e1 x e2 + e2 x e3
+cs=[np.cross(e[3],e[0]),np.cross(e[0],e[1]),np.cross(e[1],e[2]),np.cross(e[2],e[3])]; S=sum(cs); print('sum of the four corner cross products / diagonal normal :',np.round(np.linalg.norm(S,axis=1)/np.linalg.norm(nD,axis=1),6)[:3],'parallel:',bool(np.allclose(np.cross(S,nD),0,atol=1e-9)))
+def jmin(Pq,nm):
+    j=np.empty((len(Pq),4))
+    for k in range(4):
+        u=Pq[:,(k+1)%4]-Pq[:,k]; v=Pq[:,(k-1)%4]-Pq[:,k]; j[:,k]=np.einsum('ij,ij->i',np.cross(u,v),nm)/np.maximum(np.linalg.norm(u,axis=1)*np.linalg.norm(v,axis=1),1e-12)
+    return j.min(1)
+def normed(a): return a/np.maximum(np.linalg.norm(a,axis=1,keepdims=True),1e-12)
+def run(obj,edge,o):
+    m=diag.AP.mesh(os.path.abspath(obj)); zones=diag.ANY.segment(m,25.0,max(4,int(0.002*len(m['F']))),merge_deg=35.0,log=lambda s:None); acc=np.zeros((4,3),int); tot=0; warp=[]
+    for k,(Z,seed) in enumerate(zones):
+        try: r,err=diag.fill4(m,Z,edge,o)
+        except Exception: continue
+        if r is None: continue
+        Q=r['Q']; Pq=r['P3r'][Q]; tot+=len(Q); eq=[Pq[:,(k+1)%4]-Pq[:,k] for k in range(4)]
+        n0=normed(np.cross(Pq[:,1]-Pq[:,0],Pq[:,3]-Pq[:,0])); nd=normed(np.cross(Pq[:,2]-Pq[:,0],Pq[:,3]-Pq[:,1]))
+        nc=normed(sum(normed(c) for c in [np.cross(eq[3],eq[0]),np.cross(eq[0],eq[1]),np.cross(eq[1],eq[2]),np.cross(eq[2],eq[3])]))
+        ns=normed(r['Nz'][r['tri_of']][Q].mean(1))
+        for i,nm in enumerate((n0,nd,nc,ns)):
+            jm=jmin(Pq,nm); acc[i]+=[int((jm<0).sum()),int((jm<0.3).sum()),int((jm<0.5).sum())]
+        warp+=list(np.degrees(np.arccos(np.clip(np.einsum('ij,ij->i',n0,nd),-1,1))))
+    return tot,acc,np.array(warp)
+S='/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt'
+for name,path,edge in (('arch',S+'/arch_hard.obj',0.07),('lily',S+'/lily_plant.obj',0.0066)):
+    tot,acc,w=run(path,edge,dict(k=300,relax=0.0,snap='1',sag=0.001))
+    print(name,'quads',tot,'| angle between corner-0 normal and diagonal normal: median %.1f deg, p90 %.1f, max %.1f'%(np.median(w),np.percentile(w,90),w.max()))
+    for lab_,a in zip(('corner-0 (shipped)','diagonals = Verdict center normal','mean of 4 corner normals','mean surface normal at the 4 vertices'),acc): print('   ',lab_,': J<0',a[0],f'({100*a[0]/tot:.2f}%)  J<0.3',a[1],f'({100*a[1]/tot:.2f}%)  J<0.5',a[2])

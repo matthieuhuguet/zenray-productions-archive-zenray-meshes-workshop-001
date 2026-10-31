@@ -1,0 +1,185 @@
+"""E2b : facettes obliques par ombrage multivue (H3 corrigée : intensité affine, lumière calibrée sur l'enveloppe polyédrique).
+Entrée : enveloppe visuelle (M01) et six images argile. Sortie : plans coupants (normale, offset), enveloppe recoupée, scores. 30 October 2026."""
+import sys, json, time
+import numpy as np, cv2, trimesh
+from scipy.optimize import least_squares
+sys.path.insert(0, ".")
+from e2_common import *
+
+def hull_buffers(hull, case):
+    V = np.array(hull.vertices); T = np.array(hull.faces); tn = np.array(hull.face_normals)
+    out = {}
+    for nm in VIEWS6:
+        a, b, d, x0, y1, px, H, W = view_frame(case["views"][nm])
+        R = render(V, T, nm, px=px, bounds=(x0, x0 + W * px, y1 - H * px, y1), margin=0)
+        ids = R["id"]; m = ids >= 0
+        N = np.zeros((H, W, 3)); N[m] = tn[ids[m]]
+        out[nm] = dict(mask=m, n=N, z=np.where(m, R["z"], np.nan))
+    return out
+
+def predict(cal, N):
+    """Modèle de Lambert avec plancher : I = a + h n_y + max(0, b.n) ; N (...,3)."""
+    a, h, b, s = cal
+    return a + h * N[..., 1] + np.clip(N @ b, 0, None)
+
+def calibrate(img, hb, truth_mask, nmax=20000, seed=0):
+    """Calibrage de la lumière par vue sur les facettes de l'enveloppe polyédrique (normales connues) : moindres carrés robustes (perte de Cauchy)
+    du modèle I = a + h n_y + max(0, b.n). Initialisation par la régression linéaire."""
+    m = hb["mask"] & (truth_mask > 0)
+    idx = np.flatnonzero(m.ravel())
+    rng = np.random.default_rng(seed)
+    if len(idx) > nmax: idx = rng.choice(idx, nmax, replace=False)
+    Nn = hb["n"].reshape(-1, 3)[idx]; y = img.ravel()[idx]
+    X = np.c_[np.ones(len(y)), Nn]; c, *_ = np.linalg.lstsq(X, y, rcond=None)
+    th0 = np.r_[c[0], 0.0, np.clip(c[1:], -2, 2)]
+    f = lambda th: th[0] + th[1] * Nn[:, 1] + np.clip(Nn @ th[2:], 0, None) - y
+    sol = least_squares(f, th0, loss="cauchy", f_scale=0.02, max_nfev=60)
+    r = f(sol.x); s = 1.4826 * np.median(np.abs(r - np.median(r))) + 1e-4
+    return float(sol.x[0]), float(sol.x[1]), sol.x[2:], float(s)
+
+def residual_regions(img, hb, a, h, b, sigma, truth_mask, min_px=40, k=4.0):
+    pred = np.where(hb["mask"], predict((a, h, b, sigma), hb["n"]), 0)
+    r = img - pred
+    bad = (np.abs(r) > max(k * sigma, 0.02)) & hb["mask"] & (truth_mask > 0)
+    bad = cv2.morphologyEx(bad.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lab, st, cen = cv2.connectedComponentsWithStats(bad, 4)
+    regs = []
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] >= min_px:
+            ys, xs = np.where(lab == i)
+            regs.append(dict(px=np.c_[ys, xs], area=int(st[i, cv2.CC_STAT_AREA]), I=float(np.median(img[ys, xs])), lab=i))
+    return regs, lab
+
+def point3d(case, hb, nm, r, c):
+    a, b, d, x0, y1, px, H, W = view_frame(case["views"][nm])
+    u = x0 + (c + 0.5) * px; v = y1 - (r + 0.5) * px
+    return u * a + v * b + hb[nm]["z"][r, c] * d
+
+def estimate_cuts(case, hull, verbose=False):
+    hb = hull_buffers(hull, case)
+    cal = {nm: calibrate(case["imgs"][nm], hb[nm], case["masks"][nm]) for nm in VIEWS6}
+    regs = {}; labs = {}
+    for nm in VIEWS6:
+        a_, h_, b_, s_ = cal[nm]
+        regs[nm], labs[nm] = residual_regions(case["imgs"][nm], hb[nm], a_, h_, b_, s_, case["masks"][nm])
+    nodes = [(nm, i) for nm in VIEWS6 for i in range(len(regs[nm]))]
+    idx = {n: k for k, n in enumerate(nodes)}
+    parent = list(range(len(nodes)))
+    def find(x):
+        while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    # association : centroïde 3D d'une région projeté dans les autres vues
+    for (nm, i) in nodes:
+        reg = regs[nm][i]; ctr = reg["px"].mean(0); j = np.argmin(((reg["px"] - ctr) ** 2).sum(1)); r0, c0 = reg["px"][j]
+        P = point3d(case, hb, nm, r0, c0)
+        for w in VIEWS6:
+            if w == nm: continue
+            a, b, d, x0, y1, px, H, W = view_frame(case["views"][w])
+            cc = int((P @ a - x0) / px); rr = int((y1 - P @ b) / px)
+            if not (0 <= cc < W and 0 <= rr < H) or not hb[w]["mask"][rr, cc]: continue
+            if abs(hb[w]["z"][rr, cc] - P @ d) > 0.03: continue           # le point doit être visible dans w
+            lab = labs[w][max(rr - 2, 0):rr + 3, max(cc - 2, 0):cc + 3]
+            for l in np.unique(lab[lab > 0]):
+                k2 = [t for t, rg in enumerate(regs[w]) if rg["lab"] == l]
+                if k2: parent[find(idx[(nm, i)])] = find(idx[(w, k2[0])])
+    groups = {}
+    for n in nodes: groups.setdefault(find(idx[n]), []).append(n)
+    cuts = []
+    for g in groups.values():
+        vs = {nm for nm, _ in g}
+        if len(vs) < 2: continue
+        eqs = []; dirs = []
+        used = []
+        for nm, i in g:
+            a_, h_, b_, s_ = cal[nm]; Ik = regs[nm][i]["I"]
+            if Ik - a_ < 0.03 + abs(h_): continue                                  # facette dans l'ombre propre : pas d'équation
+            eqs.append((b_ + h_ * np.array([0.0, 1.0, 0.0]), Ik - a_)); dirs.append(view_frame(case["views"][nm])[2]); used.append(nm)
+        if len(eqs) < 2: continue
+        def cost(t, eqs=eqs):
+            n = np.array([np.sin(t[0]) * np.cos(t[1]), np.cos(t[0]), np.sin(t[0]) * np.sin(t[1])])
+            return np.array([bb @ n - cc for bb, cc in eqs])
+        best = None
+        rng = np.random.default_rng(1)
+        for _ in range(60):
+            t0 = [rng.uniform(0.1, np.pi - 0.1), rng.uniform(0, 2 * np.pi)]
+            sol = least_squares(cost, t0)
+            n = np.array([np.sin(sol.x[0]) * np.cos(sol.x[1]), np.cos(sol.x[0]), np.sin(sol.x[0]) * np.sin(sol.x[1])])
+            if any(n @ dd < 0.05 for dd in dirs): continue                          # face vers chaque caméra qui la voit
+            if best is None or sol.cost < best[0] - 1e-9: best = (sol.cost, n)
+        if best is None: continue
+        n = best[1]
+        # offset : points de la couronne extérieure de chaque région (pixels de l'enveloppe non résiduels, justes à côté)
+        pts = []
+        for nm, i in g:
+            m = np.zeros(hb[nm]["mask"].shape, np.uint8); m[regs[nm][i]["px"][:, 0], regs[nm][i]["px"][:, 1]] = 1
+            ring = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=3) - cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
+            rr, cc = np.where((ring > 0) & hb[nm]["mask"] & (labs[nm] == 0))
+            sel = np.random.default_rng(2).choice(len(rr), min(len(rr), 200), replace=False) if len(rr) else []
+            for r_, c_ in zip(rr[sel], cc[sel]): pts.append(point3d(case, hb, nm, r_, c_))
+        if len(pts) < 8: continue
+        pts = np.array(pts); dd = pts @ n; med = np.median(dd); keep = np.abs(dd - med) < 0.03
+        if keep.sum() < 6: continue
+        off = float(np.median(dd[keep]))
+        cuts.append(dict(n=n, d=off, area=sum(regs[nm][i]["area"] for nm, i in g), views=sorted(vs), resid=float(best[0])))
+    cuts.sort(key=lambda c: -c["area"])
+    return cuts, cal, hb
+
+def total_energy(case, hull, cal):
+    hb = hull_buffers(hull, case); E = 0.0
+    for nm in VIEWS6:
+        m = hb[nm]["mask"] & (case["masks"][nm] > 0)
+        E += float(((case["imgs"][nm] - predict(cal[nm], hb[nm]["n"]))[m] ** 2).sum())
+    return E
+
+def apply_cuts(case, hull, cuts, cal):
+    cur = hull; E = total_energy(case, cur, cal); acc = []
+    for c in cuts:
+        try:
+            cand = trimesh.intersections.slice_mesh_plane(cur, plane_normal=-c["n"], plane_origin=c["n"] * c["d"], cap=True)
+        except Exception:
+            continue
+        if cand is None or len(cand.faces) == 0 or not cand.is_watertight: continue
+        E2 = total_energy(case, cand, cal)
+        if E2 < E * 0.995: cur, E = cand, E2; acc.append(c)
+    return cur, acc
+
+def recovery(case, accepted, tol_deg=8.0):
+    """Pour chaque plan oblique de la vérité visible : meilleure coupe estimée (angle) et écart d'offset (distance des sommets du polygone au plan estimé)."""
+    names = plane_names(case["car"]); out = []
+    offs = np.cumsum([0] + [len(P.n) for P in case["car"].pieces])
+    for k, P in enumerate(case["car"].pieces):
+        for i, poly in P.polys.items():
+            nm = P.names[i]
+            if not any(t in nm for t in ("top_corner", "pillar", "haunch")): continue
+            nt = P.n[i]
+            best = None
+            for c in accepted:
+                ang = np.degrees(np.arccos(np.clip(nt @ c["n"], -1, 1)))
+                if best is None or ang < best[0]: best = (ang, c)
+            if best is None: out.append({"plane": nm, "found": False}); continue
+            dist = np.abs(poly @ best[1]["n"] - best[1]["d"]).mean() * 1000
+            out.append({"plane": nm, "found": bool(best[0] < tol_deg and dist < 20), "angle_err_deg": float(best[0]), "offset_err_mm": float(dist)})
+    return out
+
+if __name__ == "__main__":
+    levels = [("propre", dict()), ("bruit_image_1pct", dict(noise_img=0.01)), ("planche_moyenne", dict(edge_jitter=1.0, noise_img=0.01)), ("planche_mauvaise", dict(edge_jitter=2.0, noise_img=0.02))]
+    res = {}
+    for name, kw in levels:
+        t = time.time()
+        case = make_case(**kw)
+        hull = visual_hull(case, eps_px=1.5)
+        f0 = fidelity(hull, case["truth"])
+        cuts, cal, hb = estimate_cuts(case, hull)
+        final, acc = apply_cuts(case, hull, cuts, cal)
+        f1 = fidelity(final, case["truth"])
+        rec = recovery(case, acc)
+        big = [r for r in rec if not r["plane"].startswith("front_haunch")]    # les petites facettes (0,16 % de la surface) sont hors score
+        found = sum(r["found"] for r in big)
+        v = vsummary(verify(final))
+        print(f"{name}: coupes candidates {len(cuts)}, acceptées {len(acc)}; facettes obliques retrouvées {found}/{len(big)}", flush=True)
+        print("  avant :", {k: round(x, 3) for k, x in f0.items()}, flush=True)
+        print("  après :", {k: round(x, 3) for k, x in f1.items()}, v, flush=True)
+        print("  facettes :", [(r['plane'], r.get('found'), round(r.get('angle_err_deg', -1), 1), round(r.get('offset_err_mm', -1), 1)) for r in big], round(time.time() - t, 1), "s", flush=True)
+        res[name] = {"cuts_candidates": len(cuts), "cuts_accepted": len(acc), "oblique_found": found, "oblique_total": len(big), "before": f0, "after": f1, "verifiers_after": v, "per_plane": rec,
+                     "light_calibration_sigma": {nm: float(cal[nm][3]) for nm in VIEWS6}}
+    json.dump(res, open("out/e2b_shading.json", "w"), indent=1)

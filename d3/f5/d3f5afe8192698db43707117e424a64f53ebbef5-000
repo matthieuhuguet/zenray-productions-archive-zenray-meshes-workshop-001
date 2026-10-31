@@ -1,0 +1,61 @@
+"""30 October 2026 : DRACARD episode 3 (Body Modeling) rebuilt node for node in /obj/Mad_Villain, from notes/ep03.md. Run inside Houdini : exec(open(path).read()). The reference dragon bgeo of the tutorial is not available : the Otto test skeleton (the author's own working skeleton) drives every part."""
+import hou
+obj = hou.node("/obj")
+old = obj.node("Mad_Villain")
+if old: old.destroy()
+mv = obj.createNode("geo", "Mad_Villain"); MISSING = []
+def mk(t, name, *inputs, **parms):
+    try: n = mv.createNode(t, name)
+    except Exception as e: MISSING.append((t, name, str(e)[:60])); return None
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items():
+        try: n.parm(k).set(v)
+        except Exception as e: MISSING.append(("parm", name + "." + k, str(e)[:40]))
+    return n
+RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25))
+otto = mk("testgeometry_otto", "testgeometry_otto1", output=3)
+null1 = mk("null", "null1"); null1.setInput(0, otto, 1)                      # output 1 = captured pose skeleton
+left = mk("blast", "blast_right_side", null1, grouptype=3, group="@P.x<-0.0001", negate=0)    # keep the left half only, the other side is made by Mirror
+def limb(tag, group, radius, length=0.04, scale_ramp=True, cols=24, src=None):
+    """blast (group) -> OUT_SKEL null -> attribdelete -> polypath -> resample -> sweep -> transform from centroid -> smooth -> sculpt (red)."""
+    b = mk("blast", "blast_" + tag, src or left, grouptype=0, group=group, negate=1)
+    o = mk("null", "OUT_SKEL_" + tag.upper(), b)
+    a = mk("attribdelete", "attribdelete_" + tag, o, ptdel="* ^P", primdel="*", vtxdel="*", dtldel="*")
+    p = mk("polypath", "polypath_" + tag, a)
+    r = mk("resample", "resample_" + tag, p, length=length)
+    s = mk("sweep::2.0", "sweep_" + tag, r, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=radius, cols=cols, applyscale=1 if scale_ramp else 0)
+    t = mk("xform", "transform_from_centroid_" + tag, s)
+    m = mk("smooth::2.0", "smooth_" + tag, t)
+    c = mk("sculpt", "sculpt_" + tag, m); c.setColor(RED)
+    return c
+spine = limb("spine", "spine", 0.14, 0.04, src=null1)
+leg = limb("leg", "biped_leg_full", 0.07, 0.04)
+foot = limb("foot", "biped_foot biped_foot_extra", 0.05, 0.02)
+arm = limb("arm", "biped_arm_full", 0.045, 0.03)
+fingers = [limb("finger_" + f, "L_finger_" + f, 0.012, 0.01, cols=8) for f in ("index", "middle", "ring", "pinky", "thumb")]
+leg_mirror = mk("mirror", "mirror_leg", mk("merge", "merge_leg_foot", leg, foot), dirx=1, diry=0, dirz=0)
+arm_all = mk("merge", "merge_arm_fingers", arm, *fingers)
+arm_mirror = mk("mirror", "mirror_arm", arm_all, dirx=1, diry=0, dirz=0)
+# tail : a curve drawn by hand in the tutorial (curve1), resample, sweep10, sculpt
+# the tutorial draws curve1 by clicks in the viewport (a stateful Curve SOP : not scriptable) : an Add SOP holding the same kind of 5 point line stands in, named curve1
+curve = mk("add", "curve1", keep=0); pts = [(0, 0.98, -0.03), (0, 0.9, -0.4), (0, 0.75, -0.9), (0, 0.6, -1.5), (0, 0.55, -2.0)]
+curve.parm("points").set(len(pts))
+for i, p in enumerate(pts):
+    for k, ax in enumerate("xyz"): curve.parm("pt%d%s" % (i, ax)).set(p[k])
+curve.parm("prims").set(1); curve.parm("prim0").set("0-%d" % (len(pts) - 1)); curve.parm("closed0").set(0)    # one open polyline through all points
+tr = mk("resample", "resample_tail", curve, length=0.05)
+tw = mk("sweep::2.0", "sweep10", tr, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=0.12, cols=24, applyscale=1)
+tail = mk("sculpt", "sculpt_tail", tw); tail.setColor(RED)
+# the torso mask : limbs push into the torso
+sub = mk("subdivide", "subdivide1", spine, iterations=2); sm6 = mk("smooth::2.0", "smooth6", sub)
+mask = mk("distancefromgeometry", "maskfromgeometry1", sm6, leg_mirror)
+soft = mk("softpeak", "softpeak1", mask)
+merge5 = mk("merge", "merge5", soft, leg_mirror, arm_mirror, tail)
+for n in (merge5,):
+    if n: n.setDisplayFlag(True); n.setRenderFlag(True)
+mv.layoutChildren(); report = {}
+for n in mv.children():
+    try: n.cook(force=True); g = n.geometry(); report[n.name()] = (len(g.points()), len(g.prims()), [e[:60] for e in n.errors()][:1])
+    except Exception as e: report[n.name()] = str(e)[:70]
+RESULT = {"missing": MISSING, "report": report}

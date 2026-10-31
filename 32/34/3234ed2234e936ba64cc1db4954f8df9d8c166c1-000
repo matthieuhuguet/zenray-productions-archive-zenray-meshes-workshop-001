@@ -1,0 +1,25 @@
+import sys, json, numpy as np, time, collections
+sys.path.insert(0, '.'); import TF7 as T
+GT="/Users/zenray/.claude/tmp/tmp-zenray-meshes/benchmark/gt/"
+def classes(pr, nZ):
+    return ("strip" if pr["strip"] else "true") + str(pr["K"] if pr["K"] in (3,4) else "n") + ("_tiny" if nZ<=4 else "")
+def run(mesh, edge, mf, variants):
+    m = T.AP.mesh(GT+mesh+".obj"); zones = T.ANY.segment(m, 25.0, max(1,int(mf*len(m["F"]))), merge_deg=35.0, log=lambda s: None); tri=m["P"][m["F"]]; area=0.5*np.linalg.norm(np.cross(tri[:,1]-tri[:,0],tri[:,2]-tri[:,0]),axis=1)
+    agg = {v: collections.defaultdict(lambda: [0,0,0,0,0,0.0]) for v in variants}
+    for k,(Z,seed) in enumerate(zones):
+        for v,opts in variants.items():
+            pr = T.prep(m, Z, edge, dict(T.OPTS, **opts))
+            if "fail" in pr: continue
+            try: P3,Q,rep = T.fill(m, Z, edge, dict(T.OPTS, **opts), pr=pr)
+            except Exception as ex: continue
+            if P3 is None: continue
+            _,_,j,_ = T.QS.stats(P3, Q); a = agg[v][classes(pr, len(Z))]; a[0]+=1; a[1]+=len(Q); a[2]+=int((j<0).sum()); a[3]+=int((j<0.3).sum()); a[4]+=rep["unlocated"]; a[5]+=float(area[Z].sum())
+    return agg
+if __name__=="__main__":
+    mesh, edge, mf = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]); variants = json.loads(sys.argv[4])
+    agg = run(mesh, edge, mf, variants)
+    keys = sorted({k for v in agg.values() for k in v})
+    print(mesh, "class", *variants)
+    for k in keys:
+        print("%-12s"%k, *["z%3d q%5d f%4d s%5d (%.0f%%)"%(agg[v][k][0],agg[v][k][1],agg[v][k][2],agg[v][k][3],100*agg[v][k][3]/max(agg[v][k][1],1)) for v in variants])
+    print("TOTAL", *["q%5d f%4d (%.2f%%) s%5d (%.2f%%)"%tuple([sum(x[1] for x in agg[v].values()),sum(x[2] for x in agg[v].values()),100*sum(x[2] for x in agg[v].values())/max(1,sum(x[1] for x in agg[v].values())),sum(x[3] for x in agg[v].values()),100*sum(x[3] for x in agg[v].values())/max(1,sum(x[1] for x in agg[v].values()))]) for v in variants])

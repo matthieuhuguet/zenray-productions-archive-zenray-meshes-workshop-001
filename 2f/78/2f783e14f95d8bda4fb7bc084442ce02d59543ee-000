@@ -1,0 +1,122 @@
+"""30 October 2026 : ZenRay BOARD 3D : a comparison board of quad meshes, one cell per method, same camera, shaded with the wire, FOLDED quads in red and SQUASHED ones in orange, the numbers under every cell. A visual at every step of the development (rule of Matthieu).
+    python -I ZrlBoard3D.py out.png --title "Arch" --cell "Houdini=path.obj" --cell "QuadWild=path.obj" ... [--az 35 --el 22 --size 620 --box-from ref.obj] [--zoom x0,y0,x1,y1]
+Every cell is a label and an OBJ ; the camera frames the first cell (or --box-from) so the cells compare at the same scale. --zoom gives a window in the normalized screen coordinates of the first view (0 to 1) to look closer.
+FR : une planche comparative : une vignette par methode, meme camera, quads plies en rouge et ecrases en orange, chiffres sous chaque vignette."""
+import argparse, collections, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import ZrlQuadStats as QS
+
+
+def load(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), F
+
+
+def stats(V, F):
+    Q = np.array([f for f in F if len(f) == 4], np.int64)
+    if not len(Q): return None
+    _, _, j, _ = QS.stats(V, Q); nb = collections.defaultdict(set); ec = collections.Counter()
+    for q in Q:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1; nb[a].add(b); nb[b].add(a)
+    bd = {v for (a, b), c in ec.items() if c == 1 for v in (a, b)}; val = np.array([len(nb[v]) for v in nb if v not in bd]) if len(nb) > len(bd) else np.array([4])
+    return {"quads": len(Q), "tris": sum(1 for f in F if len(f) == 3), "folded": int((j < 0).sum()), "squashed": int((j < 0.3).sum()), "poles": 1000.0 * float((val != 4).sum()) / len(Q), "j": j}
+
+
+def rot(az, el):
+    a, e = np.radians(az), np.radians(el); Ry = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]]); Rx = np.array([[1, 0, 0], [0, np.cos(e), -np.sin(e)], [0, np.sin(e), np.cos(e)]]); return Rx @ Ry
+
+
+def heat(j):
+    """scaled Jacobian to colour : red folded, orange squashed (under 0.3), yellow, green regular."""
+    if j < 0: return (230, 40, 40)
+    stops = [(0.0, (240, 120, 40)), (0.3, (240, 160, 40)), (0.6, (225, 205, 80)), (0.85, (140, 190, 100)), (1.0, (70, 170, 115))]
+    for (a, ca), (b, cb) in zip(stops, stops[1:]):
+        if j <= b: t = (j - a) / (b - a); return tuple(int(ca[k] + (cb[k] - ca[k]) * t) for k in range(3))
+    return stops[-1][1]
+
+
+def patch_colour(label):
+    import colorsys
+    h = (label * 0.61803398875) % 1.0; r, g, b = colorsys.hsv_to_rgb(h, 0.45, 0.92); return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def render(V, F, st, R, frame, size, zoom=None, wire=True, fc=None):
+    """frame = (centre (3,), scale px per unit) from the first cell."""
+    c, sc = frame; X = (V - c) @ R.T; img = Image.new("RGB", (size, size), (24, 24, 30)); d = ImageDraw.Draw(img)
+    S = np.stack([size / 2 + X[:, 0] * sc, size / 2 - X[:, 1] * sc], 1)
+    if zoom is not None: x0, y0, x1, y1 = zoom; S = (S / size - [x0, y0]) / [x1 - x0, y1 - y0] * size
+    faces = [(i, f) for i, f in enumerate(F) if len(f) in (3, 4)]; quad_i = {i: k for k, (i, f) in enumerate([(i, f) for i, f in enumerate(F) if len(f) == 4])}
+    depth = np.array([X[f, 2].mean() for _, f in faces]); light = np.array([0.4, 0.6, 0.7]); light /= np.linalg.norm(light)
+    for k in np.argsort(depth):
+        i, f = faces[k]; P = X[f]; n = np.cross(P[1] - P[0], P[-1] - P[0]); nn = np.linalg.norm(n)
+        sh = abs(float(n @ light)) / nn if nn > 0 else 0.5; base = np.array([150, 175, 195]) * (0.35 + 0.65 * sh); col = tuple(int(x) for x in base)
+        if fc is not None and i in fc: col = tuple(int(x * (0.55 + 0.45 * sh)) for x in fc[i])
+        if st is not None and fc is None and i in quad_i:
+            j = st["j"][quad_i[i]]
+            if j < 0: col = (230, 40, 40)
+            elif j < 0.3: col = (240, 160, 40)
+        d.polygon([tuple(S[v]) for v in f], fill=col, outline=(35, 38, 48) if wire else None)
+    return img
+
+
+def wrap_text(d, text, f, width):
+    out = []; cur = ""
+    for w in text.split():
+        t = (cur + " " + w).strip()
+        if d.textlength(t, font=f) <= width: cur = t
+        else: out.append(cur); cur = w
+    if cur: out.append(cur)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("out"); ap.add_argument("--title", default=""); ap.add_argument("--cell", action="append", required=True); ap.add_argument("--az", type=float, default=35); ap.add_argument("--el", type=float, default=22); ap.add_argument("--size", type=int, default=620); ap.add_argument("--box-from"); ap.add_argument("--zoom"); ap.add_argument("--cols", type=int, default=0); a = ap.parse_args()
+    cells = [(c.split("=", 1)[0], c.split("=", 1)[1]) for c in a.cell]; R = rot(a.az, a.el); data = []; notes = []; solids = []; modes = []
+    for lab, p in cells:
+        note = ""
+        if "::" in p: p, note = p.split("::", 1)
+        solid = p.endswith("@solid"); p = p[:-6] if solid else p; mode = "heat" if p.endswith("@heat") else "angle" if p.endswith("@angle") else "sym" if p.endswith("@sym") else "wire"
+        if mode == "heat": p = p[:-5]
+        elif mode in ("angle", "sym"): p = p[:-(6 if mode == "angle" else 4)]
+        pf = None
+        if "@patch=" in p: p, pf = p.split("@patch=", 1); mode = "patch"                         # 30 October 2026 : @heat = the quads coloured by their scaled Jacobian, @patch=file = the triangles coloured by patch id (QuadWild .patch file)
+        notes.append(note); solids.append(solid or mode != "wire"); modes.append((mode, pf))
+        if os.path.exists(p): V, F = load(p); data.append((lab, V, F, None if (solid or mode != "wire") else stats(V, F)))
+        else: data.append((lab, None, None, None))
+    ref = load(a.box_from)[0] if a.box_from else next(d[1] for d in data if d[1] is not None); X = (ref - ref.mean(0)) @ R.T; ext = max(np.ptp(X[:, 0]), np.ptp(X[:, 1])); frame = ((ref.max(0) + ref.min(0)) / 2, 0.92 * a.size / ext)
+    zoom = tuple(float(x) for x in a.zoom.split(",")) if a.zoom else None; font = ImageFont.truetype('/Users/zenray/Library/Fonts/Literata[opsz,wght].ttf', 17); cols = a.cols or len(data); rows = -(-len(data) // cols); cell_h = a.size + 120
+    W = a.size * cols; H = 36 + rows * cell_h; board = Image.new("RGB", (W, H), (14, 14, 18)); d = ImageDraw.Draw(board); d.text((10, 8), a.title, fill=(235, 235, 240), font=ImageFont.truetype('/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf', 20))
+    for k, (lab, V, F, st) in enumerate(data):
+        x = (k % cols) * a.size; y0 = 36 + (k // cols) * cell_h
+        if V is None: d.text((x + 10, y0 + 10), lab + " : missing", fill=(230, 120, 120), font=font); continue
+        fc = None; mode, pf = modes[k]
+        if mode == "heat":
+            st2 = stats(V, F); idx = [i for i, f in enumerate(F) if len(f) == 4]; fc = {i: heat(float(st2["j"][q])) for q, i in enumerate(idx)}; st = st2
+        elif mode == "angle":                                                                                      # corner angle error : the worst corner of every quad, 0 degrees green to 45 degrees red
+            import ZrlTopoJudge as TJ_; idx = [i for i, f in enumerate(F) if len(f) == 4]; Qa = np.array([F[i] for i in idx], np.int64); dv = np.abs(TJ_.quad_angles(V, Qa) - 90.0).max(1); fc = {i: heat(1.0 - min(dv[q] / 45.0, 1.0)) for q, i in enumerate(idx)}; st = stats(V, F)
+        elif mode == "sym":                                                                                        # mirror symmetry error : distance of the mirrored quad centre to the nearest quad centre, in mean edge lengths : 0 green, 0.5 and more red
+            from scipy.spatial import cKDTree
+            idx = [i for i, f in enumerate(F) if len(f) == 4]; Qa = np.array([F[i] for i in idx], np.int64); Cq = V[Qa].mean(1); el = np.linalg.norm(V[Qa[:, 0]] - V[Qa[:, 1]], axis=1).mean(); used = np.unique(Qa); cc = (V[used].max(0) + V[used].min(0)) / 2; best = None
+            for ax in range(3):
+                M = Cq.copy(); M[:, ax] = 2 * cc[ax] - M[:, ax]; dd = cKDTree(Cq).query(M)[0] / el
+                if best is None or dd.mean() < best.mean(): best = dd
+            fc = {i: heat(1.0 - min(best[q] / 0.5, 1.0)) for q, i in enumerate(idx)}; st = stats(V, F)
+        elif mode == "patch":
+            ids = [int(t) for t in open(pf).read().split()]; lab_ = ids[1:1 + ids[0]]; fc = {i: patch_colour(int(lab_[i])) for i in range(min(len(F), len(lab_)))}
+        board.paste(render(V, F, st if mode != "patch" else None, R, frame, a.size, zoom, wire=(mode != "wire" or not solids[k]) and not (mode == "wire" and solids[k]), fc=fc), (x, y0))
+        d.text((x + 10, y0 + 8), lab, fill=(255, 255, 255), font=ImageFont.truetype('/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf', 24))
+        yy = y0 + a.size + 6
+        if st:
+            line = "%d quads   plié %d (%.2f %%)   écrasé %d (%.1f %%)   pôles/1000 %.0f" % (st["quads"], st["folded"], 100 * st["folded"] / st["quads"], st["squashed"], 100 * st["squashed"] / st["quads"], st["poles"]); d.text((x + 10, yy), line, fill=(235, 235, 240), font=font); yy += 24
+        if notes[k]:
+            for ln in wrap_text(d, notes[k], font, a.size - 20): d.text((x + 10, yy), ln, fill=(255, 205, 120), font=font); yy += 22
+    board.save(a.out); print(a.out, [d_[0] for d_ in data])
+
+
+if __name__ == "__main__": main()

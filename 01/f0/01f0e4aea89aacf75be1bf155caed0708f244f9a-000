@@ -1,0 +1,38 @@
+"""30 October 2026 : SEAM GAPS between the components of a car : for every boundary vertex of every part, the distance to the nearest surface of ANOTHER part. A perfect join has a gap near 0 ; a boundary vertex with no other part within --near is a free edge (open border).
+    python -I QwCarSeams.py car.obj [parts.json]      (parts.json : one part name per face ; without it the OBJ groups are used)
+FR : jours entre composants : distance de chaque sommet de bord de chaque piece a la surface d'une autre piece."""
+import collections, json, os, sys
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+from scipy.spatial import cKDTree
+import QwCarCover as C
+
+
+def parts_of(path, parts_json=None):
+    if parts_json:
+        V, F = C.load_all(path); names = json.load(open(parts_json)); G = collections.OrderedDict()
+        for f, n in zip(F, names): G.setdefault(n, []).append(f)
+        return V, G
+    return C.load_groups(path)
+
+
+def seams(V, G, near=0.03, per_m2=3000):
+    rng = np.random.default_rng(3); S = []; L = []
+    for k, (p, F) in enumerate(G.items()):
+        if not F: continue
+        s, _ = C.sample(V, F, rng, per_m2); S.append(s); L += [k] * len(s)
+    S = np.vstack(S); L = np.array(L); tree = cKDTree(S); names = [p for p, F in G.items() if F]; out = {}; gaps = []; free = 0; tot = 0
+    for k, p in enumerate([p for p, F in G.items() if F]):
+        F = G[p]; ec = collections.Counter()
+        for f in F:
+            for i in range(len(f)): a, b = f[i], f[(i + 1) % len(f)]; ec[(min(a, b), max(a, b))] += 1
+        bv = sorted({v for (a, b), c in ec.items() if c == 1 for v in (a, b)})
+        if not bv: out[p] = (0, 0, 0.0); continue
+        d, idx = tree.query(V[bv], k=60); other = L[idx] != names.index(p) if False else (L[idx] != L[np.flatnonzero(L == k)[0]] if (L == k).any() else np.ones_like(idx, bool))
+        best = np.where(other, d, 9.0).min(1); joined = best < near; gaps += best[joined].tolist(); free += int((~joined).sum()); tot += len(bv); out[p] = (len(bv), int((~joined).sum()), float(np.median(best[joined])) if joined.any() else -1.0)
+    g = np.array(gaps) if gaps else np.zeros(1)
+    return {"boundary_vertices": tot, "free_edge_share": round(free / max(tot, 1), 3), "gap_median_mm": round(float(np.median(g)) * 1000, 2), "gap_p90_mm": round(float(np.percentile(g, 90)) * 1000, 2), "gap_p99_mm": round(float(np.percentile(g, 99)) * 1000, 2), "per_part": out}
+
+
+if __name__ == "__main__":
+    V, G = parts_of(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None); r = seams(V, G); print({k: v for k, v in r.items() if k != "per_part"})

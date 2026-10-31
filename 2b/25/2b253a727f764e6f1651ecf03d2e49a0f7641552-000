@@ -1,0 +1,109 @@
+# Segmentation en régions-disques : VSA, fusion contrainte, SDF et décomposition convexe (30 October 2026)
+
+Statuts : [DOC] lu (VSA lu en entier par extraction du PDF) ; [MESURÉ] exécuté ici (numpy seul, aucun code externe) ; [ESTIMÉ] déduction. Source principale : Cohen-Steiner, Alliez, Desbrun, "Variational Shape Approximation", SIGGRAPH 2004, https://people.engr.tamu.edu/schaefer/teaching/689_Fall2006/p905-cohen-steiner.pdf ; implémentation de référence CGAL https://doc.cgal.org/latest/Surface_mesh_approximation/index.html .
+
+## 1. VSA avec la métrique L2,1 : formules exactes [DOC]
+
+Partition R = (R_1..R_k) de la surface en régions connexes ; chaque région R_i a un PROXY P_i = (X_i, N_i) (point et normale).
+- Métrique L2 : L2(R_i, P_i) = intégrale sur R_i de la distance carrée au plan du proxy ||x - Pi_i(x)||^2 dx (Pi_i = projection orthogonale sur le plan). Sur un triangle dont les trois distances signées au plan sont d_1, d_2, d_3 : intégrale = |T| / 6 (d_1^2 + d_2^2 + d_3^2 + d_1 d_2 + d_2 d_3 + d_3 d_1) [ESTIMÉ, intégrale d'un carré de fonction linéaire, calcul fait ici ; le papier renvoie à l'annexe B non lue].
+- Métrique L2,1 : L2,1(R_i, P_i) = intégrale sur R_i de ||n(x) - N_i||^2 dx ; sur un triangle plat : E(T, P) = |T| ||n_T - N_i||^2.
+- Ajustement du proxy : L2 : X_i = barycentre de la région, N_i = vecteur propre de la plus petite valeur propre de la matrice de covariance (plan des moindres carrés, ACP) ; L2,1 : N_i = moyenne des normales pondérée par l'aire (normalisée), X_i = barycentre (sans importance pour l'optimisation). L2,1 est numériquement supérieure (anisotropie mieux captée, rapport d'aspect asymptotique en |kappa_max / kappa_min|), et son ajustement est plus simple et plus rapide.
+- Partition par inondation (flooding) : pour chaque proxy on choisit le triangle de sa région le plus proche du proxy (erreur minimale) comme graine ; on pousse les triangles voisins des graines dans UNE file de priorité globale avec la priorité E(T_j, P_i) et l'étiquette i ; on dépile le moins distordu ; si le triangle est déjà étiqueté on l'ignore, sinon on lui donne l'étiquette et on empile ses voisins non étiquetés avec la même étiquette ; la file vide, tout triangle a un proxy. Garantie : régions connexes et disjointes ; coût N log N.
+- Itération de Lloyd : partition puis ajustement, jusqu'à convergence (le papier observe un bon comportement en 2 à 20 itérations ; pas de convergence globale garantie ; garantie pour les objets convexes avec L2,1, équivalent à des k-moyennes pondérées sur la sphère de Gauss).
+- Amorçage : k triangles au hasard (proxy = barycentre et normale du triangle) ; pour les pièces mécaniques, amorçage incrémental : ajouter une région à la fois au triangle d'erreur maximale de sa région, sans ajustement entre les inondations (fonctionne très bien sur objets non lisses, pas d'intérêt pour des objets bruités) ; amorçage hiérarchique de CGAL : N_k = floor(E_k / E_moyen + 0,5) nouveaux proxies par région proportionnellement à son erreur.
+- Insertion : ajouter un proxy dans la région d'erreur totale maximale, au triangle de pire erreur. Suppression (merge) : pour chaque paire de régions adjacentes, simuler la fusion et recalculer le proxy optimal ; remplacer la paire de plus petite distorsion par une seule région. Téléportation : supprimer une région puis l'insérer là où elle est le plus utile ; faite à intervalles réguliers si l'erreur ajoutée par la suppression simulée est inférieure à la moitié de l'erreur de la pire région. Arrêt CGAL : nombre maximal de proxies ou baisse relative d'erreur minimale, convergence quand (E_{m-1} - E_m) / E_{m-1} passe sous un seuil.
+- Coût mesuré par les auteurs : modèle de 400 000 faces approché par 5 000 polygones en 5 minutes (légende de la figure 2) ; CGAL : 20 188 triangles et 200 proxies en 2,0 s, 62 467 triangles en 7,6 s (20 itérations).
+
+## 2. Mesure de mon implémentation numpy [MESURÉ]
+
+Banc : bande de sphère de 14 400 triangles ; VSA L2,1 avec amorçage aléatoire, 10 itérations, file de priorité heapq : k = 8 régions en 0,5 s, k = 30 en 0,6 s (Python pur plus numpy, sans optimisation) ; régions non disques : 0 sur 8 et 0 sur 30 (test d'Euler de la section 3). Le code est en section 6 (sans téléportation ni insertion).
+
+## 3. Garantir des régions homéomorphes à un disque [ESTIMÉ sauf mention]
+
+VSA garantit des régions connexes, pas simplement connexes (une région peut encercler une autre, donc avoir un trou, ou être annulaire sur un tore ou une surface à anse). Critères et remèdes :
+1. Test de disque (calcul exact) : pour la région R vue comme ensemble de triangles, V - E + F = 1 ET une seule boucle de bord (composantes connexes des arêtes de bord) ET aucun sommet non manifold (le bord ne se touche pas lui-même). Implémentation : fonction region_topology du code. Lecture : chi = 1 avec une boucle = disque ; une boucle de plus = trou (chi = 0) ; chi = 2 sans bord = sphère (région qui couvre une composante fermée).
+2. Trou : si une boucle de bord entoure un ensemble de régions qui ne touchent que cette région, fusionner ces régions dans R (remplissage) ; sinon couper R le long du plus court chemin du trou au bord extérieur (QuadWild : « cut the mesh open along feature-edges » et les chemins de découpe de ses rondes, voir autopatch_decomposition).
+3. Fusion agglomérative contrainte qui garantit le disque PAR CONSTRUCTION (alternative à VSA) : partir de chaque triangle comme région (un disque) ; fusionner deux régions adjacentes seulement si leur frontière commune est UN SEUL arc contigu (une seule composante connexe d'arêtes partagées) : l'union de deux disques le long d'un arc unique est un disque, donc l'invariant « toutes les régions sont des disques » est conservé ; priorité = surcroît d'erreur L2,1 de la fusion = (somme des aires) x norme carrée du résultat de la moyenne de normales comparée à la somme des erreurs ; arrêt au nombre de régions voulu ou au seuil d'erreur ; interdire toute fusion qui franchit une arête de feature ou fait dépasser un cône de normales de theta degrés (par exemple 60 degrés). Complexité : O(E log E) avec une file et un test d'arc par fusion. C'est l'idée du « face clustering » de Garland, Willmott, Heckbert 2001, cité dans l'article VSA [DOC pour l'existence de la référence ; contenu non relu].
+4. Cône de normales : exiger que l'angle maximal entre une normale de face et la normale du proxy reste inférieur à theta (60 degrés par exemple) pour que la région se projette sans recouvrement sur son plan proxy ; sinon la scinder en deux (k-moyennes à deux proxies à l'intérieur de la région). Condition nécessaire pour que la paramétrisation de la région par Tutte ne produise pas de triangles minuscules.
+5. Nombre de coins : après segmentation, les sommets du bord où se rencontrent trois régions ou plus sont des coins candidats ; la région doit avoir 3 à 8 coins (le solveur gère 3 à 8 maintenant) ; trop de coins : supprimer ceux de plus grande somme d'angles (QuadWild : sommets TVConvex, TVConcave, TVNarrow non supprimés), trop peu : ajouter ceux de plus petite somme d'angles [CODE, voir quadwild_source_notes].
+6. Bord : alisser le bord de chaque région (QuadWild : PTr.SmoothPatches) car les frontières de VSA suivent les arêtes du maillage et zigzaguent.
+
+## 4. SDF (Shape Diameter Function) [DOC via recherche]
+
+Shapira, Shamir, Cohen-Or, The Visual Computer 24(4), 2008, pp. 249-259 (https://faculty.runi.ac.il/arik/site/mesh-partition.asp) : le SDF estime l'épaisseur locale du volume en chaque face par des rayons lancés dans un cône vers l'intérieur (réimplémentation citée : cône de 120 degrés, 60 rayons) ; la segmentation comporte trois étapes : SDF, regroupement doux par un mélange gaussien 1D à nombre de composantes fixé, puis coupe de graphe (expansion alpha) avec un terme de lissage fondé sur l'angle dièdre et la concavité. Ce que cela apporte : des parties sémantiques (membres, tronc) d'un volume, pas des patchs quadrangulables. Pour une doublure d'habitacle ou un dessous de plancher (coques minces, souvent ouvertes) : le SDF n'a pas de sens stable sur une coque ouverte et donne une épaisseur à peu près constante : il segmenterait peu [ESTIMÉ] ; inutile ici.
+
+## 5. Décomposition convexe (V-HACD, CoACD) [DOC via recherche pour CoACD]
+
+CoACD (Wei, Liu, Ling, Su, SIGGRAPH 2022, https://arxiv.org/pdf/2205.02961 ; code https://github.com/sarahweiii/CoACD, licence MIT d'après un index tiers, paquet Python coacd.run_coacd(mesh) qui rend une liste d'enveloppes convexes ; seuil de concavité 0,01 à 1, défaut 0,05) : métrique de concavité tenant compte des collisions, coupe directe du maillage par des plans 3D, recherche arborescente. V-HACD : licence et détails non lus dans cette passe. Ce que cela apporte pour une doublure d'habitacle ou un dessous de plancher : des macro-pièces à frontières PLANES, à peu près convexes, qui servent de découpage de premier niveau avant VSA (une pièce convexe a un cône de normales borné et se paramétrise sans repliement) ; limites : ces méthodes visent des volumes fermés et la collision, pas des coques ouvertes ; les plans de coupe ne suivent pas les arêtes de feature ; le résultat est un ensemble de maillages découpés (nouvelles faces de coupe) qu'il faut recoller à la surface d'origine [ESTIMÉ]. Recommandation : essayer la fusion contrainte (section 3 point 3) en priorité ; ne recourir à CoACD qu'en cas d'échec ; ne rien installer sans l'accord de Matthieu (consigne de la passe).
+
+## 6. Code numpy testé (VSA L2,1 + test de disque)
+
+```python
+"""30 October 2026 : VSA (Cohen-Steiner, Alliez, Desbrun 2004) with the L2,1 metric + disk test + constrained agglomerative merge. numpy only. python -I vsa.py (self test)"""
+import heapq, numpy as np
+def tri_data(X, F):
+    e1, e2 = X[F[:, 1]] - X[F[:, 0]], X[F[:, 2]] - X[F[:, 0]]; c = np.cross(e1, e2)
+    area = 0.5 * np.linalg.norm(c, axis=1); n = c / (2 * area[:, None] + 1e-30)
+    return area, n, X[F].mean(axis=1)
+def adjacency(F):
+    ed = {}; 
+    for t, f in enumerate(F):
+        for k in range(3): ed.setdefault(tuple(sorted((f[k], f[(k + 1) % 3]))), []).append(t)
+    nb = [[] for _ in F]
+    for e, ts in ed.items():
+        if len(ts) == 2: nb[ts[0]].append(ts[1]); nb[ts[1]].append(ts[0])
+    return nb, ed
+def vsa_l21(X, F, k, iters=15, seed=0, blocked=None):
+    """returns label per triangle; blocked = set of undirected edges (feature edges) that regions must not cross."""
+    area, n, cen = tri_data(X, F); nb, ed = adjacency(F); rng = np.random.default_rng(seed)
+    T = len(F); blocked = blocked or set()
+    tri_edges = [[tuple(sorted((f[j], f[(j + 1) % 3]))) for j in range(3)] for f in F]
+    def crossing(t, u):
+        return bool(set(tri_edges[t]) & set(tri_edges[u]) & blocked)
+    seeds = rng.choice(T, k, replace=False); N = n[seeds].copy()
+    for it in range(iters):
+        lab = -np.ones(T, int); pq = []
+        for i, s in enumerate(seeds):
+            lab[s] = i
+        for i, s in enumerate(seeds):
+            for u in nb[s]:
+                if not crossing(s, u): heapq.heappush(pq, (area[u] * np.sum((n[u] - N[i]) ** 2), u, i))
+        while pq:
+            err, u, i = heapq.heappop(pq)
+            if lab[u] >= 0: continue
+            lab[u] = i
+            for w in nb[u]:
+                if lab[w] < 0 and not crossing(u, w): heapq.heappush(pq, (area[w] * np.sum((n[w] - N[i]) ** 2), w, i))
+        # unreached triangles (blocked components): own labels
+        miss = np.where(lab < 0)[0]
+        if len(miss): lab[miss] = lab.max() + 1 + np.arange(len(miss)); 
+        K = lab.max() + 1; Nn = np.zeros((K, 3))
+        np.add.at(Nn, lab, n * area[:, None]); Nn /= np.linalg.norm(Nn, axis=1, keepdims=True) + 1e-30      # proxy normal: area-weighted mean normal (L2,1)
+        E = area * np.sum((n - Nn[lab]) ** 2, axis=1)                                                        # E(T,P) = |T| ||n_T - N_P||^2
+        seeds = np.array([np.where(lab == i)[0][np.argmin(E[lab == i])] for i in range(K)]); N = Nn
+    return lab, float(E.sum())
+def region_topology(F, lab, r):
+    """Euler characteristic and number of boundary loops of region r (triangle subset)."""
+    sub = F[lab == r]; V = set(sub.ravel()); ed = {}
+    for a, b, c in sub:
+        for u, v in ((a, b), (b, c), (c, a)): ed[tuple(sorted((u, v)))] = ed.get(tuple(sorted((u, v))), 0) + 1
+    chi = len(V) - len(ed) + len(sub); bnd = [e for e, c in ed.items() if c == 1]
+    par = {}
+    def find(x):
+        while par.setdefault(x, x) != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    for a, b in bnd: par[find(a)] = find(b)
+    loops = len({find(v) for e in bnd for v in e}); return chi, loops
+if __name__ == '__main__':
+    import time, sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_fill import sphere_patch
+    X, F, _ = sphere_patch(120, 60, np.radians(100), np.radians(45)); print('tris', len(F))
+    for k in (8, 30):
+        t0 = time.time(); lab, err = vsa_l21(X, F, k, iters=10); dt = time.time() - t0
+        bad = []
+        for r in range(lab.max() + 1):
+            chi, loops = region_topology(F, lab, r)
+            if not (chi == 1 and loops == 1): bad.append((r, chi, loops))
+        print(f'k={k}: regions {lab.max()+1}, error {err:.4f}, time {dt:.1f}s, non-disk regions {len(bad)} {bad[:5]}')
+```

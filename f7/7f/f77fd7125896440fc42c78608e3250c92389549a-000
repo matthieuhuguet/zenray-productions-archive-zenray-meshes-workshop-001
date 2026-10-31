@@ -1,0 +1,81 @@
+"""30 October 2026 : DRACARD episode 4 (Head Modeling) rebuilt node for node in /obj/Mad_Villain (adds to the episode 3 network), from notes/ep04.md. exec inside Houdini after Ep03.py."""
+import hou
+mv = hou.node("/obj/Mad_Villain"); MISSING = []; RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25))
+def mk(t, name, *inputs, **parms):
+    old = mv.node(name)
+    if old: old.destroy()
+    try: n = mv.createNode(t, name)
+    except Exception as e: MISSING.append((t, name, str(e)[:50])); return None
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items():
+        p = n.parm(k)
+        if p is None: MISSING.append(("parm", name + "." + k, "absent")); continue
+        try: p.set(v)
+        except Exception as e: MISSING.append(("parm", name + "." + k, str(e)[:30]))
+    return n
+def red(n): n.setColor(RED); return n
+null1 = mv.node("null1")
+def polyline(name, pts):
+    n = mk("add", name, keep=0); n.parm("points").set(len(pts))
+    for i, p in enumerate(pts):
+        for k, ax in enumerate("xyz"): n.parm("pt%d%s" % (i, ax)).set(p[k])
+    n.parm("prims").set(1); n.parm("prim0").set("0-%d" % (len(pts) - 1)); n.parm("closed0").set(0); return n
+# A. skull from the neck
+blast12 = mk("blast", "blast12", null1, grouptype=3, group="neck", negate=1)
+tf0 = mk("xform", "transform_from_centroid_head", blast12)
+blast_last = mk("blast", "blast_head_point", tf0, grouptype=3, group="0-3", negate=0)           # keep only the last point
+sphere1 = mk("sphere", "sphere1", type=1, radx=0.14, rady=0.12, radz=0.2, rows=13, cols=24) if False else mk("sphere", "sphere1", type="polymesh", radx=0.14, rady=0.12, radz=0.2, rows=13, cols=24)
+cp1 = mk("copytopoints::2.0", "copytopoints1", sphere1, blast_last)
+ad7 = mk("attribdelete", "attribdelete7", cp1, ptdel="* ^P ^N", primdel="*", vtxdel="*", dtldel="*")
+s11 = red(mk("sculpt", "sculpt11", ad7)); sub3 = mk("subdivide", "subdivide3", s11, iterations=1); s12 = red(mk("sculpt", "sculpt12", sub3))
+sub4 = mk("subdivide", "subdivide4", s12, iterations=1); s13 = red(mk("sculpt", "sculpt13", sub4))
+qr1 = mk("quadremesh", "quadremesh1", s13); s14 = red(mk("sculpt", "sculpt14", qr1))
+# B. volume, eye cavities
+vfp1 = mk("vdbfrompolygons", "vdbfrompolygons1", s14, fillinterior=1); vsm1 = mk("vdbsmooth", "vdbsmooth1", vfp1)
+sphere2 = mk("sphere", "sphere2", type="polymesh", radx=0.03, rady=0.03, radz=0.03, rows=13, cols=24)
+eyept = polyline("eye_points", [(0.07, 1.74, 0.16), (0.07, 1.74, 0.16)]) if False else mk("add", "eye_points", keep=0, points=1)
+eyept.parm("pt0x").set(0.07); eyept.parm("pt0y").set(1.74); eyept.parm("pt0z").set(0.17)
+cp2 = mk("copytopoints::2.0", "copytopoints2", sphere2, eyept); tf8 = mk("xform", "transform_from_centroid8", cp2); mir3 = mk("mirror", "mirror3", tf8, dirx=1, diry=0, dirz=0)
+vfpE = mk("vdbfrompolygons", "vdbfrompolygons_eyes", mir3, fillinterior=1); vcomb1 = mk("vdbcombine", "vdbcombine1", vsm1, vfpE, operation=4) if False else mk("vdbcombine", "vdbcombine1", vsm1, vfpE)
+# C. mouth by curve
+curve3 = polyline("curve3", [(0.0, 1.66, 0.22), (0.05, 1.65, 0.2), (0.09, 1.66, 0.15)]); pex1 = mk("polyextrude::2.0", "polyextrude1", curve3, dist=0.01)
+vfpM = mk("vdbfrompolygons", "vdbfrompolygons_mouth", pex1, fillinterior=1); vcombM = mk("vdbcombine", "vdbcombine_mouth", vcomb1, vfpM); curve2 = polyline("curve2", [(0.0, 1.66, 0.22), (0.05, 1.65, 0.2), (0.09, 1.66, 0.15)])
+# D. teeth
+line_t = polyline("curve4", [(0.0, 1.655, 0.22), (0.045, 1.65, 0.2), (0.085, 1.655, 0.15)])
+polyp10 = mk("polypath", "polypath10", line_t); res12 = mk("resample", "resample12", polyp10, length=0.01, curveu=1) if False else mk("resample", "resample12", polyp10, length=0.01)
+fuse1 = mk("fuse", "fuse1", polyp10); carve2 = mk("carve", "carve2", res12)
+box1 = mk("box", "box1", sizex=0.21, sizey=0.1, sizez=0.21); tf11 = mk("xform", "transform_from_centroid11", box1, scale=0.1); sub6 = mk("subdivide", "subdivide6", tf11, iterations=1); sub7 = mk("subdivide", "subdivide7", sub6, iterations=1); ms1 = mk("matchsize", "matchsize1", sub7)
+remap1 = mk("attribremap", "attribremap1", res12); orient1 = mk("orientalongcurve", "orientalongcurve1", remap1)
+cp5 = mk("copytopoints::2.0", "copytopoints5", ms1, orient1); mir6 = mk("mirror", "mirror6", cp5, dirx=1, diry=0, dirz=0)
+mask2 = mk("distancefromgeometry", "maskfromgeometry2", s14, mir6); soft2 = mk("softpeak", "softpeak2", mask2)
+tf13 = mk("xform", "transform_from_centroid13", curve2, ty=-0.0); merge10 = mk("merge", "merge10", soft2, mir6)
+# E. topology, horns and ears
+qr2 = mk("quadremesh", "quadremesh2", vcombM) if False else None
+cvdb = mk("convertvdb", "convertvdb1", vcombM); qr2 = mk("quadremesh", "quadremesh2", cvdb)
+horn_c = polyline("curve5", [(0.05, 1.78, 0.0), (0.12, 1.92, -0.05), (0.15, 2.05, -0.15)]); rs15 = mk("resample", "resample15", horn_c, length=0.02)
+tf17 = mk("xform", "transform_from_centroid17", rs15); sw12 = mk("sweep::2.0", "sweep12", tf17, surfaceshape="tube", surfacetype="quads", endcaptype="none", radius=0.03, applyscale=1)
+mir9 = mk("mirror", "mirror9", sw12, dirx=1, diry=0, dirz=0)
+vfp6 = mk("vdbfrompolygons", "vdbfrompolygons6", mir9, fillinterior=1); vfp5 = mk("vdbfrompolygons", "vdbfrompolygons_head", qr2, fillinterior=1)
+vcomb5 = mk("vdbcombine", "vdbcombine5", vfp5, vfp6); cvdb2 = mk("convertvdb", "convertvdb2", vcomb5)
+qr3 = mk("quadremesh", "quadremesh3", cvdb2); s18 = red(mk("sculpt", "sculpt18", qr3)); qr4 = mk("quadremesh", "quadremesh4", s18); s19 = red(mk("sculpt", "sculpt19", qr4))
+out_head = mk("null", "OUT_HEAD", s19); out_eyes = mk("null", "OUT_EYES", mir3); out_teeth = mk("null", "OUT_TEETH", mir6); out_ears = mk("null", "OUT_EARS", mir9)
+merge13 = mk("merge", "merge13", out_head, out_eyes, out_teeth); null4 = mk("null", "null4", merge13)
+body = mv.node("merge5"); merge16 = mk("merge", "merge16", body, null4)
+for n, c in ((qr1, None),):
+    pass
+for nm, nodes in (("Mouth_Inside", (curve3, pex1, vfpM, vcombM, curve2)), ("Eyes_Cavity", (vfpE, vcomb1)), ("Eyes", (sphere2, eyept, cp2, tf8, mir3))):
+    nb = mv.createNetworkBox(nm); nb.setColor(GREEN)
+    for n in nodes:
+        if n: nb.addNode(n)
+for n in mv.children():          # tuned values : voxel size 0.006 for a head of 0.14, 5000 quads (as in the episode), convert VDB to polygons, symmetry on the second remesh
+    t = n.type().name()
+    if t == "vdbfrompolygons": n.parm("voxelsize").set(0.006)
+    if t == "quadremesh": n.parm("targetquadcount").set(5000)
+    if t == "convertvdb": n.parm("conversion").set("poly")
+mv.node("quadremesh2").parm("symmetry").set(1)
+merge16.setDisplayFlag(True); merge16.setRenderFlag(True); mv.layoutChildren(); report = {}
+for n in mv.children():
+    try: n.cook(force=True); g = n.geometry(); report[n.name()] = (len(g.points()), len(g.prims()), [e[:70] for e in n.errors()][:1])
+    except Exception as e: report[n.name()] = str(e)[:70]
+RESULT = {"missing": MISSING, "report": report}

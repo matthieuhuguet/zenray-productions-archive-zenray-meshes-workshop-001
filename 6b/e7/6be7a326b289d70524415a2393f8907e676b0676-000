@@ -1,0 +1,93 @@
+"""30 October 2026 : ZenRay QUAD BARRIER : the rigorous quad straightener of the retopology chain (Winslow type barrier energy of Garanzha et al. 2021, written and measured by the cloud research session in pass 9 : no folded quad, no squashed quad, right angles and straight lines).
+EN: takes a quad mesh and the QuadWild files of its remeshed input (`<prefix>.obj`, `<prefix>.feature`), classifies every vertex (free on the surface, sliding along its hard edge, fixed at a hard-edge corner or on an open boundary), then minimises the barrier energy in the tangent plane of every vertex (L-BFGS) with a projection on the reference surface between outer iterations and a fold guard. The faces and their connectivity never change.
+    python -I ZrlQuadBarrier.py quads.obj prefix_of_rem_p0 out.obj [--outer 10 --inner 60 --theta 0.0078125 --size keep|smooth] [--no-features] [--json]
+FR : le redresseur rigoureux de la chaine de retopologie : energie de Winslow a barriere dans le plan tangent de chaque sommet, arêtes vives suivies en glissement, coins et bords fixes, aucune face ne change."""
+import argparse, collections, json, os, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+from scipy.spatial import cKDTree
+import ZrlBarrierCore as BC
+
+
+def load_obj(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V, float), F
+
+
+def save_obj(path, V, F):
+    with open(path, "w") as f:
+        f.write("".join("v %.6f %.6f %.6f\n" % tuple(p) for p in V)); f.write("".join("f " + " ".join(str(int(i) + 1) for i in q) + "\n" for q in F))
+
+
+def read_features(prefix, Vr, Fr):
+    """the hard edges of the remeshed triangle mesh (QuadWild .feature : a count, then `face,edge` lines, edge j = vertex j to j + 1) as segments (n, 2, 3)."""
+    p = prefix + ".feature"
+    if not os.path.exists(p): return np.zeros((0, 2, 3))
+    lines = [l.strip() for l in open(p) if l.strip()]; segs = []
+    for l in lines[1:]:
+        fi, ei = (int(x) for x in l.split(",")); f = Fr[fi]; segs.append((Vr[f[ei]], Vr[f[(ei + 1) % len(f)]]))
+    return np.array(segs).reshape(-1, 2, 3)
+
+
+class Crease:
+    """the hard edge segments : nearest point and unit tangent of the nearest segment (the same set for every sliding vertex)."""
+    def __init__(self, segs, k=6):
+        self.A = segs[:, 0]; self.B = segs[:, 1]; self.tree = cKDTree((self.A + self.B) / 2); self.k = min(k, len(segs))
+    def nearest_all(self, X):
+        _, idx = self.tree.query(X, k=self.k); idx = idx.reshape(len(X), -1); best = np.full(len(X), 1e30); pt = X.copy(); tan = np.zeros_like(X)
+        for j in range(idx.shape[1]):
+            t = idx[:, j]; a = self.A[t]; b = self.B[t]; ab = b - a; u = np.clip(((X - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-30), 0, 1); c = a + ab * u[:, None]; d = ((c - X) ** 2).sum(1); m = d < best; best[m] = d[m]; pt[m] = c[m]; tan[m] = ab[m] / np.maximum(np.linalg.norm(ab[m], axis=1, keepdims=True), 1e-30)
+        return pt, tan, np.sqrt(best)
+    def nearest(self, aid, X):                                                            # the interface of ArcSet in ZrlBarrierCore.barrier
+        pt, tan, _ = self.nearest_all(X); return pt, tan
+
+
+def classify(V, Q, crease, tol_frac=0.1, turn_deg=30.0, slide_ends=False):
+    """kind (n,) : 0 free on the surface, 1 slides along a hard edge, 2 fixed (hard edge corner, junction, open boundary, unused vertex)."""
+    nv = len(V); kind = np.zeros(nv, int); used = np.zeros(nv, bool); used[Q.ravel()] = True; ec = collections.Counter(); nbr = collections.defaultdict(set)
+    for q in Q:
+        for k in range(4): a, b = int(q[k]), int(q[(k + 1) % 4]); ec[(min(a, b), max(a, b))] += 1; nbr[a].add(b); nbr[b].add(a)
+    el = float(np.mean([np.linalg.norm(V[a] - V[b]) for a, b in ec])); tol = tol_frac * el
+    if crease is not None:
+        _, _, dist = crease.nearest_all(V); on = dist < tol; mid = np.array([(V[a] + V[b]) / 2 for a, b in ec]); keys = list(ec); _, _, dm = crease.nearest_all(mid); cedge = {k for k, d in zip(keys, dm) if d < tol and on[k[0]] and on[k[1]]}
+    else: on = np.zeros(nv, bool); cedge = set()
+    cn = collections.defaultdict(list)
+    for a, b in cedge: cn[a].append(b); cn[b].append(a)
+    bd = set()
+    for (a, b), c in ec.items():
+        if c == 1: bd |= {a, b}
+    for v in range(nv):
+        if not used[v] or v in bd: kind[v] = 2; continue
+        if on[v] or cn.get(v):
+            ns = cn.get(v, [])
+            if len(ns) > 2 or (len(ns) < 2 and not slide_ends): kind[v] = 2; continue                # 30 October 2026 : slide_ends frees the vertices that lie on a hard edge but have fewer than two hard edges in the quads (the hard edge crosses the quad) : they slide along it
+            if len(ns) < 2: kind[v] = 1; continue
+            u = V[ns[0]] - V[v]; w = V[ns[1]] - V[v]; cosang = float(u @ w) / max(np.linalg.norm(u) * np.linalg.norm(w), 1e-30); turn = 180.0 - np.degrees(np.arccos(np.clip(cosang, -1, 1)))
+            kind[v] = 1 if turn < turn_deg else 2
+    return kind
+
+
+def straighten(V, Q, Vr, Fr, features=None, outer=10, inner=60, theta=1.0 / 128, size="keep", turn_deg=30.0, slide_ends=False, log=print):
+    surf = BC.Surface(Vr, Fr); crease = Crease(features) if features is not None and len(features) else None; kind = classify(V, Q, crease, turn_deg=turn_deg, slide_ends=slide_ends)
+    log("barrier : %d vertices : %d free, %d slide on a hard edge, %d fixed ; %d quads" % (len(V), int((kind == 0).sum()), int((kind == 1).sum()), int((kind == 2).sum()), len(Q)))
+    arc_of = np.where(kind == 1, 0, -1); P, hist = BC.barrier(V, Q, surf, outer=outer, inner=inner, theta=theta, size=size, kind=kind, arc_of=arc_of, arcs=crease); return P, hist, kind
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("quads"); ap.add_argument("prefix"); ap.add_argument("out"); ap.add_argument("--outer", type=int, default=10); ap.add_argument("--inner", type=int, default=60); ap.add_argument("--theta", type=float, default=1.0 / 128); ap.add_argument("--size", default="keep"); ap.add_argument("--no-features", action="store_true"); ap.add_argument("--turn-deg", type=float, default=30.0); ap.add_argument("--slide-ends", action="store_true"); ap.add_argument("--json", action="store_true"); ap.add_argument("--ref"); a = ap.parse_args()
+    import ZrlTopoJudge as TJ
+    V, F = load_obj(a.quads); Q = np.array([f for f in F if len(f) == 4], np.int64); Vr, Fr = load_obj(a.prefix + ".obj"); feats = None if a.no_features else read_features(a.prefix, Vr, Fr); ref = a.ref or a.prefix + ".obj"
+    t0 = time.time(); P, hist, kind = straighten(V, Q, Vr, Fr, feats, a.outer, a.inner, a.theta, a.size, a.turn_deg, a.slide_ends, log=(lambda s: None) if a.json else print); save_obj(a.out, P, [list(q) for q in Q])
+    keys = ("quads", "folded_share", "squashed_share", "jac_mean", "angle_dev_mean_deg", "angle_dev_p90_deg", "straight_iso_mean_deg", "straight_iso_p90_deg", "straight_dev_mean_deg", "poles_per_1000_quads", "dev_mean_mm", "symmetry_mean_edge", "edge_std_over_mean")
+    before = TJ.judge(a.quads, ref); after = TJ.judge(a.out, ref); rep = {"seconds": round(time.time() - t0, 1), "slide": int((kind == 1).sum()), "fixed": int((kind == 2).sum()), "before": {k: before.get(k) for k in keys}, "after": {k: after.get(k) for k in keys}}
+    if a.json: print(json.dumps(rep))
+    else:
+        print("seconds", rep["seconds"])
+        for k in keys: print("%-24s %10s -> %10s" % (k, before.get(k), after.get(k)))
+
+
+if __name__ == "__main__": main()

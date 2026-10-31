@@ -1,0 +1,64 @@
+"""Q9, mesure 6 : faces extérieures dont la normale d'enroulement pointe vers l'INTÉRIEUR (rendues sombres par un éclairage à une face)
+et frontières entre pièces (escaliers). 30 October 2026."""
+import sys, json, collections
+import numpy as np
+sys.path.insert(0, ".")
+from zrcar_common import *
+P = "/home/user/Memory/Projects/zenray-meshes/handoff/car-finish-30-October-2026/files/tmp/tmp-zenray-meshes/versions/ZenRayCar_v752.obj"
+V, F, G, names = load_obj(P)
+Q, keep = quads_to_array(F); Gq = G[keep]
+N, A, C = face_geom(V, Q)
+ext = np.load("out/v752_exterior.npz"); vis = ext["vis"]; sgn = ext["sign"]
+inward = vis & (sgn < 0)
+print("faces extérieures", vis.sum(), "dont enroulement vers l'intérieur", inward.sum(), f"({100*inward.sum()/vis.sum():.1f} %), aire m2", A[inward].sum(), "sur", A[vis].sum())
+rows = []
+for gi, nm in enumerate(names):
+    m = (Gq == gi) & vis
+    if m.sum() == 0: continue
+    rows.append((int((m & inward).sum()), int(m.sum()), nm, float(A[m & inward].sum())))
+rows.sort(reverse=True)
+for k, t, nm, a in rows[:20]:
+    print(f"{nm:34s} {k:6d}/{t:6d} ({100*k/t:5.1f} %)  {a:6.3f} m2")
+# zone des phares : z > 1.9, |x| < 1.2, y entre 0.3 et 0.9
+m = inward & (C[:, 2] > 1.85)
+print("faces à enroulement intérieur avec z > 1.85 (avant) :", int(m.sum()), "aire m2", A[m].sum())
+# frontières entre pièces
+ed = edge_table(Q)
+bd = [(u, v) for (u, v), fl in ed.items() if len(fl) == 2 and Gq[fl[0]] != Gq[fl[1]] and vis[fl[0]] and vis[fl[1]]]
+print("arêtes frontières entre pièces extérieures", len(bd))
+adj = collections.defaultdict(list)
+for u, v in bd: adj[u].append(v); adj[v].append(u)
+seen = set(); chains = []
+def walk(a, b):
+    ch = [a, b]; seen.add((min(a, b), max(a, b))); prev, cur = a, b
+    while len(adj[cur]) == 2:
+        nx = [x for x in adj[cur] if x != prev][0]; k = (min(cur, nx), max(cur, nx))
+        if k in seen: break
+        seen.add(k); ch.append(nx); prev, cur = cur, nx
+    return ch
+for v0 in list(adj):
+    if len(adj[v0]) != 2:
+        for n0 in adj[v0]:
+            if (min(v0, n0), max(v0, n0)) not in seen: chains.append(walk(v0, n0))
+for v0 in list(adj):
+    for n0 in adj[v0]:
+        if (min(v0, n0), max(v0, n0)) not in seen: chains.append(walk(v0, n0))
+out = []
+for ch in chains:
+    p = V[ch]; L = np.linalg.norm(np.diff(p, axis=0), axis=1).sum()
+    if L < 0.10 or len(ch) < 8: continue
+    d = np.diff(p, axis=0); d /= np.linalg.norm(d, axis=1)[:, None] + 1e-12
+    cosv = np.clip((d[:-1] * d[1:]).sum(1), -1, 1); turn = np.degrees(np.arccos(cosv))
+    t90 = int(((turn > 60) & (turn < 120)).sum())
+    # écart à la corde (escalier = zigzag autour de la corde)
+    c = p.mean(0); u_, s_, vt = np.linalg.svd(p - c, full_matrices=False)
+    dev = np.linalg.norm((p - c) - np.outer((p - c) @ vt[0], vt[0]), axis=1)
+    out.append({"length_m": float(L), "edges": len(ch), "turns90": t90, "turns90_per_m": t90 / L, "line_rms_mm": float(np.sqrt((dev ** 2).mean()) * 1000),
+                "centre": p.mean(0).round(3).tolist()})
+out.sort(key=lambda r: -r["turns90_per_m"])
+print("chaînes de frontière entre pièces > 10 cm :", len(out))
+for r in out[:12]: print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
+tp = np.array([r["turns90_per_m"] for r in out]) if out else np.zeros(1)
+print("virages 60-120 deg par mètre : médiane %.2f, chaînes >= 8/m : %d" % (np.median(tp), (tp >= 8).sum()))
+json.dump({"inward_visible_faces": int(inward.sum()), "visible_faces": int(vis.sum()), "inward_area_m2": float(A[inward].sum()), "per_component": [{"name": nm, "inward": k, "visible": t} for k, t, nm, a in rows[:40]],
+           "front_inward_faces": int(m.sum()), "boundary_chains": out[:100]}, open("out/q9_inward.json", "w"), indent=1)

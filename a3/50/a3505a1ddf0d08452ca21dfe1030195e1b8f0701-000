@@ -1,0 +1,108 @@
+# Takayama 2014 : validation sur la Figure 11, équations exactes et tableau de sélection (30 October 2026)
+
+Complète takayama_patch_templates_30-October-2026.md sans le réécrire. Sources : le papier (https://cims.nyu.edu/gcl/papers/pattern-based-quadrangulation.pdf) et le code de référence C++ embarqué dans /Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf/libs/quadretopology/patterns/patterns/patchgen/Pattern_N_k.h (lecture seule). Statuts : [CODE] = lu dans ces fichiers ; [CALCULÉ] = résultat d'un script en lecture seule (python -I, venv zenray-meshes, scipy.optimize.milp) qui relit ces fichiers, scripts dans le dossier scratchpad de la session ; [ESTIMÉ] = interprétation.
+
+## 1. Les lectures de figure du fichier précédent sont confirmées par le code
+
+La lecture de la Figure 4 est validée : pour 4-sided pattern 1 les colonnes donnent (2 + x, 2 + x, 1, 1), pattern 2 : (3 + x + y, 1 + x, 1, 1 + y), pattern 4 : (4 + 2x + y, 2 + y, 1, 1), 5-sided pattern 1 : (2 + x, 1 + x, 1, 1, 1), pattern 3 : (5 + 2x + y, 2 + y, 1, 1, 1), 6-sided pattern 0 : (1 + x, 1, 1, 1 + x, 1, 1) [CODE]. Le code contient en plus des motifs absents du papier : 3-2, 3-3, 4-3 et 5-4 (motifs de Yasseen et al., Computer-Aided Design 45, 2013) et ses patterns 4-3 ; la sélection par défaut de patchgen::get_default_parameter parcourt, par motif croissant, toutes les permutations (rotations puis miroir) ; le motif 5-4 n'est parcouru que par la sélection interactive (switch_pattern).
+
+## 2. Équations exactes Ax = b (une ligne par motif) [CODE]
+
+Notation : l_j = const_j + somme des variables x multipliées par leur colonne. Les variables de bourrage p_i (padding) ajoutent 1 aux côtés i-1 et i+1 pour N >= 3 (N = 2 : colonne (0,2) et (2,0) ; N = 4 motif 0 : seulement deux variables, p0 pour les côtés (1,3) et p1 pour (0,2)). Les colonnes sont données dans l'ordre (côtés 0, 1, 2...). Pour N >= 3, p_i = indicateur des côtés i-1 et i+1 ; je ne répète donc pas ces colonnes, seulement les variables supplémentaires.
+
+| Motif | const (l - const = Ax) | variables supplémentaires (colonnes) |
+|---|---|---|
+| 2-0 | (3, 1) | p0=(0,2), p1=(2,0), y=(1,1) |
+| 2-1 | (2, 2) | p0=(0,2), p1=(2,0), x=(1,1), y=(1,1) |
+| 3-0 | (2, 1, 1) | aucune |
+| 3-1 | (4, 1, 1) | q1=(1,0,1), q2=(1,1,0), x=(2,0,0) |
+| 3-2 | (3, 2, 1) | q2=(1,1,0), x=(2,0,0) |
+| 3-3 | (4, 2, 2) | q1=(1,0,1), q2=(1,1,0), x=(2,0,0) |
+| 4-0 | (1, 1, 1, 1) | uniquement p0=(0,1,0,1), p1=(1,0,1,0) |
+| 4-1 | (2, 2, 1, 1) | x=(1,1,0,0) |
+| 4-2 | (3, 1, 1, 1) | x=(1,1,0,0), y=(1,0,0,1) |
+| 4-3 | (3, 1, 1, 1) | q1=(1,0,1,0), x=(2,0,0,0) |
+| 4-4 | (4, 2, 1, 1) | q1=(1,0,1,0), x=(2,0,0,0), y=(1,1,0,0) |
+| 5-0 | (2, 1, 1, 1, 1) | aucune |
+| 5-1 | (2, 1, 1, 1, 1) | q4=(1,0,0,1,0), x=(1,1,0,0,0) |
+| 5-2 | (4, 1, 1, 1, 1) | q0=(0,1,0,0,1), q1=(1,0,1,0,0), q4=(1,0,0,1,0), x=(2,0,0,0,0) |
+| 5-3 | (5, 2, 1, 1, 1) | q1=(1,0,1,0,0), q4=(1,0,0,1,0), x=(2,0,0,0,0), y=(1,1,0,0,0) |
+| 5-4 | (3, 3, 3, 1, 2) | q0=(0,1,0,0,1), q1=(1,0,1,0,0), x=(1,1,0,0,0) |
+| 6-0 | (1, 1, 1, 1, 1, 1) | x=(1,0,0,1,0,0) |
+| 6-1 | (2, 2, 1, 1, 1, 1) | x=(1,1,0,0,0,0), y=(1,0,0,1,0,0), z=(0,1,0,0,1,0), w=(0,0,1,0,0,1) |
+| 6-2 | (3, 1, 1, 1, 1, 1) | q0=(0,1,0,0,0,1), q3=(0,0,1,0,1,0), x=(2,0,0,0,0,0), y=(1,0,0,1,0,0) |
+| 6-3 | (4, 2, 1, 1, 1, 1) | q3=(0,0,1,0,1,0), x=(2,0,0,0,0,0), y=(1,1,0,0,0,0), z=(1,0,0,1,0,0) |
+Rappel : q_i a la même colonne que p_i : « le bourrage p_i et q_i ont le même effet sur le bord » (commentaire du code) ; p_i s'ajoute en dehors du motif (grille de bord), q_i s'insère à l'intérieur.
+
+## 3. Choix des paramètres (get_default_parameter) [CODE]
+
+1. Équation Ax = b avec tout entier >= 0 ; si l - const a une composante négative, motif refusé.
+2. Variable de « boucles d'arêtes » (x pour presque tous, y pour 2-0, aucune pour 3-0, 4-x, 5-0) : calcul de son minimum et de son maximum sous Ax = b seul, puis contrainte médiane - 1 <= variable <= médiane + 1 avec médiane = (min + max) / 2 en division entière.
+3. Contraintes secondaires : 3-1 : p1 <= q1, p2 <= q2 ; 3-2 : p2 <= q2 ; 3-3 : p1 <= q1, p2 <= q2 ; 4-1 et 4-2 : p0 <= p2, p1 <= p3 ; 4-3 et 4-4 : idem + p3 <= q1 ; 5-1 : p4 <= q4 ; 5-2 : p0 <= q0, p1 <= q1, p4 <= q4 ; 5-3 et 5-4 : p1 <= q1, p4 <= q4 ; 6-2 : p0 <= q0, p3 <= q3.
+4. Objectif : maximiser la somme des p_i (bourrage maximal = grilles régulières maximales = le moins de singularités).
+5. Ordre : par motif d'indice croissant (2 : 0, 1 ; 3 : 0, 1, 2 ; 4 : 0 à 4 ; 5 : 0 à 3 ; 6 : 0 à 3) ; pour chaque motif, 2N permutations (id 0 à N-1 rotations, N à 2N-1 miroir : l permuté par l'index (j + id) mod N ou N - 1 - (j + id - N) mod N) ; le premier motif faisable est retenu.
+6. Le script [CALCULÉ] reproduit exactement cette sélection (faithful.py).
+
+## 4. Validation sur la Figure 11 [CALCULÉ]
+
+| Entrée | Papier | Sélection du script (code) |
+|---|---|---|
+| Triangle (5, 15, 6), somme 26 | triangle avec plusieurs singularités (pattern 1 du papier : 4 + 2x) | motif 3-1, permutation 1, l permuté (15, 6, 5), p0 = 1, p1 = 1, p2 = 2, q1 = 2, q2 = 2, x = 2 ; vérif : 4 + 1 + 2 + 2 + 2 + 4 = 15, 1 + 2 + 1 + 2 = 6, 1 + 1 + 1 + 2 = 5 ✓. L'inégalité de Tarini (15 <= 5 + 6) est violée, donc un seul pôle est impossible : cohérent avec le choix de 3-1 (irréguliers locaux : 2 sommets de valence 3 sur le bord et le coin apex) |
+| Pentagone (4, 5, 6, 8, 3), somme 26 | cinq côtés de 4, 5, 6, 8, 3 | motif 5-1, permutation 2, l permuté (6, 8, 3, 4, 5), p0 = 4, p1 = 2, p2 = 2, p3 = 0, p4 = 0, q4 = 1, x = 1 ✓ (2 coins irréguliers locaux) |
+| Pentagone (4, 12, 3, 4, 4), somme 27 | Yasseen introduit un triangle (entrée invalide) | refus : somme impaire |
+| Pentagone (4, 13, 3, 4, 4), somme 28 | le papier retient le motif 3 des pentagones | le code retient 5-2 (premier faisable par indice) : permutation 1, l permuté (13, 3, 4, 4, 4), p2 = 2, p3 = 3, q4 = 1, x = 4 ; les deux motifs ont 5 sommets irréguliers locaux (ESTIMÉ : le papier parcourt peut-être l'ordre autrement) |
+Conclusion : les sélections concordent avec le comportement décrit par le papier ; l'écart sur le dernier cas est un détail d'ordre de test sans conséquence sur la validité.
+
+## 5. Tableau « comptes d'arêtes (exemples) -> motif retenu -> pôles » [CALCULÉ]
+
+Les pôles sont comptés sur la topologie de BASE (x = y = 0, sans bourrage) du motif d'après les faces du code ; la valence d'un coin suit la convention du papier (arêtes + 2) : une valence de coin différente de 4 n'est un vrai pôle que si les patchs voisins ne la compensent pas ; V = sommet non coin (vrai pôle de valence 3 ou 5).
+
+| N | Entrée (l) | Motif | Paramètres | Pôles locaux de base |
+|---|---|---|---|---|
+| 2 | (3, 1) | 2-0 | p0 = p1 = y = 0 | V0, V1 de valence 3 (2 pôles de bord) |
+| 2 | (5, 1) | 2-0 | p1 = 1, y = 0 | idem |
+| 2 | (4, 4) | 2-0 | p0 = 1, y = 1 | idem |
+| 2 | (2, 2) | 2-1 | tout 0 | idem (un seul quad) |
+| 3 | (2, 1, 1), (3, 3, 2), (4, 3, 3), (5, 5, 4) | 3-0 | (0,0,0), (1,0,1), (1,1,1), (2,1,2) | aucun V ; pôle central de valence 3 (au coin apex de la convention) |
+| 3 | (4, 1, 1) | 3-1 | tout 0 | V1, V3 de valence 3 ; coin C2 de valence 5 |
+| 3 | (8, 3, 3) | 3-1 | p0 = 2, x = 2 | idem |
+| 3 | (10, 2, 2) | 3-1 | p0 = 1, x = 3 | idem |
+| 3 | (5, 15, 6) | 3-1 | voir section 4 | idem |
+| 4 | (3, 3, 3, 3), (5, 3, 5, 3) | 4-0 | p0 = 2, p1 = 2 ; p0 = 2, p1 = 4 | aucun (grille) |
+| 4 | (2, 2, 1, 1) | 4-1 | tout 0 | V2 (3), C3 (5) |
+| 4 | (3, 1, 1, 1), (4, 2, 1, 1), (8, 2, 6, 2) | 4-2 | (0), (x = 1), (p0 = 1, p1 = 5) | V1 (3), C2 (5) |
+| 4 | (4, 5, 6, 3) | 4-1 | perm 1, p0 = 3, p1 = 2, x = 1 | V2 (3), C3 (5) |
+| 4 | (8, 4, 1, 1), (10, 4, 1, 1) | 4-4 | x = 1 y = 2 ; x = 2 y = 2 | V4, V6 (3), C2, C3 (5) |
+| 4 | (6, 3, 1, 1) | rien | | somme impaire |
+| 5 | (2, 1, 1, 1, 1), (6, 4, 3, 5, 4), (3, 3, 3, 1, 2) | 5-0 | (0) ; p = (2,1,1,1,3) ; perm 1 p0 = 2, p4 = 1 | centre de valence 5 : C3 de valence 6 en convention coin |
+| 5 | (3, 2, 1, 1, 1) | 5-1 | x = 1 | C0, C2 (5) |
+| 5 | (4, 1, 1, 1, 1) | 5-2 | tout 0 | V1, V3 (3), C0, C1, C3 (5) |
+| 5 | (5, 2, 1, 1, 1) | 5-3 | tout 0 | V5, V8 (3), C2, C3, C4 (5) |
+| 6 | (1,1,1,1,1,1), (2,1,1,2,1,1), (4,4,3,3,2,2) | 6-0 | x = 0 ; x = 1 ; p = (1,2,2,0,0,1) | C2, C5 (5) |
+| 6 | (2, 2, 1, 1, 1, 1) | 6-1 | tout 0 | V2 (3), C0, C2, C4 (5) |
+| 6 | (3, 1, 1, 1, 1, 1), (6, 2, 2, 2, 2, 2) | 6-2 | tout 0 ; q0 = 1, q3 = 1, x = 1, y = 1 | V2, V3 (3), C0, C1, C3, C4 (5) |
+| 6 | (4, 2, 1, 1, 1, 1) | 6-3 | tout 0 | V4, V7, V8 (3), V5 (5), C2, C3, C4, C5 (5) |
+
+Nombre de sommets irréguliers locaux de base par motif (V hors coins / coins) [CALCULÉ] : 2-0 : 2/0 ; 2-1 : 2/0 ; 3-0 : 0/0 ; 3-1 : 2/1 ; 3-2 : 2/1 ; 3-3 : 3/2 ; 4-0 : 0/0 ; 4-1 : 1/1 ; 4-2 : 1/1 ; 4-3 : 2/2 ; 4-4 : 2/2 ; 5-0 : 0/1 ; 5-1 : 0/2 ; 5-2 : 2/3 ; 5-3 : 2/3 ; 5-4 : 3/0 ; 6-0 : 0/2 ; 6-1 : 1/3 ; 6-2 : 2/4 ; 6-3 : 4/4. Règle pratique : plus l'indice du motif est élevé, plus il y a de singularités ; la sélection par indice croissant minimise donc leur nombre.
+
+## 6. Le cas N = 2 (lentille) de Tarini [DOC, arXiv 2101.11569 Section 3.1]
+
+Un patch à 2 côtés (une lentille) est quadrangulable avec un seul sommet irrégulier intérieur (un doublet, valence 2) si et seulement si e0 et e1 sont PAIRS (condition plus forte que la parité) ; les inconnues valent s0 = e1 / 2 et s1 = e0 / 2 (équations e0 = 2 s1, e1 = 2 s0). Tarini note qu'un doublet n'est pas toujours considéré comme valide mais peut l'être. Le motif de Takayama évite le doublet : pattern 2-0 couvre (A, 1) avec A impair (3 + 2x) et pattern 2-1 le cas (2, 2) : [CODE] 2-0 : l = (3 + 2 p1 + y, 1 + 2 p0 + y) ; 2-1 : l = (2 + 2 p1 + x + y, 2 + 2 p0 + x + y) ; le script montre que (4, 4), (6, 2) et (4, 2) sont tous obtenus par 2-0 avec y = 1 et bourrage. Géométrie du bord de la lentille dans le code : deux arcs de cercle de plus ou moins 60 degrés (théta = (2 t - 1) pi / 3, x = sin theta, y = -cos theta + 0,5), voir quadwild_source_notes. Résultat pour la lentille 2-0 en base : un quad dont deux sommets de bord non coins ont valence 3.
+
+## 7. Pseudo-code de sélection (numpy/scipy) [CALCULÉ, équivalent du code C++]
+
+    CFG = {(n,k): (xmid_var, [(a,b) meaning a<=b])}   # section 3 point 3
+    def default_param(n, k, l_perm):
+        A, const, names = PATTERN[(n,k)]                     # section 2
+        b = l_perm - const
+        if (b < 0).any(): return None
+        x = milp_feasible(A, b)                              # scipy.optimize.milp, integrality=1, bounds>=0
+        if xmid_var:
+            lo, hi = min_and_max(A, b, var=xmid_var); mid = (lo + hi)//2
+            extra = [mid-1 <= var <= mid+1]
+        extra += [a <= b for (a,b) in pairs]
+        return milp(maximize sum(p_i), A x = b, extra)       # None if infeasible
+    for k in ORDER[n]:
+        for id in range(2*n):  # rotations then mirrored rotations
+            r = default_param(n, k, permute(l, id, n))
+            if r: return k, id, r

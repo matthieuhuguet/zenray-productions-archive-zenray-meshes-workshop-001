@@ -1,0 +1,78 @@
+"""Q2 et Q3 mesurés sur la planche réelle : (a) constance de l'ombrage par régions (H3) ; (b) segments LSD, part des pixels d'arête expliquée par des droites (H1/H5).
+Sortie out/q2q3_board.json et images. 30 October 2026."""
+import sys, json, os
+import numpy as np, cv2
+from PIL import Image
+sys.path.insert(0, ".")
+from board_masks import panels, mask_of
+os.makedirs("out/board", exist_ok=True)
+P = panels()
+res = {}
+lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV)
+for k, (img, org) in P.items():
+    m, bg = mask_of(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    inner = cv2.erode(m, np.ones((13, 13), np.uint8))
+    sm = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    gx = cv2.Sobel(sm, cv2.CV_32F, 1, 0, ksize=3) / 8.0; gy = cv2.Sobel(sm, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    gm = np.hypot(gx, gy)
+    A = int(inner.sum())
+    r = {"inner_px": A}
+    for tau in (0.5, 1.0, 2.0):
+        flat = ((gm < tau) & (inner > 0)).astype(np.uint8)
+        flat = cv2.morphologyEx(flat, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, lab, stats, cen = cv2.connectedComponentsWithStats(flat, 4)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        big = [i + 1 for i, a_ in enumerate(areas) if a_ >= 400]
+        cover = sum(areas[i - 1] for i in big) / A
+        # écart type de l'intensité DANS chaque région plate puis après retrait d'un plan (a x + b y + c)
+        stds = []; slopes = []; after = []
+        for i in big:
+            ys, xs = np.where(lab == i)
+            I = gray[ys, xs]
+            X = np.c_[xs, ys, np.ones_like(xs)].astype(np.float64)
+            co, *_ = np.linalg.lstsq(X, I, rcond=None)
+            stds.append(float(I.std())); after.append(float((I - X @ co).std())); slopes.append(float(np.hypot(co[0], co[1]) * 100))   # niveaux de gris par 100 px
+        r[f"tau{tau}"] = {"regions_ge_400px": len(big), "mask_cover_by_big_regions": float(cover),
+                          "std_median": float(np.median(stds)) if stds else None, "std_after_plane_median": float(np.median(after)) if after else None,
+                          "slope_per_100px_median": float(np.median(slopes)) if slopes else None, "slope_per_100px_p90": float(np.percentile(slopes, 90)) if slopes else None}
+    # 2. LSD
+    g8 = np.clip(gray, 0, 255).astype(np.uint8)
+    segs = lsd.detect(g8)[0]
+    segs = segs.reshape(-1, 4) if segs is not None else np.zeros((0, 4))
+    L = np.hypot(segs[:, 2] - segs[:, 0], segs[:, 3] - segs[:, 1])
+    # on écarte les segments sur la silhouette (à moins de 6 px du bord du masque)
+    dist_in = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    mid = ((segs[:, :2] + segs[:, 2:]) / 2).round().astype(int)
+    mid[:, 0] = np.clip(mid[:, 0], 0, m.shape[1] - 1); mid[:, 1] = np.clip(mid[:, 1], 0, m.shape[0] - 1)
+    inside = dist_in[mid[:, 1], mid[:, 0]] > 6
+    keepm = inside & (L >= 12)
+    ang = np.degrees(np.arctan2(segs[:, 3] - segs[:, 1], segs[:, 2] - segs[:, 0])) % 180
+    # 3. pixels d'arête forts (hors silhouette) et part expliquée par un segment LSD >= 20 px
+    edges = cv2.Canny(g8, 12, 30)
+    edges[(dist_in <= 6)] = 0
+    seg_img = np.zeros_like(edges)
+    for (x1, y1, x2, y2), Lk, kp in zip(segs, L, keepm):
+        if kp and Lk >= 20:
+            cv2.line(seg_img, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), 255, 1)
+    near = cv2.dilate(seg_img, np.ones((5, 5), np.uint8)) > 0
+    expl = float((edges > 0)[near].sum() / max((edges > 0).sum(), 1))
+    # histogramme d'orientation des segments longs
+    long_ = keepm & (L >= 20)
+    h, _ = np.histogram(ang[long_], bins=18, range=(0, 180))
+    ax = ((ang[long_] < 3) | (ang[long_] > 177) | ((ang[long_] > 87) & (ang[long_] < 93))).mean() if long_.sum() else 0
+    r["lsd"] = {"segments_total": int(len(segs)), "segments_inside_ge12px": int(keepm.sum()), "segments_ge20px": int(long_.sum()), "length_px_total_ge20": float(L[long_].sum()),
+                "length_px_median_ge20": float(np.median(L[long_])) if long_.sum() else None, "axis_aligned_share_3deg": float(ax), "orientation_hist_10deg": h.tolist(),
+                "canny_edge_px": int((edges > 0).sum()), "canny_explained_by_ge20px_lines_tol2px": expl}
+    # image de contrôle
+    ov = cv2.cvtColor(g8, cv2.COLOR_GRAY2RGB)
+    for (x1, y1, x2, y2), Lk, kp in zip(segs, L, keepm):
+        if kp and Lk >= 20: cv2.line(ov, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), (255, 60, 60), 1, cv2.LINE_AA)
+    Image.fromarray(ov).save(f"out/board/{k}_lsd.png")
+    flat = ((gm < 1.0) & (inner > 0))
+    vis = np.dstack([g8, g8, g8]); vis[flat] = (0.5 * vis[flat] + 0.5 * np.array([60, 200, 90])).astype(np.uint8)
+    Image.fromarray(vis).save(f"out/board/{k}_flat.png")
+    res[k] = r
+    print(k, "A=", A, " tau1:", {a: (round(b, 3) if isinstance(b, float) else b) for a, b in r["tau1.0"].items()})
+    print("    LSD:", {a: (round(b, 3) if isinstance(b, float) else b) for a, b in r["lsd"].items() if a != "orientation_hist_10deg"})
+json.dump(res, open("out/q2q3_board.json", "w"), indent=1)

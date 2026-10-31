@@ -1,0 +1,43 @@
+"""Auto-test des vérificateurs dans les DEUX sens. Vert attendu : voiture facettée exacte ; rouge attendu : ondulations, bruit, plis ondulés, v752. 30 October 2026."""
+import sys, json, time
+import numpy as np
+sys.path.insert(0, ".")
+from facetcar import *; from facet_mesh import *; from verifiers import *
+car, p = build()
+U, lab = closed_mesh(car, 0.05)
+V0 = np.array(U.vertices); T0 = np.array(U.faces)
+cases = {}
+cases["GREEN_exact_polyhedron"] = (V0, T0)
+# rouge 1 : ondulation basse fréquence 3 mm (longueur d'onde 0.4 m) le long de la normale du sommet
+N = np.array(U.vertex_normals)
+wave = 0.003 * np.sin(2 * np.pi * V0[:, 2] / 0.4) * np.cos(2 * np.pi * V0[:, 0] / 0.5)
+cases["RED_waves_3mm"] = (V0 + N * wave[:, None], T0)
+# rouge 2 : bruit blanc 1 mm
+rng = np.random.default_rng(5)
+cases["RED_noise_1mm"] = (V0 + rng.normal(0, 0.001, V0.shape), T0)
+# rouge 3 : plis ondulés : écart de 2 mm de période 0.3 m appliqué seulement près des arêtes vives
+e, ang, L, ff = dihedrals(V0, T0)
+vs = np.unique(e[ang > 35].ravel()); near = np.zeros(len(V0), bool); near[vs] = True
+tree = cKDTree(V0[vs]); dd, _ = tree.query(V0); w = np.exp(-(dd / 0.03) ** 2)
+wob = 0.002 * np.sin(2 * np.pi * (V0[:, 0] + V0[:, 2]) / 0.3) * w
+cases["RED_wobbly_creases_2mm"] = (V0 + N * wob[:, None], T0)
+# rouge 4 : trou (un triangle retiré)
+cases["RED_hole"] = (V0, np.delete(T0, 1000, axis=0))
+# rouge 5 : asymétrie (déplacement de 5 mm d'un côté seulement)
+V5 = V0.copy(); V5[V5[:, 0] > 0.3, 1] += 0.005
+cases["RED_asymmetric_5mm"] = (V5, T0)
+res = {}
+for name, (V, T) in cases.items():
+    t = time.time(); r = run_all(V, T); res[name] = r
+    f = lambda k, key: r[k].get(key)
+    print(f"{name:26s} clos {r['closure']['pass']!s:5} | facettes {r['facet_planarity']['planar_area_fraction']:.3f} ({'ok' if r['facet_planarity']['pass'] else 'ROUGE'}) | plan-local {r['planarity']['planar_fraction']:.3f} | plis {r['crease_straightness'].get('segments_per_m', float('nan')):.2f} seg/m ({'ok' if r['crease_straightness']['pass'] else 'ROUGE'}) | ondul {r['undulation']['undulation_length_fraction']:.4f} ({'ok' if r['undulation']['pass'] else 'ROUGE'}) | sym p99 {r['symmetry']['mirror_p99_mm']:.3f} mm ({'ok' if r['symmetry']['pass'] else 'ROUGE'})  [{time.time()-t:.1f}s]")
+json.dump(res, open("out/verifier_selftest.json", "w"), indent=1)
+# attendu : GREEN passe tout ; chaque RED échoue au vérificateur qui lui correspond
+exp = {"RED_waves_3mm": ["facet_planarity", "planarity", "undulation"], "RED_noise_1mm": ["planarity", "undulation"], "RED_wobbly_creases_2mm": ["crease_straightness"], "RED_hole": ["closure"], "RED_asymmetric_5mm": ["symmetry"]}
+ok = all(res["GREEN_exact_polyhedron"][k]["pass"] for k in res["GREEN_exact_polyhedron"])
+bad = []
+for case, ks in exp.items():
+    for k in ks:
+        if res[case][k]["pass"]: bad.append((case, k))
+print("VERT sur le cas exact :", ok, "| vérificateurs qui n'ont PAS viré au rouge là où il le fallait :", bad)
+sys.exit(0 if ok and not bad else 1)

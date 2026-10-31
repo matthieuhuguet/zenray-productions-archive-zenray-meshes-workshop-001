@@ -1,0 +1,31 @@
+"""30 October 2026 : ZenRay Meshes, FINISH ALL : the whole finishing chain of a welded multi-part quad mesh in ONE command : facet filter passes with the do-no-harm gate (ZenRayFinish), caps for the small open loops (CarCloseHoles), clean slabs for the stair-stepped small parts (CarCleanSmallParts), the per-part report (CarPartsReport) and a before/after board in three views. Nothing of the input is modified.
+    python -I ZenRayFinishAll.py in.obj out_dir [--preset car|hard] [--caps "rocker|liner"] [--small "headlight|vent_fender"] [--no-board]
+Writes out_dir/finished.obj, bilan.json, parts.json and boards/*.png. FR : toute la chaine de finition en une commande ; l'entree n'est jamais modifiee.
+Time : about 4 minutes for the 150 thousand quads car."""
+import argparse, json, os, subprocess, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); PY = [sys.executable, "-I"]
+
+
+def run(args, log):
+    r = subprocess.run(PY + args, capture_output=True, text=True); log.append((" ".join(os.path.basename(x) for x in args[:1]), (r.stdout.strip().split("\n") or [""])[-1][:300], r.returncode))
+    if r.returncode: print("FAILED", args[0], r.stderr[-600:]); sys.exit(1)
+    return r.stdout
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out_dir"); ap.add_argument("--preset", default="car"); ap.add_argument("--caps", default="rocker|liner"); ap.add_argument("--small", default="headlight|vent_fender"); ap.add_argument("--no-board", action="store_true"); a = ap.parse_args()
+    os.makedirs(a.out_dir, exist_ok=True); t0 = time.time(); log = []; d = a.out_dir; s1 = os.path.join(d, "step1_facets.obj"); s2 = os.path.join(d, "step2_caps.obj"); fin = os.path.join(d, "finished.obj")
+    run([os.path.join(HERE, "ZenRayFinish.py"), a.inp, s1, "--preset", a.preset, "--bilan", os.path.join(d, "bilan.json")], log)
+    bil = json.load(open(os.path.join(d, "bilan.json")))
+    run([os.path.join(HERE, "CarCloseHoles.py"), s1, s2, "--parts", a.caps, "--max-edges", "60"], log)
+    run([os.path.join(HERE, "CarCleanSmallParts.py"), s2, fin, "--parts", a.small, "--edge-mm", "25"], log)
+    run([os.path.join(HERE, "CarPartsReport.py"), fin, "--json", os.path.join(d, "parts.json")], log)
+    if not a.no_board:
+        os.makedirs(os.path.join(d, "boards"), exist_ok=True)
+        for nm, az, el in (("q", 35, 22), ("s", 90, 10), ("t", 0, 89)):
+            run([os.path.join(HERE, "lines", "ZrlBoard3D.py"), os.path.join(d, "boards", "before_after_%s.png" % nm), "--title", "before (left) and finished (right), az %d el %d" % (az, el), "--cell", "before=%s@solid" % os.path.abspath(a.inp), "--cell", "finished=%s@solid" % os.path.abspath(fin), "--az", str(az), "--el", str(el), "--size", "800"], log)
+    out = {"input": os.path.abspath(a.inp), "finished": os.path.abspath(fin), "accepted_filter": bil.get("accepted"), "note": bil.get("note"), "steps": log, "seconds": round(time.time() - t0, 1), "bilan": os.path.join(d, "bilan.json")}
+    json.dump(out, open(os.path.join(d, "finish_all.json"), "w"), indent=1); print(json.dumps({k: out[k] for k in ("finished", "accepted_filter", "note", "seconds")}, indent=1))
+
+
+if __name__ == "__main__": main()

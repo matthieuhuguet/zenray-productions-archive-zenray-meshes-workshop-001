@@ -1,0 +1,46 @@
+"""Pass 9 : straighten the hybrid output (comptes de QuadWild, Tutte fill, exact weld) with vertex constraints : nodes fixed,
+arc vertices sliding along their arc (or only the feature arcs), interior vertices free on the surface.
+Usage : python3 -I run_straighten_hybrid.py base=WORK names=arch:qw,bracket:qw scales=arch:3.0,... out=res.json"""
+import sys, json, time
+sys.path.insert(0, ".")
+import numpy as np
+import zr8_io as IO, zr8_judge as J, zr8_straighten as S, zr8_hybrid as H, layout_probe as LP
+
+a = dict(kv.split("=", 1) for kv in sys.argv[1:])
+base = a["base"]; scales = dict(kv.split(":") for kv in a.get("scales", "").split(",") if kv)
+rows = []
+for spec in a["names"].split(","):
+    n, d = spec.split(":"); pre = "%s/%s/%s_rem_p0" % (base, d, n)
+    args = {"prefix": pre, "scale": scales.get(n, "3.0"), "counts": "qw", "dump": pre + "_123_dump.txt", "quad": pre + "_123_quadrangulation.obj"}
+    r = H.build(args); P, Q, keys, lay, arcs = r["P"], r["Q"], r["vkeys"], r["lay"], r["arcs"]
+    Vr, Fr = IO.read_obj_tri_or_quad(pre + ".obj"); surf = S.Surface(Vr, Fr)
+    akeys = list(arcs.keys()); aid = {k: i for i, k in enumerate(akeys)}
+    arcset = S.ArcSet([lay.V[list(k)] for k in akeys])
+    groups = np.concatenate([np.full(len(p["quads"]), i) for i, p in enumerate(r["parts"])])
+    kind_all = np.zeros(len(P), int); kind_feat = np.zeros(len(P), int); kind_geo = np.zeros(len(P), int); arc_of = np.full(len(P), -1)
+    feat_node = set()
+    for k_, v_ in arcs.items():
+        if v_["feature"]:
+            feat_node.add(int(k_[0])); feat_node.add(int(k_[-1]))
+    for i, k in enumerate(keys):
+        if k[0] == "node" and k[1] in feat_node: kind_geo[i] = 2
+        elif k[0] == "arc" and arcs[k[1]]["feature"]: kind_geo[i] = 1; arc_of[i] = aid[k[1]]
+        if k[0] == "node": kind_all[i] = kind_feat[i] = 2
+        elif k[0] == "arc":
+            arc_of[i] = aid[k[1]]; kind_all[i] = 1; kind_feat[i] = 1 if arcs[k[1]]["feature"] else 0
+    Vs, Qs = IO.read_obj_tri_or_quad(pre + "_123_quadrangulation_smooth.obj")
+    res = {"name": n, "features": int(sum(1 for v in arcs.values() if v["feature"])), "arcs": len(arcs)}
+    def add(label, X, secs=0.0):
+        x = J.judge_plus(X, Q, ref_tris=(Vr, Fr)); x["seconds"] = round(secs, 1); res[label] = x
+    add("raw", P)
+    x = J.judge_plus(Vs, Qs, ref_tris=(Vr, Fr)); x["seconds"] = 0.0; res["qw_smooth"] = x
+    for label, kind, th in (("barrier_slide_all", kind_all, 1 / 8), ("barrier_slide_feature", kind_feat, 1 / 8), ("barrier_geometry_only", kind_geo, 1 / 8), ("barrier_geometry_only_th128", kind_geo, 1 / 128)):
+        t = time.time(); X, h = S.barrier(P, Q, surf, outer=10, inner=60, theta=th, size="patch", groups=groups, kind=kind, arc_of=arc_of, arcs=arcset); add(label, X, time.time() - t)
+    rows.append(res); print(n, "done", flush=True)
+json.dump(rows, open(a["out"], "w"), indent=1)
+labels = ["raw", "qw_smooth", "barrier_slide_all", "barrier_slide_feature", "barrier_geometry_only", "barrier_geometry_only_th128"]
+print("%-9s %-24s %5s %5s %6s %7s %7s %7s %7s %7s %6s %5s" % ("mesh", "method", "fold%", "sq%", "jacM", "angDev", "angP99", "turn", "turnP90", "edgeCV", "areaCV", "sec"))
+for r in rows:
+    for l in labels:
+        x = r[l]
+        print("%-9s %-24s %5.2f %5.2f %6.3f %7.2f %7.1f %7.2f %7.2f %7.3f %6.3f %5.1f" % (r["name"], l, 100 * x["folded_frac"], 100 * x["squashed_frac"], x["jac_mean"], x["angle_dev_mean_deg"], x["angle_dev_p99_deg"], x["loop_turn_mean_deg"], x["loop_turn_p90_deg"], x["edge_cv"], x["area_cv"], x["seconds"]))

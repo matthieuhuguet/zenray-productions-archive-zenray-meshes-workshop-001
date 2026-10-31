@@ -1,0 +1,52 @@
+"""30 October 2026 : ZenRay Meshes : QuadWild with the creases GIVEN as hard constraints. The creases of a FINISHED triangle mesh (flat facets, crisp edges) are written as a .sharp file (count, then convex flag, face, edge per line) and handed to QuadWild, instead of letting its angle threshold guess them on a blurred surface.
+    python -I QwCreases.py tri.obj out_dir target_quads [--crease-deg 20] [--alpha 0.02]
+FR : QuadWild avec les plis imposes (fichier .sharp ecrit depuis la voiture finie) ; sortie out_dir/quads.obj."""
+import argparse, collections, os, shutil, subprocess, sys
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.join(HERE, "lines"))
+import QwParts as QP
+QW = QP.QW
+
+
+def write_sharp(obj, path, deg):
+    V = []; F = []
+    for l in open(obj):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("f "): F.append([int(x.split("/")[0]) - 1 for x in l.split()[1:]])
+    V = np.array(V); F = np.array(F); assert F.shape[1] == 3, "triangle mesh expected"
+    n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]); n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30); C = V[F].mean(1); ef = collections.defaultdict(list)
+    for fi, f in enumerate(F):
+        for k in range(3): u, w = int(f[k]), int(f[(k + 1) % 3]); ef[(min(u, w), max(u, w))].append((fi, k))
+    cosf = np.cos(np.radians(deg)); rows = []
+    for e, l in ef.items():
+        if len(l) != 2: continue
+        (f1, k1), (f2, k2) = l
+        if float(n[f1] @ n[f2]) < cosf:
+            convex = 1 if float(n[f2] @ (C[f1] - C[f2])) < 0 else 0; rows.append((convex, f1, k1))
+    with open(path, "w") as f:
+        f.write("%d\n" % len(rows))
+        for c, fi, k in rows: f.write("%d,%d,%d\n" % (c, fi, k))
+    return len(rows)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out_dir"); ap.add_argument("target", type=int); ap.add_argument("--crease-deg", type=float, default=20.0); ap.add_argument("--alpha", default="0.02"); ap.add_argument("--flow", default="lemon"); a = ap.parse_args()
+    d = os.path.abspath(a.out_dir); os.makedirs(d, exist_ok=True); part = os.path.join(d, "part.obj"); shutil.copy(a.inp, part); sharp = os.path.join(d, "part.sharp"); ns = write_sharp(part, sharp, a.crease_deg); print("sharp edges written :", ns)
+    prep = os.path.join(d, "prep.txt"); open(prep, "w").write("do_remesh 1\nsharp_feature_thr 35\nalpha 0.01\nscaleFact 1\n"); edge = (QP.area_of(part) / a.target) ** 0.5
+    r0 = subprocess.run([f"{QW}/build/Build/bin/quadwild", part, "2", prep, sharp], capture_output=True, text=True, timeout=1800, cwd=QW); rem = os.path.join(d, "part_rem_p0.obj")
+    if not os.path.exists(rem): print("no remesh", (r0.stdout + r0.stderr)[-500:]); sys.exit(1)
+    e0 = QP.mean_edge(rem); sf = edge / e0; flowfile = f"{QW}/config/main_config/flow_noalign_{a.flow}.txt"; best = None
+    for attempt in range(3):
+        txt = open(flowfile).read().replace("scaleFact 1", "scaleFact %.5f" % sf).replace("alpha 0.005", "alpha %s" % a.alpha); cfg = os.path.join(d, "main.txt"); open(cfg, "w").write(txt); outp = os.path.join(d, "part_rem_p0_123_quadrangulation_smooth.obj")
+        if os.path.exists(outp): os.remove(outp)
+        subprocess.run([f"{QW}/build/Build/bin/quad_from_patches", rem, "123", cfg], capture_output=True, text=True, timeout=1800, cwd=QW); rawq = outp.replace("_smooth", "")
+        if not os.path.exists(outp) and os.path.exists(rawq): shutil.copy(rawq, outp)
+        if not os.path.exists(outp): break
+        n = sum(1 for l in open(outp) if l.startswith("f ")); best = (outp, n)
+        if abs(n / a.target - 1) <= 0.08: break
+        sf = sf * (n / a.target) ** 0.5
+    if not best: print("no quads"); sys.exit(1)
+    shutil.copy(best[0], os.path.join(d, "quads.obj")); print("quads", best[1], "->", os.path.join(d, "quads.obj"))
+
+
+if __name__ == "__main__": main()

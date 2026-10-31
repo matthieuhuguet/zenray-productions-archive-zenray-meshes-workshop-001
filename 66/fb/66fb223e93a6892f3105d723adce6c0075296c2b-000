@@ -1,0 +1,89 @@
+"""30 October 2026 : QuadWild Bi-MDF PART BY PART on the groups of an OBJ, in parallel, as extra candidates of the part tournament.
+    python -I QwParts.py ref.obj PART1,PART2,... out_dir [workers 6] [timeout_s 300] [edge_m 0.04]
+Every named group is cut out of the OBJ (triangulated), run through quadwild (organic and mechanical setups) and quad_from_patches ; the quad meshes are written as out_dir/<PART>/qw_organic.obj and qw_mechanical.obj (the folders ZrlPartTournament.py reads). FR : QuadWild piece par piece, en parallele."""
+import collections, os, shutil, subprocess, sys
+from concurrent.futures import ProcessPoolExecutor
+QW = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/quadwild-bimdf"
+
+
+def groups(path, wanted):
+    V = []; G = collections.defaultdict(list); cur = None
+    for l in open(path):
+        t = l.split()
+        if not t: continue
+        if t[0] == "v": V.append(t[1:4])
+        elif t[0] in ("g", "o"): cur = t[1] if len(t) > 1 else None
+        elif t[0] == "f" and cur in wanted: G[cur].append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return V, G
+
+
+def write_part(V, faces, dst):
+    used = sorted({i for f in faces for i in f}); mp = {i: k + 1 for k, i in enumerate(used)}
+    with open(dst, "w") as o:
+        o.write("".join("v %s %s %s\n" % tuple(V[i]) for i in used))
+        for f in faces:
+            for k in range(1, len(f) - 1): o.write("f %d %d %d\n" % (mp[f[0]], mp[f[k]], mp[f[k + 1]]))
+
+
+def mean_edge(path):
+    import numpy as np
+    V = []; E = set()
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f":
+            f = [int(x.split("/")[0]) - 1 for x in t[1:]]
+            for k in range(len(f)): a, b = f[k], f[(k + 1) % len(f)]; E.add((min(a, b), max(a, b)))
+    V = np.array(V); e = np.array(sorted(E)); return float(np.linalg.norm(V[e[:, 0]] - V[e[:, 1]], axis=1).mean())
+
+
+def area_of(path):
+    import numpy as np
+    V = []; a = 0.0
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f":
+            f = [int(x.split("/")[0]) - 1 for x in t[1:]]
+            for k in range(1, len(f) - 1): a += 0.5 * float(np.linalg.norm(np.cross(np.array(V[f[k]]) - V[f[0]], np.array(V[f[k + 1]]) - V[f[0]])))
+    return a
+
+
+def run(args):
+    """30 October 2026 : DENSITY CONTROL (agent study, pass 6) : EdgeSize = mean edge of the remeshed part x scaleFact (main.cpp), so scaleFact = target edge / e0 ; one correction scaleFact x sqrt(quads / target) when the count is off by more than 20 percent."""
+    part, d, tmo, edge = args; res = {}; tgt = max(8.0, area_of(os.path.join(d, "part.obj")) / (edge * edge))
+    for kind, thr in [k for k in (("organic", -1), ("mechanical", 35)) if k[0] in os.environ.get("QW_KINDS", "organic,mechanical").split(",")]:            # 30 October 2026 : QW_KINDS=mechanical runs only the mechanical setup
+        w = os.path.join(d, "_qw_" + kind); os.makedirs(w, exist_ok=True); src = os.path.join(w, "part.obj"); shutil.copy(os.path.join(d, "part.obj"), src)
+        prep = os.path.join(w, "prep.txt"); open(prep, "w").write("do_remesh 1\nsharp_feature_thr %s\nalpha 0.01\nscaleFact 1\n" % thr)
+        try:
+            subprocess.run([f"{QW}/build/Build/bin/quadwild", src, "2", prep], capture_output=True, text=True, timeout=tmo, cwd=QW)
+            rem = os.path.join(w, "part_rem_p0.obj")
+            if not os.path.exists(rem): res[kind] = "no remesh"; continue
+            e0 = mean_edge(rem); sf = edge / e0; best = None
+            for attempt in range(2):
+                cfg = os.path.join(w, "main.txt"); open(cfg, "w").write(open(f"{QW}/config/main_config/flow_noalign_lemon.txt").read().replace("scaleFact 1", "scaleFact %.5f" % sf))
+                outp = os.path.join(w, "part_rem_p0_123_quadrangulation_smooth.obj")
+                if os.path.exists(outp): os.remove(outp)
+                subprocess.run([f"{QW}/build/Build/bin/quad_from_patches", rem, "123", cfg], capture_output=True, text=True, timeout=tmo, cwd=QW)
+                if not os.path.exists(outp): break
+                n = sum(1 for l in open(outp) if l.startswith("f ")); best = (n, outp, sf)
+                if abs(n / tgt - 1) <= 0.2: break
+                sf = sf * (n / tgt) ** 0.5
+            if best: shutil.copy(best[1], os.path.join(d, "qw_%s.obj" % kind)); res[kind] = "ok %d quads (target %d, scaleFact %.2f)" % (best[0], tgt, best[2])
+            else: res[kind] = "no quads"
+        except subprocess.TimeoutExpired: res[kind] = "timeout"
+    return part, res
+
+
+def main():
+    ref, parts, out = os.path.abspath(sys.argv[1]), sys.argv[2].split(","), os.path.abspath(sys.argv[3]); workers = int(sys.argv[4]) if len(sys.argv) > 4 else 6; tmo = int(sys.argv[5]) if len(sys.argv) > 5 else 300; edge = float(sys.argv[6]) if len(sys.argv) > 6 else 0.04
+    V, G = groups(ref, set(parts)); jobs = []
+    for p in parts:
+        if p not in G: continue
+        d = os.path.join(out, p); os.makedirs(d, exist_ok=True); write_part(V, G[p], os.path.join(d, "part.obj")); jobs.append((p, d, tmo, edge))
+    jobs.sort(key=lambda j: -len(G[j[0]]))
+    with ProcessPoolExecutor(workers) as ex:
+        for part, res in ex.map(run, jobs): print(part, res, flush=True)
+
+
+if __name__ == "__main__": main()

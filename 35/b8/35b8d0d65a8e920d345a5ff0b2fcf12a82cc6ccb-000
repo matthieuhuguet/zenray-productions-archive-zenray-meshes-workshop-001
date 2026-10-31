@@ -1,0 +1,84 @@
+"""30 October 2026 : ZenRay RETOPOLOGY BENCH (F6) : the one command of ZenRayRetopology.py run on five classes at equal density, one table of gates (green or red), one JSON.
+Classes : the arch (hard surface), Manny (organic character), the lily (open thin leaves), the eucalyptus (tree), pieces of the car (groups CAR_* of versions/ZenRayCar_v752.obj, density = their own quad count).
+    python -I ZrlRetopoBench.py out_dir [--only arch,manny,lily,eucalyptus,car] [--set key=value ...] [--cars CAR_body_door_L,...]
+The verifier is tested in both directions : `python -I ZrlRetopoBench.py --selftest` checks that the gates turn RED on a deliberately broken result (a folded quad, an asymmetric half, a lost component) and GREEN on a perfect grid.
+FR : le banc de ZenRay Retopology : cinq classes a densite egale, un tableau de portes vert ou rouge."""
+import argparse, collections, json, os, subprocess, sys, time
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+CLASSES = {"arch": ("benchmark/gt/arch_hard.obj", 5100), "manny": ("benchmark/gt/manny_character.obj", 6000), "lily": ("benchmark/gt/lily_plant.obj", 15000), "eucalyptus": ("benchmark/gt/eucalyptus_tree.obj", 3000)}
+CARS = ["CAR_body_door_L", "CAR_body_hood_C", "CAR_wheel_tyre_FL", "CAR_body_fender_front_L"]
+GATES = ["density", "folded", "squashed", "straightness", "symmetry", "closure", "coverage", "creases"]
+
+
+def extract_group(obj, group, dst):
+    V = []; F = []; cur = None
+    for l in open(obj):
+        t = l.split()
+        if not t: continue
+        if t[0] == "v": V.append(t[1:4])
+        elif t[0] in ("g", "o"): cur = t[1] if len(t) > 1 else None
+        elif t[0] == "f" and cur == group: F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    used = sorted({i for f in F for i in f}); mp = {i: k + 1 for k, i in enumerate(used)}; nquads = sum(1 for f in F if len(f) == 4) + 2 * sum(1 for f in F if len(f) > 4)
+    with open(dst, "w") as o:
+        o.write("".join("v %s %s %s\n" % tuple(V[i]) for i in used))
+        for f in F: o.write("f " + " ".join(str(mp[i]) for i in f) + "\n")                  # the ORIGINAL faces (quads) : the reference quads are then judged by the no regression guard
+    return len(F)
+
+
+def table(rows):
+    cols = ["case", "regime", "source", "quads"] + GATES
+    out = ["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    for name, r in rows:
+        if "gates" not in r: out.append("| %s | ERROR %s |" % (name, str(r.get("error", ""))[:60])); continue
+        cells = [name, r["regime"]["regime"], r.get("result_source", "zenray_retopology"), str(r["measures"]["quads"])]
+        for g in GATES:
+            x = r["gates"][g]; cells.append(("GREEN " if x["pass"] else "RED ") + str(x["value"]))
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("out", nargs="?"); ap.add_argument("--only", default="arch,manny,lily,eucalyptus,car"); ap.add_argument("--set", action="append", default=[]); ap.add_argument("--cars", default=",".join(CARS)); ap.add_argument("--selftest", action="store_true"); a = ap.parse_args()
+    if a.selftest: return selftest()
+    out = os.path.abspath(a.out); os.makedirs(out, exist_ok=True); cases = []
+    for k in a.only.split(","):
+        if k in CLASSES: cases.append((k, os.path.join(ROOT, CLASSES[k][0]), CLASSES[k][1]))
+        elif k == "car":
+            for g in a.cars.split(","):
+                dst = os.path.join(out, g + "_ref.obj"); n = extract_group(os.path.join(ROOT, "versions/ZenRayCar_v752.obj"), g, dst); cases.append((g, dst, n))
+    rows = []
+    for name, mesh, target in cases:
+        t0 = time.time(); cmd = [sys.executable, "-I", os.path.join(HERE, "ZenRayRetopology.py"), "run", mesh, "--target", str(target), "--out", os.path.join(out, name)]
+        for s in a.set: cmd += ["--set", s]
+        r = subprocess.run(cmd, capture_output=True, text=True); rp = os.path.join(out, name, "report.json")
+        rep = json.load(open(rp)) if os.path.exists(rp) else {"error": (r.stdout + r.stderr)[-300:]}; rows.append((name, rep)); print(name, "%.0f s" % (time.time() - t0), {g: ("G" if rep["gates"][g]["pass"] else "R") for g in GATES} if "gates" in rep else rep.get("error"), flush=True)
+    md = table(rows); open(os.path.join(out, "BENCH.md"), "w").write(md + "\n"); json.dump({n: r for n, r in rows}, open(os.path.join(out, "bench.json"), "w"), indent=1); print(md)
+
+
+def selftest():
+    """the gate verifiers in both directions (green on a good case, red on a deliberately broken one) : folded, squashed, straightness, symmetry, closure, coverage, crease fidelity."""
+    import ZenRayRetopology as R, ZrlTopoJudge as TJ, tempfile
+    n = 21; V = np.array([[i, j, 0.0] for j in range(n) for i in range(n)]); Q = np.array([[j * n + i, j * n + i + 1, (j + 1) * n + i + 1, (j + 1) * n + i] for j in range(n - 1) for i in range(n - 1)]); d = tempfile.mkdtemp(); good = os.path.join(d, "good.obj"); bad = os.path.join(d, "bad.obj")
+    def save(p, V, F): open(p, "w").write("".join("v %.6f %.6f %.6f\n" % tuple(x) for x in V) + "".join("f " + " ".join(str(i + 1) for i in f) + "\n" for f in F))
+    save(good, V, Q); Vb = V.copy(); Vb[5 * n + 5] = Vb[6 * n + 6] + [0.3, 0.1, 0]; Vb[10 * n + 10] += [1.7, 0.9, 0]; save(bad, Vb, Q)
+    g = TJ.judge(good, good); b = TJ.judge(bad, good); res = {}
+    res["folded"] = g["folded_share"] == 0 and b["folded_share"] > 0; res["squashed"] = g["squashed_share"] == 0; res["straightness"] = g["straight_iso_mean_deg"] < 0.01 and b["straight_iso_mean_deg"] > g["straight_iso_mean_deg"] + 0.05
+    sg = TJ.judge(good, good)["symmetry_mean_edge"]; Vs = V.copy(); Vs[:, 0] += 0.3 * Vs[:, 1]; Vs[:, 2] = 0.05 * Vs[:, 0] ** 2 / 10; save(os.path.join(d, "asym.obj"), Vs, Q); sb = TJ.judge(os.path.join(d, "asym.obj"), good)["symmetry_mean_edge"]; res["symmetry"] = sg < 1e-3 and sb > sg + 1e-3
+    QT = np.vstack([Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]]); rec_full, _, wf = R.coverage(V, QT, V, Q, 0.75); half = Q[(V[Q][:, :, 0].mean(1) < 10)]; rec_half, _, wh = R.coverage(V, QT, V, half, 0.75); res["coverage"] = rec_full > 0.99 and wf > 0.9 and rec_half < 0.6
+    cube = np.array([[x, y, z] for z in (0, 1) for y in (0, 1) for x in (0, 1)], float); faces = [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]]; closed, _ = R.boundary_length(cube, faces); opened, _ = R.boundary_length(cube, faces[:5]); res["closure"] = closed == 0 and opened > 3.9
+    Vl = np.array([[x, 0, 0] for x in range(0, 11)] + [[x, y, 0] for y in range(1, 11) for x in range(0, 11)], float)                      # an L : floor plus wall, crease on the line y = 0 of the plane z = 0 / x
+    floor = np.array([[x, y, 0] for y in range(0, 11) for x in range(0, 11)], float); wall = np.array([[x, 0, z] for z in range(1, 11) for x in range(0, 11)], float); Vt = np.vstack([floor, wall]); T = []
+    for y in range(10):
+        for x in range(10): a = y * 11 + x; T += [[a, a + 1, a + 12], [a, a + 12, a + 11]]
+    wid = lambda z, x: len(floor) + (z - 1) * 11 + x
+    for x in range(10): T += [[x, wid(1, x + 1), wid(1, x)], [x, x + 1, wid(1, x + 1)]]
+    for z in range(1, 10):
+        for x in range(10): a = wid(z, x); T += [[a, a + 1, a + 12], [a, a + 12, a + 11]]
+    T = np.array(T); cr = R.crease_alignment(Vt, T, floor, np.array([[y * 11 + x, y * 11 + x + 1, (y + 1) * 11 + x + 1, (y + 1) * 11 + x] for y in range(10) for x in range(10)]), 60.0, 1.0); shifted = floor + [0.5, 0.5, 0]; cr2 = R.crease_alignment(Vt, T, shifted, np.array([[y * 11 + x, y * 11 + x + 1, (y + 1) * 11 + x + 1, (y + 1) * 11 + x] for y in range(10) for x in range(10)]), 60.0, 1.0)
+    res["creases"] = cr is not None and cr[0] > 0.95 and cr2[0] < 0.6
+    ok = all(res.values()); print("selftest (green on the good case, red on the broken one) :", {k: ("OK" if v else "FAILED") for k, v in res.items()}, "->", "VERIFIERS OK" if ok else "VERIFIERS FAILED"); sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__": main()

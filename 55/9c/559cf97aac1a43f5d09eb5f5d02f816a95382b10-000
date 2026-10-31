@@ -1,0 +1,124 @@
+"""30 October 2026 : DRACARD episodes 8 to 12 (Blendshapes, Procedural Texturing, Skeleton and Skinning, Auto Rig Builder, LookDev and Rendering) rebuilt in five geo objects (and one LOP network for episode 12) from notes/ep08_ep09.md and notes/ep10_ep12.md. Node types are found by name in the node type catalogue ; a type that does not exist in this Houdini is listed in MISSING, never faked. exec inside Houdini after Ep07.py."""
+import hou, time
+obj = hou.node("/obj"); MISSING = []; GREEN = hou.Color((0.2, 0.7, 0.25)); RED = hou.Color((0.9, 0.15, 0.15))
+SOP = hou.sopNodeTypeCategory().nodeTypes()
+def find(*subs):
+    for k in sorted(SOP, key=len):
+        if all(s in k for s in subs): return k
+    return None
+def geo(name):
+    o = obj.node(name)
+    if o: o.destroy()
+    return obj.createNode("geo", name)
+def maker(net):
+    def mk(t, name, *inputs, **parms):
+        tt = t if t in SOP or not t.startswith("~") else None
+        if t.startswith("~"): tt = find(*t[1:].split("+"))
+        if not tt: MISSING.append((t, name, "no such node type")); return None
+        try: n = net.createNode(tt, name)
+        except Exception as e: MISSING.append((t, name, str(e)[:50])); return None
+        for i, x in enumerate(inputs):
+            if x is None: continue
+            try: n.setInput(i, x)
+            except Exception as e: MISSING.append(("input", name + ".%d" % i, "invalid input (type has fewer inputs)"))
+        for k, v in parms.items():
+            p = n.parm(k)
+            if p is None: MISSING.append(("parm", name + "." + k, "absent")); continue
+            try: p.set(v)
+            except Exception as e: MISSING.append(("parm", name + "." + k, str(e)[:30]))
+        return n
+    return mk
+FINAL = "/obj/Mad_Villain_Retopo/unsubdivide1"
+# ------------------------------------------------------------------ EP08 Blendshapes
+B = geo("Mad_Villain_Blendshapes"); mk = maker(B)
+file1 = mk("object_merge", "file1", objpath1=FINAL, xformtype=1); file1.setColor(GREEN)
+sp = mk("split", "split_body", file1); s1 = mk("sculpt", "sculpt1", sp); s1.setColor(RED)
+n2 = mk("null", "null2", s1); name1 = mk("name", "name1", n2) if mk is None else mk("~name", "name1", n2)
+wr = mk("attribwrangle", "pointwrangle_Mirror_Blendshape1", n2, class_=0) if False else mk("attribwrangle", "pointwrangle_Mirror_Blendshape1", n2)
+if wr: wr.parm("snippet").set("// rest to first pos, blendshape to second pos\nvector mirror_pos = set(-@P.x, @P.y, @P.z);\nint pt = nearpoint(1, mirror_pos);\nvector off = point(1, 'P', pt) - mirror_pos;\n@P = mirror_pos + off * 0;\n")
+n3 = mk("null", "null3", wr); name2 = mk("name", "name2", n3)
+mp = mk("~mergepacked", "mergepacked1", name1, name2); cbs = mk("~kinefx+characterblendshapesadd", "characterblendshapeadd1", file1, mp)
+s2 = mk("sculpt", "sculpt2", sp); s2.setColor(RED); n4 = mk("null", "null4", s2); name3 = mk("name", "name3", n4); mir1 = mk("mirror", "mirror1", name3, dirx=1, diry=0, dirz=0, keeporiginal=0) if False else mk("mirror", "mirror1", name3, dirx=1, diry=0, dirz=0)
+name7 = mk("name", "name7", mir1); merge1 = mk("merge", "merge1", name3, name7)
+ec = mk("~extractcentroid", "extractcentroid1", file1); name5 = mk("name", "name5", ec); rd = mk("~kinefx+rigdoctor", "rigdoctor1", name5)
+cp = mk("~captureproximity", "captureproximity1", file1, rd); pc = mk("~packcharacter", "packcharacter1", cp); pf = mk("~packfolder", "packfolder1", pc)
+ar = mk("~autorigcomponent", "autorigcomponent1", pf)
+g1 = mk("group", "group1", file1); curve = mk("~edgegroup", "edgegroup_to_curve1", g1)
+for n in (cbs or merge1,): n.setDisplayFlag(True)
+B.layoutChildren()
+# ------------------------------------------------------------------ EP09 Procedural texturing
+T = geo("Mad_Villain_Textures"); mk = maker(T)
+file1 = mk("object_merge", "file1", objpath1=FINAL, xformtype=1); file1.setColor(GREEN)
+parts = ["head", "tongue", "teeth_upper", "teeth_lower", "eyes", "eyes_yellow", "nails", "wings", "wings_orange", "legs", "arms", "tail", "scales", "horn_ears_bump", "black"]
+cols = [(0.6, 0.7, 0.3), (0.7, 0.2, 0.2), (0.95, 0.93, 0.8), (0.95, 0.93, 0.8), (0.9, 0.9, 0.9), (0.9, 0.8, 0.1), (0.02, 0.02, 0.02), (0.9, 0.5, 0.1), (0.9, 0.5, 0.1), (0.5, 0.6, 0.3), (0.5, 0.6, 0.3), (0.5, 0.6, 0.3), (0.3, 0.4, 0.2), (0.7, 0.65, 0.5), (0.05, 0.05, 0.05)]
+colored = []
+for i, (pn, c) in enumerate(zip(parts, cols), 1):
+    s = mk("split", "split%d" % i, file1); col = mk("color", "color%d" % i, s, colorr=c[0], colorg=c[1], colorb=c[2]); colored.append(col)
+mrg = mk("merge", "merge1", *colored)
+sph = mk("sphere", "sphere1", type="polymesh", rows=13, cols=24, radx=0.6, rady=0.6, radz=0.6); mask = mk("distancefromgeometry", "maskfromgeometry1", mrg, sph)
+uvf = mk("~uvflatten", "uvflatten1", mask); uvl = mk("~uvlayout", "uvlayout1", uvf)
+cn = T.createNode("copnet", "copnet1") if find("copnet") or True else None
+COPM = []
+try:
+    noise = cn.createNode("~fractal" if False else "noise", "fractal1") if False else None
+except Exception: pass
+COPT = hou.copNodeTypeCategory().nodeTypes()
+def cfind(*subs):
+    for k in sorted(COPT, key=len):
+        if all(x in k for x in subs): return k
+prev = None
+for want, nm in (("fractalnoise", "fractalnoise1"), ("contrast", "contrast1"), ("mult", "multiply1"), ("stripe", "pinstripe1")):
+    t = want if want in COPT else cfind(want)
+    if not t: MISSING.append(("cop:" + want, nm, "no such cop type")); continue
+    try:
+        n = cn.createNode(t, nm)
+        if prev is not None and n.maxNumInputs() > 0:
+            try: n.setInput(0, prev)
+            except Exception: pass
+        prev = n
+    except Exception as e: MISSING.append(("cop:" + want, nm, str(e)[:40]))
+cn.layoutChildren()
+out9 = mk("null", "OUT_TEXTURED", uvl); out9.setDisplayFlag(True); T.layoutChildren()
+# ------------------------------------------------------------------ EP10 Skeleton and skinning
+S = geo("Mad_Villain_Skeleton"); mk = maker(S)
+body = mk("object_merge", "Object_Merge_Body", objpath1=FINAL, xformtype=1); body.setColor(GREEN)
+segs = []
+for nm in ("spine", "leg", "arm", "tail", "neck"):
+    om = mk("object_merge", "Object_Merge_" + nm, objpath1="/obj/Mad_Villain/OUT_SKEL_" + nm.upper() if nm in ("spine", "leg", "arm") else "/obj/Mad_Villain/null1", xformtype=1); segs.append(om)
+pj = mk("~parentjoints", "parentjoints1", *segs) if False else mk("merge", "merge_skeleton", *segs)
+rdoc = mk("~kinefx+rigdoctor", "rigdoctor1", pj); jc = mk("~jointcapturebiharmonic", "jointcapturebiharmonic1", body, rdoc)
+dfg = mk("distancefromgeometry", "distancefromgeometry1", body, rdoc); sm = mk("smooth::2.0" if "smooth::2.0" in SOP else "smooth", "smooth1", dfg); rm = mk("attribremap", "attribremap1", sm)
+bd = mk("bonedeform", "bonedeform1", jc, rdoc); ray = mk("ray", "ray1", body, body); shr = mk("~shrinkwrap", "shrinkwrap1", body, body)
+bd.setDisplayFlag(True) if bd else None; S.layoutChildren()
+# ------------------------------------------------------------------ EP11 Auto rig builder
+A = geo("Mad_Villain_AutoRig"); mk = maker(A)
+shp = mk("object_merge", "Base_shp", objpath1=FINAL, xformtype=1); shp.setColor(GREEN); skl = mk("object_merge", "Base_skel", objpath1="/obj/Mad_Villain/null1", xformtype=1)
+pcg = mk("~packcharacter", "packcharacter1", shp, skl); pfd = mk("~packfolder", "packfolder1", pcg)
+comps = []
+prev = pfd
+for c in ("Spine", "Leg", "Arm", "Hand", "Neck", "LookAt", "BlendShape"):
+    prev = mk("~autorigcomponent", "autorigcomponent_" + c, prev); comps.append(prev)
+cfg = mk("~configurecontrols", "configurecontrols1", prev); sac = mk("~sceneaddcharacter", "sceneaddcharacter1", cfg); san = mk("~sceneanimate", "sceneanimate1", sac)
+A.layoutChildren()
+# ------------------------------------------------------------------ EP12 LookDev and rendering (Solaris)
+stage = hou.node("/stage")
+for nm in ("sopimport_Mad_Villain", "camera1", "materiallibrary1", "arealight1", "karmarendersettings1"):
+    o = stage.node(nm)
+    if o: o.destroy()
+LOP = {}
+try:
+    si = stage.createNode("sopimport", "sopimport_Mad_Villain"); si.parm("soppath").set(FINAL); LOP["sopimport"] = si
+    grid = stage.createNode("grid", "grid1") if "grid" in [t for t in hou.lopNodeTypeCategory().nodeTypes()] else None
+    cam = stage.createNode("camera", "camera1"); lib = stage.createNode("materiallibrary", "materiallibrary1"); lt = stage.createNode("arealight::2.0" if "arealight::2.0" in hou.lopNodeTypeCategory().nodeTypes() else "light", "arealight1")
+    krs = stage.createNode("karmarendersettings", "karmarendersettings1")
+    chain = [x for x in (si, grid, cam, lib, lt, krs) if x]
+    for a, b in zip(chain, chain[1:]): b.setInput(0, a)
+    krs.setDisplayFlag(True); stage.layoutChildren(); LOP = {n.name(): n.type().name() for n in chain}
+except Exception as e: MISSING.append(("lop", "stage", str(e)[:80]))
+report = {}
+for net in (B, T, S, A):
+    for n in net.children():
+        t = time.time()
+        try: n.cook(force=True); g = n.geometry(); report[net.name() + "/" + n.name()] = (len(g.points()) if g else None, round(time.time() - t, 1), [e[:70] for e in n.errors()][:1])
+        except Exception as e: report[net.name() + "/" + n.name()] = str(e)[:70]
+RESULT = {"missing": MISSING, "lop": LOP, "report": report}

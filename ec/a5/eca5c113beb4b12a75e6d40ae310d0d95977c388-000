@@ -1,0 +1,50 @@
+"""30 October 2026 : DRACARD episode 7 (Model Assembly and Retopology) rebuilt in /obj/Mad_Villain_Retopo from notes/ep07.md : split by groups, VDB from Polygons, VDB Smooth, Convert VDB (adaptivity 0.5), Quad Remesh (Beta) with X symmetry, merge, wings by the same chain, Unsubdivide Depth 1. The paid Labs Exoside QuadRemesher is not installed : the second remesher is the SideFX Quad Remesh at the episode's target counts (exoside_* names are kept as notes in the node comments)."""
+import hou, sys
+obj = hou.node("/obj"); MISSING = []; GREEN = hou.Color((0.2, 0.7, 0.25))
+QUADS_BODY = int(globals().get("QUADS_BODY", 50000)); QUADS_WINGS = int(globals().get("QUADS_WINGS", 5000)); VOX = float(globals().get("VOX", 0.012))
+old = obj.node("Mad_Villain_Retopo")
+if old: old.destroy()
+R = obj.createNode("geo", "Mad_Villain_Retopo")
+def mk(t, name, *inputs, **parms):
+    try: n = R.createNode(t, name)
+    except Exception as e: MISSING.append((t, name, str(e)[:50])); return None
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items():
+        p = n.parm(k)
+        if p is None: MISSING.append(("parm", name + "." + k, "absent")); continue
+        try: p.set(v)
+        except Exception as e: MISSING.append(("parm", name + "." + k, str(e)[:30]))
+    return n
+def part(label, path, grp):
+    o = mk("object_merge", "Dot_" + label, objpath1=path, xformtype=1); o.setColor(GREEN)
+    g = mk("groupcreate", "group_" + label, o, groupname=grp, groupbase=0) if False else mk("group", "group_" + label, o, crname=grp, groupop=0)
+    return g
+character = part("Character", "/obj/Mad_Villain/merge16", "body"); wings = part("Wings", "/obj/Mad_Villain_Wings/merge21", "wings_wings_orange")
+jacket = part("Jacket", "/obj/Mad_Villain_Clothing/merge1", "jacket")
+for nm, nodes in (("Jacket", (jacket,)),):
+    nb = R.createNetworkBox(nm); nb.setColor(GREEN)
+    for n in nodes: nb.addNode(n)
+merge_all = mk("merge", "merge1", character, wings, jacket); null12 = mk("null", "null12", merge_all); null2 = mk("null", "null2", null12)
+split3 = mk("split", "split3", null2, group="wings_wings_orange", grouptype=0) ; split4 = mk("split", "split4", null2, group="body", grouptype=0)
+split5 = mk("split", "split5", null2, group="body", grouptype=0); split6 = mk("split", "split6", split5, group="nails", grouptype=0); split7 = mk("split", "split7", null2, group="wings_wings_orange", grouptype=0)
+# the rig group menu is not scripted : split4 gives the body (the tutorial reads the group in the Split menu)
+body_src = split4
+vfp2 = mk("vdbfrompolygons", "vdbfrompolygons2", body_src, voxelsize=VOX, fillinterior=1, exteriorbandvoxels=3, interiorbandvoxels=3)
+vsm2 = mk("vdbsmooth", "vdbsmooth2", vfp2, iterations=4, radius=1)
+cvdb2 = mk("convertvdb", "convertvdb2", vsm2, conversion="poly", adaptivity=0.5)
+qr2 = mk("quadremesh", "quadremesh2", cvdb2, targetquadcount=QUADS_BODY, symmetry=1)
+exo1 = mk("quadremesh", "exoside_quadremesher1", qr2, targetquadcount=min(QUADS_BODY, 20000), symmetry=1); exo1.setComment("stand-in for Labs Exoside QuadRemesher (paid plugin), 20000 in the episode"); exo1.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+merge5 = mk("merge", "merge5", exo1, split6)
+vfp3 = mk("vdbfrompolygons", "vdbfrompolygons3", split7, voxelsize=VOX, fillinterior=1); vsm3 = mk("vdbsmooth", "vdbsmooth3", vfp3); cvdb3 = mk("convertvdb", "convertvdb3", vsm3, conversion="poly", adaptivity=0.5)
+exo2 = mk("quadremesh", "exoside_quadremesher2", cvdb3, targetquadcount=QUADS_WINGS, symmetry=1); exo2.setComment("stand-in for Labs Exoside QuadRemesher, 5000 for the wings")
+merge6 = mk("merge", "merge6", merge5, exo2); unsub = mk("unsubdivide", "unsubdivide1", merge6)
+unsub.setDisplayFlag(True); unsub.setRenderFlag(True); R.layoutChildren()
+if globals().get("COOK", True):
+    import time; report = {}
+    for n in R.children():
+        t = time.time()
+        try: n.cook(force=True); g = n.geometry(); report[n.name()] = (len(g.points()), len(g.prims()), round(time.time() - t, 1), [e[:70] for e in n.errors()][:1])
+        except Exception as e: report[n.name()] = str(e)[:70]
+    RESULT = {"missing": MISSING, "report": report}
+else: RESULT = {"missing": MISSING}
