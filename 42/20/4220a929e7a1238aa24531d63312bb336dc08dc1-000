@@ -1,0 +1,106 @@
+"""30 October 2026 : ZenRay CONFORM : closes the zero area SLITS of a quad mesh, the non conforming interfaces where one side of a seam has more edges than the other (arch : 2 edges against 4 along a straight crease, a boundary loop of 6 edges with no area).
+EN: a slit is a boundary loop whose vertices lie on a line (area over perimeter squared under a threshold). Its two chains between the extreme vertices carry nA and nB edges. The coarse chain is refined by CHORD INSERTION (every quad of the dual chord through a coarse boundary edge is cut in two, midpoints on the crossed edges : the mesh stays pure quads and conforming), until both chains have the same count, then the vertices are zipped pairwise (merged at their mean). No quad is removed, only added along the chords.
+    python -I ZrlConform.py in.obj out.obj [--tol 0.05]
+FR : ferme les fentes de surface nulle d'un maillage de quads : raffinement de la chaine grossiere par insertion de cordes (maillage conforme, quads purs) puis soudure des sommets par paires."""
+import argparse, collections, sys
+import numpy as np
+
+
+def load(path):
+    V = []; F = []
+    for l in open(path):
+        t = l.split()
+        if t and t[0] == "v": V.append([float(x) for x in t[1:4]])
+        elif t and t[0] == "f": F.append([int(x.split("/")[0]) - 1 for x in t[1:]])
+    return np.array(V), [list(f) for f in F]
+
+
+def save(path, V, F):
+    open(path, "w").write("".join("v %.9g %.9g %.9g\n" % tuple(p) for p in V) + "".join("f " + " ".join(str(int(i) + 1) for i in f) + "\n" for f in F))
+
+
+def ekey(a, b): return (a, b) if a < b else (b, a)
+
+
+def boundary_loops(F):
+    cnt = collections.Counter(); he = []
+    for q in F:
+        for k in range(len(q)): a, b = q[k], q[(k + 1) % len(q)]; cnt[ekey(a, b)] += 1; he.append((a, b))
+    nxt = collections.defaultdict(list)
+    for a, b in he:
+        if cnt[ekey(a, b)] == 1: nxt[a].append(b)
+    seen = set(); loops = []
+    for s in list(nxt):
+        if s in seen: continue
+        loop = [s]; seen.add(s); cur = nxt[s][0] if nxt[s] else None
+        while cur is not None and cur != s and cur not in seen and len(loop) < 100000:
+            loop.append(cur); seen.add(cur); cur = nxt[cur][0] if nxt[cur] else None
+        if cur == s: loops.append(loop)
+    return loops
+
+
+def is_slit(V, loop, tol):
+    """thin loop : the largest distance of its vertices to their principal line is under tol times the mean edge of the loop."""
+    P = V[loop]; c = P.mean(0); u = np.linalg.svd(P - c, full_matrices=False)[2][0]; d = np.linalg.norm((P - c) - np.outer((P - c) @ u, u), axis=1).max(); e = np.linalg.norm(np.diff(np.vstack([P, P[:1]]), axis=0), axis=1).mean()
+    return d < tol * e, u, c
+
+
+def split_chord(V, F, a, b):
+    """cut in two every quad of the dual chord through the edge (a, b). Returns (V, F, id of the midpoint of (a, b)) or None when the chord crosses a quad twice."""
+    ef = collections.defaultdict(list)
+    for fi, q in enumerate(F):
+        for k in range(4): ef[ekey(q[k], q[(k + 1) % 4])].append(fi)
+    start = ekey(a, b); steps = []; used = set(); crossed = [start]
+    def walk(edge, face):
+        out = []
+        while True:
+            if face in used: return None
+            q = F[face]; ks = next(k for k in range(4) if ekey(q[k], q[(k + 1) % 4]) == edge); ko = (ks + 2) % 4; used.add(face); out.append((face, ks, ko)); oe = ekey(q[ko], q[(ko + 1) % 4]); crossed.append(oe); others = [f for f in ef[oe] if f != face]
+            if not others or oe == start: return out
+            edge = oe; face = others[0]
+    for fi in ef[start]:
+        if fi in used: continue
+        w = walk(start, fi)
+        if w is None: return None
+        steps += w
+    mid = {}; Vn = [list(p) for p in V]
+    for e in dict.fromkeys(crossed):
+        mid[e] = len(Vn); Vn.append(list((np.asarray(V[e[0]]) + np.asarray(V[e[1]])) / 2))
+    Fn = []; cut = {s[0]: s for s in steps}
+    for fi, q in enumerate(F):
+        if fi not in cut: Fn.append(q); continue
+        _, ks, ko = cut[fi]; p0, p1, p2, p3 = q[ks], q[(ks + 1) % 4], q[(ks + 2) % 4], q[(ks + 3) % 4]; ms = mid[ekey(p0, p1)]; mo = mid[ekey(p2, p3)]; Fn.append([p0, ms, mo, p3]); Fn.append([ms, p1, p2, mo])
+    return np.array(Vn), Fn, mid[start]
+
+
+def conform(V, F, tol=0.05, max_slits=200, log=print):
+    """returns (V, F, report). Slits that cannot be closed (a chord crossing itself) are left and counted."""
+    V = np.array(V, float); F = [list(map(int, f)) for f in F]; closed = 0; skipped = 0; added = 0; tried = set()
+    for _ in range(max_slits):
+        loops = boundary_loops(F); target = None
+        for lp in loops:
+            if len(lp) > 64 or len(lp) < 4 or tuple(sorted(lp)) in tried: continue
+            ok, u, c = is_slit(V, lp, tol)
+            if ok: target = (lp, u, c); break
+        if target is None: break
+        lp, u, c = target; tried.add(tuple(sorted(lp))); t = (V[lp] - c) @ u; i0 = int(np.argmin(t)); i1 = int(np.argmax(t)); n = len(lp)
+        A = [lp[(i0 + k) % n] for k in range((i1 - i0) % n + 1)]; B = [lp[(i1 + k) % n] for k in range((i0 - i1) % n + 1)][::-1]            # both run from the min end to the max end
+        coarse, fine = (A, B) if len(A) < len(B) else (B, A); fail = False
+        while len(coarse) < len(fine):
+            L = [np.linalg.norm(V[coarse[k + 1]] - V[coarse[k]]) for k in range(len(coarse) - 1)]; k = int(np.argmax(L)); r = split_chord(V, F, coarse[k], coarse[k + 1])
+            if r is None: fail = True; break
+            before = len(F); V, F, m = r; added += len(F) - before; coarse.insert(k + 1, m)
+        if fail or len(coarse) != len(fine): skipped += 1; continue
+        mp = {}
+        for a_, b_ in zip(coarse, fine):
+            if a_ != b_: V[a_] = 0.5 * (V[a_] + V[b_]); mp[b_] = a_
+        F = [[mp.get(v, v) for v in q] for q in F]; closed += 1
+    used = sorted({v for q in F for v in q}); idx = {v: i for i, v in enumerate(used)}; V = V[used]; F = [[idx[v] for v in q] for q in F]
+    return V, F, {"slits_closed": closed, "slits_skipped": skipped, "quads_added": added, "boundary_edges_after": sum(len(l) for l in boundary_loops(F))}
+
+
+def main():
+    ap = argparse.ArgumentParser(); ap.add_argument("inp"); ap.add_argument("out"); ap.add_argument("--tol", type=float, default=0.05); a = ap.parse_args(); V, F = load(a.inp); b0 = sum(len(l) for l in boundary_loops(F)); V2, F2, rep = conform(V, F, a.tol); save(a.out, V2, F2); print("boundary edges %d -> %d ; %s ; quads %d -> %d" % (b0, rep["boundary_edges_after"], rep, len(F), len(F2)))
+
+
+if __name__ == "__main__": main()
