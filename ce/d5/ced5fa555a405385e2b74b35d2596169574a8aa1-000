@@ -1,0 +1,27 @@
+"""31 October 2026 : the ALGORITHM's wheel component (Scripts/WheelBuild.py, interface = a wheel_params json) built with the values MEASURED on the reference, written as one OBJ per
+part in the overlay frame (image right = car rear, up = up, toward the camera = outward, left wheel) so WheelOverlay.py, CompareWheel.py and the quad judge read it as they read any wheel.
+    python -I WheelRef.py wheel_params_ref.json out_dir
+FR : la roue de l'algorithme (WheelBuild, HDA) construite avec les valeurs mesurées sur la référence, une OBJ par pièce, dans le repère de la vue."""
+import sys, os, json
+import numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts")
+import WheelBuild as W
+p = json.load(open(sys.argv[1])); out = sys.argv[2]; os.makedirs(out + "/parts", exist_ok=True)
+m = W.build_wheel(p); P = np.array(m.P)
+def tf(v): return np.stack([-v[:, 2], v[:, 1], v[:, 0]], 1)         # local (axle x, y, z) -> view (right = -z, up = y, camera = x)
+def write(path, V, F):
+    with open(path, "w") as fh:
+        for v in V: fh.write("v %.6f %.6f %.6f\n" % tuple(v))
+        for f in F: fh.write("f " + " ".join(str(k + 1) for k in f) + "\n")
+byname = {}
+for q, n in zip(m.Q, m.N): byname.setdefault(n, []).append(q)
+allq = []
+for n, Q in byname.items():
+    used = sorted({i for q in Q for i in q}); loc = {g: k for k, g in enumerate(used)}
+    write(f"{out}/{n}.obj", tf(P[used]), [[loc[i] for i in q] for q in Q]); allq += Q
+write(f"{out}/wheel.obj", tf(P), allq)
+for src, dst in (("rim_spoke", "spokes"), ("rim_hub", "hub"), ("tyre", "tyre")): os.replace(f"{out}/{src}.obj", f"{out}/parts/{dst}.obj") if os.path.exists(f"{out}/{src}.obj") else None
+import trimesh
+trimesh.util.concatenate([trimesh.load(f"{out}/rim_barrel.obj", force="mesh", process=False), trimesh.load(f"{out}/rim_lip.obj", force="mesh", process=False)]).export(f"{out}/parts/rim_band.obj")
+import shutil; shutil.copy(f"{out}/parts/hub.obj", f"{out}/parts/dish.obj")
+print(json.dumps({n: len(Q) for n, Q in byname.items()}))

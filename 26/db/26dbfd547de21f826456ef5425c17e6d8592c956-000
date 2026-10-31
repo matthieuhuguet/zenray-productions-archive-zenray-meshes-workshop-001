@@ -1,0 +1,76 @@
+"""31 October 2026 : TRANSLATE a guide pack into a clean quad mesh in Houdini : the guides are the ONLY input (no number is written here). revolve curve -> Add SOP closed polygon -> Revolve SOP (quads) ;
+extrude curve -> closed polygon -> PolyExtrude (with back face) -> PolyBevel ; each part flipped outward by its signed volume ; parts written as OBJ in the view frame for the same overlay and judge.
+    exec inside Houdini after setting GUIDES and OUT_DIR        FR : traduire un paquet de guides en mesh de quads propres dans Houdini, les guides sont la seule entrée."""
+import hou, json, os, time
+_t0 = time.time(); G = json.load(open(GUIDES)); os.makedirs(OUT_DIR + "/parts", exist_ok=True)
+assert G["transform"] == [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], "only the identity transform is translated here"
+old = hou.node("/obj/Guides_Wheel")
+if old: old.destroy()
+H = hou.node("/obj").createNode("geo", "Guides_Wheel")
+def mk(typ, name, *ins, **parms):
+    n = H.createNode(typ, name)
+    for i, x in enumerate(ins):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items(): n.parm(k).set(v)
+    return n
+def poly(name, pts):
+    n = mk("add", name, keep=0, points=len(pts))
+    for i, q in enumerate(pts):
+        for k, ax in enumerate("xyz"): n.parm("pt%d%s" % (i, ax)).set(q[k])
+    n.parm("prims").set(1); n.parm("prim0").set("0-%d" % (len(pts) - 1)); n.parm("closed0").set(1); return n
+def outward(name, node):
+    node.cook(force=True); v = 0.0
+    for p in node.geometry().prims():
+        q = [x.point().position() for x in p.vertices()]
+        for i in range(1, len(q) - 1): v += q[0].dot(q[i].cross(q[i + 1])) / 6.0
+    return mk("reverse", name, node) if v > 0 else node   # 31 October 2026 : INSIDE Houdini a shell is outward when its right hand signed volume is NEGATIVE (clockwise winding), checked on prim.normal() against the radial direction ; the OBJ export reverses it, so the file reads positive
+def audit(node):
+    node.cook(force=True); g = node.geometry(); e = {}; vol = 0.0
+    for p in g.prims():
+        vs = [v.point().number() for v in p.vertices()]
+        for i in range(len(vs)): a, b = vs[i], vs[(i + 1) % len(vs)]; k = (min(a, b), max(a, b)); e[k] = e.get(k, 0) + 1
+        q = [v.point().position() for v in p.vertices()]
+        for i in range(1, len(q) - 1): vol += q[0].dot(q[i].cross(q[i + 1])) / 6.0
+    quads = sum(1 for p in g.prims() if p.numVertices() == 4)
+    return {"prims": len(g.prims()), "open_edges": sum(1 for c in e.values() if c == 1), "non_manifold": sum(1 for c in e.values() if c > 2), "quad_share": round(quads / max(len(g.prims()), 1), 3), "volume": round(vol, 5)}
+def coons_sop(c):
+    """a bilinearly blended Coons patch from the four sides of a closed outline (corners : left root, right root, right tip, left tip ; the polyline between the last two corners is the curved side), written by a Python SOP"""
+    import math
+    P = [tuple(q) for q in c["points"]]; i0, i1, i2, i3 = c["patch"]["corners"]; nu, nv = c["patch"]["cols"], c["patch"]["rows"]
+    arc = [P[k] for k in range(i2, i3 + 1)][::-1]; L = [0.0]
+    for a, b in zip(arc[:-1], arc[1:]): L.append(L[-1] + math.dist(a, b))
+    def T(u):
+        d = u * L[-1]
+        for k in range(len(arc) - 1):
+            if d <= L[k + 1] + 1e-12:
+                t = (d - L[k]) / max(L[k + 1] - L[k], 1e-12); return tuple(arc[k][m] + (arc[k + 1][m] - arc[k][m]) * t for m in range(3))
+        return arc[-1]
+    lerp = lambda a, b, t: tuple(a[m] + (b[m] - a[m]) * t for m in range(3))
+    grid = []
+    for j in range(nv):
+        v = j / (nv - 1)
+        for i in range(nu):
+            u = i / (nu - 1); B = lerp(P[i0], P[i1], u); Tp = T(u); Lv = lerp(P[i0], P[i3], v); Rv = lerp(P[i1], P[i2], v)
+            corner = tuple((1 - u) * (1 - v) * P[i0][m] + u * (1 - v) * P[i1][m] + (1 - u) * v * P[i3][m] + u * v * P[i2][m] for m in range(3))
+            grid.append(tuple(round((1 - v) * B[m] + v * Tp[m] + (1 - u) * Lv[m] + u * Rv[m] - corner[m], 6) for m in range(3)))
+    quads = [(j * nu + i, j * nu + i + 1, (j + 1) * nu + i + 1, (j + 1) * nu + i) for j in range(nv - 1) for i in range(nu - 1)]
+    n = H.createNode("python", c["name"] + "_coons")
+    n.parm("python").set("g = hou.pwd().geometry()\nPT = %r\nQ = %r\nps = [g.createPoint() for _ in PT]\nfor p, x in zip(ps, PT): p.setPosition(x)\nfor q in Q:\n    pr = g.createPolygon()\n    for k in q: pr.addVertex(ps[k])\n" % (grid, quads))
+    return n
+PARTMAP = {"rim": "rim_band"}; groups = {}
+for c in G["curves"]:
+    pts = [tuple(p) for p in c["points"]]; g = poly(c["name"] + "_guide", pts)
+    if c["role"] == "revolve":
+        r = mk("revolve", c["name"], g, divs=c["divisions"], surftype=5); r.parmTuple("dir").set(tuple(G["axis"])); r.parmTuple("origin").set((0, 0, 0)); node = outward(c["name"] + "_outward", r)
+    else:
+        if c.get("patch"): g = coons_sop(c)       # 31 October 2026 : four sided Coons patch (Houdini has no such node), all quads front and back
+        ext = mk("polyextrude::2.0", c["name"] + "_extrude", g, dist=c["depth"], outputback=1)
+        bev = mk("polybevel::3.0", c["name"] + "_bevel", ext, offset=c["bevel"], divisions=c["bevel_div"], ignoreflatedges=1)   # flat grid edges are left alone, only the sharp outline is chamfered
+        node = outward(c["name"] + "_outward", bev)
+    groups.setdefault(PARTMAP.get(c["name"], "spokes" if c["name"].startswith("spoke_") else c["name"]), []).append(node)
+outs = {}
+for part, nodes in groups.items():
+    m = mk("merge", "merge_" + part, *nodes); o = mk("null", "OUT_" + part, m); o.cook(force=True); o.geometry().saveToFile("%s/parts/%s.obj" % (OUT_DIR, part)); outs[part] = o
+allm = mk("merge", "merge_wheel", *outs.values()); out = mk("null", "OUT_WHEEL", allm); out.setDisplayFlag(True); out.setRenderFlag(True); out.cook(force=True); out.geometry().saveToFile(OUT_DIR + "/wheel.obj"); H.layoutChildren()
+RESULT = {k: audit(v) for k, v in outs.items()}; RESULT["OUT_WHEEL"] = audit(out); RESULT["seconds"] = round(time.time() - _t0, 2)
+RESULT["errors"] = {c.name(): c.errors()[0][:90] for c in H.children() if c.errors()}

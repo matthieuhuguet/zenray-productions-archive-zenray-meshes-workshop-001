@@ -1,0 +1,35 @@
+"""31 October 2026 : the wheel TAKEN FROM the validated car (v752), the way the ZenRay Meshes algorithm does it (audit the part as it is, keep it if clean) :
+all parts named CAR_wheel_*_<corner> re-centred on the tyre centre, axis on +Z toward the camera, written as one OBJ (+ one per part) so the same overlay and
+the same part audit judge it.   FR : la roue PRISE sur la voiture validée (v752), recentrée, axe sur +Z, pour la juger avec les mêmes outils.
+    python -I WheelFromCar.py FL out_dir [flip]"""
+import sys, os, fnmatch
+import numpy as np
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/retopo")
+import ZrrData as D
+corner = sys.argv[1]; out = sys.argv[2]; flip = len(sys.argv) > 3 and sys.argv[3] == "flip"
+os.makedirs(out, exist_ok=True)
+car = D.load()
+ids = [i for i, n in enumerate(car["names"]) if fnmatch.fnmatch(n, f"CAR_wheel_*_{corner}") and "brake" not in n]
+tyre = [i for i in ids if "tyre" in car["names"][i]][0]
+tp = np.flatnonzero(car["T"] == tyre); tv = np.unique(np.concatenate([car["I"][car["off"][p]:car["off"][p + 1]] for p in tp]))
+c = car["P"][tv].mean(0)                                   # tyre centre = wheel centre (the tyre is a body of revolution)
+sgn = 1.0 if c[0] > 0 else -1.0                            # outward = away from the symmetry plane x = 0
+print("corner", corner, "centre", np.round(c, 4), "outward sign", sgn)
+allv, allf, parts = [], [], {}
+for i in ids:
+    ps = np.flatnonzero(car["T"] == i); loc = {}; V = []; F = []
+    for p in ps:
+        w = car["I"][car["off"][p]:car["off"][p + 1]]; f = []
+        for v in w:
+            if v not in loc: loc[v] = len(V); q = car["P"][v] - c; V.append([(q[2] * (-1 if flip else 1)), q[1], q[0] * sgn])   # x <- car z, y <- car y, z <- outward
+            f.append(loc[v])
+        F.append(f)
+    parts[car["names"][i]] = (np.array(V), F)
+    base = sum(len(a) for a in allv); allv.append(np.array(V)); allf += [[k + base for k in f] for f in F]
+def write(path, V, F):
+    with open(path, "w") as fh:
+        for v in V: fh.write("v %.6f %.6f %.6f\n" % tuple(v))
+        for f in F: fh.write("f " + " ".join(str(k + 1) for k in f) + "\n")
+write(f"{out}/wheel_{corner}{'_flip' if flip else ''}.obj", np.concatenate(allv), allf)
+for n, (V, F) in parts.items(): write(f"{out}/{n}.obj", V, F)
+print("parts", len(parts), "faces", len(allf))

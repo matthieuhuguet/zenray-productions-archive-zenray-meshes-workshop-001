@@ -106,7 +106,10 @@ def tyre_profile(p):
 
 def spoke_ribbon(p, a_center, off):
     """one spoke: side curves at angle a_center +- half width (+ off for split pairs), from hub to lip ; concave in x."""
-    rh, rl = p["hub_r"], p["rim_r"] - p["lip_w"]; n = p["spoke_steps"]; hw = p["spoke_w"] / 2
+    # 31 October 2026 : three optional parameters, the defaults give back the old wheel to the bit : spoke_r_in and spoke_r_out (where the ribbon
+    # starts and ends), spoke_taper [width factor at the hub, at the tip] ; FR : début, fin et conicité du rayon, mesurés sur la référence.
+    rh, rl = p.get("spoke_r_in", p["hub_r"]), p.get("spoke_r_out", p["rim_r"] - p["lip_w"]); n = p["spoke_steps"]; hw = p["spoke_w"] / 2
+    tp0, tp1 = p.get("spoke_taper", [0.8, 1.2])
     r = np.linspace(rh, rl, n); xface = p["face_x"] - p["concave"] * (1 - (r - rh) / (rl - rh))   # sinks toward the hub
     tw = math.radians(p["twist_deg"]) * (r - rh) / (rl - rh)
     rows = []
@@ -116,7 +119,7 @@ def spoke_ribbon(p, a_center, off):
     # a ridge (spoke_ridge) on three samples (25 October 2026)
     prof = p.get("spoke_profile") or [[sv, p.get("spoke_ridge", 0.0) * (1 - abs(sv))] for sv in np.linspace(-1, 1, 3)]
     for s, dxp in prof:
-        ang = a_center + tw + (offr + s * hw * (0.8 + 0.4 * t)) / r
+        ang = a_center + tw + (offr + s * hw * (tp0 + (tp1 - tp0) * t)) / r
         xr = xface + dxp
         rows.append(np.stack([xr, r * np.cos(ang), r * np.sin(ang)], 1))
     top = np.stack(rows, 1)                              # (n, k, 3)
@@ -161,10 +164,14 @@ def build_wheel(p):
         cap_p, cap_q = quad_disc(seg, p["hub_r"], lambda r: back_x)
         m.quads(cap_p, cap_q, "rim_hub")
     offs = [-p["split_gap"] / 2 - p["spoke_w"] / 2, p["split_gap"] / 2 + p["spoke_w"] / 2] if p["split"] else [0.0]
+    # 31 October 2026 : spoke_angles_deg (one angle per spoke, 0 = twelve o'clock, counter clockwise seen from outside the left wheel) and spoke_offsets_m
+    # (lateral shift of each spoke, metres) replace the regular spacing when given : a generated sheet is never regular. FR : angles mesurés par rayon.
+    angs, offk = p.get("spoke_angles_deg"), p.get("spoke_offsets_m")
+    assert angs is None or len(angs) == p["spokes"], "spoke_angles_deg must have one angle per spoke"
     for k in range(p["spokes"]):
-        a = 2 * math.pi * k / p["spokes"] + math.radians(p["phase_deg"])
+        a = math.radians(angs[k]) if angs else 2 * math.pi * k / p["spokes"] + math.radians(p["phase_deg"])
         for o in offs:
-            top, bot = spoke_ribbon(p, a, o)
+            top, bot = spoke_ribbon(p, a, o + (offk[k] if offk else 0.0))
             if p.get("spoke_tube", 1):
                 # 26 October 2026: CLOSED TUBE ; section = top row then bottom row reversed (the long sides exist, the
                 # four ribbons of before left them open), swept from hub to lip, two end caps as quad strips ; welded.
@@ -175,6 +182,13 @@ def build_wheel(p):
                 m.grid(top, "rim_spoke"); m.grid(bot, "rim_spoke", flip=True)
                 m.grid(np.stack([top[:, 0], bot[:, 0]], 1), "rim_spoke", flip=True); m.grid(np.stack([top[:, -1], bot[:, -1]], 1), "rim_spoke")
     m.weld(p.get("weld_tol_m", 1e-7))   # 26 October 2026
+    if p.get("outward_check", 0):       # 31 October 2026 : every closed part must have its normals OUTWARD (positive signed volume), else its quads are reversed ; off by default so v752 stays as delivered
+        P_ = np.array(m.P)              # FR : chaque pièce fermée doit avoir ses normales vers l'extérieur (volume signé positif), sinon ses quads sont retournés
+        for name in sorted(set(m.N)):
+            idx = [i for i, n_ in enumerate(m.N) if n_ == name]
+            vol = sum(np.dot(P_[m.Q[i][0]], np.cross(P_[m.Q[i][k]], P_[m.Q[i][k + 1]])) / 6 for i in idx for k in (1, 2))
+            if vol < 0:
+                for i in idx: m.Q[i] = m.Q[i][::-1]
     return m
 
 
