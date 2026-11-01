@@ -1,0 +1,63 @@
+"""1 November 2026 : M22 step 2f, the LEGEND of the micro-components : numbers in reading order of the catalog (dataset), semi transparent masks on the reference panels with the numbers at the middle of each mask, the legend list with instance count and size, and one ICON per micro-component (best view of the reference, its mask in colour, the rest dimmed). Writes 02_masks/mc.json, legend_board.png, 02_masks/icons/MC<n>.png.
+    python -I MicroLegend.py Projects/<id>/params.json        FR : la légende : numéros, masques semi-transparents, liste et icône de chaque micro-component."""
+import sys, os, json, re
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+ZONE = re.compile(r"_z\d\d$")
+FONT_NUM = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"; FONT_TXT = "/Users/zenray/Library/Fonts/Literata[opsz,wght].ttf"
+
+
+def build_mc(p, home):
+    M = json.load(open(f"{home}/02_masks/micro.json")); K = json.load(open(C.abspath(p["catalog"]))); F = K["families"]; ref = json.load(open(f"{home}/02_masks/metrics.json")); atoms = M["atoms"]; order = {g: i for i, g in enumerate(K["groups"])}; fam_order = {f: i for i, f in enumerate(F)}; out = []
+    for D in M["definitions"]:
+        if D["hidden"]: continue
+        vis = {}; src = {}
+        for a in D["atoms"]:
+            for v, c in ref["ref_px"].get(str(a), {}).items(): vis[v] = vis.get(v, 0) + c; src[v] = "reference"
+            for v, c in ref["template_px"].get(str(a), {}).items(): vis[v] = vis.get(v, 0) + c; src.setdefault(v, "gabarit")
+        a0 = atoms[D["atoms"][0]]; size = [round(a0["hi"][k] - a0["lo"][k], 3) for k in range(3)]; sc = p["scale"] ** 2; base = ZONE.sub("", D["family"]); f = F.get(base); assert f, "family missing in the catalog : " + D["family"]
+        if base != D["family"]:                   # 1 November 2026 : a zone cut along the reference is named by its place on its parent
+            f = dict(f); cy, cx = (a0["lo"][1] + a0["hi"][1]) / 2, abs((a0["lo"][0] + a0["hi"][0]) / 2); cz = (a0["lo"][2] + a0["hi"][2]) / 2; same = [atoms[i] for i in range(len(atoms)) if ZONE.sub("", atoms[i]["family"]) == base]; yl, yh = min(a["lo"][1] for a in same), max(a["hi"][1] for a in same); zl, zh = min(a["lo"][2] for a in same), max(a["hi"][2] for a in same); xh = max(max(abs(a["lo"][0]), abs(a["hi"][0])) for a in same)
+            long_ = zh - zl > 2 * (yh - yl); w = cz if long_ else cy; a_, b_ = (zl, zh) if long_ else (yl, yh); t = (w - a_) / max(b_ - a_, 1e-6); names = ("arrière", "milieu", "avant") if long_ else ("bas", "milieu", "haut"); pos = names[0 if t < 0.34 else 1 if t < 0.67 else 2]; lat = "central" if cx < 0.25 * xh else "extérieur"; fam_no = int(D["family"].rsplit("_z", 1)[1])
+            f["zone_base"] = f["fr"]; f["shape"] = f"partie {pos}, {lat}, de : {F[base]['fr'].lower()}, découpée selon les traits de la planche"
+        out.append(dict(def_id=D["id"], family=D["family"], zone_base=f.get("zone_base"), fr=f["fr"], group=f["group"], shape=f["shape"], instances=D.get("instances", len(D["atoms"])), atoms=D["atoms"], faces=D["faces"], size_m=size, visible_px={k: int(v / sc) for k, v in vis.items()}, mask_source=src))
+    seen = [m for m in out if m["visible_px"]]; off = [m for m in out if not m["visible_px"]]
+    for m in off:
+        if m.get("zone_base"): m["fr"] = m["zone_base"] + ", partie non visible"
+    seen.sort(key=lambda m: (order[m["group"]], fam_order[ZONE.sub("", m["family"])], m["family"], m["def_id"]))
+    count = {}
+    for k, m in enumerate(seen):
+        m["mc"] = k + 1
+        if m.get("zone_base"): count[m["zone_base"]] = count.get(m["zone_base"], 0) + 1; m["fr"] = f"{m['zone_base']}, partie {count[m['zone_base']]}"
+    json.dump(dict(mc=seen, off_sheet=off), open(f"{home}/02_masks/mc.json", "w"), indent=0, ensure_ascii=False); return seen, off, atoms
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; seen, off, atoms = build_mc(p, home); na = len(atoms); seen = [m for m in seen];  mc_of_atom = np.full(na + 1, 0); os.makedirs(f"{home}/02_masks/icons", exist_ok=True)
+    for m in seen: mc_of_atom[m["atoms"]] = m["mc"]
+    tiles = []; best = {}; areas = {}; fn = ImageFont.truetype(FONT_NUM, 26)
+    for name in p["views"]:
+        lab = np.load(f"{home}/02_masks/labels_{name}.npz")["labels"]; rgb = C.panel_rgb(p, name); mc = mc_of_atom[np.clip(lab, 0, None)] * (lab >= 0); L = mc - 1; img = Image.fromarray(C.overlay(rgb, L, sc, alpha=0.42)); d = ImageDraw.Draw(img); ids, cnt = np.unique(mc[mc > 0], return_counts=True)
+        for i, c in zip(ids, cnt):
+            if c > best.get(int(i), (0,))[0]: best[int(i)] = (int(c), name)
+            areas.setdefault(int(i), {})[name] = int(c)
+        for i in ids:
+            m = mc == i; dt = ndi.distance_transform_edt(m); y, x = np.unravel_index(dt.argmax(), dt.shape)
+            if dt.max() < 8: continue
+            t = str(int(i)); bb = d.textbbox((0, 0), t, font=fn); w, h = bb[2] - bb[0], bb[3] - bb[1]; d.rectangle((x - w / 2 - 4, y - h / 2 - 5, x + w / 2 + 4, y + h / 2 + 5), fill=(255, 255, 255)); d.text((x - w / 2, y - h / 2 - bb[1]), t, font=fn, fill=(0, 0, 0))
+        tiles.append(np.asarray(img))
+    for m in seen:                                 # icons : the two views where the reference shows the part best, the mask in its colour, the rest dimmed
+      m["icon_views"] = [v for v, _ in sorted(areas.get(m["mc"], {}).items(), key=lambda x: -x[1])[:2]]; m["icon_view"] = m["icon_views"][0] if m["icon_views"] else None
+      for ic_i, v in enumerate(m["icon_views"]):
+        lab = np.load(f"{home}/02_masks/labels_{v}.npz")["labels"]; mm = mc_of_atom[np.clip(lab, 0, None)] * (lab >= 0) == m["mc"]; rgb = np.asarray(Image.fromarray(C.panel_rgb(p, v)).resize((lab.shape[1], lab.shape[0]), Image.BICUBIC)).astype(np.float32); col = C.colour(m["mc"] - 1)
+        out = rgb * 0.45 + 40; out[mm] = rgb[mm] * 0.45 + col * 0.55; cc, _nc = ndi.label(mm); big = np.bincount(cc[cc > 0]).argmax(); ys, xs = np.nonzero(cc == big); pad = int(max(np.ptp(ys), np.ptp(xs)) * 0.45) + 45   # 1 November 2026 : framed on the largest instance
+        y0, y1, x0, x1 = max(ys.min() - pad, 0), ys.max() + pad, max(xs.min() - pad, 0), xs.max() + pad; Image.fromarray(np.clip(out[y0:y1, x0:x1], 0, 255).astype(np.uint8)).save(f"{home}/02_masks/icons/MC{m['mc']:03d}{'' if ic_i == 0 else '_b'}.png")
+    gone = [m for m in seen if not m.get("icon_views")]; seen = [m for m in seen if m.get("icon_views")]; off += gone
+    for k, m in enumerate(seen): m["mc_final"] = k + 1
+    json.dump(dict(mc=seen, off_sheet=off), open(f"{home}/02_masks/mc.json", "w"), indent=0, ensure_ascii=False); C.save_board(tiles, f"{home}/02_masks/legend_board.png"); print("micro-components on the sheet", len(seen), "off sheet", len(off), [m["fr"] for m in off])
+
+
+if __name__ == "__main__": main(sys.argv[1])

@@ -1,0 +1,42 @@
+"""1 November 2026 : M22 step 2c bis, ATOMIC DIVISION : a large template part that covers several real regions of the reference (a whole rear face, a whole floor) is cut along those regions : each polygon seen in the given view takes the region under it, a small region and a hidden polygon go to the nearest zone, and mirror zones share one family. Updates shells.json and shell_of_poly.npy (run after MicroShells.py and MicroRegions.py, before MicroLabels.py).
+    python -I MicroZones.py Projects/<id>/params.json        FR : division atomique : une grande pièce du gabarit est coupée le long des régions réelles de la référence."""
+import sys, json
+import numpy as np
+from scipy.spatial import cKDTree
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts"); import Raster
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroLabels as ML
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; Z = p.get("zone_split", {}); minpx = p.get("zone_min_px", 300) * sc * sc; S = json.load(open(f"{home}/02_masks/shells.json")); sop = np.load(f"{home}/02_masks/shell_of_poly.npy"); fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    d = np.load(C.abspath(p["model"]), allow_pickle=True); P, Cn, I, T = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64), d["T"].astype(np.int64); names = [str(n) for n in d["names"]]; off = np.concatenate([[0], np.cumsum(Cn)]); shells = S["shells"]
+    if any("zone" in s for s in shells): raise SystemExit("zones already applied : run MicroShells.py first")
+    centre = lambda q: P[I[off[q]:off[q + 1]]].mean(0); report = {}
+    # every part and every part already drawn in front of it are rendered together, so a polygon counts only where it is really seen
+    tris = []; owner = []
+    for k in np.unique(Cn):
+        ps = np.flatnonzero(Cn == k); base = off[ps]
+        for j in range(1, k - 1): tris.append(np.stack([I[base], I[base + j], I[base + j + 1]], 1)); owner.append(ps)
+    tris = np.concatenate(tris); owner = np.concatenate(owner); mr = Raster.Renderer(P, tris)
+    for part, view in Z.items():
+        k = names.index(part); ps = np.flatnonzero(T == k); R = np.load(f"{home}/02_masks/regions_{view}.npz")["regions"]; H_, W_ = R.shape; c, s, axes, RR = ML.panel_camera(fr, V[view], R.shape, sc); M, D_, N, F = mr.render(c.tolist(), s, axes, RR); F = F[:H_, :W_]; poly = np.where(F >= 0, owner[np.clip(F, 0, None)], -1); own = np.isin(poly, ps) & (R >= 0)
+        pairs = np.stack([poly[own], R[own]], 1); area = np.bincount(R[own], minlength=int(R.max()) + 1); keep = set(np.flatnonzero(area >= minpx).tolist()); zone_of = {}
+        u, cnt = np.unique(pairs, axis=0, return_counts=True); best = {}
+        for (q, r), c_ in zip(u.tolist(), cnt.tolist()):
+            if r in keep and c_ > best.get(q, (0, -1))[0]: best[q] = (c_, r)
+        seen = np.array(sorted(best)); cs = np.array([centre(q) for q in seen]); zs = np.array([best[q][1] for q in seen]); tree = cKDTree(cs); all_c = np.array([centre(q) for q in ps]); _, nn = tree.query(all_c); zone = zs[nn]; ids = sorted(set(zone.tolist())); centres = {z: all_c[zone == z].mean(0) for z in ids}; base_family = shells[sop[ps[0]]]["family"]; used = {}; n_new = 0; lo0, hi0 = all_c.min(0), all_c.max(0)
+        for i, z in enumerate(ids):
+            if z in used: continue
+            c0 = centres[z]; pair = None
+            for z2 in ids:                       # mirror partner across x = 0
+                if z2 != z and z2 not in used and abs(centres[z2][0] + c0[0]) < 0.06 and np.linalg.norm(centres[z2][1:] - c0[1:]) < 0.08: pair = z2; break
+            tag = f"{base_family}_z{len(set(used.values())) + 1:02d}"; used[z] = tag
+            if pair is not None: used[pair] = tag
+        for z in ids:
+            qs = ps[zone == z]; X = P[np.unique(np.concatenate([I[off[q]:off[q + 1]] for q in qs]))]; ctr = X.mean(0); sid = len(shells); sop[qs] = sid; ext = np.sort(np.ptp(X, axis=0))[::-1]; shells.append(dict(id=sid, part=part, family=used[z], zone=int(z), base=base_family, faces=int(len(qs)), centre=ctr.round(4).tolist(), lo=X.min(0).round(4).tolist(), hi=X.max(0).round(4).tolist(), extents=ext.round(4).tolist())); n_new += 1
+        report[part] = dict(view=view, zones=n_new, families=len(set(used.values())))
+    S["shells"] = shells; json.dump(S, open(f"{home}/02_masks/shells.json", "w"), indent=0); np.save(f"{home}/02_masks/shell_of_poly.npy", sop); print(report)
+
+
+if __name__ == "__main__": main(sys.argv[1])

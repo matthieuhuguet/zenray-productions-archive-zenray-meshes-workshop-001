@@ -1,0 +1,175 @@
+"""1 November 2026 : M22 step 5, the PROJECT DOCUMENT : one self contained HTML page per project : the reference, the masks and their honest measures, every sheet with its copy buttons and its reception state, the list of micro-components, and the register of all design, reference and plan documents, appended as they come (documents.json, never rewritten).
+    python -I MicroDoc.py Projects/<id>/params.json                                   rebuild index.html
+    python -I MicroDoc.py Projects/<id>/params.json add "title" /abs/path "kind"      append a document, then rebuild
+    python -I MicroDoc.py Projects/<id>/params.json note "stable-id" "text"           append a dated journal entry (journal.json), a changed text keeps the old one as a dated revision, the same text adds nothing
+FR : le document du projet, une page HTML autonome, à laquelle on ajoute les références au fur et à mesure."""
+import sys, os, json, io, base64, html, datetime, zoneinfo
+from PIL import Image
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+FONTS = "/Users/zenray/.claude/skills/zenray-edit/designs/_shared/fonts"
+STEPS = ["Planche 6 vues", "Preview Components LowRes et légende", "Prompt et index des couleurs", "Planche de découpe parfaite", "Contrôle des couleurs, composants validés", "Feuilles à remplir, découpe réutilisée", "Images reçues et contrôlées", "Modélisation, composant par composant", "Vérification 3D contre l'image", "Placement exact"]
+
+
+def b64(path): return base64.b64encode(open(path, "rb").read()).decode()
+def jpg(path, w, q=86):
+    im = Image.open(path).convert("RGB")
+    if im.size[0] > w: im = im.resize((w, int(im.size[1] * w / im.size[0])), Image.LANCZOS)
+    b = io.BytesIO(); im.save(b, "JPEG", quality=q); return "data:image/jpeg;base64," + base64.b64encode(b.getvalue()).decode()
+def today():
+    d = datetime.date.today(); return f"{d.day} {d.strftime('%B %Y')}"
+def e(x): return html.escape(str(x))
+TZ = zoneinfo.ZoneInfo("Europe/Paris"); FAMILIES = [("01_reference", "Référence"), ("02_masks", "Masques et mesures"), ("03_sheets", "Feuilles et prompts"), ("04_received", "Images reçues et simulées"), ("05_models", "Composants retenus"), ("06_checks", "Contrôles")]
+def now_iso(): return datetime.datetime.now(TZ).isoformat(timespec="seconds")
+def when(iso):
+    """ISO 8601 with its UTC offset, shown as day, month in full, year, hour and time zone"""
+    d = datetime.datetime.fromisoformat(iso).astimezone(TZ); return f"{d.day} {d.strftime('%B %Y')}, {d.strftime('%H:%M')}, Europe/Paris"
+def inventory(home):
+    """the files of the project folder, family by family, folded : the modification date is measured on the disk, it is never given as a creation date"""
+    out = []; total = 0
+    for sub, label in FAMILIES:
+        rows = []
+        for base, _, names in os.walk(f"{home}/{sub}"):
+            for n in sorted(names):
+                f = os.path.join(base, n); st_ = os.stat(f); rows.append(f'<tr><td>{e(os.path.relpath(f, home))}</td><td>{e(os.path.splitext(n)[1][1:] or "?")}</td><td class="n">{st_.st_size / 1e6:.2f} Mo</td><td class="n">{when(datetime.datetime.fromtimestamp(st_.st_mtime, TZ).isoformat())}</td><td class="path"><a href="file://{e(f)}">ouvrir</a></td></tr>')
+        total += len(rows)
+        if rows: out.append(f'<details class="fold"><summary>{e(label)}, <span class="n">{len(rows)}</span> fichier{"s" if len(rows) > 1 else ""}</summary><div class="tw"><table><thead><tr><th>Fichier</th><th>Type</th><th>Taille</th><th>Modifié le</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div></details>')
+    return total, "".join(out)
+
+
+def versions_html(home):
+    """every version of the masks : a table in order of time, where a measure that gets worse is marked, then one folded entry per version, the newest first"""
+    f = f"{home}/versions/index.json"
+    if not os.path.exists(f): return ""
+    V = json.load(open(f)); keys = [("pieces", "Pièces", 0, 0), ("px1", "Vérité ± 1 pixel", 1, 3), ("px2", "Vérité ± 2 pixels", 1, 3), ("out2", "Contour faux à plus de 2 pixels", -1, 3), ("mirror", "Accord miroir gauche droite", 1, 1), ("straight", "Longueur droite", 0, 1)]; prev = {}; rows = []
+    for x in V:
+        cells = ""
+        for k, _, sense, nd in keys:
+            val = x.get(k)
+            if val is None: cells += '<td class="n soft">non mesuré</td>'; continue
+            cls = ""
+            if sense and k in prev and val != prev[k]: cls = "up" if (val - prev[k]) * sense > 0 else "down"
+            mark = {"up": " plus haut" if sense > 0 else " plus bas", "down": " recul"}.get(cls, ""); txt = f"{val:.{nd}f} %" if nd else str(val); cells += f'<td class="n {cls}">{txt}<span class="mk">{mark}</span></td>'; prev[k] = val
+        rows.append(f'<tr><td><a href="#{x["v"]}">{x["v"]}</a></td><td class="n">{e(when(x["at"]))}</td><td>{e(x["note"])}</td>{cells}</tr>')
+    head = "".join(f"<th>{e(t)}</th>" for _, t, _, _ in keys); board = next((x.get("truth_board") for x in V if x.get("truth_board")), None); arts = ""
+    for x in reversed(V):
+        figs = f'<figure><img class="board" alt="Légende de {x["v"]}" loading="lazy" src="data:image/jpeg;base64,{b64(home + "/versions/" + x["legend"])}"><figcaption>Légende</figcaption></figure>'
+        if x.get("borders"): figs += f'<figure><img class="board" alt="Bords de {x["v"]}" loading="lazy" src="data:image/jpeg;base64,{b64(home + "/versions/" + x["borders"])}"><figcaption>Bords sur la référence</figcaption></figure>'
+        how = ("version utilisée par la Preview Components LowRes, " if x.get("chosen") else "") + "image d'origine, date du fichier" if x.get("original") else ("version utilisée par la Preview Components LowRes, " if x.get("chosen") else "") + ("reconstruite avec les réglages de l'époque" if x.get("rebuilt") else "calculée à cette date"); ver = f'<p class="verdict"><strong>Verdict de Matthieu.</strong> {e(x["verdict"])}</p>' if x.get("verdict") else ""; arts += f'<details class="fold ver" id="{x["v"]}"><summary>{x["v"]}, <span class="n">{e(when(x["at"]))}</span>, {e(x["note"])}</summary><p class="meta">{e(how)}</p>{ver}<div class="cols">{figs}</div></details>'
+    note = f"<p>Les mesures de vérité viennent de la planche <code>{e(board)}</code>, calculées avec le même algorithme. Une mesure qui recule est signalée, mais le verdict à l'œil prime : la voiture montre qu'un chiffre peut monter sans que la découpe soit juste.</p>" if board and board != os.path.basename(home) else "<p>Une mesure qui recule est signalée. Le verdict à l'œil prime sur les chiffres.</p>"
+    return f'<h2 id="versions">Versions de l\'algorithme</h2>{note}<div class="tw"><table><thead><tr><th>Version</th><th>Date</th><th>Ce qui change</th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div><div style="margin-top:12px">{arts}</div>'
+
+
+def check_html(home):
+    """the verdict of the verifier on the generations received : a model cannot prove its own work. FR : le verdict du vérificateur sur les générations reçues."""
+    f = f"{home}/06_checks/cut_check.json"
+    if not os.path.exists(f): return ""
+    R = json.load(open(f)); G = sorted(R["generated"].items(), key=lambda kv: -kv[1]["seeds_ok"])
+    if not G: return ""
+    rows = "".join(f'<tr><td>{e(n)}</td><td class="n">{x["seeds_ok"] * 100:.1f} %</td><td class="n">{x["components_ok"]} sur {x["components"]}</td><td class="n">{x["silhouette"] * 100:.1f} %</td><td class="n">{x["alpha"] * 100:.0f} %</td><td>{"Juste" if x["passed"] else "À refaire"}</td></tr>' for n, x in G); pairs = "".join(f'<p>Entre {e(x["a"])} et {e(x["b"])}, <span class="n">{x["same"] * 100:.1f} %</span> des pixels portent le même composant.</p>' for x in R["pairs"]); boards = "".join(f'<details class="fold"><summary>Verdict de {e(n)}</summary><p class="meta">Cercle vert : la pièce porte la couleur de sa pastille. Cercle rouge, avec le numéro attendu : elle en porte une autre.</p><img class="board" alt="Verdict {e(n)}" loading="lazy" src="{jpg(home + "/" + x["board"], 1254, 86)}"></details>' for n, x in G) + "".join(f'<details class="fold"><summary>Où {e(x["a"])} et {e(x["b"])} diffèrent</summary><img class="board" alt="Différences" loading="lazy" src="{jpg(home + "/" + x["map"], 1254, 86)}"></details>' for x in R["pairs"])
+    return f'''<h2 id="check">Contrôle des générations reçues</h2><p>La vérification écrite dans le prompt guide seulement le modèle, qui ne peut pas prouver son propre travail. Ce contrôle-ci tranche : pour chaque pastille de l'index, la pièce placée dessous porte-t-elle sa couleur ? Une image passe à partir de <span class="n">{R["gates"]["seeds"] * 100:.1f} %</span> de pastilles justes et <span class="n">{R["gates"]["silhouette"] * 100:.0f} %</span> de silhouette. Il a été éprouvé sur une planche parfaite et sur des couleurs échangées. L'index venant de l'algorithme, une pastille mal placée compte comme une erreur de l'image : regarder le verdict avant de conclure.</p><div class="tw"><table><thead><tr><th>Génération</th><th>Pastilles justes</th><th>Composants justes</th><th>Silhouette</th><th>Opacité mesurée</th><th>Verdict</th></tr></thead><tbody>{rows}</tbody></table></div>{pairs}{boards}'''
+
+
+def cut_html(p, home):
+    """the start of the value chain : the preview of the components with their legend, then the 6 views and the prompt to hand to ChatGPT Images"""
+    if not os.path.exists(f"{home}/03_sheets/cut_prompt.txt"): return ""
+    t = open(f"{home}/03_sheets/cut_prompt.txt").read(); C_ = json.load(open(f"{home}/03_sheets/cut_components.json"))["components"]; rows = "".join(f'<tr><td class="n">{x["n"]}</td><td><span class="sw" style="background:{x["hex"]}"></span></td><td>{e(x["name"])}</td><td>{e(x["description"])}{"" if x.get("visible", True) else " <em>Absent des 6 vues.</em>"}</td><td class="n">{x["copies"]}</td><td class="n">{x["hex"]}</td></tr>' for x in C_)
+    return f'''<h2 id="cut">Preview Components LowRes</h2><p>Le résultat attendu et ses <span class="n">{len(C_)}</span> composants. Cette image sert uniquement à les vérifier avant de générer : ses bords ne sont pas valides, et elle n'est pas donnée à ChatGPT.</p><img class="board" alt="Preview Components LowRes" src="{jpg(home + "/03_sheets/preview_components_lowres.png", 1800, 86)}"><h3 style="margin-top:20px">Légende des composants</h3><div class="tw" style="margin-top:8px"><table><thead><tr><th>N</th><th></th><th>Composant</th><th>Ce que c'est</th><th>Exemplaires</th><th>Couleur</th></tr></thead><tbody>{rows}</tbody></table></div>
+<h2 id="prompt">Générer la planche de découpe</h2><p>Dans ChatGPT Images, joindre l'image 1 puis l'image 2, puis coller le prompt. L'image 2 est la planche elle-même, intacte, avec des pastilles posées à l'intérieur des pièces : elle dit quelle couleur va où et ne porte aucune ligne de l'algorithme, si bien que ses bords faux ne peuvent pas être recopiés. Enregistrer chaque résultat sous <code>{e(home)}/04_received/gen_X.png</code>.</p><div class="cards"><article class="card" id="cutref"><div class="card-head"><h3>Image 1, la planche 6 vues</h3></div><img class="sheet" alt="Planche 6 vues" loading="lazy" src="data:image/png;base64,{b64(home + "/03_sheets/cut_reference.png")}"><div class="actions" style="margin-top:10px"><button data-copy-img="cutref">Copier l'image 1</button><button class="primary" data-copy-txt="cutref">Copier le prompt</button><a class="btn" download="cut_reference.png" data-dl="cutref">Télécharger</a></div><textarea hidden id="t-cutref">{e(t)}</textarea></article><article class="card" id="cutidx"><div class="card-head"><h3>Image 2, l'index des couleurs</h3></div><img class="sheet" alt="Index des couleurs" loading="lazy" src="data:image/png;base64,{b64(home + "/03_sheets/cut_index.png")}"><div class="actions" style="margin-top:10px"><button data-copy-img="cutidx">Copier l'image 2</button><a class="btn" download="cut_index.png" data-dl="cutidx">Télécharger</a></div></article></div>{check_html(home)}'''
+
+
+def build(params):
+    p, home = C.load(params); MCj = json.load(open(f"{home}/02_masks/mc.json")); MC = MCj["mc"]; M = json.load(open(f"{home}/02_masks/metrics.json")); idx = json.load(open(f"{home}/03_sheets/sheets.json")) if os.path.exists(f"{home}/03_sheets/sheets.json") else dict(sheets=[], total=0); has_sheets = bool(idx["sheets"]); docs = json.load(open(f"{home}/documents.json")) if os.path.exists(f"{home}/documents.json") else []; sheet_of = {r["mc"]: s["id"] for s in idx["sheets"] for r in s["rows"]}
+    state = []; rec = {}
+    for s in idx["sheets"]:
+        f = f"{home}/04_received/{s['id']}/report.json"
+        if os.path.exists(f): rec[s["id"]] = json.load(open(f))
+    done = [True, True, True, os.path.exists(f"{home}/04_received/cut_sheet.png"), False, False, idx["total"] > 0 and len(rec) == idx["total"], False, False, False]; cards = []
+    for s in idx["sheets"]:
+        png = f"{home}/03_sheets/{s['image']}"; txt = open(f"{home}/03_sheets/{s['prompt']}").read(); r = rec.get(s["id"]); names = ", ".join(f"{x['mc']} {x['fr']}" for x in s["rows"])
+        if r is None: badge = '<span class="badge wait">En attente</span>'
+        else:
+            ok = sum(1 for l in r["lines"] if l["verdict"] == "ok"); bad = len(r["lines"]) - ok; badge = f'<span class="badge {"ok" if bad == 0 else "warn"}"><span class="n">{ok}</span> justes, <span class="n">{bad}</span> à vérifier</span>'
+        cards.append(f'''<article class="card" id="{s['id']}"><div class="card-head"><h3>Feuille <span class="n">{s['id'][1:].lstrip('0')}</span></h3><span class="meta"><span class="n">{len(s['rows'])}</span> pièce{"s" if len(s['rows']) > 1 else ""}</span>{badge}</div>
+<img class="sheet" alt="Grille {s['id']}" loading="lazy" src="data:image/png;base64,{b64(png)}">
+<p class="names">{e(names)}</p><div class="actions"><button class="primary" data-copy-img="{s['id']}">Copier l'image</button><button data-copy-txt="{s['id']}">Copier le prompt</button><a class="btn" download="{s['image']}" data-dl="{s['id']}">Télécharger</a></div><textarea hidden id="t-{s['id']}">{e(txt)}</textarea></article>''')
+    rows = []
+    for m in (MC if has_sheets else []):
+        src = m.get("mask_source", {}); ic = jpg(f"{home}/02_masks/icons/MC{m['mc']:03d}.png", 160, 80); vs = " ".join(f'<span class="v {"r" if src.get(v) == "reference" else "g"}" title="{e(src.get(v, ""))}">{v[0].upper()}</span>' for v in p["views"] if v in src)
+        rows.append(f'<tr><td class="n">{m["mc"]}</td><td><img class="ico" alt="" loading="lazy" src="{ic}"></td><td>{e(m["fr"])}</td><td class="n">{m["instances"]}</td><td class="n">{round(m["size_m"][0] * 1000)} x {round(m["size_m"][1] * 1000)} x {round(m["size_m"][2] * 1000)} mm</td><td>{e(m["group"])}</td><td>{vs}</td><td><a href="#{sheet_of[m["mc"]]}">{sheet_of[m["mc"]]}</a></td></tr>')
+    vm = "".join(f'<tr><td>{e(k)}</td><td class="n">{v["regions"]}</td><td class="n">{v["coverage"] * 100:.1f} %</td><td class="n">{v.get("support_cal", v["line_support"]) * 100:.1f} %</td><td class="n">{v["line_recall"] * 100:.1f} %</td></tr>' for k, v in M["per_view"].items()); sym = "".join(f'<tr><td>{e(k.replace("_self", " contre son miroir").replace("left_vs_right", "gauche contre droite"))}</td><td class="n">{v * 100:.1f} %</td></tr>' for k, v in M["symmetry"].items()); off = ", ".join(e(m["fr"]) for m in MCj["off_sheet"])
+    dl = "".join(f'<tr><td class="n">{e(when(d["at"]) if d.get("at") else d["date"] + ", heure inconnue")}</td><td>{e(d["title"])}</td><td>{e(d["kind"])}</td><td class="path"><a href="file://{e(d["path"])}">{e(d["path"])}</a></td></tr>' for d in docs)
+    st = json.load(open(f"{home}/06_checks/selftest.json")) if os.path.exists(f"{home}/06_checks/selftest.json") else None; review = ""
+    if st:
+        items = "".join(f'<tr><td><a href="#{e(x["sheet"])}">{e(x["sheet"])}</a></td><td class="n">{x["line"]}</td><td class="n">{x["mc"]}</td><td>{e(x["fr"])}</td><td>{e("; ".join(x["reasons"][:2]))}</td></tr>' for x in st["flagged"])
+        review = f'<h2>Contrôle de la lecture</h2><p>Le contrôle remplit chaque grille avec une pièce aux dimensions annoncées, puis la relit : <span class="n">{st["green"]}</span> lignes sur <span class="n">{st["lines"]}</span> concordent. Une feuille remplie exprès de travers ressort rouge sur les lignes <span class="n">{", ".join(str(x) for x in st["bad_red_lines"])}</span>, celles qui ont été faussées.</p>' + ('<p>Une ligne ci-dessous n\'est pas une erreur de masque : ses vues simulées ne se répondent pas, le plus souvent parce que le gabarit découpe cette zone en fragments. Elle demande un regard quand la vraie image revient.</p>' if st["flagged"] else "") + (f'<div class="tw"><table><thead><tr><th>Feuille</th><th>Ligne</th><th>N</th><th>Pièce</th><th>Écart</th></tr></thead><tbody>{items}</tbody></table></div>' if st["flagged"] else "")
+    truth_rows = ""
+    for name_, pid in p.get("truth_projects", []):
+        f_ = C.abspath(f"Projects/{pid}/06_checks/truth.json")
+        if os.path.exists(f_):
+            t_ = json.load(open(f_)); truth_rows += f'<tr><td>{e(name_)}</td><td class="n">{t_["accuracy"] * 100:.2f} %</td><td class="n">{t_["accuracy_2px"] * 100:.2f} %</td><td class="n">{t_["accuracy_3px"] * 100:.3f} %</td><td class="n">{t_.get("ambiguous_share", 0) * 100:.2f} %</td></tr>'
+    jf = f"{home}/journal.json"; journal = json.load(open(jf)) if os.path.exists(jf) else []; jr = "".join(f'<article class="entry" id="j-{e(j["id"])}"><p class="meta n">{e(when(j["at"]))}</p><p>{e(j["text"])}</p>' + "".join(f'<details><summary>Révision du <span class="n">{e(when(r["at"]))}</span> : texte précédent</summary><p>{e(r["text"])}</p></details>' for r in j.get("revisions", [])) + '</article>' for j in reversed(journal)); n_files, inv = inventory(home); summary = "".join(f"<p>{e(x)}</p>" for x in p.get("doc_summary", []))
+    cut = cut_html(p, home); vers = versions_html(home); bf = f"{home}/06_checks/borders_finished.png"; borders = f'<h3 style="margin-top:20px">Bords finis, sur la référence</h3><p>Chaque bord est une droite, sinon une courbe à peu de points de contrôle, conservée en code dans <code>02_masks/arcs_*.json</code>.</p><img class="board" alt="Bords finis sur la planche de référence" loading="lazy" src="{jpg(bf, 1800, 84)}">' if os.path.exists(bf) else ""
+    steps = "".join(f'<li class="{"done" if done[k] else "todo"}"><span class="n">{k + 1}</span> {e(t)}</li>' for k, t in enumerate(STEPS))
+    real = f'''<h2 id="masks">Masques de l'algorithme</h2><p>Chaque numéro renvoie à la liste des pièces. Vert dans la liste : le contour de la pièce suit des traits de la référence ; orange : il garde la place donnée par le gabarit.</p><img class="board" alt="Masques semi-transparents numérotés" src="{jpg(f'{home}/02_masks/legend_board.png', 1800, 84)}">
+<h2 id="ref">Référence</h2><img class="board" alt="Planche 6 views" loading="lazy" src="{jpg(C.abspath(p['sheet']), 1254, 90)}">
+<div class="cols" style="margin-top:16px"><div class="tw"><table><thead><tr><th>Vue</th><th>Régions</th><th>Couverture</th><th>Bords sur un trait, seuil calé sur la vérité, 2 pixels</th><th>Traits sur un bord</th></tr></thead><tbody>{vm}</tbody></table></div><div class="tw"><table><thead><tr><th>Accord entre vues</th><th>Accord</th></tr></thead><tbody>{sym}</tbody></table></div></div>
+<h2 id="truth">Précision des masques</h2><p>Une image générée n'a pas de vérité : la précision se mesure sur une planche rendue depuis un modèle connu, où chaque pixel connaît sa pièce, avec un gabarit volontairement faussé. Note : pixels justes, hors d'une bande autour des vrais bords.</p><div class="tw"><table><thead><tr><th>Planche de vérité</th><th>± 1 pixel</th><th>± 2 pixels</th><th>± 3 pixels</th><th>Pixels exclus (deux pièces à moins de 6 mm)</th></tr></thead><tbody>{truth_rows}</tbody></table></div>
+<h2 id="sheets">Feuilles à remplir</h2><section class="how"><h3>Remplir une feuille</h3><ol><li>« Copier l'image », ou glisser directement l'image de la feuille dans ChatGPT : le prompt est imprimé dessus. Joindre aussi la planche de référence.</li><li>Enregistrer l'image obtenue sous <code>{e(home)}/04_received/Sxx.png</code>, xx étant le numéro de la feuille.</li><li>Le contrôle lit la grille, range chaque case et signale les lignes à vérifier.</li></ol></section><div class="cards">{"".join(cards)}</div>
+{review}<h2 id="pieces">Micro-components</h2><p>Lettres : vues où la pièce apparaît, vert si ses bords viennent de la référence, orange s'ils viennent du gabarit. {("Hors planche, donc sans feuille : " + off + ".") if off else "Toutes les pièces ont leur feuille."}</p><details class="fold"><summary>Liste des <span class="n">{len(MC)}</span> pièces</summary><div class="tw"><table><thead><tr><th>N</th><th></th><th>Pièce</th><th>Exemplaires</th><th>Taille</th><th>Famille</th><th>Vues</th><th>Feuille</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div></details>
+''' if has_sheets else ""      # 1 November 2026 : masks, sheets and pieces appear only once the real cut sheet is read. FR : masques, feuilles et pièces n'apparaissent qu'après la vraie découpe.
+    page = f'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(p['title'])}</title>
+<style>
+@font-face{{font-family:'GT Ultra';src:url(data:font/woff2;base64,{b64(FONTS + '/GT-Ultra-Regular.woff2')}) format('woff2');font-weight:400}}
+@font-face{{font-family:'Literata';src:url(data:font/woff2;base64,{b64(FONTS + '/Literata-latin.woff2')}) format('woff2');font-weight:200 900}}
+:root{{--font-title:'GT Ultra','Hiragino Sans W4',sans-serif;--font-body:'Literata','Hiragino Mincho ProN W3',Georgia,serif;--bg:#fbfaf7;--panel:#fff;--ink:#1a1a1c;--soft:#62626a;--line:#deddd8;--accent:#1a1a1c;--on-accent:#fff;--ok:#1d7a46;--warn:#a85b00;--wait:#62626a;--ref:#1d7a46;--tpl:#a85b00;--t:.2s}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#17171a;--panel:#1f1f23;--ink:#ececee;--soft:#a4a4ac;--line:#35353b;--accent:#ececee;--on-accent:#17171a;--ok:#57c98a;--warn:#e0a458;--wait:#a4a4ac;--ref:#57c98a;--tpl:#e0a458}}}}
+:root[data-theme="dark"]{{--bg:#17171a;--panel:#1f1f23;--ink:#ececee;--soft:#a4a4ac;--line:#35353b;--accent:#ececee;--on-accent:#17171a;--ok:#57c98a;--warn:#e0a458;--wait:#a4a4ac;--ref:#57c98a;--tpl:#e0a458}}
+@media (prefers-reduced-motion:reduce){{:root{{--t:0s}}}}
+*{{box-sizing:border-box}}code{{overflow-wrap:anywhere}}body{{margin:0;background:var(--bg);color:var(--ink);font:400 17px/1.55 var(--font-body)}}main{{max-width:1180px;margin:0 auto;padding:40px 16px 96px}}
+h1,h2,h3,button,.btn,.badge,th,.steps,.meta,.v{{font-family:var(--font-title);font-weight:400}}.n{{font-family:var(--font-title);font-weight:400}}
+h1{{font-size:38px;line-height:1.15;margin:0 0 8px}}h2{{font-size:24px;margin:56px 0 12px}}h3{{font-size:18px;margin:0}}p{{margin:0 0 12px;max-width:68ch}}.lead{{color:var(--soft)}}
+.steps{{list-style:none;padding:0;margin:20px 0 0;display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:8px;font-size:14px}}.steps li{{padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}}.steps li.done{{border-color:var(--ok);color:var(--ok)}}.steps li.todo{{color:var(--soft)}}
+.how{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin-top:24px}}.how ol{{margin:0;padding-left:22px}}
+img.board{{width:100%;height:auto;border-radius:10px;border:1px solid var(--line);display:block}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,520px),1fr));gap:20px}}.card{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;scroll-margin-top:16px}}.card-head{{display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap}}.meta{{color:var(--soft);font-size:14px}}
+img.sheet{{width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:zoom-in}}.names{{font-size:14px;color:var(--soft);margin:10px 0}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap}}button,.btn{{font-size:14px;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--ink);cursor:pointer;text-decoration:none;transition:background var(--t),color var(--t),border-color var(--t)}}button:hover,.btn:hover{{border-color:var(--ink)}}button.primary{{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}}button.good{{background:var(--ok);border-color:var(--ok);color:#fff}}button.bad{{background:var(--warn);border-color:var(--warn);color:#fff}}
+.badge{{font-size:13px;padding:2px 10px;border-radius:99px;border:1px solid currentColor;margin-left:auto}}.badge.wait{{color:var(--wait)}}.badge.ok{{color:var(--ok)}}.badge.warn{{color:var(--warn)}}
+.tw{{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel)}}table{{border-collapse:collapse;width:100%;font-size:15px}}th{{text-align:left;font-size:13px;color:var(--soft);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}}td{{padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:middle}}tr:last-child td{{border-bottom:0}}img.ico{{width:72px;height:auto;border-radius:4px;display:block}}.v{{display:inline-block;font-size:12px;width:20px;text-align:center;border-radius:4px;margin-right:2px;color:#fff}}.v.r{{background:var(--ref)}}.v.g{{background:var(--tpl)}}.path a{{font-size:13px;word-break:break-all;color:var(--soft)}}a{{color:inherit}}
+.toc{{display:flex;flex-wrap:wrap;gap:6px 16px;margin:16px 0 0;font:400 14px var(--font-title)}}.toc a{{color:var(--soft)}}details.fold{{margin:8px 0}}details>summary{{cursor:pointer;font-family:var(--font-title);font-size:15px;padding:6px 0}}.entry{{border-top:1px solid var(--line);padding:10px 0}}.entry p{{margin:0 0 6px}}h2{{scroll-margin-top:16px}}
+.sw{{display:inline-block;width:18px;height:18px;border-radius:4px;vertical-align:middle}}figure{{margin:0}}figcaption{{font:400 13px var(--font-title);color:var(--soft);margin-top:4px}}.ver{{border-top:1px solid var(--line);scroll-margin-top:16px}}.verdict{{border-left:2px solid var(--warn);padding-left:10px}}td.up,td.up .mk{{color:var(--ok)}}td.down,td.down .mk{{color:var(--warn)}}.mk{{display:block;font-size:12px}}.soft{{color:var(--soft)}}
+.cols{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:16px}}.lb{{position:fixed;inset:0;background:rgba(0,0,0,.86);display:none;align-items:center;justify-content:center;padding:16px;z-index:9;cursor:zoom-out}}.lb.on{{display:flex}}.lb img{{max-width:100%;max-height:100%}}
+</style></head><body><main>
+<h1>{e(p['title'])}</h1>{summary}<p class="meta">Document généré le <span class="n">{e(when(now_iso()))}</span>{(", dernière entrée du journal le <span class='n'>" + e(when(journal[-1]["at"])) + "</span>") if journal else ""}. Sauvegarde cloud non vérifiée par ce document.</p>
+<nav class="toc">{'<a href="#cut">Preview</a><a href="#prompt">Prompt</a>' if cut else ""}{'<a href="#check">Contrôle</a>' if '<h2 id="check">' in cut else ""}{'<a href="#versions">Versions</a>' if vers else ""}{'<a href="#masks">Masques</a><a href="#ref">Référence</a><a href="#truth">Précision</a><a href="#sheets">Feuilles</a><a href="#pieces">Pièces</a>' if has_sheets else ""}<a href="#journal">Journal</a><a href="#files">Fichiers</a></nav><ol class="steps">{steps}</ol>
+{cut}{vers}{real}<h2 id="journal">Journal</h2><p>Chaque entrée garde sa date d'ajout ; régénérer ce document ne la change pas.</p><details class="fold"><summary><span class="n">{len(journal)}</span> entrée{"s" if len(journal) > 1 else ""}</summary>{jr}</details>
+<h2 id="files">Fichiers</h2><p>Documents du projet, puis contenu du dossier <code>{e(home)}</code>, <span class="n">{n_files}</span> fichiers. Cet inventaire lit le disque ; il ne prouve aucune sauvegarde.</p><details class="fold"><summary>Documents du projet, <span class="n">{len(docs)}</span></summary><div class="tw"><table><thead><tr><th>Date</th><th>Document</th><th>Nature</th><th>Chemin</th></tr></thead><tbody>{dl}</tbody></table></div></details>{inv}
+</main><div class="lb" id="lb"><img alt=""></div>
+<script>
+function flash(b,ok,label){{const o=b.dataset.label||b.textContent;b.dataset.label=o;b.textContent=label;b.classList.add(ok?'good':'bad');setTimeout(()=>{{b.textContent=o;b.classList.remove('good','bad')}},1800)}}
+document.querySelectorAll('[data-copy-img]').forEach(b=>b.addEventListener('click',async()=>{{const img=document.querySelector('#'+b.dataset.copyImg+' img.sheet');try{{const blob=await (await fetch(img.src)).blob();await navigator.clipboard.write([new ClipboardItem({{'image/png':blob}})]);flash(b,true,'Image copiée')}}catch(e){{console.warn('clipboard image',e.name,e.message);const r=document.createRange();r.selectNode(img);const s=getSelection();s.removeAllRanges();s.addRange(r);let ok=false;try{{ok=document.execCommand('copy')}}catch(x){{}}s.removeAllRanges();flash(b,ok,ok?'Image copiée':'Copie refusée : glisser l\\'image')}}}}));
+document.querySelectorAll('[data-copy-txt]').forEach(b=>b.addEventListener('click',async()=>{{const t=document.getElementById('t-'+b.dataset.copyTxt).value;try{{await navigator.clipboard.writeText(t);flash(b,true,'Prompt copié')}}catch(e){{console.warn('clipboard text',e.name,e.message);const a=document.createElement('textarea');a.value=t;document.body.append(a);a.select();let ok=false;try{{ok=document.execCommand('copy')}}catch(x){{}}a.remove();flash(b,ok,ok?'Prompt copié':'Copie refusée')}}}}));
+document.querySelectorAll('[data-dl]').forEach(a=>{{a.href=document.querySelector('#'+a.dataset.dl+' img.sheet').src}});
+const lb=document.getElementById('lb');document.querySelectorAll('img.sheet').forEach(i=>i.addEventListener('click',()=>{{lb.querySelector('img').src=i.src;lb.classList.add('on')}}));lb.addEventListener('click',()=>lb.classList.remove('on'));
+</script></body></html>'''
+    open(f"{home}/index.html", "w").write(page); print("index.html", round(len(page) / 1e6, 2), "MB", "documents", len(docs))
+
+
+def add(params, title, path, kind):
+    p, home = C.load(params); f = f"{home}/documents.json"; docs = json.load(open(f)) if os.path.exists(f) else []
+    if not any(d["path"] == path for d in docs): docs.append(dict(date=today(), at=now_iso(), title=title, path=path, kind=kind)); json.dump(docs, open(f, "w"), indent=1, ensure_ascii=False)
+
+
+def note(params, nid, text):
+    """1 November 2026 : a journal entry keeps the date it was added ; a new text under the same id is a revision, the same text adds nothing"""
+    p, home = C.load(params); f = f"{home}/journal.json"; J = json.load(open(f)) if os.path.exists(f) else []; old = next((j for j in J if j["id"] == nid), None)
+    if old is None: J.append(dict(id=nid, at=now_iso(), text=text))
+    elif old["text"] != text: old.setdefault("revisions", []).append(dict(at=now_iso(), text=old["text"])); old["text"] = text
+    json.dump(J, open(f, "w"), indent=1, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[2] == "add": add(sys.argv[1], sys.argv[3], sys.argv[4], sys.argv[5])
+    if len(sys.argv) > 2 and sys.argv[2] == "note": note(sys.argv[1], sys.argv[3], sys.argv[4])
+    build(sys.argv[1])

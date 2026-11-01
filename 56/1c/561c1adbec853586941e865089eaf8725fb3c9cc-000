@@ -1,0 +1,132 @@
+"""1 November 2026 : M22 step 2b, version 2 : the REFERENCE decides the boundaries, nothing else is read : (1) the image is denoised, (2) two edge responses are kept : thin dark or light lines (a seam, a drawn joint) and step edges (a facet), a broad shading gradient of a smooth form counting for nothing, (3) the silhouette is what the background cannot reach : flat zones connected to the panel border, opened so they do not leak through a small gap, the scale cube removed, (4) a fine watershed, then boundaries merged weakest first by a robust strength (a median along the boundary, so that noise and one stray pixel decide nothing), (5) small crumbs merged. Writes 02_masks/regions_<view>.npz, regions_overlay.png. All values come from params (R_ keys), DEF gives the defaults.
+    python -I MicroRegions.py Projects/<id>/params.json        FR : la référence décide des bords : débruitage, traits fins et marches séparés des dégradés, silhouette par inondation depuis le bord, ligne de partage des eaux, fusion robuste."""
+import sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import filters, morphology, segmentation, measure, restoration
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+DEF = dict(R_mask_close_px=0, R_mask_mirror=0, R_ground_open_px=0, R_ground_band_px=10, R_nlm_h=0.6, R_line_px=2.5, R_step_s1=1.0, R_step_s2=3.5, R_step_k=1.0, R_seed=0.10, R_seed_open=1, R_min_seed=20, R_merge=0.22, R_merge_q=0.5, R_min_area=25, R_bg_edge=0.035, R_bg_open=2.0, R_bg_band=1.2, R_smooth=0.5, R_ws_sigma=0.35, R_contour_bias=0.0, R_cube_margin=6, R_mask_prior_px=0, R_symmetry=0, R_symmetry_gain=0.85)
+
+
+def denoise(g, h):
+    """non local means on the sheet pixels, the noise measured on the image itself"""
+    if h <= 0: return g
+    lap = ndi.convolve(g, np.array([[1, -2, 1], [-2, 4, -2], [1, -2, 1]], float)); s = float(np.sqrt(np.pi / 2) * np.abs(lap[1:-1, 1:-1]).mean() / 6)     # Immerkaer noise estimate, no extra dependency
+    return restoration.denoise_nl_means(g, h=h * max(s, 1e-3), sigma=s, patch_size=5, patch_distance=6, fast_mode=True)
+def edges(g, sc, r):
+    """g is enlarged sc times : ridge = thin lines, darker or lighter than both sides, step = fine scale gradient minus what a coarse scale already explains"""
+    line = 0
+    for k in (1.0, 1.6):
+        fp = morphology.disk(max(1, int(round(r["R_line_px"] * k * sc / 2)))); s = filters.gaussian(g, 0.45 * sc); line = np.maximum(line, np.maximum(morphology.black_tophat(s, fp), 0.7 * morphology.white_tophat(s, fp)))
+    a = filters.sobel(filters.gaussian(g, r["R_step_s1"] * sc * 0.5)); b = filters.sobel(filters.gaussian(g, r["R_step_s2"] * sc * 0.5)); step = np.clip(a - r["R_step_k"] * b, 0, None) + 0.0
+    return line, step
+def closed_limit(mask, W, H, sc, r):
+    """1 November 2026 : the split mask only says where the object cannot be, and it can be wrong on low contrast : a dent narrower than the closing is filled, so the lines of the image decide there. FR : le détourage de départ dit seulement où l'objet ne peut pas être ; une encoche étroite s'y referme et les traits de l'image décident."""
+    lim = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)) > 127; c = int(r["R_mask_close_px"] * sc)
+    return ndi.binary_closing(np.pad(lim, c), morphology.disk(c))[c:-c, c:-c] if c > 0 else lim
+
+
+def silhouette(g, sc, r, cube_box):
+    """what the background cannot reach : low gradient zones connected to the panel border, opened so they do not pass through a small gap in the outline"""
+    H, W = g.shape; e = filters.sobel(filters.gaussian(g, 0.6 * sc)); flat = e < r["R_bg_edge"] * max(np.percentile(e, 99.7), 1e-4); flat = ndi.binary_opening(flat, morphology.disk(max(1, int(r["R_bg_open"] * sc / 2))))
+    lab, n = ndi.label(flat); edge_ids = set(np.unique(np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]])).tolist()) - {0}; bg = np.isin(lab, list(edge_ids)); fg = ndi.binary_fill_holes(~bg)
+    if cube_box: x0, y0, x1, y1 = [int(v * sc) for v in cube_box]; m = int(r["R_cube_margin"] * sc); fg[max(y0 - m, 0):y1 + m, max(x0 - m, 0):x1 + m] = False
+    lab, n = ndi.label(fg)
+    if n > 1: sz = ndi.sum(fg, lab, range(1, n + 1)); fg = np.isin(lab, 1 + np.flatnonzero(sz >= 0.02 * sz.max()))
+    fg = ndi.binary_fill_holes(fg)
+    # the flat zone stops short of the outline by the width of the gradient : the contour is found again on the gradient between a sure inside and the outside
+    band = r["R_bg_band"] * sc; d_in = ndi.distance_transform_edt(fg); mk = np.zeros(fg.shape, np.int32); mk[~fg] = 2; mk[d_in > band] = 1; ws = segmentation.watershed(filters.sobel(filters.gaussian(g, r["R_ws_sigma"] * sc)), mk); fg = ndi.binary_fill_holes(ws == 1); return filters.gaussian(fg.astype(np.float32), r["R_smooth"] * sc) > 0.5 + r["R_contour_bias"]
+def merge_regions(L, E, r):
+    """adjacent regions merged weakest boundary first, the strength of a boundary = a quantile of the edge map along it ; a crumb under R_min_area is merged with its weakest neighbour whatever the strength"""
+    H, W = L.shape; pairs = {}
+    for dy, dx in ((0, 1), (1, 0)):
+        a = L[:H - dy, :W - dx]; b = L[dy:, dx:]; m = (a != b) & (a > 0) & (b > 0); lo = np.minimum(a[m], b[m]); hi = np.maximum(a[m], b[m]); val = np.maximum(E[:H - dy, :W - dx][m], E[dy:, dx:][m]); order = np.lexsort((hi, lo)); lo, hi, val = lo[order], hi[order], val[order]; cut = np.flatnonzero((lo[1:] != lo[:-1]) | (hi[1:] != hi[:-1])) + 1
+        for l_, h_, v_ in zip(lo[np.r_[0, cut]], hi[np.r_[0, cut]], np.split(val, cut)): pairs.setdefault((int(l_), int(h_)), []).append(v_)
+    pairs = {k: np.concatenate(v) for k, v in pairs.items()}; parent = {}; area = dict(zip(*[x.tolist() for x in np.unique(L[L > 0], return_counts=True)]))
+    def find(x):
+        while parent.get(x, x) != x: parent[x] = parent.get(parent[x], parent[x]); x = parent[x]
+        return x
+    q = r["R_merge_q"]; strength = {k: float(np.quantile(v, q)) for k, v in pairs.items()}; adj = {}
+    for (a, b) in pairs: adj.setdefault(a, set()).add(b); adj.setdefault(b, set()).add(a)
+    import heapq
+    heap = [(s, k) for k, s in strength.items()]; heapq.heapify(heap); ts = r["R_merge"]
+    while heap:
+        s, k = heapq.heappop(heap); a, b = k
+        if k not in strength or strength[k] != s: continue
+        small = min(area[a], area[b]) < r["R_min_area"]
+        if s >= ts and not small: continue
+        # merge b into a
+        if area[a] < area[b]: a, b = b, a
+        parent[b] = a; area[a] += area[b]; del strength[k]; pairs.pop(k); adj[a].discard(b); adj[b].discard(a)
+        for n in list(adj[b]):
+            kb = (min(b, n), max(b, n)); ka = (min(a, n), max(a, n)); adj[n].discard(b); vb = pairs.pop(kb); strength.pop(kb, None); pairs[ka] = np.concatenate([pairs[ka], vb]) if ka in pairs else vb; adj[a].add(n); adj[n].add(a); strength[ka] = float(np.quantile(pairs[ka], q)); heapq.heappush(heap, (strength[ka], ka))
+        adj[b] = set()
+    # crumbs that kept a strong boundary and stay small are pushed again by a second pass over the heap of what remains
+    ids = np.arange(int(L.max()) + 1); ids = np.array([find(int(i)) for i in ids]); return ids[L]
+
+
+def prepare(rgb, mask, sc, r, cube_box=None):
+    """the edge map and the silhouette of a panel, before any partition"""
+    H, W = mask.shape[0] * sc, mask.shape[1] * sc; g0 = np.asarray(Image.fromarray(rgb).convert("L")).astype(np.float32) / 255; gd = denoise(g0, r["R_nlm_h"]); g = np.asarray(Image.fromarray(gd.astype(np.float32), mode="F").resize((W, H), Image.BICUBIC)); line, step = edges(g, sc, r); inside = silhouette(g, sc, r, cube_box)
+    if r["R_mask_prior_px"] > 0: lim = closed_limit(mask, W, H, sc, r); inside &= ndi.binary_dilation(lim, iterations=int(r["R_mask_prior_px"] * sc))
+    ref = max(float(np.percentile(line[inside], 99.5)), 1e-4); ref2 = max(float(np.percentile(step[inside], 99.5)), 1e-4); return np.clip(np.maximum(line / ref, step / ref2), 0, 1), inside
+def partition(E, inside, r):
+    flat = (E < r["R_seed"]) & inside
+    if r["R_seed_open"]: flat = ndi.binary_opening(flat, morphology.disk(int(r["R_seed_open"])))
+    seeds = measure.label(flat, connectivity=1); sz = np.bincount(seeds.ravel()); seeds[sz[seeds] < r["R_min_seed"]] = 0; L = segmentation.watershed(filters.gaussian(E, 0.5), seeds, mask=inside); L2 = merge_regions(L, E, r); L2, _, _ = segmentation.relabel_sequential(L2); return L2.astype(np.int32) - 1
+def mirror_on(E, centre_from, centre_to, axis):
+    """E mirrored across the object centre of its own panel, placed on the centre of the target panel : axis 1 left right, 0 up down"""
+    F = E[:, ::-1] if axis == 1 else E[::-1, :]; n = E.shape[axis]; src = n - 1 - centre_from; sh = [0, 0]; sh[axis] = int(round(centre_to - src)); return ndi.shift(F, sh, order=0, cval=0)
+def apply_symmetry(Es, ins, centres, r, frame_views):
+    """1 November 2026 : on a symmetric object a line drawn on one side closes the same boundary on the other side : front, back, top and bottom answer to their own mirror, left answers to right ; a leak through a gap of a generated image closes this way"""
+    if not r["R_symmetry"]: return Es
+    k = r["R_symmetry_gain"]; out = dict(Es)
+    for v, ax in [(v, 1 if abs(frame_views[v]["rx"][0]) > 0.5 else 0) for v in ("front", "back", "top", "bottom") if v in frame_views]:     # the plane of symmetry is x = 0 : the mirror axis of a view follows from its frame
+        if v in Es: c = centres[v][0] if ax == 1 else centres[v][1]; out[v] = np.maximum(Es[v], k * mirror_on(Es[v], c, c, ax)) * ins[v]
+    if "left" in Es and "right" in Es:
+        H = min(Es["left"].shape[0], Es["right"].shape[0]); W = max(Es["left"].shape[1], Es["right"].shape[1])
+        for a, b in (("left", "right"), ("right", "left")):
+            m = mirror_on(Es[b], centres[b][0], centres[a][0], 1); sh = int(round(centres[a][1] - centres[b][1])); m = ndi.shift(m, (sh, 0), order=0, cval=0); h, w = min(m.shape[0], Es[a].shape[0]), min(m.shape[1], Es[a].shape[1]); t = Es[a].copy(); t[:h, :w] = np.maximum(t[:h, :w], k * m[:h, :w]); out[a] = t * ins[a]
+    return out
+def mirrored_limits(masks, centres, frame_views, sc):
+    """1 November 2026 : on a symmetric object the split mask of one side repairs the other : a dent on one side only is filled by the mirror, and a concave corner between a tyre and the sill stays open, which a morphological closing fills by mistake. FR : le détourage d'un côté répare l'autre ; une encoche d'un seul côté se remplit, un coin concave réel reste ouvert."""
+    out = dict(masks)
+    for v, m in masks.items():
+        if v in ("front", "back", "top", "bottom"): ax = 1 if abs(frame_views[v]["rx"][0]) > 0.5 else 0; c = (centres[v][0] if ax == 1 else centres[v][1]) / sc; out[v] = m | (mirror_on(m.astype(np.uint8), c, c, ax) > 0)
+    if "left" in masks and "right" in masks:
+        for a, b in (("left", "right"), ("right", "left")):
+            f = mirror_on(masks[b].astype(np.uint8), centres[b][0] / sc, centres[a][0] / sc, 1); f = ndi.shift(f, (int(round((centres[a][1] - centres[b][1]) / sc)), 0), order=0, cval=0); h, w = min(f.shape[0], masks[a].shape[0]), min(f.shape[1], masks[a].shape[1]); t = masks[a].copy(); t[:h, :w] |= f[:h, :w] > 0; out[a] = t
+    return out
+def ground_trim(inside, sc, r):
+    """1 November 2026 : a generated sheet leaves a thin contact shadow around what touches the ground : an opening only inside the lowest band of the object removes it, a thin part higher up, such as a splitter, is not touched. FR : ombre de contact mince au sol, retirée seulement dans la bande la plus basse."""
+    rr, band = int(r["R_ground_open_px"] * sc), int(r["R_ground_band_px"] * sc)
+    if rr <= 0 or not inside.any(): return inside
+    y1 = int(np.nonzero(inside.any(1))[0].max()) + 1; y0 = max(y1 - band, 0); o = ndi.binary_opening(np.pad(inside, rr), morphology.disk(rr))[rr:-rr, rr:-rr]; out = inside.copy(); out[y0:y1] = o[y0:y1]; return out
+def regions(rgb, mask, sc, r, cube_box=None):
+    # 1 November 2026 : R_mask_prior_px > 0 : a sheet with cast shadows, a ground line or a cube the split could not name keeps the split mask (shadow removal) as an outer limit, dilated by that many pixels
+    H, W = mask.shape[0] * sc, mask.shape[1] * sc; g0 = np.asarray(Image.fromarray(rgb).convert("L")).astype(np.float32) / 255; gd = denoise(g0, r["R_nlm_h"]); g = np.asarray(Image.fromarray(gd.astype(np.float32), mode="F").resize((W, H), Image.BICUBIC)); line, step = edges(g, sc, r); inside = silhouette(g, sc, r, cube_box)
+    if r["R_mask_prior_px"] > 0: lim = closed_limit(mask, W, H, sc, r); inside &= ndi.binary_dilation(lim, iterations=int(r["R_mask_prior_px"] * sc))
+    ref = max(float(np.percentile(line[inside], 99.5)), 1e-4); ref2 = max(float(np.percentile(step[inside], 99.5)), 1e-4); E = np.clip(np.maximum(line / ref, step / ref2), 0, 1)
+    flat = (E < r["R_seed"]) & inside
+    if r["R_seed_open"]: flat = ndi.binary_opening(flat, morphology.disk(int(r["R_seed_open"])))
+    seeds = measure.label(flat, connectivity=1); sz = np.bincount(seeds.ravel()); seeds[sz[seeds] < r["R_min_seed"]] = 0; L = segmentation.watershed(filters.gaussian(E, 0.5), seeds, mask=inside); L2 = merge_regions(L, E, r); L2, _, _ = segmentation.relabel_sequential(L2); return L2.astype(np.int32) - 1, E, inside
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; r = {k: p.get(k, v) for k, v in DEF.items()}; tiles = []; sheet = json.load(open(C.abspath(p["views_dir"]) + "/sheet.json")); cubes = {x["name"]: (x.get("cube") or {}).get("bbox") for x in sheet["panels"]}
+    fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}; Es = {}; ins = {}; centres = {n: ((V[n]["bbox"][0] + V[n]["bbox"][2]) / 2 * sc, (V[n]["bbox"][1] + V[n]["bbox"][3]) / 2 * sc) for n in p["views"]}
+    masks = {name: C.panel_mask(p, name) for name in p["views"]}
+    if r["R_mask_mirror"]: masks = mirrored_limits(masks, centres, V, sc)
+    for name in p["views"]: Es[name], ins[name] = prepare(C.panel_rgb(p, name), masks[name], sc, r, cubes.get(name))
+    Eraw = dict(Es)       # 1 November 2026 : before any mask, because the line of the outline lies half outside the object. FR : avant tout masque, car le trait du contour est à moitié hors de l'objet.
+    for name in p["views"]:
+        if name in ("front", "back", "left", "right"): ins[name] = ground_trim(ins[name], sc, r); Es[name] = Es[name] * ins[name]
+    Es = apply_symmetry(Es, ins, centres, r, V)
+    for name in p["views"]:
+        rgb = C.panel_rgb(p, name); E = Es[name]; inside = ins[name]; L = partition(E, inside, r); np.savez_compressed(f"{home}/02_masks/regions_{name}.npz", regions=L, edges=(E * 255).astype(np.uint8), edges_raw=(Eraw[name] * 255).astype(np.uint8)); tiles.append(C.overlay(rgb, L, sc, alpha=0.45)); print(name, "regions", int(L.max()) + 1, "px", int((L >= 0).sum()))
+    C.save_board(tiles, f"{home}/02_masks/regions_overlay.png")
+
+
+if __name__ == "__main__": main(sys.argv[1])

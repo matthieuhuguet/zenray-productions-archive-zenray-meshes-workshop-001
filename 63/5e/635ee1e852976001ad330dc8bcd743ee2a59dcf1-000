@@ -1,0 +1,89 @@
+"""1 November 2026 : M22 step 2e, the MICRO-COMPONENTS and their masks : atoms (a whole part, or one shell when a part repeats a shell at least 3 times), definitions (atoms with the same family, faces and sorted size, HDA logic), per view label map : a reference region goes to the atom that covers it most, an atom with no region keeps its template pixels (flagged). Honest measures : coverage, line support, line recall, attribution share, left/right agreement. Writes 02_masks/micro.json, labels_<view>.npz, metrics.json.
+    python -I MicroMasks.py Projects/<id>/params.json        FR : les micro-components et leurs masques, avec des mesures honnêtes."""
+import sys, json, fnmatch, re
+import numpy as np
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+NUM = re.compile(r"_\d\d$|(?<=rib_rear)_[abc]$")
+DEF = dict(hidden_families=["CAR_closer*", "CAR_liner*"], instance_tol_m=0.006, repeat_min=3, min_visible_px=108, edge_on=0.25, region_force={}, patch_support_min=0.55, zone_tol_m=0.05)
+
+
+def build_atoms(S, r):
+    """atoms and definitions from the shells"""
+    shells = S["shells"]; by_part = {}
+    for s in shells: by_part.setdefault(s["part"], []).append(s)
+    atoms = []
+    for part, ss in by_part.items():
+        zs = [s for s in ss if "zone" in s]; live = {s["id"] for s in ss} if not zs else {s["id"] for s in zs}; ss = [s for s in ss if s["id"] in live]   # 1 November 2026 : a divided part is its zones only (MicroZones.py)
+        if zs: atoms += [dict(part=part, family=s["family"], shells=[s["id"]], zone=True) for s in zs]; continue
+        groups = {}
+        for s in ss:
+            for k in groups:
+                if k[0] == s["faces"] and max(abs(a - b) for a, b in zip(k[1], s["extents"])) <= r["instance_tol_m"]: groups[k].append(s); break
+            else: groups[(s["faces"], tuple(s["extents"]))] = [s]
+        big = max(groups.values(), key=len)
+        if len(big) >= r["repeat_min"]:
+            rest = [s for s in ss if s not in big]; atoms += [dict(part=part, family=s["family"], shells=[s["id"]]) for s in big]
+            if rest: atoms.append(dict(part=part, family=rest[0]["family"], shells=[s["id"] for s in rest]))
+        else: atoms.append(dict(part=part, family=ss[0]["family"], shells=[s["id"] for s in ss]))
+    for a in atoms:
+        ss = [shells[i] for i in a["shells"]]; lo = np.min([s["lo"] for s in ss], 0); hi = np.max([s["hi"] for s in ss], 0); a["lo"] = lo.round(4).tolist(); a["hi"] = hi.round(4).tolist(); a["faces"] = int(sum(s["faces"] for s in ss)); a["centre"] = ((lo + hi) / 2).round(4).tolist()
+        a["family"] = NUM.sub("", a["family"])                 # 1 November 2026 : grille_upright_02 and rib_rear_a are the same family
+        a["sig"] = sorted(ss[0]["extents"], reverse=True) if len(ss) == 1 else sorted((hi - lo).tolist(), reverse=True); a["hidden"] = any(fnmatch.fnmatch(a["family"], h) for h in r["hidden_families"])
+    atoms.sort(key=lambda a: (a["family"], a["part"], a["shells"][0]))
+    defs = []
+    for k, a in enumerate(atoms):
+        a["id"] = k
+        for D in defs:
+            if D["family"] == a["family"] and (a.get("zone") or D["faces"] == a["faces"]) and max(abs(x - y) for x, y in zip(D["sig"], a["sig"])) <= (r["zone_tol_m"] if a.get("zone") else r["instance_tol_m"]): D["atoms"].append(k); a["def"] = D["id"]; break
+        else: a["def"] = len(defs); defs.append(dict(id=len(defs), family=a["family"], faces=a["faces"], sig=a["sig"], atoms=[k], hidden=a["hidden"]))
+    return atoms, defs
+
+
+def main(params):
+    p, home = C.load(params); r = {k: p.get(k, v) for k, v in DEF.items()}; sc = p["scale"]; S = json.load(open(f"{home}/02_masks/shells.json")); atoms, defs = build_atoms(S, r); n = len(S["shells"]); atom_of = np.full(n + 1, -1); hidden_atom = np.array([a["hidden"] for a in atoms])
+    for a in atoms: atom_of[a["shells"]] = a["id"]
+    dropped = []; def_of = np.array([a["def"] for a in atoms] + [-1]); na = len(atoms); M = {}; px_ref = {a["id"]: {} for a in atoms}; px_tpl = {a["id"]: {} for a in atoms}; shares = []; labels = {}
+    for name in p["views"]:
+        raw = np.load(f"{home}/02_masks/raw_{name}.npz")["labels"]; D = np.load(f"{home}/02_masks/regions_{name}.npz"); R, E = D["regions"], D["edges"].astype(np.float32) / 255; rawA = atom_of[np.clip(raw, 0, None)] * (raw >= 0) - (raw < 0); inside = R >= 0; nr = int(R.max()) + 1
+        ok = inside & (rawA >= 0) & ~hidden_atom[np.clip(rawA, 0, None)]; H = np.zeros((nr, na), np.int64); np.add.at(H, (R[ok], rawA[ok]), 1); area = np.bincount(R[inside], minlength=nr)
+        winner = np.where(H.sum(1) > 0, H.argmax(1), -1); forced = r["region_force"].get(name, {})
+        for k, v in forced.items(): winner[int(k)] = v
+        share = np.array([H[k, winner[k]] / max(area[k], 1) if winner[k] >= 0 else 0 for k in range(nr)]); shares.append((float((share * area).sum()), float(area.sum())))
+        lab = np.full(R.shape, -1, np.int32); lab[inside] = winner[R[inside]]; won = set(int(w) for w in winner if w >= 0)
+        near_edges = ndi.binary_dilation(E > r["edge_on"], iterations=int(round(p["support_tol_px"] * sc)))
+        for a in range(na):                       # an atom with no region of its own keeps its template pixels, thin parts painted last
+            if a in won or hidden_atom[a]: continue
+            m = (rawA == a) & inside
+            if m.sum() < r["min_visible_px"]: continue
+            bd = m ^ ndi.binary_erosion(m); sup = float(near_edges[bd].mean()) if bd.any() else 0.0   # 1 November 2026 : a template patch stays only if its outline follows lines of the reference
+            if sup < r["patch_support_min"]: dropped.append((name, atoms[a]["family"], int(m.sum() / sc ** 2), round(sup, 2))); continue
+            lab[m] = a; px_tpl[a][name] = int(m.sum())
+        for a in won:
+            m = lab == a
+            if m.any(): px_ref[a][name] = int(m.sum())
+        labels[name] = lab; np.savez_compressed(f"{home}/02_masks/labels_{name}.npz", labels=lab)
+        b = np.zeros(R.shape, bool); dl = def_of[np.clip(lab, 0, None)] * (lab >= 0) - (lab < 0); b[:, 1:] |= dl[:, 1:] != dl[:, :-1]; b[1:, :] |= dl[1:, :] != dl[:-1, :]; b &= ndi.binary_erosion(inside, iterations=2)
+        tol = int(round(p["support_tol_px"] * sc)); e = (E > r["edge_on"]) & ndi.binary_erosion(inside, iterations=2 * sc); near_e = ndi.binary_dilation(e, iterations=tol); near_b = ndi.binary_dilation(b, iterations=tol)
+        M[name] = dict(coverage=round(float((lab[inside] >= 0).mean()), 4), line_support=round(float(near_e[b].mean()) if b.any() else 0, 4), line_recall=round(float(near_b[e].mean()) if e.any() else 0, 4), attribution=round(shares[-1][0] / max(shares[-1][1], 1), 4), regions=nr)
+    # left/right agreement : definition labels of the left panel against the mirrored right panel, front/back/top/bottom against their own mirror, on the common object
+    def dl(v): return def_of[np.clip(labels[v], 0, None)] * (labels[v] >= 0) - (labels[v] < 0)
+    fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    def agree(a, b):
+        ys, xs = np.nonzero(a >= 0); h = min(a.shape[0], b.shape[0]); w = min(a.shape[1], b.shape[1]); A, B = a[:h, :w], b[:h, :w]; m = (A >= 0) & (B >= 0); return round(float((A[m] == B[m]).mean()), 4) if m.any() else 0.0
+    def recentre(a, v):       # shift a label image so that the object bbox centre is at the image centre
+        bb = [x * sc for x in V[v]["bbox"]]; cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2; return ndi.shift(a, (a.shape[0] / 2 - cy, a.shape[1] / 2 - cx), order=0, cval=-1)
+    sym = dict(left_vs_right=agree(recentre(dl("left"), "left"), recentre(dl("right"), "right")[:, ::-1]))
+    for v in ("front", "back", "top", "bottom"): c = recentre(dl(v), v); sym[v + "_self"] = agree(c, c[::-1] if v in ("top", "bottom") else c[:, ::-1])
+    json.dump(dict(atoms=atoms, definitions=defs), open(f"{home}/02_masks/micro.json", "w"), indent=0); json.dump(dict(per_view=M, symmetry=sym, ref_px={str(k): v for k, v in px_ref.items() if v}, template_px={str(k): v for k, v in px_tpl.items() if v}), open(f"{home}/02_masks/metrics.json", "w"), indent=1)
+    vis = [D for D in defs if not D["hidden"]]; seen = [D for D in vis if any(px_ref[a] or px_tpl[a] for a in D["atoms"])]; withref = [D for D in vis if any(px_ref[a] for a in D["atoms"])]
+    print("atoms", len(atoms), "definitions", len(defs), "visible on the sheet", len(seen), "with a reference region", len(withref), "hidden or unseen", len(defs) - len(seen))
+    for k, v in M.items(): print(k, v)
+    print(sym)
+    print("template patches dropped", len(dropped), "largest", sorted(dropped, key=lambda x: -x[2])[:8])
+    print("template only :", ", ".join(sorted(D["family"] + " x%d" % len(D["atoms"]) for D in seen if D not in withref)))
+    print("unseen :", ", ".join(sorted(D["family"] for D in vis if D not in seen)))
+
+
+if __name__ == "__main__": main(sys.argv[1])

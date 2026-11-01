@@ -1,0 +1,46 @@
+"""1 November 2026 : M22 step 2a, per pixel shell labels of the template model (named parts of a validated model, here v752) seen in each panel of the 6 views sheet, at params.scale times the sheet resolution, with the sheet panel camera
+(same conventions as SheetScore.render_in_panel). Writes 02_masks/raw_<view>.npz (labels, part names) and raw_overlay.png.
+    python -I MicroLabels.py Projects/<id>/params.json        FR : étiquettes par pixel des pièces nommées du gabarit, dans chaque case de la planche."""
+import sys, os, json
+import numpy as np
+from PIL import Image
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts"); import Raster
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+
+
+def panel_camera(fr, v, shape_hr, sc):
+    """centre, px per metre, axes and square render size of a panel at sc times the sheet resolution"""
+    lo = np.array(fr["lo"]); D = np.array(fr["dims_m"]); hi = lo + D; rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+    if v["name"] == "top" and tz[1] < 0 or v["name"] == "bottom" and tz[1] > 0: tz = -tz
+    a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy))); umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]
+    s = v["px_per_m"] * sc; bb = [x * sc for x in v["bbox"]]; R = int(max(shape_hr)); xc, yc = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+    ucen, vcen = umin + D[a] / 2, vmax - D[b] / 2; cu = ucen + (R / 2 - xc) / s; cv = vcen + (yc - R / 2) / s
+    return cu * rx + cv * uy, s, (rx.tolist(), uy.tolist(), tz.tolist()), R
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; fr = json.load(open(C.abspath(p["frame"]))); views = {v["name"]: v for v in fr["views"]}
+    d = np.load(C.abspath(p["model"]), allow_pickle=True); P, Cn, I, T = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64), d["T"].astype(np.int64); names = [str(n) for n in d["names"]]
+    off = np.concatenate([[0], np.cumsum(Cn)]); tris = []; owner = []
+    for k in np.unique(Cn):
+        ps = np.flatnonzero(Cn == k); base = off[ps]
+        for j in range(1, k - 1): tris.append(np.stack([I[base], I[base + j], I[base + j + 1]], 1)); owner.append(ps)
+    # 1 November 2026 : truth test : the template can be spoiled on purpose (scale, shift, slow deformation), like the gap between a model and a generated image ; the true labels are kept beside it
+    pert = p.get("template_perturb"); P0 = P.copy()
+    if pert:
+        rng = np.random.default_rng(pert.get("seed", 1)); b0 = P.min(0); D0 = np.ptp(P, axis=0); w = 2 * np.pi / (pert.get("wave_m", 0.6)); ph = rng.uniform(0, 6.28, (3, 3)); field = np.stack([np.sin(w * P[:, (k + 1) % 3] + ph[k, 0]) + np.sin(w * P[:, (k + 2) % 3] + ph[k, 1]) for k in range(3)], 1) * 0.5 * pert.get("noise_m", 0.0); c0 = b0 + D0 / 2; P = c0 + (P - c0) * (1 + pert.get("scale", 0.0)) + np.array(pert.get("shift_m", [0, 0, 0])) + field
+    tris = np.concatenate(tris); owner = np.concatenate(owner); mr = Raster.Renderer(P, tris); mt = Raster.Renderer(P0, tris) if pert else None; shell_of_poly = np.load(f"{home}/02_masks/shell_of_poly.npy"); part_of_face = shell_of_poly[owner]; tiles = []   # 1 November 2026 : labels are SHELL ids (MicroShells.py), one spoke, one bolt
+    for name in p["views"]:
+        rgb = C.panel_rgb(p, name); H, W = rgb.shape[:2]; c, s, axes, R = panel_camera(fr, views[name], (H * sc, W * sc), sc)
+        M, D_, N, F = mr.render(c.tolist(), s, axes, R); F = F[: H * sc, : W * sc]
+        lab = np.where(F >= 0, part_of_face[np.clip(F, 0, None)], -1).astype(np.int32)
+        if mt is not None:
+            Mt, D2, N2, F2 = mt.render(c.tolist(), s, axes, R); F2 = F2[: H * sc, : W * sc]; np.savez_compressed(f"{home}/02_masks/truth_{name}.npz", labels=np.where(F2 >= 0, part_of_face[np.clip(F2, 0, None)], -1).astype(np.int32))
+        else: np.savez_compressed(f"{home}/02_masks/truth_{name}.npz", labels=lab)
+        np.savez_compressed(f"{home}/02_masks/raw_{name}.npz", labels=lab, names=np.array(names)); tiles.append(C.overlay(rgb, lab, sc, alpha=0.45))
+        print(name, lab.shape, "visible shells", len(np.unique(lab)) - 1, "px", int((lab >= 0).sum()))
+    C.save_board(tiles, f"{home}/02_masks/raw_overlay.png")
+
+
+if __name__ == "__main__": main(sys.argv[1])

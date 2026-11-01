@@ -1,0 +1,225 @@
+"""1 November 2026 : M22 step 2e, the MICRO-COMPONENTS and their masks : atoms (a whole part, or one shell when a part repeats a shell at least 3 times), definitions (atoms with the same family, faces and sorted size, HDA logic), per view label map : a reference region goes to the atom that covers it most, an atom with no region keeps its template pixels (flagged). Honest measures : coverage, line support, line recall, attribution share, left/right agreement. Writes 02_masks/micro.json, labels_<view>.npz, metrics.json.
+    python -I MicroMasks.py Projects/<id>/params.json        FR : les micro-components et leurs masques, avec des mesures honnêtes."""
+import sys, json, fnmatch, re
+import numpy as np
+from scipy import ndimage as ndi
+from skimage import segmentation
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroArcs
+NUM = re.compile(r"_\d\d$|(?<=rib_rear)_[abc]$")
+DEF = dict(S_sym_regions=0, S_sym_region_major=0.6, S_free_sigma=0.0, S_free_edge=0.12, S_free_lock_px=1.0, hidden_families=["CAR_closer*", "CAR_liner*"], instance_tol_m=0.006, repeat_min=3, min_visible_px=108, edge_on=0.25, region_force={}, patch_support_min=0.55, zone_tol_m=0.05, S_erode_px=1.5, S_speck_px=3, S_speck_frac=0.01, S_land_sigma=0.3, S_compact=0.0005, S_support_ref=0.5, S_align=1, S_align_scale=0.03, S_align_px=12, S_region_major=0.8, S_piece_support=0.5, S_bd_min=0.0, S_bd_passes=30, S_bd_len_px=2, S_symmetry=0, S_sym_min_px=60, S_sym_ratio=1.0, edge_cal=0.12, faces_tol=0.01, S_auto=0, S_reliable=0.62, S_rf_major=0.05, S_rf_bd=0.55)
+
+
+def snap(rawA, E, inside, r, sc, hidden):
+    """1 November 2026 : the template gives one seed per part, the image gives the boundaries : each connected piece of a part is eroded to a seed (a thin piece keeps its core), then a watershed on the edge map : a boundary lands on a line when there is one, and midway between the seeds, which is the template's own place, when there is none. Specks of the template (stray polygons, parts poking through) make no seed."""
+    L = rawA.copy(); L[~inside] = -1; L[(L >= 0) & hidden[np.clip(L, 0, None)]] = -1; mk = np.zeros(L.shape, np.int32); ero = r["S_erode_px"] * sc; ids = np.unique(L[L >= 0])
+    for a in ids:
+        m = L == a; cc, nc = ndi.label(m)
+        if nc == 0: continue
+        sz = ndi.sum(m, cc, range(1, nc + 1)); big = sz.max(); objs = ndi.find_objects(cc)
+        for k, sl in enumerate(objs):
+            if sz[k] < max(r["S_speck_px"] * sc * sc, r["S_speck_frac"] * big): continue
+            sub = cc[sl] == k + 1; dt = ndi.distance_transform_edt(np.pad(sub, 1))[1:-1, 1:-1]; th = min(ero, 0.6 * dt.max()); mk[sl][dt > th] = int(a) + 1
+    if not mk.any(): return np.full(L.shape, -1, np.int32)
+    land = E if r["S_land_sigma"] <= 0 else ndi.gaussian_filter(E, r["S_land_sigma"] * sc); lab = segmentation.watershed(land, mk, mask=inside, compactness=r["S_compact"]); return lab.astype(np.int32) - 1
+
+
+def clean_by_regions(lab, R, E, r, sc, near_edges):
+    """1 November 2026 : the reference has the last word : inside a closed region of the image, a minority piece of a part whose inner outline follows no line is template noise, it goes to the part that dominates the region. A piece with a real outline stays, and so does a division the template knows when no part dominates."""
+    if not r["S_region_major"]: return lab
+    out = lab.copy(); n = int(R.max()) + 1; objs = ndi.find_objects(R + 1)
+    for k, sl in enumerate(objs):
+        if sl is None: continue
+        reg = R[sl] == k; ids, cnt = np.unique(lab[sl][reg], return_counts=True); keep = ids >= 0; ids, cnt = ids[keep], cnt[keep]
+        if len(ids) < 2 or cnt.max() < r["S_region_major"] * cnt.sum(): continue
+        dom = ids[cnt.argmax()]; inner = ndi.binary_erosion(reg, iterations=2)
+        for a in ids:
+            if a == dom: continue
+            m = (lab[sl] == a) & reg; cc, nc = ndi.label(m)
+            for j in range(1, nc + 1):
+                piece = cc == j; bd = (piece ^ ndi.binary_erosion(piece)) & inner
+                sup = float(near_edges[sl][bd].mean()) if bd.any() else 0.0
+                if sup < r["S_piece_support"]: out[sl][piece] = dom
+    return out
+
+
+def drop_unsupported(lab, r, sc, near_edges, inside):
+    """1 November 2026 : a boundary the reference does not draw does not exist on this sheet : connected pieces of labels, a piece whose boundary with a neighbour follows no line (support under S_bd_min) gives way to that neighbour, smallest piece first, until every boundary left is on a line. The silhouette is not a boundary between parts."""
+    if not r["S_bd_min"]: return lab
+    out = lab.copy()
+    for _ in range(int(r["S_bd_passes"])):
+        piece = np.zeros(out.shape, np.int32); n = 0; atom_of = {}
+        for a in np.unique(out[out >= 0]):
+            cc, k = ndi.label(out == a); piece[cc > 0] = cc[cc > 0] + n
+            for j in range(1, k + 1): atom_of[n + j] = int(a)
+            n += k
+        H, W = piece.shape; tally = {}
+        for dy, dx in ((0, 1), (1, 0)):
+            a_ = piece[:H - dy, :W - dx]; b_ = piece[dy:, dx:]; m = (a_ != b_) & (a_ > 0) & (b_ > 0); lo = np.minimum(a_[m], b_[m]); hi = np.maximum(a_[m], b_[m]); on = near_edges[:H - dy, :W - dx][m]; key = lo.astype(np.int64) * (n + 2) + hi; u, inv = np.unique(key, return_inverse=True); tot = np.bincount(inv); sup = np.bincount(inv, weights=on.astype(float))
+            for kk, t_, s_ in zip(u.tolist(), tot.tolist(), sup.tolist()): v = tally.setdefault(kk, [0, 0.0]); v[0] += t_; v[1] += s_
+        area = np.bincount(piece.ravel(), minlength=n + 2); weak = sorted(((v[1] / v[0], kk) for kk, v in tally.items() if v[1] / v[0] < r["S_bd_min"] and v[0] >= r["S_bd_len_px"] * sc), key=lambda x: x[0]); done = set(); change = {}
+        for s_, kk in weak:
+            a_, b_ = kk // (n + 2), kk % (n + 2)
+            if a_ in done or b_ in done: continue
+            small, big = (a_, b_) if area[a_] < area[b_] else (b_, a_)
+            if atom_of[small] != atom_of[big]: change[small] = atom_of[big]; done.update((small, big))
+        if not change: break
+        for sm, at in change.items(): out[piece == sm] = at
+    return out
+
+
+def symmetrize(labels, def_of, atoms, centres, r, frame_views):
+    """1 November 2026 : on a symmetric object a piece and its mirror image are the same definition : front, back, top and bottom against their own mirror, left against right. Where they disagree the larger total area wins and the other side takes the mirror instance of that definition. Asymmetric sheets : S_symmetry 0."""
+    if not r["S_symmetry"]: return labels
+    by_def = {}
+    for a in atoms: by_def.setdefault(a["def"], []).append(a)
+    def instance(d, xsign):
+        c = by_def[d]; return max(c, key=lambda a: a["centre"][0] * xsign)["id"] if len(c) > 1 else c[0]["id"]
+    out = {k: v.copy() for k, v in labels.items()}
+    for v_a, v_b, ax in [(v, v, 1 if abs(frame_views[v]["rx"][0]) > 0.5 else 0) for v in ("front", "back", "top", "bottom") if v in frame_views] + [("left", "right", 1)]:      # the plane of symmetry is x = 0 : the mirror axis of a view follows from its frame
+        if v_a not in out or v_b not in out: continue
+        A = out[v_a]; B = out[v_b]; Bm = B[:, ::-1] if ax == 1 else B[::-1, :]; n = B.shape[ax]; src = n - 1 - (centres[v_b][0] if ax == 1 else centres[v_b][1]); sh = [0, 0]; sh[ax] = int(round((centres[v_a][0] if ax == 1 else centres[v_a][1]) - src)); sh[1 - ax] = int(round((centres[v_a][1] - centres[v_b][1]) if ax == 1 else (centres[v_a][0] - centres[v_b][0]))); Bm = ndi.shift(Bm, sh, order=0, cval=-1); h, w = min(A.shape[0], Bm.shape[0]), min(A.shape[1], Bm.shape[1]); A_, B_ = A[:h, :w], Bm[:h, :w]; both = (A_ >= 0) & (B_ >= 0)
+        for a in np.unique(A_[both]):
+            cc, nc = ndi.label(A_ == a)
+            for j, sl in enumerate(ndi.find_objects(cc)):
+                pc = cc[sl] == j + 1; vals = B_[sl][pc]; vals = vals[vals >= 0]
+                if len(vals) < r["S_sym_min_px"]: continue
+                ids, cnt = np.unique(vals, return_counts=True); m = ids[cnt.argmax()]
+                if def_of[m] == def_of[a] or cnt.max() < 0.6 * pc.sum(): continue
+                area_a = int(pc.sum()); total_m = int((B == m).sum()); total_a = int((A == a).sum())
+                if total_m > total_a * r["S_sym_ratio"]: xs = atoms[int(a)]["centre"][0]; A[:h, :w][sl][pc] = instance(int(def_of[m]), 1 if xs >= 0 else -1)
+    return out
+
+
+def symmetrize_regions(labels, raws, def_of, atoms, centres, r, frame_views, home):
+    """1 November 2026 : a closed region of the image and its mirror image are the same piece : where they disagree, the template decides by its vote over both regions, because the larger area would give a bumper corner to the tyre. FR : une région fermée et son image miroir sont la même pièce ; en cas de désaccord, le gabarit tranche sur les deux régions, jamais la plus grande aire."""
+    if not r["S_sym_regions"]: return labels
+    by_def = {}
+    for a in atoms: by_def.setdefault(a["def"], []).append(a)
+    def instance(d, xsign):
+        c = by_def[d]; return max(c, key=lambda a: a["centre"][0] * xsign)["id"] if len(c) > 1 else c[0]["id"]
+    def mirrored(X, v_a, v_b, ax):
+        F = X[:, ::-1] if ax == 1 else X[::-1, :]; n = X.shape[ax]; src = n - 1 - (centres[v_b][0] if ax == 1 else centres[v_b][1]); sh = [0, 0]; sh[ax] = int(round((centres[v_a][0] if ax == 1 else centres[v_a][1]) - src)); sh[1 - ax] = int(round((centres[v_a][1] - centres[v_b][1]) if ax == 1 else (centres[v_a][0] - centres[v_b][0]))); F = ndi.shift(F, sh, order=0, cval=-1); O = np.full(labels[v_a].shape, -1, F.dtype); h, w = min(O.shape[0], F.shape[0]), min(O.shape[1], F.shape[1]); O[:h, :w] = F[:h, :w]; return O
+    out = {k: v.copy() for k, v in labels.items()}; pairs = [(v, v, 1 if abs(frame_views[v]["rx"][0]) > 0.5 else 0) for v in ("front", "back", "top", "bottom") if v in frame_views] + [("left", "right", 1), ("right", "left", 1)]; n_changed = {}
+    for v_a, v_b, ax in pairs:
+        if v_a not in out or v_b not in out: continue
+        A = out[v_a]; Bm = mirrored(labels[v_b], v_a, v_b, ax); Ra, Rm = raws[v_a], mirrored(raws[v_b], v_a, v_b, ax); R = np.load(f"{home}/02_masks/regions_{v_a}.npz")["regions"]; changed = 0
+        for q, sl in enumerate(ndi.find_objects(R + 1)):
+            if sl is None: continue
+            pc = R[sl] == q; own, mir = A[sl][pc], Bm[sl][pc]; k = (own >= 0) & (mir >= 0)
+            if k.sum() < r["S_sym_min_px"]: continue
+            d_own, d_mir = def_of[own[k]], def_of[mir[k]]; ids_o, cnt_o = np.unique(d_own, return_counts=True); ids_m, cnt_m = np.unique(d_mir, return_counts=True); a, b = ids_o[cnt_o.argmax()], ids_m[cnt_m.argmax()]
+            if a == b or cnt_o.max() < r["S_sym_region_major"] * k.sum() or cnt_m.max() < r["S_sym_region_major"] * k.sum(): continue
+            v_ = np.concatenate([Ra[sl][pc], Rm[sl][pc]]); v_ = def_of[v_[v_ >= 0]]; vote_a, vote_b = int((v_ == a).sum()), int((v_ == b).sum())
+            if vote_b > vote_a:
+                sel = pc & (def_of[np.clip(A[sl], 0, None)] == a) & (A[sl] >= 0); ids = np.unique(A[sl][sel])
+                for i in ids: A[sl][sel & (A[sl] == i)] = instance(int(b), 1 if atoms[int(i)]["centre"][0] >= 0 else -1)
+                changed += int(sel.sum())
+        n_changed[v_a] = changed
+    print("regions answered by their mirror, pixels changed :", n_changed); return out
+
+
+def smooth_free(lab, E, inside, r, sc):
+    """1 November 2026 : a border that follows no line of the image is arbitrary, so it must at least be calm : a label vote in a gaussian window, only on pixels far from any line, so a border on a line never moves and the outline of the object stays. FR : un bord sans trait est arbitraire, il doit au moins être calme ; un bord sur un trait ne bouge pas."""
+    s = r["S_free_sigma"] * sc
+    if s <= 0: return lab
+    locked = ndi.binary_dilation(E > r["S_free_edge"], iterations=int(round(r["S_free_lock_px"] * sc))); best = np.zeros(lab.shape, np.float32); who = lab.copy(); m_ = int(np.ceil(3 * s)) + 1; H, W = lab.shape
+    for a, sl in enumerate(ndi.find_objects(lab + 1)):      # 1 November 2026 : entry a is label a, because the background -1 becomes 0 and find_objects does not list 0
+        if sl is None: continue
+        y0, y1, x0, x1 = max(sl[0].start - m_, 0), min(sl[0].stop + m_, H), max(sl[1].start - m_, 0), min(sl[1].stop + m_, W); g = ndi.gaussian_filter((lab[y0:y1, x0:x1] == a).astype(np.float32), s); bb, ww = best[y0:y1, x0:x1], who[y0:y1, x0:x1]; up = g > bb; bb[up] = g[up]; ww[up] = a
+    free = inside & (lab >= 0) & ~locked; out = lab.copy(); out[free] = who[free]; return out
+
+
+def align(rawA, inside, r, sc):
+    """1 November 2026 : the template is registered on the image, one view at a time : shift and scale on both axes that best cover the silhouette, coarse to fine on a reduced image. Returns the warped label map and the transform found."""
+    if not r["S_align"]: return rawA, (1.0, 1.0, 0.0, 0.0)
+    q = max(1, sc); A = (rawA[::q, ::q] >= 0); B = inside[::q, ::q]; H, W = A.shape; ys, xs = np.nonzero(A); cy, cx = (ys.min() + ys.max()) / 2, (xs.min() + xs.max()) / 2; yy, xx = np.nonzero(A); best = (-1, 1.0, 1.0, 0.0, 0.0)
+    def ev(sy, sx, dy, dx):
+        Y = np.round(cy + (yy - cy) * sy + dy).astype(int); X = np.round(cx + (xx - cx) * sx + dx).astype(int); ok = (Y >= 0) & (Y < H) & (X >= 0) & (X < W); I = np.zeros((H, W), bool); I[Y[ok], X[ok]] = True; I = ndi.binary_closing(I, iterations=1) if max(sy, sx) > 1.0 else I; return (I & B).sum() / max((I | B).sum(), 1)
+    for span_s, n_s, span_d, n_d in ((r["S_align_scale"], 5, r["S_align_px"], 9), (r["S_align_scale"] / 3, 5, r["S_align_px"] / 3, 7), (r["S_align_scale"] / 9, 3, r["S_align_px"] / 9, 5)):
+        _, s0y, s0x, d0y, d0x = best if best[0] >= 0 else (0, 1.0, 1.0, 0.0, 0.0)
+        for sy in np.linspace(s0y - span_s, s0y + span_s, n_s):
+            for sx in np.linspace(s0x - span_s, s0x + span_s, n_s):
+                for dy in np.linspace(d0y - span_d, d0y + span_d, n_d):
+                    for dx in np.linspace(d0x - span_d, d0x + span_d, n_d):
+                        v = ev(sy, sx, dy, dx)
+                        if v > best[0]: best = (v, sy, sx, dy, dx)
+    _, sy, sx, dy, dx = best; Hh, Ww = rawA.shape; cyh, cxh = cy * q, cx * q; R_, C_ = np.mgrid[:Hh, :Ww]; Rs = np.round(cyh + (R_ - cyh - dy * q) / sy).astype(int); Cs = np.round(cxh + (C_ - cxh - dx * q) / sx).astype(int); ok = (Rs >= 0) & (Rs < Hh) & (Cs >= 0) & (Cs < Ww); out = np.full(rawA.shape, -1, rawA.dtype); out[ok] = rawA[Rs[ok], Cs[ok]]; return out, (round(float(sy), 4), round(float(sx), 4), round(float(dy * q), 1), round(float(dx * q), 1))
+
+
+def build_atoms(S, r):
+    """atoms and definitions from the shells"""
+    shells = S["shells"]; by_part = {}
+    for s in shells: by_part.setdefault(s["part"], []).append(s)
+    atoms = []
+    for part, ss in by_part.items():
+        zs = [s for s in ss if "zone" in s]; live = {s["id"] for s in ss} if not zs else {s["id"] for s in zs}; ss = [s for s in ss if s["id"] in live]   # 1 November 2026 : a divided part is its zones only (MicroZones.py)
+        if zs: atoms += [dict(part=part, family=s["family"], shells=[s["id"]], zone=True) for s in zs]; continue
+        groups = {}
+        for s in ss:
+            for k in groups:
+                if k[0] == s["faces"] and max(abs(a - b) for a, b in zip(k[1], s["extents"])) <= r["instance_tol_m"]: groups[k].append(s); break
+            else: groups[(s["faces"], tuple(s["extents"]))] = [s]
+        big = max(groups.values(), key=len)
+        if len(big) >= r["repeat_min"]:
+            rest = [s for s in ss if s not in big]; atoms += [dict(part=part, family=s["family"], shells=[s["id"]]) for s in big]
+            if rest: atoms.append(dict(part=part, family=rest[0]["family"], shells=[s["id"] for s in rest]))
+        else: atoms.append(dict(part=part, family=ss[0]["family"], shells=[s["id"] for s in ss]))
+    for a in atoms:
+        ss = [shells[i] for i in a["shells"]]; lo = np.min([s["lo"] for s in ss], 0); hi = np.max([s["hi"] for s in ss], 0); a["lo"] = lo.round(4).tolist(); a["hi"] = hi.round(4).tolist(); a["faces"] = int(sum(s["faces"] for s in ss)); a["centre"] = ((lo + hi) / 2).round(4).tolist()
+        a["family"] = NUM.sub("", a["family"])                 # 1 November 2026 : grille_upright_02 and rib_rear_a are the same family
+        a["sig"] = sorted(ss[0]["extents"], reverse=True) if len(ss) == 1 else sorted((hi - lo).tolist(), reverse=True); a["hidden"] = any(fnmatch.fnmatch(a["family"], h) for h in r["hidden_families"])
+    atoms.sort(key=lambda a: (a["family"], a["part"], a["shells"][0]))
+    defs = []
+    for k, a in enumerate(atoms):
+        a["id"] = k
+        for D in defs:
+            if D["family"] == a["family"] and (a.get("zone") or abs(D["faces"] - a["faces"]) <= r["faces_tol"] * max(D["faces"], 1)) and max(abs(x - y) for x, y in zip(D["sig"], a["sig"])) <= (r["zone_tol_m"] if a.get("zone") else r["instance_tol_m"]): D["atoms"].append(k); a["def"] = D["id"]; break
+        else: a["def"] = len(defs); defs.append(dict(id=len(defs), family=a["family"], faces=a["faces"], sig=a["sig"], atoms=[k], hidden=a["hidden"]))
+    return atoms, defs
+
+
+def main(params):
+    p, home = C.load(params); r = {k: p.get(k, v) for k, v in DEF.items()}; sc = p["scale"]; S = json.load(open(f"{home}/02_masks/shells.json")); atoms, defs = build_atoms(S, r); n = len(S["shells"]); atom_of = np.full(n + 1, -1); hidden_atom = np.array([a["hidden"] for a in atoms])
+    for a in atoms: atom_of[a["shells"]] = a["id"]
+    dropped = []; aligns = {}; trust = {}; def_of = np.array([a["def"] for a in atoms] + [-1]); na = len(atoms); M = {}; px_ref = {a["id"]: {} for a in atoms}; px_tpl = {a["id"]: {} for a in atoms}; shares = []; labels = {}; raws = {}
+    for name in p["views"]:
+        raw = np.load(f"{home}/02_masks/raw_{name}.npz")["labels"]; D = np.load(f"{home}/02_masks/regions_{name}.npz"); R, E = D["regions"], D["edges"].astype(np.float32) / 255; rawA = atom_of[np.clip(raw, 0, None)] * (raw >= 0) - (raw < 0); inside = R >= 0; nr = int(R.max()) + 1
+        rawA, tf_ = align(rawA, inside, r, sc); aligns[name] = tf_; raws[name] = rawA; near_edges = ndi.binary_dilation(E > r["edge_on"], iterations=int(round(p["support_tol_px"] * sc))); rr = r
+        if r["S_auto"]:                 # 1 November 2026 : the template earns its trust view by view : its inner boundaries must fall on lines of the image ; trusted, it keeps the divisions the image does not draw ; not trusted, the closed regions of the image decide alone
+            vis = np.where((rawA >= 0) & hidden_atom[np.clip(rawA, 0, None)], -1, rawA); tb = np.zeros(vis.shape, bool); tb[:, 1:] |= vis[:, 1:] != vis[:, :-1]; tb[1:, :] |= vis[1:, :] != vis[:-1, :]; tb &= ndi.binary_erosion(vis >= 0, iterations=3 * sc) & ndi.binary_erosion(inside, iterations=3 * sc); rel = float(near_edges[tb].mean()) if tb.any() else 0.0; trust[name] = round(rel, 3); rr = dict(r); rr.update(dict(S_region_major=0.0, S_bd_min=0.0) if rel >= r["S_reliable"] else dict(S_region_major=r["S_rf_major"], S_bd_min=r["S_rf_bd"]))
+        lab = snap(rawA, E, inside, rr, sc, hidden_atom); lab = clean_by_regions(lab, R, E, rr, sc, near_edges); lab = drop_unsupported(lab, rr, sc, near_edges, inside); labels[name] = lab; np.savez_compressed(f"{home}/02_masks/labels_{name}.npz", labels=lab)
+        shares.append((float((lab[inside] >= 0).sum()), float(inside.sum())))
+    fr0 = json.load(open(C.abspath(p["frame"]))); V0 = {v["name"]: v for v in fr0["views"]}; centres = {n: ((V0[n]["bbox"][0] + V0[n]["bbox"][2]) / 2 * sc, (V0[n]["bbox"][1] + V0[n]["bbox"][3]) / 2 * sc) for n in p["views"]}; labels = symmetrize(labels, def_of, atoms, centres, r, V0); labels = symmetrize_regions(labels, raws, def_of, atoms, centres, r, V0, home)
+    for name in p["views"]: labels[name] = smooth_free(labels[name], np.load(f"{home}/02_masks/regions_{name}.npz")["edges"].astype(np.float32) / 255, np.load(f"{home}/02_masks/regions_{name}.npz")["regions"] >= 0, r, sc)
+    labels, arc_stats = MicroArcs.finish_views(labels, p, home, sc)      # 1 November 2026 : the borders become drawn lines. FR : les bords deviennent des traits dessinés.
+    if arc_stats: print("arcs :", json.dumps(arc_stats))
+    for name in p["views"]:
+        lab = labels[name]; D = np.load(f"{home}/02_masks/regions_{name}.npz"); R, E = D["regions"], D["edges"].astype(np.float32) / 255; inside = R >= 0; nr = int(R.max()) + 1; np.savez_compressed(f"{home}/02_masks/labels_{name}.npz", labels=lab); near_edges = ndi.binary_dilation(E > r["edge_on"], iterations=int(round(p["support_tol_px"] * sc)))
+        for a in np.unique(lab[lab >= 0]):       # an atom in this view : its outline follows lines of the reference, or it keeps the place of the template
+            m = lab == a; bd = m ^ ndi.binary_erosion(m); sup = float(near_edges[bd].mean()) if bd.any() else 0.0
+            if sup >= r["S_support_ref"]: px_ref[int(a)][name] = int(m.sum())
+            else: px_tpl[int(a)][name] = int(m.sum())
+        b = np.zeros(R.shape, bool); dl = def_of[np.clip(lab, 0, None)] * (lab >= 0) - (lab < 0); b[:, 1:] |= dl[:, 1:] != dl[:, :-1]; b[1:, :] |= dl[1:, :] != dl[:-1, :]; b &= ndi.binary_erosion(inside, iterations=2)
+        tol = int(round(p["support_tol_px"] * sc)); e = (E > r["edge_on"]) & ndi.binary_erosion(inside, iterations=2 * sc); near_e = ndi.binary_dilation(e, iterations=tol); near_b = ndi.binary_dilation(b, iterations=tol)
+        sup_low = float(ndi.binary_dilation((E > r["edge_cal"]) & ndi.binary_erosion(inside, iterations=2 * sc), iterations=2 * sc)[b].mean()) if b.any() else 0.0   # the same at the threshold calibrated on the truth, within 2 pixels of the sheet
+        M[name] = dict(coverage=round(float((lab[inside] >= 0).mean()), 4), line_support=round(float(near_e[b].mean()) if b.any() else 0, 4), line_recall=round(float(near_b[e].mean()) if e.any() else 0, 4), support_cal=round(sup_low, 4), regions=nr)
+    # left/right agreement : definition labels of the left panel against the mirrored right panel, front/back/top/bottom against their own mirror, on the common object
+    def dl(v): return def_of[np.clip(labels[v], 0, None)] * (labels[v] >= 0) - (labels[v] < 0)
+    fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    def agree(a, b):
+        ys, xs = np.nonzero(a >= 0); h = min(a.shape[0], b.shape[0]); w = min(a.shape[1], b.shape[1]); A, B = a[:h, :w], b[:h, :w]; m = (A >= 0) & (B >= 0); return round(float((A[m] == B[m]).mean()), 4) if m.any() else 0.0
+    def recentre(a, v):       # shift a label image so that the object bbox centre is at the image centre
+        bb = [x * sc for x in V[v]["bbox"]]; cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2; return ndi.shift(a, (a.shape[0] / 2 - cy, a.shape[1] / 2 - cx), order=0, cval=-1)
+    sym = dict(left_vs_right=agree(recentre(dl("left"), "left"), recentre(dl("right"), "right")[:, ::-1]))
+    for v in ("front", "back", "top", "bottom"): c = recentre(dl(v), v); sym[v + "_self"] = agree(c, c[:, ::-1] if abs(V[v]["rx"][0]) > 0.5 else c[::-1])
+    json.dump(dict(atoms=atoms, definitions=defs), open(f"{home}/02_masks/micro.json", "w"), indent=0); print("trust in the template, share of its boundaries on a line :", trust); print("template registered on the image (sy, sx, dy, dx) :", aligns); json.dump(dict(per_view=M, arcs=arc_stats, symmetry=sym, aligns=aligns, ref_px={str(k): v for k, v in px_ref.items() if v}, template_px={str(k): v for k, v in px_tpl.items() if v}), open(f"{home}/02_masks/metrics.json", "w"), indent=1)
+    vis = [D for D in defs if not D["hidden"]]; seen = [D for D in vis if any(px_ref[a] or px_tpl[a] for a in D["atoms"])]; withref = [D for D in vis if any(px_ref[a] for a in D["atoms"])]
+    print("atoms", len(atoms), "definitions", len(defs), "visible on the sheet", len(seen), "with a reference region", len(withref), "hidden or unseen", len(defs) - len(seen))
+    for k, v in M.items(): print(k, v)
+    print(sym)
+    print("template only :", ", ".join(sorted(D["family"] + " x%d" % len(D["atoms"]) for D in seen if D not in withref)))
+    print("unseen :", ", ".join(sorted(D["family"] for D in vis if D not in seen)))
+
+
+if __name__ == "__main__": main(sys.argv[1])

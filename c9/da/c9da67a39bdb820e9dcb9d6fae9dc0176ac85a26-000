@@ -1,0 +1,25 @@
+"""1 November 2026 : M22, tournament of the region settings against the truth, CPU in parallel : every combination of the listed R_ values is run on the six views, scored by MicroTruth. Writes 06_checks/sweep.json, prints the best. Fills the method sheet : every combination tried stays written.
+    python -I MicroSweep.py Projects/<id>/params.json '{"R_merge":[0.1,0.2],"R_seed":[0.08,0.12]}'        FR : tournoi des réglages contre la vérité, en parallèle sur les cœurs."""
+import sys, json, itertools
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroRegions as G, MicroTruth as T
+
+
+def one(args):
+    params, over = args; p, home = C.load(params); sc = p["scale"]; r = {k: p.get(k, v) for k, v in G.DEF.items()}; r.update(over); sheet = json.load(open(C.abspath(p["views_dir"]) + "/sheet.json")); cubes = {x["name"]: (x.get("cube") or {}).get("bbox") for x in sheet["panels"]}; good = tot = 0; nreg = 0; miss = 0; prec = []; rec = []; sil = []
+    for name in p["views"]:
+        L, E, ins = G.regions(C.panel_rgb(p, name), C.panel_mask(p, name), sc, r, cubes.get(name)); Tr = np.load(f"{home}/02_masks/raw_{name}.npz")["labels"]; o, _ = T.score(L, Tr, sc); good += o["_good"]; tot += o["_total"]; nreg += o["regions"]; miss += len(o["parts_missed"]); prec.append(o["bd_precision"]); rec.append(o["bd_recall"]); sil.append(o["silhouette_iou"])
+    return dict(over=over, accuracy=round(good / max(tot, 1), 5), regions=nreg, missed=miss, precision=round(float(np.mean(prec)), 4), recall=round(float(np.mean(rec)), 4), silhouette=round(float(np.mean(sil)), 4), sil_min=round(float(min(sil)), 4))
+
+
+def main(params, grid):
+    p, home = C.load(params); keys = list(grid); combos = [dict(zip(keys, v)) for v in itertools.product(*[grid[k] for k in keys])]; print("combinations", len(combos))
+    with ProcessPoolExecutor(max_workers=16) as ex: res = list(ex.map(one, [(params, c) for c in combos]))
+    res.sort(key=lambda x: (-(x["accuracy"] + 0.5 * 2 * x["precision"] * x["recall"] / max(x["precision"] + x["recall"], 1e-6))))
+    f = f"{home}/06_checks/sweep.json"; old = json.load(open(f)) if __import__("os").path.exists(f) else []; json.dump(old + res, open(f, "w"), indent=0)
+    for x in res[:8]: print(x)
+
+
+if __name__ == "__main__": main(sys.argv[1], json.loads(sys.argv[2]))

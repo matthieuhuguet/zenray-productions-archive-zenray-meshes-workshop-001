@@ -1,0 +1,36 @@
+"""1 November 2026 : M22 step 2c, the DATASET of micro-components read from the named parts of the template model : every part is split into connected shells (a spoke, a bolt), shells with the same face count and the same principal extents are one DEFINITION with several INSTANCES (HDA logic : mirror pairs, four wheels, six spokes). Writes 02_masks/shells.json.
+    python -I MicroShells.py Projects/<id>/params.json        FR : le dataset des micro-components : pièces coupées en coques connexes, coques identiques réunies en une définition et ses instances."""
+import sys, json, re
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+SIDE = re.compile(r"_(FL|FR|RL|RR|L|R|C)$")
+
+
+def main(params):
+    p, home = C.load(params); tol = p.get("instance_tol_m", 0.004); d = np.load(C.abspath(p["model"]), allow_pickle=True); P, Cn, I, T = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64), d["T"].astype(np.int64); names = [str(n) for n in d["names"]]
+    off = np.concatenate([[0], np.cumsum(Cn)]); shells = []; shell_of_poly = np.full(len(Cn), -1, np.int64)
+    for k, n in enumerate(names):
+        ps = np.flatnonzero(T == k)
+        if len(ps) == 0: continue
+        rows = np.concatenate([np.full(Cn[q], j) for j, q in enumerate(ps)]); cols = np.concatenate([I[off[q]:off[q + 1]] for q in ps]); uv, cols = np.unique(cols, return_inverse=True)
+        A = coo_matrix((np.ones(len(rows)), (rows, cols + len(ps))), shape=(len(ps) + len(uv), len(ps) + len(uv))); nc, lab = connected_components(A, directed=False); lp = lab[: len(ps)]
+        for c in np.unique(lp):
+            qs = ps[lp == c]; sid = len(shells); shell_of_poly[qs] = sid; v = np.unique(np.concatenate([I[off[q]:off[q + 1]] for q in qs])); X = P[v]; ctr = X.mean(0)
+            ext = np.sort(np.ptp((X - ctr) @ np.linalg.svd(X - ctr, full_matrices=False)[2].T, axis=0))[::-1]
+            shells.append(dict(id=sid, part=n, family=SIDE.sub("", n), faces=int(len(qs)), centre=ctr.round(4).tolist(), lo=X.min(0).round(4).tolist(), hi=X.max(0).round(4).tolist(), extents=ext.round(4).tolist()))
+    defs = []
+    for s in sorted(shells, key=lambda s: (s["family"], s["part"], s["id"])):                   # a shell joins a definition of the same family with the same faces and extents
+        for D in defs:
+            r = D["ref"]
+            if r["family"] == s["family"] and r["faces"] == s["faces"] and max(abs(a - b) for a, b in zip(r["extents"], s["extents"])) <= tol: D["shells"].append(s["id"]); break
+        else: defs.append(dict(ref=s, shells=[s["id"]]))
+    for k, D in enumerate(defs): D["id"] = k; D["family"] = D["ref"]["family"]; D["instances"] = len(D["shells"]); D["faces"] = D["ref"]["faces"]; D["extents_m"] = D["ref"]["extents"]; D["size_m"] = np.round(np.array(D["ref"]["hi"]) - np.array(D["ref"]["lo"]), 4).tolist(); del D["ref"]
+    json.dump(dict(shells=shells, definitions=defs), open(f"{home}/02_masks/shells.json", "w"), indent=0); np.save(f"{home}/02_masks/shell_of_poly.npy", shell_of_poly)
+    print("parts", len(set(s["part"] for s in shells)), "shells", len(shells), "definitions", len(defs))
+    for D in sorted(defs, key=lambda D: -D["instances"])[:14]: print(D["family"], "x", D["instances"], "faces", D["faces"], D["extents_m"])
+
+
+if __name__ == "__main__": main(sys.argv[1])

@@ -1,0 +1,100 @@
+"""1 November 2026, 22:10 : M22, THE VERIFIER OF A CUT SHEET received from an image model. A model cannot prove its own work, so a check written in the prompt only guides it : this one decides.
+Each pixel is read as the palette colour most likely under a semi-transparent mask, then every disc of the colour index asks : does the piece under me carry my colour ? Writes 06_checks/cut_check.json, a board per image (green ring right, red ring wrong, with the expected number) and a map of where two generations differ.
+    python -I MicroCutCheck.py Projects/<id>/params.json [image.png ...]      default : 04_received/gen_*.png and cut_sheet.png ; exit 0 if one image passes the gates
+    python -I MicroCutCheck.py selftest Projects/<id>/params.json             green on a perfect sheet, red on swapped colours
+Settings : cut_check in params.json, see DEF.
+FR : le vérificateur d'une planche de découpe : un modèle ne peut pas prouver son propre travail, la vérification écrite dans le prompt le guide seulement, celle-ci tranche."""
+import sys, os, json, glob, itertools
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+DEF = dict(alpha_min=0.3, alpha_band=0.1, dark_val=60.0, tol=40.0, tie_margin=6.0, ref_sigma_px=0.0, sat_fg=26.0, window_ratio=0.6, window_depth_ratio=0.7, gate_seed_share=0.999, gate_silhouette=0.97, chunk=65536)      # 1 November 2026 : every value of the check, in pixels of the sheet and 8 bit levels. FR : tous les réglages du contrôle.
+FONT = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"; GOOD = (40, 220, 90); BAD = (255, 40, 40)
+
+
+def context(params):
+    p, home = C.load(params); sheet = np.asarray(Image.open(C.abspath(p["sheet"])).convert("RGB")).astype(np.float32); cj = json.load(open(f"{home}/03_sheets/cut_components.json"))["components"]; sj = json.load(open(f"{home}/03_sheets/cut_seeds.json")); pal = np.array([[int(c["hex"][k:k + 2], 16) for k in (1, 3, 5)] for c in cj], np.float32); full = np.load(f"{home}/03_sheets/cut_map.npz")["map"]; sil = np.zeros(full.shape, bool)
+    for v in p["views"]:
+        m = C.panel_mask(p, v); ox, oy = sj["origins"][v]; h, w = min(m.shape[0], sil.shape[0] - oy), min(m.shape[1], sil.shape[1] - ox); sil[oy:oy + h, ox:ox + w] = m[:h, :w]
+    r = {**DEF, **p.get("cut_check", {})}; ref = np.stack([ndi.gaussian_filter(sheet[..., k], r["ref_sigma_px"]) for k in range(3)], 2) if r["ref_sigma_px"] else sheet
+    return dict(p=p, home=home, sheet=sheet, ref=ref, comps=cj, seeds=sj["seeds"], origins=sj["origins"], pal=pal, map=full, sil=sil, r=r)
+
+
+def fit(o, b, P, lo, hi, chunk):
+    """best palette entry under o = (1 - a) b + a P : its index, residual and opacity. FR : meilleure couleur de la palette sous un masque semi-transparent."""
+    K, E, A = [], [], []
+    for s in range(0, len(o), chunk):
+        e = o[s:s + chunk] - b[s:s + chunk]; d = P[None] - b[s:s + chunk, None]; a = np.clip((e[:, None] * d).sum(2) / np.maximum((d * d).sum(2), 1.0), lo, hi); res = ((e[:, None] - a[..., None] * d) ** 2).sum(2); k = res.argmin(1); j = np.arange(len(k)); K.append(k); E.append(res[j, k]); A.append(a[j, k])
+    return np.concatenate(K), np.sqrt(np.concatenate(E)), np.concatenate(A)
+
+
+def decode(img, ctx):
+    """component number of every pixel of the silhouette, 0 if it is a line, -1 if its colour is off the list. The opacity is first measured on the image, since a model does not respect 50 % exactly. FR : numéro de composant de chaque pixel ; 0 trait, -1 couleur hors liste ; l'opacité réelle est d'abord mesurée."""
+    r = ctx["r"]; yy, xx = np.nonzero(ctx["sil"]); o = img[yy, xx]; b = ctx["ref"][yy, xx]; s = o[::9]; k0, e0, a0 = fit(s, b[::9], ctx["pal"], r["alpha_min"], 1.0, r["chunk"]); good = (e0 < r["tol"]) & (s.max(1) > r["dark_val"]); alpha = float(np.median(a0[good])) if good.any() else 0.5
+    k, e, _ = fit(o, b, ctx["pal"], max(alpha - r["alpha_band"], r["alpha_min"]), min(alpha + r["alpha_band"], 1.0), r["chunk"]); n = k + 1; n[e >= r["tol"]] = -1; n[o.max(1) <= r["dark_val"]] = 0; out = np.zeros(img.shape[:2], np.int16); out[yy, xx] = n
+    return out, alpha
+
+
+def silhouette(img, ctx):
+    """overlap between the coloured area of the image and the silhouette of the sheet. FR : recouvrement entre la zone colorée et la silhouette."""
+    fg = (img.max(2) - img.min(2)) > ctx["r"]["sat_fg"]; fg = ndi.binary_fill_holes(ndi.binary_closing(fg, iterations=2)); return float((fg & ctx["sil"]).sum() / max((fg | ctx["sil"]).sum(), 1))
+
+
+def check_seeds(img, ctx, alpha):
+    """every disc asks whether the piece under it carries its colour : the median colour under the disc against the whole palette. Two colours a viewer could not tell apart count as a tie, not as an error. FR : chaque pastille demande si la pièce sous elle porte sa couleur ; deux couleurs indiscernables comptent comme égalité."""
+    r = ctx["r"]; H, W = img.shape[:2]; base = ctx["sheet"]; P = ctx["pal"]; lo, hi = max(alpha - r["alpha_band"], r["alpha_min"]), min(alpha + r["alpha_band"], 1.0); out = []
+    for q in ctx["seeds"]:
+        rad = max(1.0, min(r["window_ratio"] * q["r"], r["window_depth_ratio"] * q["d"])); got = 0; ok = False
+        for grow in (1.0, 2.0):
+            R = rad * grow; x0, x1, y0, y1 = max(int(q["sx"] - R), 0), min(int(q["sx"] + R) + 2, W), max(int(q["sy"] - R), 0), min(int(q["sy"] + R) + 2, H); Y, X = np.mgrid[y0:y1, x0:x1]; k = np.hypot(X - q["sx"], Y - q["sy"]) <= R; o = img[y0:y1, x0:x1][k]; b = base[y0:y1, x0:x1][k]; lit = o.max(1) > r["dark_val"]
+            if lit.sum() >= 3: break
+        if lit.sum():
+            oo = np.median(o[lit], 0); bb = np.median(b[lit], 0); e = oo - bb; d = P - bb; a = np.clip((e[None] * d).sum(1) / np.maximum((d * d).sum(1), 1.0), lo, hi); res = np.linalg.norm(e[None] - a[:, None] * d, axis=1); best = int(res.argmin()); got = best + 1 if res[best] < r["tol"] else -1; ok = bool(res[q["n"] - 1] <= res[best] + r["tie_margin"] and res[q["n"] - 1] < r["tol"]); got = q["n"] if ok else got
+        out.append(dict(n=q["n"], view=q["view"], sx=q["sx"], sy=q["sy"], r=q["r"], got=got, ok=ok))
+    return out
+
+
+def score(img, ctx):
+    dec, alpha = decode(img, ctx); sd = check_seeds(img, ctx, alpha); r = ctx["r"]; per = {}
+    for s in sd: e = per.setdefault(s["n"], dict(n=s["n"], seeds=0, ok=0, got=[])); e["seeds"] += 1; e["ok"] += int(s["ok"]); e["got"] += [] if s["ok"] else [s["got"]]
+    inside = dec[ctx["sil"]]; col = inside != 0; m = ctx["map"][ctx["sil"]]; both = col & (m > 0); share = sum(x["ok"] for x in sd) / max(len(sd), 1); sil = silhouette(img, ctx)
+    return dec, dict(seeds=len(sd), seeds_ok=share, components=len(ctx["comps"]), components_ok=sum(1 for e in per.values() if e["ok"] == e["seeds"]), off_palette=float((inside == -1).sum() / max(col.sum(), 1)), preview_agreement=float((inside[both] == m[both]).mean()) if both.any() else 0.0, silhouette=sil, alpha=round(alpha, 3), passed=bool(share >= r["gate_seed_share"] and sil >= r["gate_silhouette"]), wrong=[e for e in per.values() if e["ok"] < e["seeds"]]), sd
+
+
+def board(img, sd, path):
+    """the image with its verdict : green ring right, red ring wrong with the expected number. FR : l'image et son verdict."""
+    im = Image.fromarray(img.round().astype(np.uint8)); d = ImageDraw.Draw(im); f = ImageFont.truetype(FONT, 13)
+    for s in sd:
+        R = max(s["r"], 4) + 1; d.ellipse((s["sx"] - R, s["sy"] - R, s["sx"] + R, s["sy"] + R), outline=GOOD if s["ok"] else BAD, width=2)
+        if not s["ok"]: t = str(s["n"]); bb = d.textbbox((0, 0), t, font=f); d.rectangle((s["sx"] + R + 1, s["sy"] - 8, s["sx"] + R + 7 + bb[2], s["sy"] + 8), fill=(255, 255, 255)); d.text((s["sx"] + R + 4, s["sy"] - 8), t, font=f, fill=BAD)
+    im.save(path)
+
+
+def check_files(params, files):
+    ctx = context(params); home = ctx["home"]; res = {}; decs = {}; names = {c["n"]: c["name"] for c in ctx["comps"]}; shape = ctx["sheet"].shape[:2]
+    for f in files:
+        name = os.path.splitext(os.path.basename(f))[0]; im = Image.open(f).convert("RGB"); resized = im.size != (shape[1], shape[0]); img = np.asarray(im.resize((shape[1], shape[0]), Image.LANCZOS) if resized else im).astype(np.float32); dec, rep, sd = score(img, ctx); rep.update(file=f, resized=resized, wrong=[{**e, "name": names[e["n"]]} for e in rep["wrong"]], board=f"06_checks/cut_check_{name}.png"); board(img, sd, f"{home}/{rep['board']}"); res[name] = rep; decs[name] = dec
+    pairs = []
+    for a, b in itertools.combinations(sorted(decs), 2):
+        k = ctx["sil"] & (decs[a] != 0) & (decs[b] != 0); diff = k & (decs[a] != decs[b]); grey = ctx["sheet"].mean(2, keepdims=True).repeat(3, 2) * 0.55 + 90; grey[diff] = BAD; path = f"06_checks/cut_diff_{a}_{b}.png"; Image.fromarray(grey.clip(0, 255).astype(np.uint8)).save(f"{home}/{path}"); pairs.append(dict(a=a, b=b, same=float(1 - diff.sum() / max(k.sum(), 1)), map=path))
+    best = max(res, key=lambda n: (res[n]["seeds_ok"], res[n]["silhouette"])) if res else None; json.dump(dict(generated=res, pairs=pairs, best=best, gates=dict(seeds=ctx["r"]["gate_seed_share"], silhouette=ctx["r"]["gate_silhouette"])), open(f"{home}/06_checks/cut_check.json", "w"), ensure_ascii=False, indent=1)
+    for n, x in sorted(res.items()): print(n, "discs right", f"{x['seeds_ok'] * 100:.1f} %", f"({x['seeds']})", "components right", x["components_ok"], "/", x["components"], "off list", f"{x['off_palette'] * 100:.1f} %", "preview", f"{x['preview_agreement'] * 100:.1f} %", "silhouette", round(x["silhouette"], 4), "opacity", x["alpha"], "PASS" if x["passed"] else "FAIL")
+    for x in pairs: print(x["a"], "against", x["b"], "same component", f"{x['same'] * 100:.1f} %")
+    return any(x["passed"] for x in res.values())
+
+
+def selftest(params):
+    """green on a perfect sheet, red on swapped colours, and the swapped components are exactly the ones named. FR : vert sur une planche parfaite, rouge sur des couleurs échangées, et les composants échangés sont ceux qu'il nomme."""
+    ctx = context(params); m = ctx["map"]; base = ctx["sheet"]; pal = ctx["pal"]; n = len(pal)
+    def paint(order):
+        out = base.copy(); k = m > 0; out[k] = base[k] * 0.5 + pal[order[m[k] - 1]] * 0.5; return out
+    rng = np.random.default_rng(7); same = np.arange(n); _, good, _ = score(paint(same), ctx); sw = same.copy(); pick = rng.choice(n, 8, replace=False); sw[pick] = pick[np.roll(np.arange(8), 1)]; _, bad, _ = score(paint(sw), ctx); _, chaos, _ = score(paint(rng.permutation(n)), ctx); found = {e["n"] for e in bad["wrong"]}; want = {int(i) + 1 for i in pick}
+    print("perfect sheet", round(good["seeds_ok"], 4), "8 swapped", round(bad["seeds_ok"], 4), "named", sorted(found & want), "extra", sorted(found - want), "all shuffled", round(chaos["seeds_ok"], 4)); ok = good["seeds_ok"] >= 0.98 and want <= found and chaos["seeds_ok"] < 0.2 and bad["seeds_ok"] < good["seeds_ok"]; print("selftest", "GREEN" if ok else "RED"); return ok
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "selftest": sys.exit(0 if selftest(sys.argv[2]) else 1)
+    p_, home_ = C.load(sys.argv[1]); fs = sys.argv[2:] or sorted(glob.glob(f"{home_}/04_received/gen_*.png")) + sorted(glob.glob(f"{home_}/04_received/cut_sheet.png"))
+    if not fs: print("no generation received yet"); sys.exit(0)
+    sys.exit(0 if check_files(sys.argv[1], fs) else 1)

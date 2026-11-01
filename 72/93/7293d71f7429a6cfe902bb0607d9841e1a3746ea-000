@@ -1,0 +1,33 @@
+"""1 November 2026 : M22, shared helpers of the micro-component chain : params loading, sheet panels, stable part colours, overlays and boards. FR : aides communes de la chaîne des micro-components."""
+import os, json
+import numpy as np
+from PIL import Image
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+VIEW_INDEX = {"front": 0, "back": 1, "left": 2, "right": 3, "top": 4, "bottom": 5}
+
+
+def abspath(x): return x if x.startswith("/") else os.path.join(ROOT, x)
+def load(params):
+    params = abspath(params); return json.load(open(params)), os.path.dirname(params)
+def panel_rgb(p, name):
+    return np.asarray(Image.open(f"{abspath(p['views_dir'])}/{VIEW_INDEX[name]:02d}_{name}_rgb.png").convert("RGB"))
+def panel_mask(p, name):
+    return np.asarray(Image.open(f"{abspath(p['views_dir'])}/{VIEW_INDEX[name]:02d}_{name}_mask.png").convert("L")) > 127
+def hsv(h, s, v):
+    i = int(h * 6) % 6; f = h * 6 - int(h * 6); a, b, c = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+    return [(v, c, a), (b, v, a), (a, v, c), (a, b, v), (c, a, v), (v, a, b)][i]
+def colour(k):
+    """a stable, well separated colour for an index (golden angle, two lightnesses)"""
+    r = hsv((k * 0.61803398875) % 1.0, 0.85, 0.95 if k % 2 == 0 else 0.72); return np.array(r) * 255
+def lut(n): return np.array([colour(k) for k in range(n)], np.uint8)
+def overlay(rgb, lab, sc, alpha=0.45, ids=None):
+    """reference panel enlarged sc times, with labels as semi transparent colours and thin boundaries ; lab < 0 stays the plain reference"""
+    H, W = lab.shape; base = np.asarray(Image.fromarray(rgb).resize((W, H), Image.BICUBIC)).astype(np.float32); L = lab if ids is None else ids[np.clip(lab, 0, None)] * (lab >= 0) - (lab < 0)
+    m = L >= 0; col = lut(int(L.max()) + 1 if m.any() else 1)[np.clip(L, 0, None)].astype(np.float32); out = base.copy(); out[m] = base[m] * (1 - alpha) + col[m] * alpha
+    e = np.zeros_like(m); e[:, 1:] |= L[:, 1:] != L[:, :-1]; e[1:, :] |= L[1:, :] != L[:-1, :]; out[e] = out[e] * 0.25
+    return out.astype(np.uint8)
+def save_board(tiles, path, cols=2, gap=6):
+    h = max(t.shape[0] for t in tiles); w = max(t.shape[1] for t in tiles); rows = (len(tiles) + cols - 1) // cols; B = np.full((rows * h + (rows - 1) * gap, cols * w + (cols - 1) * gap, 3), 40, np.uint8)
+    for k, t in enumerate(tiles):
+        r, c = k // cols, k % cols; B[r * (h + gap):r * (h + gap) + t.shape[0], c * (w + gap):c * (w + gap) + t.shape[1]] = t
+    Image.fromarray(B).save(path); return B.shape

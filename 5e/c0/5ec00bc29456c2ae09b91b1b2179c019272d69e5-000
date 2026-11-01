@@ -1,0 +1,50 @@
+"""1 November 2026 : M22 self test of the reading, it proves the reader and the grid, not the image generator : the part of each line is rendered from the template, scaled axis by axis to the announced size, grey clay and black wireframe, as a generator should ; the page is slightly warped and reduced to the size of a generated image. With 'bad' : two views of line 1 swapped, line 2 enlarged by 15 %, line 3 left empty ; the reader must pass the clean lines and flag those three.
+    python -I MicroSimFill.py Projects/<id>/params.json S01 out.png [bad]        FR : auto-test de la lecture : les pièces aux dimensions annoncées, remplies proprement ou volontairement fausses."""
+import sys, json
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
+from skimage import transform as tf
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts"); import Raster
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+
+
+def paint_from_masks(img, row, atom, p, home, V, bad):
+    """no template : each cell receives the mask of the piece in that view, at the announced size, grey clay with a wire grid ; a view without a mask takes the box of the announced size, as a generator would draw a solid"""
+    sc = p["scale"]; gain = 1.15 if bad and row["line"] == 2 else 1.0
+    for vn, (cx, cy, c) in row["cells"].items():
+        vv = {"left": "front", "front": "left"}.get(vn, vn) if bad and row["line"] == 1 else vn; lab = np.load(f"{home}/02_masks/labels_{vv}.npz")["labels"]; m = lab == atom["id"]; rx, uy = np.array(V[vv]["rx"]), np.array(V[vv]["uy"]); s = row["px_per_m"] * gain; eu, ev = max(row["size_mm"][int(np.argmax(np.abs(rx)))] / 1000 * s, 2), max(row["size_mm"][int(np.argmax(np.abs(uy)))] / 1000 * s, 2); R = c - 4; M = np.zeros((R, R), bool); W, H = max(int(round(eu)), 2), max(int(round(ev)), 2); x0, y0 = (R - W) // 2, (R - H) // 2
+        cc, n = ndi.label(m)
+        if n:
+            sz = np.bincount(cc.ravel())[1:]; ys, xs = np.nonzero(cc == int(sz.argmax()) + 1); crop = (cc == int(sz.argmax()) + 1)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]; piece = np.asarray(Image.fromarray(crop.astype(np.uint8) * 255).resize((W, H), Image.BILINEAR)) > 127
+            piece = piece if piece.sum() >= 0.25 * W * H else np.ones((H, W), bool)
+        else: piece = np.ones((H, W), bool)
+        h_, w_ = min(H, R - max(y0, 0)), min(W, R - max(x0, 0)); M[max(y0, 0):max(y0, 0) + h_, max(x0, 0):max(x0, 0) + w_] = piece[:h_, :w_]; cell = np.asarray(img.crop((cx + 2, cy + 2, cx + c - 2, cy + c - 2))).copy(); cell[M] = (150, 150, 152); e = M ^ ndi.binary_erosion(M); cell[e] = (20, 20, 20); st = max(5, R // 28); yy_, xx_ = np.mgrid[:R, :R]; cell[M & (((yy_ % st) < 1) | ((xx_ % st) < 1))] = (25, 25, 25); img.paste(Image.fromarray(cell), (cx + 2, cy + 2))
+
+
+def main(params, sid, out, bad=False):
+    p, home = C.load(params); idx = json.load(open(f"{home}/03_sheets/sheets.json")); S = next(s for s in idx["sheets"] if s["id"] == sid); img = Image.open(f"{home}/03_sheets/{S['image']}").convert("RGB"); micro = json.load(open(f"{home}/02_masks/micro.json")); fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    masks_only = not p.get("model")
+    if not masks_only: d = np.load(C.abspath(p["model"]), allow_pickle=True); P0, Cn, I = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64); off = np.concatenate([[0], np.cumsum(Cn)]); sop = np.load(f"{home}/02_masks/shell_of_poly.npy")
+    for row in S["rows"]:
+        if bad and row["line"] == 3: continue
+        if masks_only: paint_from_masks(img, row, micro["atoms"][row["atom"]], p, home, V, bad); continue
+        a = micro["atoms"][row["atom"]]; ps = np.flatnonzero(np.isin(sop, a["shells"])); T = [(I[off[q]], I[off[q] + j], I[off[q] + j + 1]) for q in ps for j in range(1, Cn[q] - 1)]; owner = np.array([q for q in ps for j in range(1, Cn[q] - 1)])
+        if not T: continue
+        vs = np.unique(np.array(T)); lo, hi = P0[vs].min(0), P0[vs].max(0); c3 = (lo + hi) / 2; k = (np.array(row["size_mm"]) / 1000) / np.maximum(hi - lo, 1e-4); k[hi - lo < 1e-4] = 1.0; P = c3 + (P0 - c3) * k; mr = Raster.Renderer(P, np.array(T)); gain = 1.15 if bad and row["line"] == 2 else 1.0
+        for vn, (cx, cy, c) in row["cells"].items():
+            vv = {"left": "front", "front": "left"}.get(vn, vn) if bad and row["line"] == 1 else vn; v = V[vv]; rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+            if vv == "top" and tz[1] < 0 or vv == "bottom" and tz[1] > 0: tz = -tz
+            s = row["px_per_m"] * gain; R = c - 4; M, D_, N, F = mr.render(c3.tolist(), s, (rx.tolist(), uy.tolist(), tz.tolist()), R); eu, ev = row["size_mm"][int(np.argmax(np.abs(rx)))] / 1000 * s, row["size_mm"][int(np.argmax(np.abs(uy)))] / 1000 * s
+            if M.sum() < 0.25 * eu * ev:      # 1 November 2026 : a flat template seen edge on has no thickness, a generator draws a solid at the announced size
+                x0_, x1_, y0_, y1_ = int(R / 2 - eu / 2), int(np.ceil(R / 2 + eu / 2)), int(R / 2 - ev / 2), int(np.ceil(R / 2 + ev / 2)); M = M.copy(); M[max(y0_, 0):y1_, max(x0_, 0):x1_] = True
+            key = np.array([-0.4, 0.55, 0.73]); key /= np.linalg.norm(key); val = np.clip(0.45 + 0.45 * np.clip((N * key).sum(-1), 0, 1), 0, 1); cell = np.asarray(img.crop((cx + 2, cy + 2, cx + c - 2, cy + c - 2))).copy(); cell[M] = (val[M, None] * 255 * 0.72).astype(np.uint8); e = M ^ ndi.binary_erosion(M); cell[e] = (20, 20, 20); cim = Image.fromarray(cell); dw = ImageDraw.Draw(cim); st = max(5, R // 28); yy, xx = np.nonzero(M)
+            arr = np.asarray(cim).copy(); yy_, xx_ = np.mgrid[:R, :R]; wire = ((yy_ % st) < 1) | ((xx_ % st) < 1); arr[M & wire] = (25, 25, 25); img.paste(Image.fromarray(arr), (cx + 2, cy + 2))
+        mr.release()
+    A = np.asarray(img).astype(np.float32) / 255; h, w = A.shape[:2]; src = np.array([(0, 0), (w, 0), (0, h), (w, h)], float); dst = src + np.array([(14, -9), (-12, 11), (9, 12), (-15, -8)], float); T_ = tf.ProjectiveTransform.from_estimate(src, dst) if hasattr(tf.ProjectiveTransform, "from_estimate") else None
+    if T_ is None: T_ = tf.ProjectiveTransform(); T_.estimate(src, dst)
+    W = tf.warp(A, T_.inverse, output_shape=(h, w), order=1, cval=1.0); sz = (1536, 1024) if w > h else (1024, 1536); Image.fromarray((W * 255).astype(np.uint8)).resize(sz, Image.LANCZOS).save(out); print("simulated", out, sz)
+
+
+if __name__ == "__main__": main(sys.argv[1], sys.argv[2], sys.argv[3], len(sys.argv) > 4 and sys.argv[4] == "bad")

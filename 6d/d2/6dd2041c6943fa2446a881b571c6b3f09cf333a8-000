@@ -1,0 +1,72 @@
+"""1 November 2026, 19:30 : M22 the memory of the algorithm : every version of the masks of a project keeps its legend, its finished borders, its measures, its settings and the verdict of Matthieu, in versions/ of the project (index.json, V_NNN_*.jpg), so a regression can be seen. A version whose labels did not change adds nothing ; an old version is never rewritten.
+    python -I MicroVersions.py Projects/<id>/params.json snapshot "note" [--step s] [--verdict "text"] [--rebuilt] [--truth-from Projects/<id>]
+    python -I MicroVersions.py Projects/<id>/params.json import /abs/image.png "note" ISO8601 [--verdict "text"]
+    python -I MicroVersions.py Projects/<id>/params.json verdict V_NNN "text"
+FR : la mémoire de l'algorithme : chaque version garde sa légende, ses bords, ses mesures, ses réglages et le verdict de Matthieu ; une ancienne version n'est jamais réécrite."""
+import sys, os, json, hashlib, datetime, zoneinfo
+import numpy as np
+from PIL import Image
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+TZ = zoneinfo.ZoneInfo("Europe/Paris"); WIDTH = 1500; QUALITY = 82; SETTINGS = ("R_", "S_", "A_")
+
+
+def now(): return datetime.datetime.now(TZ).isoformat(timespec="seconds")
+def load(home): f = f"{home}/versions/index.json"; return json.load(open(f)) if os.path.exists(f) else []
+def save(home, V): os.makedirs(f"{home}/versions", exist_ok=True); json.dump(V, open(f"{home}/versions/index.json", "w"), indent=1, ensure_ascii=False)
+def thumb(src, dst):
+    im = Image.open(src).convert("RGB")
+    if im.size[0] > WIDTH: im = im.resize((WIDTH, int(im.size[1] * WIDTH / im.size[0])), Image.LANCZOS)
+    im.save(dst, "JPEG", quality=QUALITY)
+
+
+def measures(p, home, truth_from):
+    """what can be compared from one version to the next ; the truth comes from the board that has one"""
+    out = {}; m = f"{home}/02_masks/metrics.json"
+    if os.path.exists(m):
+        M = json.load(open(m)); out.update(mirror=round(M["symmetry"]["left_vs_right"] * 100, 1), on_line=round(min(v.get("support_cal", v["line_support"]) for v in M["per_view"].values()) * 100, 1)); A = M.get("arcs") or {}
+        if A: out["straight"] = round(sum(x["straight_share"] for x in A.values()) / len(A) * 100, 1)
+    c = f"{home}/02_masks/mc.json"
+    if os.path.exists(c): out["pieces"] = len(json.load(open(c))["mc"])
+    t = C.abspath(truth_from) + "/06_checks/truth.json" if truth_from else f"{home}/06_checks/truth.json"
+    if p.get("has_truth") or truth_from:
+        if os.path.exists(t): T = json.load(open(t)); out.update(px1=round(T["accuracy"] * 100, 3), px2=round(T["accuracy_2px"] * 100, 3)); out.update({k: round(T[j] * 100, 3) for k, j in (("out1", "outline_wrong_1px"), ("out2", "outline_wrong_2px")) if T.get(j) is not None}); out["truth_board"] = os.path.basename(truth_from) if truth_from else os.path.basename(home)
+    return out
+
+
+def snapshot(params, note, step=None, verdict=None, rebuilt=False, truth_from=None):
+    p, home = C.load(params); V = load(home); h = hashlib.sha256()
+    for v in p["views"]: h.update(np.load(f"{home}/02_masks/labels_{v}.npz")["labels"].tobytes())
+    h = h.hexdigest()[:16]
+    if V and V[-1].get("hash") == h: print("labels unchanged since", V[-1]["v"], ": nothing added"); return V[-1]["v"]
+    name = f"V_{len(V) + 1:03d}"; os.makedirs(f"{home}/versions", exist_ok=True); thumb(f"{home}/02_masks/legend_board.png", f"{home}/versions/{name}_legend.jpg"); b = f"{home}/06_checks/borders_finished.png"
+    if os.path.exists(b): thumb(b, f"{home}/versions/{name}_borders.jpg")
+    e = dict(v=name, at=now(), note=note, step=step, rebuilt=rebuilt, hash=h, legend=f"{name}_legend.jpg", borders=f"{name}_borders.jpg" if os.path.exists(b) else None, settings={k: x for k, x in p.items() if k.startswith(SETTINGS)}, **measures(p, home, truth_from))
+    if verdict: e["verdict"] = verdict
+    V.append(e); save(home, V); print(name, note); return name
+
+
+def import_old(params, path, note, at, verdict=None):
+    """an image kept from before the versions existed : its date is the date of the file"""
+    p, home = C.load(params); V = load(home)
+    if any(x.get("source") == path for x in V): print("already imported"); return
+    name = f"V_{len(V) + 1:03d}"; os.makedirs(f"{home}/versions", exist_ok=True); thumb(path, f"{home}/versions/{name}_legend.jpg"); e = dict(v=name, at=at, note=note, source=path, legend=f"{name}_legend.jpg", borders=None, original=True)
+    if verdict: e["verdict"] = verdict
+    V.append(e); save(home, V); print(name, note)
+
+
+def verdict(params, name, text):
+    """a verdict is added with its date, an earlier one stays"""
+    p, home = C.load(params); V = load(home); e = next(x for x in V if x["v"] == name)
+    if e.get("verdict") == text: return
+    if e.get("verdict"): e.setdefault("older_verdicts", []).append(dict(text=e["verdict"], at=e.get("verdict_at")))
+    e["verdict"] = text; e["verdict_at"] = now(); save(home, V)
+
+
+def arg(a, k, d=None): return a[a.index(k) + 1] if k in a else d
+
+
+if __name__ == "__main__":
+    a = sys.argv
+    if a[2] == "snapshot": snapshot(a[1], a[3], arg(a, "--step"), arg(a, "--verdict"), "--rebuilt" in a, arg(a, "--truth-from"))
+    elif a[2] == "import": import_old(a[1], a[3], a[4], a[5], arg(a, "--verdict"))
+    elif a[2] == "verdict": verdict(a[1], a[3], a[4])

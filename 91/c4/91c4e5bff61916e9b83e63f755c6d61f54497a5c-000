@@ -1,0 +1,122 @@
+"""1 November 2026 : M22 step 3, the GRIDS waiting for the micro-components : pages of 4, 8 or 16 lines of 6 orthographic views, each line one micro-component at one scale, its template silhouette as a semi transparent mask in each of the 6 cells, its icon, name, size and description on the left, the prompt printed on the image, four corner squares for the automatic reading of the returned image. Every layout value is in LAYOUTS (HDA). Writes 03_sheets/S<nn>.png, S<nn>.txt (prompt) and sheets.json.
+    python -I MicroSheets.py Projects/<id>/params.json        FR : les grilles qui attendent les micro-components, le prompt imprimé sur chaque image."""
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts"); import Raster
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+FONT_NUM = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"; FONT_TXT = "/Users/zenray/Library/Fonts/Literata[opsz,wght].ttf"
+LAYOUTS = {4: dict(W=3072, H=2048, blocks=1, rows=4, header=318, cell=386, name=44, text=26, prompt=30), 8: dict(W=2048, H=3072, blocks=1, rows=8, header=352, cell=270, name=32, text=20, prompt=26), 16: dict(W=3072, H=2048, blocks=2, rows=8, header=268, cell=196, name=24, text=16, prompt=28)}
+INK = (24, 24, 26); CELL = (246, 246, 244); GHOST = (150, 156, 164); MARGIN = 34; FID = 46
+VIEW_FR = dict(front="FACE", back="ARRIÈRE", left="GAUCHE", right="DROITE", top="DESSUS", bottom="DESSOUS")
+PROMPT = ("REMPLIS CETTE GRILLE. Chaque ligne est UNE pièce seule, isolée de la voiture. Dans chacune des 6 cases de la ligne, dessine cette pièce vue de face, d'arrière, de gauche, de droite, de dessus et de dessous, en projection orthographique sans aucune perspective, "
+          "exactement à l'intérieur de sa silhouette grise : mêmes contours, même échelle, même position dans la case. Rendu : gris mat uniforme type clay render, sans ombre portée, avec le FIL DE FER noir fin en quads visible sur toute la surface. "
+          "Les six vues d'une ligne montrent le même objet, leurs dimensions doivent concorder. Garde intacts la grille, le fond clair, les quatre carrés noirs des coins, les numéros et tous les textes. Ne dessine rien hors des cases. L'icône à gauche de chaque ligne montre où est la pièce sur la voiture.")
+
+
+def font(path, size):
+    f = ImageFont.truetype(path, size)
+    try: f.set_variation_by_name("Regular")
+    except Exception: pass
+    return f
+def wrap(d, text, f, width):
+    out = []; line = ""
+    for w in text.split():
+        t = (line + " " + w).strip()
+        if d.textlength(t, font=f) <= width: line = t
+        else: out.append(line); line = w
+    return out + [line] if line else out
+def iou_(a, b):
+    u = (a | b).sum(); return float((a & b).sum() / u) if u else 0.0
+def box(m):
+    ys, xs = np.nonzero(m); return np.array([xs.min(), xs.max(), ys.min(), ys.max()], float)
+def same_box(a, b, tol):
+    if not a.any() or not b.any(): return False
+    n = a.shape[0]; ba = box(a); return bool(ba[0] > 1 and ba[2] > 1 and ba[1] < n - 2 and ba[3] < n - 2 and np.abs(ba - box(b)).max() <= tol * n)
+def pieces(m):
+    lab, k = ndi.label(m); return int((ndi.sum(m, lab, range(1, k + 1)) >= 20).sum()) if k else 0
+def despeckle(m, frac=0.02):
+    """a zone cut along the reference can drag stray polygons : a silhouette keeps its real pieces only"""
+    lab, k = ndi.label(m)
+    if k <= 1: return m
+    sz = ndi.sum(m, lab, range(1, k + 1)); return np.isin(lab, 1 + np.flatnonzero(sz >= max(12, frac * sz.sum())))
+def smooth(m, frac=0.006):
+    """a staircase outline is removed by a small blur, thin parts that a blur would erase stay as they are"""
+    sig = max(1.2, frac * m.shape[0]); dt = ndi.distance_transform_edt(m)
+    return m if not m.any() or dt.max() < 2.5 * sig else ndi.gaussian_filter(m.astype(np.float32), sig) > 0.5
+def ref_mask(p, home, fr, V, a, vn, size, s_cell, c3):
+    """the mask of an atom on the reference panel, moved into its cell : same axes, centre of the part at the centre of the cell, scale of the line (the panel has its own px per metre)"""
+    import MicroLabels as ML
+    lab = np.load(f"{home}/02_masks/labels_{vn}.npz")["labels"]; m = lab == a["id"]; src = json.load(open(f"{home}/02_masks/metrics.json"))["ref_px"].get(str(a["id"]), {})
+    if vn not in src or m.sum() < 30: return None
+    c, s, axes, R = ML.panel_camera(fr, V[vn], lab.shape, p["scale"]); rx, uy = np.array(axes[0]), np.array(axes[1]); du = float((c - c3) @ rx); dv = float((c - c3) @ uy); k = s / s_cell
+    # cell (row, col) -> panel (row, col) ; world in plane = (col - size / 2) / s_cell, panel col = R / 2 + (world - du) * s
+    mat = np.array([[k, 0], [0, k]]); off = np.array([R / 2 - size / 2 * k + dv * s, R / 2 - size / 2 * k - du * s]); pad = np.zeros((R, R), np.float32); pad[: lab.shape[0], : lab.shape[1]] = m
+    return ndi.affine_transform(pad, mat, offset=off, output_shape=(size, size), order=1) > 0.5
+def capacity(m, p):
+    """how many lines of this size fit on a page : tiny and without detail 16, medium 8, large or detailed 4"""
+    big = max(m["size_m"]); r = p.get("capacity", dict(tiny_m=0.16, tiny_faces=64, thin_faces=140, medium_m=1.3, medium_faces=1200))
+    if big <= r["tiny_m"] and m["faces"] <= r["tiny_faces"] * 2 or m["faces"] <= r["tiny_faces"]: return 16
+    if big <= r["medium_m"] and m["faces"] <= r["medium_faces"] or m["faces"] <= r["thin_faces"]: return 8
+    return 4
+
+
+def main(params):
+    p, home = C.load(params); O = f"{home}/03_sheets"; os.makedirs(O, exist_ok=True); MC = json.load(open(f"{home}/02_masks/mc.json"))["mc"]; micro = json.load(open(f"{home}/02_masks/micro.json")); atoms = micro["atoms"]; fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    d = np.load(C.abspath(p["model"]), allow_pickle=True); P, Cn, I = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64); off = np.concatenate([[0], np.cumsum(Cn)]); sop = np.load(f"{home}/02_masks/shell_of_poly.npy")
+    def tris_of(a):
+        ps = np.flatnonzero(np.isin(sop, a["shells"])); T = []
+        for q in ps:
+            v = I[off[q]:off[q + 1]]
+            for j in range(1, len(v) - 1): T.append((v[0], v[j], v[j + 1]))
+        return np.array(T)
+    def representative(m):
+        """the left side instance (x > 0), front first, so a mirrored pair reads like the left panel of the sheet"""
+        c = [atoms[a] for a in m["atoms"]]; return max(c, key=lambda a: (a["centre"][0] >= 0, a["centre"][2], a["centre"][1]))
+    groups = {4: [], 8: [], 16: []}
+    for m in MC: m["cap"] = capacity(m, p); groups[m["cap"]].append(m)
+    sheets = []; fnum_big = None
+    for cap in (4, 8, 16):
+        for k in range(0, len(groups[cap]), cap): sheets.append(dict(cap=cap, rows=groups[cap][k:k + cap]))
+    total = len(sheets); index = []
+    for si, S in enumerate(sheets):
+        cap = S["cap"]; L = LAYOUTS[cap]; W, H = L["W"], L["H"]; img = Image.new("RGB", (W, H), (255, 255, 255)); dr = ImageDraw.Draw(img); fT = font(FONT_NUM, int(L["prompt"] * 1.5)); fP = font(FONT_TXT, L["prompt"]); fN = font(FONT_NUM, L["name"]); fX = font(FONT_TXT, L["text"]); fS = font(FONT_NUM, max(L["text"] - 2, 14)); sid = f"S{si + 1:02d}"
+        for (x, y) in ((MARGIN, MARGIN), (W - MARGIN - FID, MARGIN), (MARGIN, H - MARGIN - FID), (W - MARGIN - FID, H - MARGIN - FID)): dr.rectangle((x, y, x + FID, y + FID), fill=(0, 0, 0))
+        tx = MARGIN + FID + 26; dr.text((tx, MARGIN - 4), f"ZenRay Meshes  {p['title']}  feuille {si + 1} sur {total}  {len(S['rows'])} pièces", font=fT, fill=INK); y = MARGIN + int(L["prompt"] * 2.0)
+        for line in wrap(dr, PROMPT, fP, W - 2 * tx): dr.text((tx, y), line, font=fP, fill=INK); y += int(L["prompt"] * 1.32)
+        assert y <= L["header"] + 6, f"prompt overflows the header on {sid} : {y} > {L['header']}"
+        avail = H - L["header"] - MARGIN - FID - 8; rh = avail // L["rows"]; bw = (W - 2 * MARGIN) // L["blocks"]; lw = bw - 6 * L["cell"] - 14; rows_json = []
+        for ri, m in enumerate(S["rows"]):
+            bk = ri // L["rows"]; rr = ri % L["rows"]; x0 = MARGIN + bk * bw; y0 = L["header"] + rr * rh + (rh - L["cell"]) // 2; a = representative(m); T = tris_of(a); mr = Raster.Renderer(P, T); lo, hi = np.array(a["lo"]), np.array(a["hi"]); size = hi - lo; c3 = (lo + hi) / 2; s = 0.80 * L["cell"] / max(size.max(), 1e-3)
+            ic = Image.open(f"{home}/02_masks/icons/MC{m['mc']:03d}.png"); iw = int(lw * 0.40); ih = min(int(ic.size[1] * iw / ic.size[0]), L["cell"] - 6); ic = ic.resize((iw, ih), Image.LANCZOS); img.paste(ic, (x0, y0)); tx0 = x0 + iw + 12; tw = lw - iw - 20; yy = y0 - 4; inst = f"  x{m['instances']}" if m["instances"] > 1 else ""
+            dr.text((tx0, yy), f"{m['mc']}", font=fN, fill=INK); yy += int(L["name"] * 1.16)
+            for line in wrap(dr, m["fr"] + inst, fN, tw)[:3]: dr.text((tx0, yy), line, font=fN, fill=INK); yy += int(L["name"] * 1.12)
+            mm = [round(float(v) * 1000) for v in size]; dims = f"{mm[0]} x {mm[1]} x {mm[2]} mm"; dr.text((tx0, yy + 2), dims, font=fS, fill=INK); yy += int(L["text"] * 1.5)
+            for line in wrap(dr, m["shape"], fX, tw): 
+                if yy + L["text"] > y0 + L["cell"]: break
+                dr.text((tx0, yy), line, font=fX, fill=(70, 70, 74)); yy += int(L["text"] * 1.22)
+            cells = {}; ghosts = {}; sources = {}; mirrored = set()
+            for vi, vn in enumerate(p["views"]):
+                c = L["cell"]; v = V[vn]; rx, uy, tz = np.array(v["rx"]), np.array(v["uy"]), np.array(v["tz"])
+                if vn == "top" and tz[1] < 0 or vn == "bottom" and tz[1] > 0: tz = -tz
+                # 1 November 2026 : the render is centred on the part, so the same 3D point is at the cell centre in the 6 views ; supersampled twice for a clean outline
+                RR = c * 2; M, D_, N, F = mr.render(c3.tolist(), s * 2, (rx.tolist(), uy.tolist(), tz.tolist()), RR); gm = np.asarray(Image.fromarray((M * 255).astype(np.uint8)).resize((c - 4, c - 4), Image.LANCZOS)) > 127; gm = despeckle(smooth(gm)); ghosts[vn] = gm; sources[vn] = "gabarit"; refm = ref_mask(p, home, fr, V, a, vn, c - 4, s, c3)
+                # 1 November 2026 : the reference outline is kept only if it stays the same object as the other views of the line : same box as the template within ghost_box_tol, not fragmented, inside the cell
+                if refm is not None and iou_(refm, gm) >= p.get("ghost_ref_min_iou", 0.6) and same_box(refm, gm, p.get("ghost_box_tol", 0.03)) and pieces(refm) <= pieces(gm) + 1: ghosts[vn] = smooth(refm); sources[vn] = "reference"
+            for vn, op, flip in (("front", "back", 1), ("back", "front", 1), ("left", "right", 1), ("right", "left", 1), ("top", "bottom", 0), ("bottom", "top", 0)):     # opposite orthographic views mirror each other : the reference side gives both
+                if sources[vn] == "gabarit" and sources[op] == "reference" and not op in mirrored: ghosts[vn] = ghosts[op][:, ::-1] if flip else ghosts[op][::-1, :]; sources[vn] = "miroir"; mirrored.add(vn)
+            for vi, vn in enumerate(p["views"]):
+                cx = x0 + lw + 8 + vi * L["cell"]; cy = y0; c = L["cell"]; gm = ghosts[vn]
+                dr.rectangle((cx, cy, cx + c - 2, cy + c - 2), fill=CELL, outline=INK, width=2); layer = np.array(img.crop((cx + 2, cy + 2, cx + c - 2, cy + c - 2))).astype(np.float32); layer[gm] = layer[gm] * 0.45 + np.array(GHOST) * 0.55; e = gm ^ ndi.binary_erosion(gm); layer[e] = INK; img.paste(Image.fromarray(layer.astype(np.uint8)), (cx + 2, cy + 2)); dr = ImageDraw.Draw(img); dr.text((cx + 8, cy + 5), VIEW_FR[vn], font=fS, fill=(110, 110, 114))
+                for k in range(0, c, c // 8): dr.line((cx + k, cy + c - 2, cx + k, cy + c - 9), fill=INK, width=1)
+                Image.fromarray(gm.astype(np.uint8) * 255).save(f"{O}/{sid}_L{ri + 1}_{vn}_ghost.png"); cells[vn] = [cx, cy, c]
+            mr.release(); wm = round(float(size.max()) * 1000); bar = 0.1 * s; bx = x0 + lw + 8; by = y0 + L["cell"] + 3
+            rows_json.append(dict(line=ri + 1, mc=m["mc"], fr=m["fr"], family=m["family"], instances=m["instances"], atom=a["id"], faces=a["faces"], ghost_source=sources, size_mm=mm, px_per_m=round(s, 3), centre_m=c3.round(4).tolist(), cells=cells, shape=m["shape"]))
+        details = "\n".join(f"Ligne {r['line']} : pièce {r['mc']}, {r['fr']}" + (f", {r['instances']} exemplaires identiques" if r["instances"] > 1 else "") + f". Dimensions {r['size_mm'][0]} x {r['size_mm'][1]} x {r['size_mm'][2]} mm (largeur x hauteur x longueur), proportions {round(r['size_mm'][0] / max(r['size_mm'][1], 1), 2)} : 1 : {round(r['size_mm'][2] / max(r['size_mm'][1], 1), 2)}. {r['shape'][0].upper() + r['shape'][1:]}." for r in rows_json)
+        ptxt = PROMPT + "\n\n" + details + "\n"; open(f"{O}/{sid}.txt", "w").write(ptxt); img.save(f"{O}/{sid}.png", optimize=True); index.append(dict(id=sid, cap=cap, size=[W, H], image=f"{sid}.png", prompt=f"{sid}.txt", rows=rows_json, fid=FID, margin=MARGIN)); print(sid, "cap", cap, "lines", len(rows_json), [r["mc"] for r in rows_json])
+    json.dump(dict(sheets=index, total=total), open(f"{O}/sheets.json", "w"), indent=0, ensure_ascii=False); print("sheets", total, "micro-components", sum(len(s["rows"]) for s in index))
+
+
+if __name__ == "__main__": main(sys.argv[1])

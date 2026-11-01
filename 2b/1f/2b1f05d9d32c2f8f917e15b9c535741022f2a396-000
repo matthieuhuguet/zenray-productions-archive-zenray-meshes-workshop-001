@@ -1,0 +1,143 @@
+"""1 November 2026, 21:45 : M22, start of the value chain of ZenRay Meshes : the PREVIEW COMPONENTS LOWRES : what the cut sheet should look like, drawn from the best version of the masks exactly as the legend draws them, with one colour per component ; the components with speaking names and a natural description ; and the prompt that asks ChatGPT Images for the perfect cut sheet. The preview is only there to check the components, it is not given to the image model.
+1 November 2026, 22:10 : two generations from the same prompt gave two different identities for the small pieces. So the prompt now takes a second image, the COLOUR INDEX : the sheet itself, untouched, with a colour disc set inside the pieces. It says which colour goes where and carries no line of the algorithm, so that its wrong borders cannot be copied. Writes 03_sheets/preview_components_lowres.png, cut_reference.png, cut_index.png, cut_seeds.json, cut_map.npz, cut_components.json, cut_prompt.txt.
+Settings in params.json : cut_object, cut_alpha, cut_seed (see SEED). Names : 03_sheets/component_names.json, {"<mc>": ["name", "description"]} ; two pieces with the same name are one component.
+    python -I MicroCutPrompt.py Projects/<id>/params.json
+FR : début de la chaîne de valeur : la preview des composants, leur détail en noms parlants, l'index des couleurs (la planche et des pastilles, aucune ligne de l'algorithme) et le prompt."""
+import sys, os, json, shutil, colorsys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from skimage.color import rgb2lab
+from skimage.feature import match_template
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+SEED = dict(radius_min_px=3.0, radius_max_px=8.0, radius_ratio=0.6, depth_min_px=2.0, spacing_px=80.0, limit_per_region=3, ring_px=1.0, thin_keep=2)      # 1 November 2026 : the discs of the colour index, in pixels of the sheet ; override with cut_seed in params.json. FR : les pastilles de l'index, en pixels de la planche.
+LABEL_MIN_PX = 8      # 1 November 2026 : a piece must leave this radius free to carry its number in a view. FR : rayon libre minimal pour porter le numéro dans une vue.
+ALPHA = 0.5; HUES = 96; SHADES = ((0.85, 0.95), (0.85, 0.72), (0.55, 0.95), (0.65, 0.6)); LOWRES_W = 1800; FONT_NUM = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"
+PROMPT = """Deux images sont jointes.
+
+Image 1 : une planche technique, 6 vues orthographiques de {cut_object} (face, arrière, gauche, droite, dessus, dessous), avec un cube d'échelle.
+Image 2 : la même planche, sur laquelle de petites pastilles de couleur cerclées de blanc sont posées à l'intérieur des pièces. C'est un index : chaque pastille dit quelle couleur donner à la pièce sur laquelle elle est posée, et rien d'autre. Une pastille n'indique jamais où passe un bord.
+
+Transforme l'image 1 en PLANCHE DE DÉCOUPE DES COMPOSANTS. Garde exactement la même image : même format, même cadrage, chaque vue à la même place et à la même taille, mêmes proportions, même fond gris, même cube, mêmes reliefs et mêmes ombrages. Ne redessine pas l'objet, ne change aucune forme, n'ajoute aucun détail.
+
+Découpe l'objet comme le ferait un modeleur 3D qui doit refaire chaque pièce séparément, selon la liste ci-dessous. Les bords se lisent uniquement sur l'image 1 : les coupes suivent exactement ses joints, ses arêtes et ses traits visibles. Ne coupe jamais une surface continue sans joint visible. Ne réunis jamais deux pièces séparées par un joint.
+
+Pose sur chaque composant un masque semi-transparent de la couleur de ses pastilles, à {percent} % d'opacité, de sorte que le relief reste visible dessous, avec un fin contour noir, net et régulier. Bords parfaitement droits quand la pièce est droite, courbes lisses quand elle est courbe, sans zigzag ni bavure. N'invente aucune couleur et ne donne jamais la même couleur à deux composants différents.
+
+Un même composant garde la même couleur dans toutes les vues. Un composant et son symétrique gauche-droite ont la même couleur. Les composants identiques répétés ont la même couleur.
+
+Aucun texte, aucun numéro, aucune pastille sur l'image rendue. Toute la surface de l'objet est couverte. Seuls le fond et le cube restent gris, sans masque.
+
+Composants et couleurs :
+{table}
+
+Vérification, à faire avant de rendre l'image ; si un point échoue, corrige-le d'abord :
+1. Sous chaque pastille de l'image 2, dans les 6 vues, la pièce a exactement la couleur de cette pastille.
+2. Aucune couleur n'est hors de la liste, et deux composants différents n'ont jamais la même couleur.
+3. Un même composant a la même couleur dans toutes les vues, et le côté gauche répond au côté droit.
+4. La silhouette de chaque vue se superpose à celle de l'image 1, au même endroit et à la même taille.
+5. Aucune pastille, aucun texte et aucun numéro ne restent sur l'image rendue."""
+
+
+def panel_origins(p, sheet):
+    """where each view sits on the sheet, so that the index and the verifier share the frame of image 1. FR : où se trouve chaque vue sur la planche."""
+    out = {}; S = sheet.mean(2).astype(np.float32)
+    for v in p["views"]:
+        r = match_template(S, C.panel_rgb(p, v).astype(np.float32).mean(2)); y, x = np.unravel_index(r.argmax(), r.shape); out[v] = [int(x), int(y)]
+    return out
+
+
+def apply_fix(M, f, origin, sc):
+    """a label the algorithm got wrong, corrected for one view : cut_fixes in params.json, {"view", "from", "to", "box" in sheet pixels, "area_max" in sheet pixels}. FR : une étiquette fausse de l'algorithme, corrigée pour une vue."""
+    k = M == f["from"] - 1
+    if "box" in f: x0, y0, x1, y1 = f["box"]; b = np.zeros(M.shape, bool); b[max((y0 - origin[1]) * sc, 0):max((y1 - origin[1]) * sc, 0), max((x0 - origin[0]) * sc, 0):max((x1 - origin[0]) * sc, 0)] = True; k &= b
+    if "area_max" in f: cc, n = ndi.label(k); sz = ndi.sum(k, cc, range(1, n + 1)); k = np.isin(cc, 1 + np.flatnonzero(sz <= f["area_max"] * sc * sc))
+    M[k] = f["to"] - 1
+
+
+def plant_seeds(m, s):
+    """the discs of one view, in panel pixels : the deepest point of each connected region, far from any border the algorithm may have wrong, then further points along long pieces. A region too thin to hold a disc is marked thin. FR : le point le plus profond de chaque région, loin des bords dont l'algorithme n'est pas sûr, puis d'autres le long des pièces longues ; une région trop fine est marquée."""
+    seeds = []
+    for i in np.unique(m[m >= 0]):
+        cc = ndi.label(m == i)[0]
+        for k, sl in enumerate(ndi.find_objects(cc)):
+            R = cc[sl] == k + 1; dt = ndi.distance_transform_edt(np.pad(R, 1))[1:-1, 1:-1]; Y, X = np.mgrid[:R.shape[0], :R.shape[1]]
+            for j in range(int(s["limit_per_region"])):
+                y, x = np.unravel_index(dt.argmax(), dt.shape); d = float(dt[y, x])
+                if d <= 0 or (j and d < s["depth_min_px"]): break
+                seeds.append(dict(n=int(i) + 1, x=int(x + sl[1].start), y=int(y + sl[0].start), d=round(d, 2), r=round(float(np.clip(d * s["radius_ratio"], s["radius_min_px"], s["radius_max_px"])), 2))); dt[(Y - y) ** 2 + (X - x) ** 2 < s["spacing_px"] ** 2] = 0
+    return seeds
+
+
+def thin_out(seeds, s):
+    """debris of the algorithm carries no disc, but every component keeps one, even a screw : its deepest ones if it has nothing thicker. FR : les débris de l'algorithme ne portent pas de pastille, mais chaque composant en garde une, même une vis."""
+    keep = [q for q in seeds if q["d"] >= s["depth_min_px"]]; have = {q["n"] for q in keep}; rest = {}
+    for q in seeds:
+        if q["n"] not in have: rest.setdefault(q["n"], []).append(q)
+    for L in rest.values(): keep += sorted(L, key=lambda q: -q["d"])[:int(s["thin_keep"])]
+    return keep
+
+
+def stamp_discs(sheet, seeds, hex_of, ring):
+    """antialiased discs on a copy of the sheet : a white ring says it is a mark, the fill says the colour. FR : pastilles lissées : le cercle blanc dit que c'est une marque, le fond dit la couleur."""
+    out = sheet.astype(np.float32).copy(); H, W = out.shape[:2]
+    for q in sorted(seeds, key=lambda q: -q["r"]):
+        R = q["r"] + ring + 1; x0, x1, y0, y1 = max(int(q["sx"] - R), 0), min(int(q["sx"] + R) + 2, W), max(int(q["sy"] - R), 0), min(int(q["sy"] + R) + 2, H); Y, X = np.mgrid[y0:y1, x0:x1]; dist = np.hypot(X - q["sx"], Y - q["sy"])
+        for rad, c in ((q["r"] + ring, (255.0, 255.0, 255.0)), (q["r"], hex_of[q["n"]])):
+            cov = np.clip(rad + 0.5 - dist, 0, 1)[..., None]; out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - cov) + np.array(c, np.float32) * cov
+    return out.round().astype(np.uint8)
+
+
+def palette(n):
+    """n colours in the spirit of the legend, as far from each other as possible by eye (Lab)"""
+    rgb = np.array([colorsys.hsv_to_rgb(h / HUES, s, v) for h in range(HUES) for s, v in SHADES]); lab = rgb2lab(rgb[None])[0]; pick = [0]; d = np.linalg.norm(lab - lab[0], axis=1)
+    for _ in range(n - 1): k = int(d.argmax()); pick.append(k); d = np.minimum(d, np.linalg.norm(lab - lab[k], axis=1))
+    return (rgb[pick] * 255).round().astype(int), lab[pick]
+
+
+def main(params):
+    p, home = C.load(params); alpha = float(p.get("cut_alpha", ALPHA)); sc = p["scale"]; mc = json.load(open(f"{home}/02_masks/mc.json"))["mc"]; atoms = json.load(open(f"{home}/02_masks/micro.json"))["atoms"]; nf = f"{home}/03_sheets/component_names.json"; given = json.load(open(nf)) if os.path.exists(nf) else {}; comps = []; by_name = {}; piece_of = np.full(len(atoms) + 1, -1)
+    for m in mc:
+        g = given.get(str(m["mc"])); name = g[0] if g else m["fr"]; desc = g[1] if g and len(g) > 1 else m.get("shape", "")
+        if name not in by_name: by_name[name] = len(comps); comps.append(dict(name=name, description=desc, copies=m["instances"], symmetric=len(m["atoms"]) > 1, pieces=[m["mc"]]))
+        else: c = comps[by_name[name]]; c["copies"] = max(c["copies"], m["instances"]); c["symmetric"] = c["symmetric"] or len(m["atoms"]) > 1; c["pieces"].append(m["mc"]); c["description"] = c["description"] or desc
+        piece_of[m["atoms"]] = by_name[name]
+    n = len(comps); labs = {v: np.load(f"{home}/02_masks/labels_{v}.npz")["labels"] for v in p["views"]}; maps = {v: np.where(L >= 0, piece_of[np.clip(L, 0, None)], -1) for v, L in labs.items()}; adj = np.zeros((n, n), bool); area = np.zeros(n)
+    for M in maps.values():
+        for a, b in ((M[:, 1:], M[:, :-1]), (M[1:, :], M[:-1, :])):
+            k = (a != b) & (a >= 0) & (b >= 0); adj[a[k], b[k]] = True; adj[b[k], a[k]] = True
+        ids, cnt = np.unique(M[M >= 0], return_counts=True); area[ids] += cnt
+    rgb, lab = palette(n); free = list(range(n)); colour = np.full(n, -1)
+    for k in np.argsort(-area):      # the largest components first, each takes the free colour furthest from its neighbours. FR : les plus grands d'abord, chacun prend la couleur libre la plus éloignée de ses voisins.
+        done = [colour[j] for j in np.flatnonzero(adj[k]) if colour[j] >= 0]; score = [min((float(np.linalg.norm(lab[c] - lab[d])) for d in done), default=0.0) for c in free]; colour[k] = free.pop(int(np.argmax(score)))
+    for k, c in enumerate(comps): c.update(n=k + 1, hex="#%02x%02x%02x" % tuple(rgb[colour[k]].tolist()))
+    sheet = np.asarray(Image.open(C.abspath(p["sheet"])).convert("RGB")); org = panel_origins(p, sheet)
+    for f_ in p.get("cut_fixes", []): apply_fix(maps[f_["view"]], f_, org[f_["view"]], sc)      # after the colours, so that fixing a label never changes the palette. FR : après les couleurs, corriger une étiquette ne change pas la palette.
+    json.dump(dict(alpha=alpha, components=comps), open(f"{home}/03_sheets/cut_components.json", "w"), indent=1, ensure_ascii=False); col = rgb[colour].astype(np.float32); fn = ImageFont.truetype(FONT_NUM, 26); tiles = []
+    spots = {v: {} for v in p["views"]}; best = {}
+    for v in p["views"]:      # where each number goes : in every view where the piece can carry it, and once anyway for a piece too thin everywhere, so that every component can be validated. FR : où va chaque numéro ; une pièce trop fine partout le porte quand même une fois, pour pouvoir la valider.
+        M = maps[v]
+        for i in np.unique(M[M >= 0]):
+            dt = ndi.distance_transform_edt(M == i); y, x = np.unravel_index(dt.argmax(), dt.shape); r = float(dt.max()); i = int(i)
+            if r >= LABEL_MIN_PX: spots[v][i] = (x, y)
+            if r > best.get(i, (0.0,))[0]: best[i] = (r, v, x, y)
+    roomy = {i for s_ in spots.values() for i in s_}
+    for i, (r, v, x, y) in best.items():
+        if i not in roomy: spots[v][i] = (x, y)
+    for k, c in enumerate(comps): c["visible"] = k in best
+    json.dump(dict(alpha=alpha, components=comps), open(f"{home}/03_sheets/cut_components.json", "w"), indent=1, ensure_ascii=False); print("too thin, numbered once", sorted(i + 1 for i in best if i not in roomy), "absent from the 6 views", [c["n"] for c in comps if not c["visible"]])
+    for v in p["views"]:      # exactly the rendering of the legend : the reference enlarged, soft colours, thin dark borders, the numbers. FR : exactement le rendu de la légende.
+        M = maps[v]; H, W = M.shape; base = np.asarray(Image.fromarray(C.panel_rgb(p, v)).resize((W, H), Image.BICUBIC)).astype(np.float32); m = M >= 0; out = base.copy(); out[m] = base[m] * (1 - alpha) + col[M[m]] * alpha; e = np.zeros(M.shape, bool); e[:, 1:] |= M[:, 1:] != M[:, :-1]; e[1:, :] |= M[1:, :] != M[:-1, :]; out[e] = out[e] * 0.25; img = Image.fromarray(out.astype(np.uint8)); d = ImageDraw.Draw(img)
+        for i, (x, y) in spots[v].items():
+            t = str(i + 1); bb = d.textbbox((0, 0), t, font=fn); w_, h_ = bb[2] - bb[0], bb[3] - bb[1]; d.rectangle((x - w_ / 2 - 4, y - h_ / 2 - 5, x + w_ / 2 + 4, y + h_ / 2 + 5), fill=(255, 255, 255)); d.text((x - w_ / 2, y - h_ / 2 - bb[1]), t, font=fn, fill=(0, 0, 0))
+        tiles.append(np.asarray(img))
+    f = f"{home}/03_sheets/preview_components_lowres.png"; C.save_board(tiles, f); im = Image.open(f); im.resize((LOWRES_W, int(im.size[1] * LOWRES_W / im.size[0])), Image.LANCZOS).save(f); shutil.copyfile(C.abspath(p["sheet"]), f"{home}/03_sheets/cut_reference.png")
+    sd = {**SEED, **p.get("cut_seed", {})}; seeds = []; full = np.zeros(sheet.shape[:2], np.uint8)
+    for v in p["views"]:      # 1 November 2026 : the colour index and the map of the verifier, both in the frame of the sheet. FR : l'index des couleurs et la carte du vérificateur, dans le cadre de la planche.
+        m = maps[v][::sc, ::sc]; ox, oy = org[v]; h_, w_ = min(m.shape[0], sheet.shape[0] - oy), min(m.shape[1], sheet.shape[1] - ox); full[oy:oy + h_, ox:ox + w_] = (m[:h_, :w_] + 1).astype(np.uint8)
+        for q in plant_seeds(m, sd): q.update(view=v, sx=q["x"] + ox, sy=q["y"] + oy); seeds.append(q)
+    seeds = thin_out(seeds, sd); hex_of = {c["n"]: tuple(int(c["hex"][k:k + 2], 16) for k in (1, 3, 5)) for c in comps}; Image.fromarray(stamp_discs(sheet, seeds, hex_of, sd["ring_px"])).save(f"{home}/03_sheets/cut_index.png"); np.savez_compressed(f"{home}/03_sheets/cut_map.npz", map=full); json.dump(dict(origins=org, seeds=seeds, settings=sd), open(f"{home}/03_sheets/cut_seeds.json", "w"), ensure_ascii=False); missing = sorted(set(hex_of) - {q["n"] for q in seeds}); print("index discs", len(seeds), "components without a disc", missing)
+    lines = "\n".join(f"{c['n']}. {c['name']}{', ' + c['description'] if c['description'] else ''}{', x' + str(c['copies']) if c['copies'] > 1 else ''} : {c['hex']}" for c in comps); open(f"{home}/03_sheets/cut_prompt.txt", "w").write(PROMPT.format(cut_object=p["cut_object"], percent=int(round(alpha * 100)), table=lines)); L = lab[colour]; D = np.linalg.norm(L[:, None] - L[None], axis=2); np.fill_diagonal(D, 1e9); print("components", n, "closest two colours (delta E)", round(float(D.min()), 1), "closest two neighbours", round(float(D[adj].min()), 1) if adj.any() else None)
+
+
+if __name__ == "__main__": main(sys.argv[1])

@@ -1,0 +1,22 @@
+"""1 November 2026 : M22, tournament of the silhouette settings against the truth, the outline judged at 1 pixel of the sheet. FR : tournoi des réglages de silhouette contre la vérité."""
+import sys, json, itertools
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from concurrent.futures import ProcessPoolExecutor
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroRegions as G
+
+
+def one(a):
+    params, over = a; p, home = C.load(params); sc = p["scale"]; r = {k: p.get(k, v) for k, v in G.DEF.items()}; r.update(over); sheet = json.load(open(C.abspath(p["views_dir"]) + "/sheet.json")); cubes = {x["name"]: (x.get("cube") or {}).get("bbox") for x in sheet["panels"]}; F = []; I = []; A = []
+    for name in p["views"]:
+        rgb, mask = C.panel_rgb(p, name), C.panel_mask(p, name); H, W = mask.shape[0] * sc, mask.shape[1] * sc; g0 = np.asarray(Image.fromarray(rgb).convert("L")).astype(np.float32) / 255; g = np.asarray(Image.fromarray(G.denoise(g0, r["R_nlm_h"]).astype(np.float32), mode="F").resize((W, H), Image.BICUBIC)); ins = G.silhouette(g, sc, r, cubes.get(name)); T = np.load(f"{home}/02_masks/truth_{name}.npz")["labels"] >= 0
+        cm = ins ^ ndi.binary_erosion(ins); ct = T ^ ndi.binary_erosion(T); nm = ndi.binary_dilation(ct, iterations=sc); nt = ndi.binary_dilation(cm, iterations=sc); pr = nm[cm].mean(); rc = nt[ct].mean(); F.append(2 * pr * rc / max(pr + rc, 1e-6)); I.append((ins & T).sum() / (ins | T).sum()); A.append(ins.sum() / T.sum())
+    return dict(over=over, f1=round(float(np.mean(F)), 4), f1_min=round(float(min(F)), 4), iou=round(float(np.mean(I)), 4), area=round(float(np.mean(A)), 4))
+
+
+if __name__ == "__main__":
+    params = sys.argv[1]; grid = json.loads(sys.argv[2]); keys = list(grid); combos = [dict(zip(keys, v)) for v in itertools.product(*[grid[k] for k in keys])]
+    with ProcessPoolExecutor(max_workers=16) as ex: res = list(ex.map(one, [(params, c) for c in combos]))
+    for x in sorted(res, key=lambda x: -x["f1"])[:8]: print(x)

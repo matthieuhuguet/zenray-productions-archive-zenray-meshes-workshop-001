@@ -1,0 +1,23 @@
+"""1 November 2026 : M22, the pixels no method can judge on a truth render : where two different parts lie within truth_coplanar_m of each other along the view (coplanar plates, shells that overlap by construction), which is in front is decided by a millimetre the image does not show. Every part is rendered alone, the two nearest depths are kept per pixel. Writes 02_masks/ambig_<view>.npz ; MicroTruth leaves them out and prints their share.
+    python -I MicroAmbig.py Projects/<id>/params.json        FR : les pixels qu'aucune méthode ne peut juger : deux pièces presque au même endroit, sans trait visible entre elles."""
+import sys, json
+import numpy as np
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts"); import Raster
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroLabels as ML
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; eps = p.get("truth_coplanar_m", 0.006); fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}; atoms = json.load(open(f"{home}/02_masks/micro.json"))["atoms"]; sop = np.load(f"{home}/02_masks/shell_of_poly.npy"); d = np.load(C.abspath(p["model"]), allow_pickle=True); P, Cn, I = d["P"].astype(float), d["C"].astype(np.int64), d["I"].astype(np.int64); off = np.concatenate([[0], np.cumsum(Cn)]); rs = []
+    for a in atoms:
+        if a["hidden"]: continue
+        ps = np.flatnonzero(np.isin(sop, a["shells"])); T = [(I[off[q]], I[off[q] + j], I[off[q] + j + 1]) for q in ps for j in range(1, Cn[q] - 1)]
+        if T: rs.append(Raster.Renderer(P, np.array(T)))
+    for name in p["views"]:
+        H, W = C.panel_rgb(p, name).shape[:2]; c, s, axes, R = ML.panel_camera(fr, V[name], (H * sc, W * sc), sc); d1 = np.full((H * sc, W * sc), -1e9, np.float32); d2 = d1.copy()
+        for mr in rs:
+            M, D_, N, F = mr.render(c.tolist(), s, axes, R); D_ = np.nan_to_num(D_[: H * sc, : W * sc], nan=-1e9).astype(np.float32); hi = D_ > d1; d2 = np.where(hi, d1, np.maximum(d2, D_)); d1 = np.where(hi, D_, d1)
+        amb = (d1 > -1e8) & (d2 > -1e8) & (d1 - d2 < eps); np.savez_compressed(f"{home}/02_masks/ambig_{name}.npz", ambig=amb); print(name, "ambiguous share of the object", round(float(amb.sum() / max((d1 > -1e8).sum(), 1)), 4))
+
+
+if __name__ == "__main__": main(sys.argv[1])

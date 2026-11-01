@@ -1,0 +1,31 @@
+"""1 November 2026 : M22, a 6 views reference sheet from a 3D model, rendered with Karma CPU in Houdini : same six orthographic views as a generated sheet, grey studio backdrop, soft light, one unit cube beside the object. The cameras are exact, so a pixel truth exists for the masks. Run inside hython with ARGS set : obj, out_dir, frame, ppm, W, H, cube_m, spp, views (optional subset).
+FR : une planche 6 vues depuis un modèle 3D, en Karma CPU, fond gris, cube d'une unité ; les caméras sont exactes, donc une vérité au pixel existe pour les masques."""
+import hou, json, os, time
+A = ARGS; os.makedirs(A["out_dir"], exist_ok=True); F = json.load(open(A["frame"])); lo = F["lo"]; D = F["dims_m"]; ctr = hou.Vector3(lo) + hou.Vector3(D) * 0.5; R = max(D)
+views = [v for v in F["views"] if v["name"] in A.get("views", [v["name"] for v in F["views"]])]
+obj = hou.node("/obj"); stage = hou.node("/stage")
+for n in ("zrm_six",): 
+    if obj.node(n): obj.node(n).destroy()
+G = obj.createNode("geo", "zrm_six")
+fi = G.createNode("file", "model"); fi.parm("file").set(A["obj"]); co = G.createNode("color", "albedo"); co.setInput(0, fi); co.parmTuple("color").set(tuple(A.get("albedo", (0.55, 0.55, 0.56)))); no = G.createNode("normal", "n"); no.setInput(0, co); no.parm("cuspangle").set(A.get("cusp", 40)); out_model = G.createNode("null", "OUT_model"); out_model.setInput(0, no)
+bx = G.createNode("box", "cube"); bx.parmTuple("size").set((A["cube_m"],) * 3); cc = G.createNode("color", "cube_c"); cc.setInput(0, bx); cc.parmTuple("color").set((0.5, 0.5, 0.5)); out_cube = G.createNode("null", "OUT_cube"); out_cube.setInput(0, cc)
+gr = G.createNode("grid", "back"); gr.parmTuple("size").set((40, 40)); gr.parm("rows").set(2); gr.parm("cols").set(2); gc = G.createNode("color", "back_c"); gc.setInput(0, gr); gc.parmTuple("color").set(tuple(A.get("backdrop", (0.17, 0.17, 0.18)))); out_back = G.createNode("null", "OUT_back"); out_back.setInput(0, gc)
+def si(name, path):
+    n = stage.createNode("sopimport", name); n.parm("soppath").set(path); return n
+a, b, c = si("m_model", out_model.path()), si("m_cube", out_cube.path()), si("m_back", out_back.path()); mg = stage.createNode("merge", "m_merge"); [mg.setInput(i, x) for i, x in enumerate((a, b, c))]
+cam = stage.createNode("camera", "m_cam"); cam.setInput(0, mg); cam.parm("primpath").set("/cameras/cam"); cam.parm("projection").set("orthographic"); dome = stage.createNode("domelight::2.0", "m_dome"); dome.setInput(0, cam); dome.parm("xn__inputsintensity_i0a").set(A.get("dome", 0.75))
+dist = stage.createNode("distantlight::2.0" if "distantlight::2.0" in hou.lopNodeTypeCategory().nodeTypes() else "distantlight", "m_key"); dist.setInput(0, dome); dist.parm("xn__inputsintensity_i0a").set(A.get("key", 1.6)); dist.parm("xn__inputsangle_zta").set(A.get("key_angle", 18))
+krp = stage.createNode("karmarenderproperties", "m_krp"); krp.setInput(0, dist); krp.parm("camera").set("/cameras/cam"); krp.parm("resolutionx").set(A["W"]); krp.parm("engine").set("cpu"); krp.parm("pathtracedsamples").set(A["spp"]); krp.parm("picture").set(A["out_dir"] + "/tmp.png")
+rop = stage.createNode("usdrender_rop", "m_rop"); rop.setInput(0, krp); rop.parm("renderer").set("BRAY_HdKarma"); rop.parm("rendersettings").set(krp.parm("primpath").eval()); rop.parm("override_res").set("specific"); rop.parm("res_user1").set(A["W"]); rop.parm("res_user2").set(A["H"])   # 1 November 2026 : on this properties node the height is locked by its auto mode, the ROP override sets it
+T = {}
+for v in views:
+    rx, uy, tz = hou.Vector3(v["rx"]), hou.Vector3(v["uy"]), hou.Vector3(v["tz"]); s = A["ppm"]; W, H = A["W"], A["H"]
+    pos = ctr + tz * (R * 2.0); m = hou.Matrix4(((rx[0], rx[1], rx[2], 0), (uy[0], uy[1], uy[2], 0), (tz[0], tz[1], tz[2], 0), (pos[0], pos[1], pos[2], 1))); ex = m.explode(rotate_order="xyz")
+    cam.parmTuple("t").set(ex["translate"]); cam.parmTuple("r").set(ex["rotate"]); cam.parm("horizontalAperture").set(1000.0 * W / s); cam.parm("verticalAperture_control").set("set"); cam.parm("verticalAperture").set(1000.0 * H / s);   # 1 November 2026 : the parm is authored divided by 100, and an orthographic USD aperture is in tenths of a scene unit
+    cam.parm("clippingRange1").set(0.01); cam.parm("clippingRange2").set(R * 20)
+    # the cube beside the object, on the floor line of the view, at the lower left of the panel
+    half_w = W / (2.0 * s); half_h = H / (2.0 * s); q = ctr - rx * (half_w - A["cube_m"] * 1.1) - uy * (half_h - A["cube_m"] * 1.1); bx.parmTuple("t").set(tuple(q)); bo = ctr - tz * (R * 1.6)
+    em = hou.Matrix4(((rx[0], rx[1], rx[2], 0), (tz[0], tz[1], tz[2], 0), (-uy[0], -uy[1], -uy[2], 0), (bo[0], bo[1], bo[2], 1))).explode(rotate_order="xyz"); bf = G.node("back_x") or G.createNode("xform", "back_x"); bf.setInput(0, gc); bf.parmTuple("t").set(em["translate"]); bf.parmTuple("r").set(em["rotate"]); out_back.setInput(0, bf)
+    key = (rx * -0.45 + uy * 0.65 + tz * 0.75).normalized(); kp = ctr + key * 5; km = hou.Matrix4(((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1))); z = key; x = hou.Vector3(0, 1, 0).cross(z); x = x.normalized() if x.length() > 1e-3 else hou.Vector3(1, 0, 0); y = z.cross(x); kr = hou.Matrix4(((x[0], x[1], x[2], 0), (y[0], y[1], y[2], 0), (z[0], z[1], z[2], 0), (kp[0], kp[1], kp[2], 1))).explode(rotate_order="xyz"); dist.parmTuple("r").set(kr["rotate"])
+    out = f'{A["out_dir"]}/{v["index"]:02d}_{v["name"]}_rgb.png'; krp.parm("picture").set(out); rop.parm("outputimage").set(out) if rop.parm("outputimage") else None; t0 = time.time(); rop.render(); T[v["name"]] = round(time.time() - t0, 1)
+RESULT = dict(times=T, errors=[e[:160] for n in (rop, krp, cam) for e in n.errors()][:4], exists={v["name"]: os.path.exists(f'{A["out_dir"]}/{v["index"]:02d}_{v["name"]}_rgb.png') for v in views})

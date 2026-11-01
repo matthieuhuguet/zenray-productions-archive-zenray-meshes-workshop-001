@@ -1,0 +1,80 @@
+"""1 November 2026 : M22 step 6, read a RETURNED grid : the four corner squares give the homography back to the canonical sheet, each of the 6 cells of each line is cut out and its object isolated from the light cell ; a line passes if every cell was filled, if opposite views mirror each other, if the sizes agree between views and with the announced size, and if the wireframe is there, otherwise it is flagged for verification. The cells are empty on the sheet (1 November 2026), so no silhouette is compared. Writes 04_received/<sheet>/L<k>_<view>.png, 05_models/MC<n>/ref_<view>.png and report.json.
+    python -I MicroIngest.py Projects/<id>/params.json S01 image.png [out_tag]        FR : lire une grille reçue, couper chaque case, contrôler entre les vues, demander une vérification si une ligne ne concorde pas."""
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from skimage import transform as tf
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+DEF = dict(bg_level=205, min_comp_frac=0.00012, dist_tol_frac=0.03, size_tol=0.06, announced_tol=0.10, filled_level=25, filled_min_len=0.5, filled_min_area=0.1, visible_min_len=16.0, size_open=1, wire_min=0.02, wire_contrast=14, wire_faces_min=30, thick_px=4)
+AX = "xyz"
+
+
+def find_corners(gray):
+    """centre of the black square nearest each corner of the image"""
+    H, W = gray.shape; dark = gray < 70; lab, n = ndi.label(dark); out = []; objs = ndi.find_objects(lab); cand = []
+    for k, sl in enumerate(objs):
+        h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start; area = (lab[sl] == k + 1).sum()
+        if h < 8 or w < 8 or max(h, w) > 0.06 * max(H, W): continue
+        if area / (h * w) > 0.8 and 0.6 < h / w < 1.6: cand.append(((sl[1].start + sl[1].stop - 1) / 2, (sl[0].start + sl[0].stop - 1) / 2))
+    for cx, cy in ((0, 0), (W, 0), (0, H), (W, H)):
+        best = min(cand, key=lambda c: (c[0] - cx) ** 2 + (c[1] - cy) ** 2) if cand else None
+        if best is None or abs(best[0] - cx) > 0.12 * W or abs(best[1] - cy) > 0.12 * H: return None
+        out.append(best)
+    return out
+
+
+def isolate(cell, r):
+    """object of a cell : what is darker than the light background, without the view label and the ticks, holes filled"""
+    g = np.asarray(cell.convert("L")).astype(np.float32); m = g < r["bg_level"]; c = g.shape[0]; b = max(13, c // 30); m[:b, :] = False; m[-b:, :] = False; m[:, :b] = False; m[:, -b:] = False; lh = max(10, c // 12); m[:lh, : c // 2] = False
+    lab, n = ndi.label(m)
+    if n == 0: return np.zeros_like(m)
+    sz = ndi.sum(m, lab, range(1, n + 1)); keep = np.isin(lab, 1 + np.flatnonzero(sz >= max(4, r["min_comp_frac"] * c * c))); return ndi.binary_fill_holes(keep)
+def gap(a, b):
+    """distance in pixels between two shapes : the larger of the two 95th percentiles of each one's pixels to the other ; an IoU punishes a thin part for a one pixel shift, a distance does not"""
+    if not a.any() or not b.any(): return 1e9
+    da = ndi.distance_transform_edt(~a); db = ndi.distance_transform_edt(~b); return float(max(np.percentile(db[a], 95), np.percentile(da[b], 95)))
+
+
+def main(params, sid, path, tag=""):
+    p, home = C.load(params); r = {k: p.get("ingest", {}).get(k, v) for k, v in DEF.items()}; idx = json.load(open(f"{home}/03_sheets/sheets.json")); S = next(s for s in idx["sheets"] if s["id"] == sid); W, H = S["size"]; im = Image.open(path).convert("RGB"); corners = find_corners(np.asarray(im.convert("L")))
+    out_dir = f"{home}/04_received/{sid}{tag}"; os.makedirs(out_dir, exist_ok=True); rep = dict(sheet=sid, image=path, lines=[], ok=False)
+    if corners is None: rep["error"] = "corner squares not found : the grid was not kept, ask for the sheet again"; json.dump(rep, open(out_dir + "/report.json", "w"), indent=1); print(rep["error"]); return rep
+    V = {v["name"]: v for v in json.load(open(C.abspath(p["frame"])))["views"]}; f, m = S["fid"], S["margin"]; dst = np.array([(m + f / 2, m + f / 2), (W - m - f / 2, m + f / 2), (m + f / 2, H - m - f / 2), (W - m - f / 2, H - m - f / 2)]); T = tf.ProjectiveTransform.from_estimate(dst, np.array(corners)) if hasattr(tf.ProjectiveTransform, "from_estimate") else None
+    if T is None: T = tf.ProjectiveTransform(); T.estimate(dst, np.array(corners))
+    can = tf.warp(np.asarray(im).astype(np.float32) / 255, T, output_shape=(H, W), order=1); can = Image.fromarray((can * 255).astype(np.uint8)); can.save(out_dir + "/rectified.png")
+    blank = Image.open(f"{home}/03_sheets/{S['image']}").convert("RGB")
+    for row in S["rows"]:
+        masks = {}; reasons = []; line = dict(line=row["line"], mc=row["mc"], fr=row["fr"], views={}); dims = {"x": [], "y": [], "z": []}; unfilled = []; wires = []
+        for v, (cx, cy, c) in row["cells"].items():
+            crop = can.crop((cx + 2, cy + 2, cx + c - 2, cy + c - 2)); crop.save(f"{out_dir}/L{row['line']}_{v}.png"); M = isolate(crop, r); masks[v] = M; a_u, a_v = int(np.argmax(np.abs(V[v]["rx"]))), int(np.argmax(np.abs(V[v]["uy"]))); exp_u, exp_v = row["size_mm"][a_u] / 1000 * row["px_per_m"], row["size_mm"][a_v] / 1000 * row["px_per_m"]; visible = max(exp_u, exp_v) >= r["visible_min_len"]; line["views"][v] = dict(px=int(M.sum()))
+            a0 = np.asarray(crop).astype(np.float32); b0 = np.asarray(blank.crop((cx + 2, cy + 2, cx + c - 2, cy + c - 2))).astype(np.float32); inner_c = np.zeros(a0.shape[:2], bool); bm = max(14, c // 12); inner_c[bm:-bm, bm:-bm] = True; changed = int((np.abs(a0 - b0).max(-1)[inner_c] > r["filled_level"]).sum()); need = min(r["filled_min_area"] * exp_u * exp_v, r["filled_min_len"] * max(exp_u, exp_v)); line["views"][v]["changed_px"] = changed      # 1 November 2026 : a thin part changes few pixels, so a filled cell is judged against the expected size of the part, never against the mean of the cell
+            er = ndi.binary_erosion(M, iterations=2); inner = er if er.sum() > 30 else M; g0 = np.asarray(crop.convert("L")).astype(np.float32); wire = float(((ndi.gaussian_filter(g0, 3) - g0)[inner] > r["wire_contrast"]).mean()) if inner.any() else 0.0; line["views"][v]["wire"] = round(wire, 3)
+            if visible and changed < need: unfilled.append(v)
+            if M.sum() > 300: wires.append(wire)
+            M_big = ndi.binary_opening(M, iterations=r["size_open"])      # 1 November 2026 : the tip of a sliver vanishes differently from one view to the next, it testifies on no size
+            if M_big.any() and ndi.distance_transform_edt(M).max() >= r["thick_px"]:      # a view of the part thinner than that is lost at the size of a generated image, it cannot testify on sizes
+                ys, xs = np.nonzero(M_big); dims[AX[a_u]].append((v, (np.ptp(xs) + 1) / row["px_per_m"])); dims[AX[a_v]].append((v, (np.ptp(ys) + 1) / row["px_per_m"]))
+        if unfilled: reasons.append("case non remplie : " + ", ".join(unfilled))
+        if wires and row.get("faces", 99) >= r["wire_faces_min"] and max(wires) < r["wire_min"]: reasons.append("fil de fer absent")
+        big = max(row["size_mm"]) / 1000
+        for ax, vals in dims.items():
+            ann = row["size_mm"][AX.index(ax)] / 1000
+            if vals and abs(max(x for _, x in vals) - ann) / big > r["announced_tol"]: reasons.append(f"taille {ax} loin de l'annoncée ({abs(max(x for _, x in vals) - ann) / big:.0%})")
+            if len(vals) >= 2:
+                sp = max(x for _, x in vals) - min(x for _, x in vals); line.setdefault("size_spread", {})[ax] = round(sp / big, 3)
+                if sp / big > r["size_tol"]: reasons.append(f"taille {ax} différente entre vues ({sp / big:.0%})")
+        for a, b, flip in (("front", "back", 1), ("left", "right", 1), ("top", "bottom", 0)):
+            A, B = masks[a], masks[b]; B2 = B[:, ::-1] if flip else B[::-1, :]; im_ = gap(A, B2) if A.any() and B.any() else 0.0; cc = row["cells"][a][2]; line.setdefault("mirror", {})[f"{a}_{b}"] = round(im_, 1)
+            if (A.sum() > 30 or B.sum() > 30) and im_ > r["dist_tol_frac"] * cc: reasons.append(f"{a} et {b} ne se répondent pas ({im_ / cc:.1%} de la case)")
+        line["verdict"] = "ok" if not reasons else "a_verifier"; line["reasons"] = reasons; rep["lines"].append(line)
+        if not reasons and not tag:
+            q = f"{home}/05_models/MC{row['mc']:03d}"; os.makedirs(q, exist_ok=True)
+            for v in row["cells"]: Image.open(f"{out_dir}/L{row['line']}_{v}.png").save(f"{q}/ref_{v}.png"); Image.fromarray(masks[v].astype(np.uint8) * 255).save(f"{q}/mask_{v}.png")
+    rep["ok"] = all(l["verdict"] == "ok" for l in rep["lines"]); json.dump(rep, open(out_dir + "/report.json", "w"), indent=1, ensure_ascii=False)
+    for l in rep["lines"]: print(sid, "L%d" % l["line"], l["mc"], l["fr"], l["verdict"], l["reasons"][:3])
+    return rep
+
+
+if __name__ == "__main__": main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else "")

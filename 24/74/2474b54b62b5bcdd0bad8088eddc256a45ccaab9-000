@@ -1,0 +1,49 @@
+"""1 November 2026 : M22 THE TRUTH TEST of the masks, on a sheet rendered from a known model (exact cameras, so each pixel knows its part) : the regions come from the image alone, the truth from the render. Measures, per view and overall : accuracy = pixels whose region's majority part is their true part, outside a band of 1 pixel of the sheet around the true boundaries (a pixel on a boundary belongs to both, no method can be judged there) ; silhouette IoU ; boundary precision and recall at 1 pixel of the sheet ; parts seen with no region of their own. Verifier both ways : the truth against itself gives 100 %, the truth with its parts shuffled in blocks falls far below.
+    python -I MicroTruth.py Projects/<id>/params.json [selftest]        FR : le test de vérité des masques : régions tirées de l'image seule, vérité tirée du rendu."""
+import sys, json
+import numpy as np
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+
+
+def bounds(L):
+    b = np.zeros(L.shape, bool); b[:, 1:] |= L[:, 1:] != L[:, :-1]; b[1:, :] |= L[1:, :] != L[:-1, :]; return b
+def score(R, T, sc, min_part=20, direct=False):
+    """R regions (-1 outside), T truth parts (-1 outside), both at sc times the sheet ; direct : R already holds the same ids as T, each pixel is judged as it is"""
+    tb = bounds(T); band = ndi.binary_dilation(tb, iterations=sc); mi = R >= 0; ti = T >= 0; inter = mi & ti; n = int(R.max()) + 1 if mi.any() else 0; nt = int(T.max()) + 1; H = np.zeros((n, nt), np.int64); ok = inter & ~band; np.add.at(H, (R[ok], T[ok]), 1); maj = H.argmax(1) if n else np.array([]); good = int(H.max(1).sum()) if n else 0; total = int(ok.sum()); out = dict(accuracy=round(good / max(total, 1), 5), silhouette_iou=round(float((mi & ti).sum() / max((mi | ti).sum(), 1)), 5), regions=n)
+    vis = np.bincount(T[ti & ~band], minlength=nt); won = set(maj[H.sum(1) > 0].tolist()) if n else set(); seen = [k for k in range(nt) if vis[k] >= min_part * sc * sc]; out["parts_seen"] = len(seen); out["parts_missed"] = [k for k in seen if k not in won]
+    F = np.full(R.shape, -1, np.int64); F[mi] = maj[R[mi]] if n else -1                       # the final mask : regions named by their majority part, a boundary inside one part does not exist
+    rb = bounds(F) & ndi.binary_erosion(mi, iterations=2); tb2 = tb & ndi.binary_erosion(ti, iterations=2); near_t = ndi.binary_dilation(tb2, iterations=sc); near_r = ndi.binary_dilation(rb, iterations=sc); out["bd_precision"] = round(float(near_t[rb].mean()) if rb.any() else 0, 4); out["bd_recall"] = round(float(near_r[tb2].mean()) if tb2.any() else 0, 4); out["_good"] = good; out["_total"] = total
+    wrong = np.zeros(R.shape, bool)
+    if direct:
+        o2 = ok; wrong[o2] = R[o2] != T[o2]; out["_good"] = int((~wrong & o2).sum()); out["accuracy"] = round(out["_good"] / max(total, 1), 5); seen_ok = [k for k in seen if ((R == k) & (T == k)).sum() >= 0.5 * (T == k).sum()]; out["parts_missed"] = [k for k in seen if k not in seen_ok]
+        rb = bounds(R) & ndi.binary_erosion(mi, iterations=2); near_r = ndi.binary_dilation(rb, iterations=sc); out["bd_precision"] = round(float(near_t[rb].mean()) if rb.any() else 0, 4); out["bd_recall"] = round(float(near_r[tb2].mean()) if tb2.any() else 0, 4)
+    elif n: wrong[ok] = maj[R[ok]] != T[ok]
+    cm = mi ^ ndi.binary_erosion(mi); ct = ti ^ ndi.binary_erosion(ti); nm = ndi.binary_dilation(ct, iterations=sc); nt2 = ndi.binary_dilation(cm, iterations=sc); pr = float(nm[cm].mean()) if cm.any() else 0; rc = float(nt2[ct].mean()) if ct.any() else 0; out["outline_f1"] = round(2 * pr * rc / max(pr + rc, 1e-6), 4); out["area_ratio"] = round(float(mi.sum() / max(ti.sum(), 1)), 4)
+    return out, wrong
+
+
+def main(params, selftest=False):
+    p, home = C.load(params); sc = p["scale"]; res = {}; G = 0; N = 0; tiles = []; wide = {}; amb_px = [0, 0]; sil_acc = [0, 0]; out_px = {}; atoms = json.load(open(f"{home}/02_masks/micro.json"))["atoms"] if __import__("os").path.exists(f"{home}/02_masks/micro.json") else None
+    if atoms: to_atom = np.zeros(max(max(a["shells"]) for a in atoms) + 2, np.int64) - 1; [to_atom.__setitem__(a["shells"], a["id"]) for a in atoms]
+    for name in p["views"]:
+        T = np.load(f"{home}/02_masks/truth_{name}.npz")["labels"]; sil_t = T >= 0; Rz = np.load(f"{home}/02_masks/labels_{name}.npz")["labels"] if atoms else np.load(f"{home}/02_masks/regions_{name}.npz")["regions"]
+        if atoms:
+            T = to_atom[np.clip(T, 0, None)] * (T >= 0) - (T < 0)     # the truth in atoms, like the masks ; a label is judged as it is, no majority vote can hide an error
+            hid = np.array([a["hidden"] for a in atoms]); T = np.where((T >= 0) & hid[np.clip(T, 0, None)], -1, T)     # hidden families are not asked of the masks
+            af = f"{home}/02_masks/ambig_{name}.npz"
+            if __import__("os").path.exists(af): amb = np.load(af)["ambig"]; amb_px[0] += int((amb & (T >= 0)).sum()); amb_px[1] += int((T >= 0).sum()); T = np.where(amb, -1, T)     # two parts within a few millimetres, no method can judge these pixels
+            b_ = bounds(T); w_ = (Rz >= 0) & (T >= 0) & (Rz != T)
+            for k_ in (2, 3): bb = ndi.binary_dilation(b_, iterations=k_ * sc); m_ = (Rz >= 0) & (T >= 0) & ~bb; wide.setdefault(k_, [0, 0]); wide[k_][0] += int((Rz[m_] == T[m_]).sum()); wide[k_][1] += int(m_.sum())
+        if selftest:
+            a, _ = score(T.copy(), T, sc); sh = T.copy(); m = sh >= 0; sh[m] = (sh[m] * 7 + (np.arange(sh.shape[1])[None, :].repeat(sh.shape[0], 0)[m] // 60)) % (T.max() + 1); b, _ = score(sh, T, sc, direct=True); print(name, "truth vs itself", a["accuracy"], "shuffled", b["accuracy"]); assert a["accuracy"] == 1.0 and b["accuracy"] < 0.9; continue
+        sil_r = Rz >= 0; xor = sil_r ^ sil_t; edge_t = sil_t ^ ndi.binary_erosion(sil_t); sil_acc[0] += int((sil_r & sil_t).sum()); sil_acc[1] += int((sil_r | sil_t).sum())      # 1 November 2026 : the pieces are judged inside both masks, so the outline needs its own measure. FR : les pièces sont jugées dans les deux masques, le contour a donc sa propre mesure.
+        for k_ in (1, 2): out_px.setdefault(k_, [0, 0]); out_px[k_][0] += int((xor & ~ndi.binary_dilation(edge_t, iterations=k_ * sc)).sum()); out_px[k_][1] += int((sil_r | sil_t).sum())
+        o, wrong = score(Rz, T, sc, direct=bool(atoms)); res[name] = o; G += o.pop("_good"); N += o.pop("_total"); rgb = C.panel_rgb(p, name); im = C.overlay(rgb, Rz, sc, alpha=0.35); im[wrong] = (255, 0, 0); tiles.append(im)
+        print(name, o)
+    if selftest: print("selftest ok"); return
+    allv = dict(accuracy=round(G / max(N, 1), 5), accuracy_2px=round(wide[2][0] / max(wide[2][1], 1), 5) if wide else None, accuracy_3px=round(wide[3][0] / max(wide[3][1], 1), 5) if wide else None, outline_iou=round(sil_acc[0] / max(sil_acc[1], 1), 5), outline_wrong_1px=round(out_px[1][0] / max(out_px[1][1], 1), 6) if out_px else None, outline_wrong_2px=round(out_px[2][0] / max(out_px[2][1], 1), 6) if out_px else None, per_view=res); json.dump(allv, open(f"{home}/06_checks/truth.json", "w"), indent=1); C.save_board(tiles, f"{home}/06_checks/truth_errors.png"); allv["ambiguous_share"] = round(amb_px[0] / max(amb_px[1], 1), 5); json.dump(allv, open(f"{home}/06_checks/truth.json", "w"), indent=1); print("ambiguous pixels left out", allv["ambiguous_share"]); print("OVERALL accuracy +-1 px", allv["accuracy"], "+-2 px", allv["accuracy_2px"], "+-3 px", allv["accuracy_3px"], "missed parts by view", {k: len(v["parts_missed"]) for k, v in res.items()})
+
+
+if __name__ == "__main__": main(sys.argv[1], len(sys.argv) > 2 and sys.argv[2] == "selftest")

@@ -1,0 +1,29 @@
+"""1 November 2026 : M22 sweep of the smoothing of borders that follow no line (S_free_sigma) : truth on the rendered boards, border pixels without a line on the real board, and a crop of the top view for the eye. FR : balayage du lissage des bords sans trait, mesuré sur la vérité et regardé sur la vraie voiture.
+    python -I MicroFreeSweep.py out_dir sigma [sigma ...]"""
+import sys, json, subprocess, os
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"; PY = sys.executable; TRUTH = ["07_Manny", "08_CarTruth"]; REAL = "06_Car"
+
+
+def run(project, sigma, truth):
+    f = f"{ROOT}/Projects/{project}/params.json"; d = json.load(open(f)); d["S_free_sigma"] = sigma; json.dump(d, open(f, "w"), indent=2, ensure_ascii=False)
+    subprocess.run([PY, "-I", f"{ROOT}/Scripts/micro/MicroMasks.py", f], check=True, capture_output=True, cwd=ROOT)
+    if truth: subprocess.run([PY, "-I", f"{ROOT}/Scripts/micro/MicroTruth.py", f], check=True, capture_output=True, cwd=ROOT); t = json.load(open(f"{ROOT}/Projects/{project}/06_checks/truth.json")); return round(t["accuracy"], 5), round(t["accuracy_2px"], 5), round(t["accuracy_3px"], 5)
+
+
+def main(out, sigmas):
+    os.makedirs(out, exist_ok=True); rows = []
+    for s in sigmas:
+        with ThreadPoolExecutor(3) as ex: fut = {p: ex.submit(run, p, s, True) for p in TRUTH}; real = ex.submit(run, REAL, s, False)
+        tr = {p: f.result() for p, f in fut.items()}; real.result(); home = f"{ROOT}/Projects/{REAL}/02_masks"; free_total = 0; board = []
+        for v in ("top", "bottom", "left"):
+            lab = np.load(f"{home}/labels_{v}.npz")["labels"]; D = np.load(f"{home}/regions_{v}.npz"); E = D["edges"].astype(np.float32) / 255; b = np.zeros(lab.shape, bool); b[:, 1:] |= lab[:, 1:] != lab[:, :-1]; b[1:, :] |= lab[1:, :] != lab[:-1, :]; b &= ndi.binary_erosion(D["regions"] >= 0, iterations=4); free_total += int((b & ~ndi.binary_dilation(E > 0.12, iterations=3)).sum())
+        m = json.load(open(f"{home}/metrics.json"))["per_view"]; rows.append(dict(sigma=s, truth=tr, free_border_px=free_total, support_cal={k: v["support_cal"] for k, v in m.items()})); print(rows[-1], flush=True)
+        lab = np.load(f"{home}/labels_top.npz")["labels"]; rng = np.random.default_rng(3); pal = rng.integers(60, 230, (int(lab.max()) + 2, 3), dtype=np.uint8); pal[-1] = 40; Image.fromarray(pal[lab]).save(f"{out}/top_sigma_{s}.png")
+    json.dump(rows, open(f"{out}/free_sweep.json", "w"), indent=1)
+
+
+if __name__ == "__main__": main(sys.argv[1], [float(x) for x in sys.argv[2:]])

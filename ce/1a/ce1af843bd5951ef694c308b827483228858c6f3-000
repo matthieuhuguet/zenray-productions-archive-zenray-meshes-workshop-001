@@ -1,0 +1,29 @@
+"""1 November 2026 : M22, tournament of the seed and watershed settings against the truth, the template registered once per view. FR : tournoi des réglages de graines et de partage des eaux contre la vérité."""
+import sys, json, itertools, fnmatch
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C, MicroMasks as M, MicroTruth as T
+CACHE = {}
+
+
+def load(params):
+    if params in CACHE: return CACHE[params]
+    p, home = C.load(params); r = {k: p.get(k, v) for k, v in M.DEF.items()}; S = json.load(open(f"{home}/02_masks/shells.json")); atoms, defs = M.build_atoms(S, r); n = len(S["shells"]); atom_of = np.full(n + 1, -1)
+    for a in atoms: atom_of[a["shells"]] = a["id"]
+    hidden = np.array([a["hidden"] for a in atoms]); V = {}
+    for name in p["views"]:
+        raw = np.load(f"{home}/02_masks/raw_{name}.npz")["labels"]; D = np.load(f"{home}/02_masks/regions_{name}.npz"); R, E = D["regions"], D["edges"].astype(np.float32) / 255; rawA = atom_of[np.clip(raw, 0, None)] * (raw >= 0) - (raw < 0); inside = R >= 0; rA, _ = M.align(rawA, inside, r, p["scale"]); Tr = np.load(f"{home}/02_masks/truth_{name}.npz")["labels"]; Tr = atom_of[np.clip(Tr, 0, None)] * (Tr >= 0) - (Tr < 0); Tr = np.where((Tr >= 0) & hidden[np.clip(Tr, 0, None)], -1, Tr); V[name] = (rA, E, inside, Tr, R)
+    CACHE[params] = (p, r, hidden, V); return CACHE[params]
+def one(a):
+    params, over = a; p, r0, hidden, V = load(params); r = dict(r0); r.update(over); sc = p["scale"]; good = tot = 0; per = {}; bp = []; br = []; miss = 0
+    wide = [0, 0]
+    for name, (rA, E, ins, Tr, R) in V.items():
+        lab = M.snap(rA, E, ins, r, sc, hidden); ne = M.ndi.binary_dilation(E > r["edge_on"], iterations=int(round(p["support_tol_px"] * sc))); lab = M.clean_by_regions(lab, R, E, r, sc, ne); o, _ = T.score(lab, Tr, sc, direct=True); good += o["_good"]; tot += o["_total"]; bb = M.ndi.binary_dilation(T.bounds(Tr), iterations=2 * sc); m_ = (lab >= 0) & (Tr >= 0) & ~bb; wide[0] += int((lab[m_] == Tr[m_]).sum()); wide[1] += int(m_.sum()); per[name] = round(o["_good"] / max(o["_total"], 1), 4); bp.append(o["bd_precision"]); br.append(o["bd_recall"]); miss += len(o["parts_missed"])
+    return dict(over=over, accuracy=round(good / max(tot, 1), 5), acc2=round(wide[0] / max(wide[1], 1), 5), per=per, prec=round(float(np.mean(bp)), 3), rec=round(float(np.mean(br)), 3), missed=miss)
+
+
+if __name__ == "__main__":
+    params = sys.argv[1]; grid = json.loads(sys.argv[2]); keys = list(grid); combos = [dict(zip(keys, v)) for v in itertools.product(*[grid[k] for k in keys])]; load(params)
+    with ProcessPoolExecutor(max_workers=16) as ex: res = list(ex.map(one, [(params, c) for c in combos]))
+    for x in sorted(res, key=lambda x: -(x["acc2"] + x["accuracy"]))[:6]: print(x)

@@ -1,0 +1,49 @@
+"""1 November 2026 : M22 step 2b, the REFERENCE decides the boundaries : each panel of the sheet is cut into closed regions along its own drawn lines, no model involved : line and gradient map, flat zones opened to cut leaks through small gaps,
+watershed, then merging of the regions whose common boundary is weak. Writes 02_masks/regions_<view>.npz, regions_overlay.png.
+    python -I MicroRegions.py Projects/<id>/params.json        FR : la référence décide des bords : chaque case est coupée en régions fermées le long de ses propres traits."""
+import sys, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import filters, morphology, segmentation, measure, graph
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"
+sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
+DEF = dict(region_sigma=1.2, region_top_px=5, region_flat=0.10, region_open_px=1, region_min_px=40, region_merge=0.16, silhouette_band_px=3, silhouette_smooth_px=0.8)
+
+
+def edge_map(gray, inside, r):
+    """gradient and thin line responses, each normalised on its high quantile inside the object, the strongest kept"""
+    s = filters.gaussian(gray, r["region_sigma"]); g = filters.sobel(s); fp = morphology.disk(int(r["region_top_px"]))
+    dark = morphology.black_tophat(s, fp); light = morphology.white_tophat(s, fp); nz = lambda a: a / max(np.percentile(a[inside], 99.5), 1e-6)
+    return np.clip(np.maximum.reduce([nz(g), nz(dark), 0.7 * nz(light)]), 0, 1)
+
+
+def regions(rgb, mask, sc, r):
+    H, W = mask.shape[0] * sc, mask.shape[1] * sc; g = np.asarray(Image.fromarray(rgb).convert("L").resize((W, H), Image.BICUBIC)).astype(np.float32) / 255
+    inside = np.asarray(Image.fromarray((mask * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)) > 127; E = edge_map(g, inside, r)
+    # 1 November 2026 : the sheet mask is jagged and catches ground shadow : its contour is re-found on the image between a sure inside and a sure outside band, then smoothed
+    if r["silhouette_band_px"] > 0:
+        b = int(r["silhouette_band_px"] * sc); dist_in = ndi.distance_transform_edt(inside); dist_out = ndi.distance_transform_edt(~inside); mk = np.zeros((H, W), np.int32); mk[dist_in > b] = 1; mk[dist_out > b] = 2
+        ws = segmentation.watershed(filters.sobel(filters.gaussian(g, r["region_sigma"])), mk); inside = filters.gaussian((ws == 1).astype(np.float32), r["silhouette_smooth_px"] * sc) > 0.5; E = edge_map(g, inside, r)
+    flat = ndi.binary_opening((E < r["region_flat"]) & inside, morphology.disk(int(r["region_open_px"]))); seeds = measure.label(flat, connectivity=1)
+    sizes = np.bincount(seeds.ravel()); seeds[sizes[seeds] < r["region_min_px"]] = 0; seeds[(~inside) & (seeds == 0)] = 0; seeds, _, _ = segmentation.relabel_sequential(seeds)
+    L = segmentation.watershed(E, seeds, mask=inside)
+    rag = graph.rag_boundary(L, E)                    # merge weak boundaries, background label 0 stays out
+    if 0 in rag: rag.remove_node(0)
+    def weight(g_, src, dst, n):
+        d = g_[dst].get(n, {"count": 0, "weight": 0.0}); e = g_[src].get(n, {"count": 0, "weight": 0.0}); c = d["count"] + e["count"]
+        return {"count": c, "weight": (d["count"] * d["weight"] + e["count"] * e["weight"]) / max(c, 1)}
+    def merge(g_, src, dst): pass
+    L2 = graph.merge_hierarchical(L, rag, r["region_merge"], False, True, merge, weight); L2, _, _ = segmentation.relabel_sequential(L2 + 1); L2 = L2 * inside   # 0 outside the object
+    return L2 - 1, E, inside          # -1 outside
+
+
+def main(params):
+    p, home = C.load(params); sc = p["scale"]; r = {k: p.get(k, v) for k, v in DEF.items()}; tiles = []
+    for name in p["views"]:
+        rgb, mask = C.panel_rgb(p, name), C.panel_mask(p, name); L, E, inside = regions(rgb, mask, sc, r)
+        np.savez_compressed(f"{home}/02_masks/regions_{name}.npz", regions=L.astype(np.int32), edges=(E * 255).astype(np.uint8)); tiles.append(C.overlay(rgb, L, sc, alpha=0.5)); print(name, "regions", L.max() + 1, "covered", round(float((L >= 0).sum() / inside.sum()), 4))
+    C.save_board(tiles, f"{home}/02_masks/regions_overlay.png")
+
+
+if __name__ == "__main__": main(sys.argv[1])

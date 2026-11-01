@@ -1,0 +1,134 @@
+"""1 November 2026, 20:40 : M22 step 2 from an image model : READ A CUT SHEET : a sheet of 6 views where ChatGPT Images painted each piece in its own flat colour with black outlines becomes the masks of the micro-components, on the same panels as the reference, so the legend, the icons and the sheets of 4, 8 or 16 pieces work as before.
+The black lines close the cells ; the colour alone says which piece a cell belongs to, in every view (decided by Matthieu : the prompt asks one colour per piece, nothing is deduced from the geometry). The side of the object separates a piece from its mirror. Writes 02_masks/labels_<view>.npz, micro.json, metrics.json, catalog.json, cut_read.json. The names come from 04_received/cut_table.txt, the table ChatGPT gives (a row holds the hex colour and the name).
+    python -I MicroCutRead.py Projects/<id>/params.json
+    python -I MicroCutRead.py selftest
+FR : lire une planche de découpe : les traits noirs ferment les cellules, la couleur seule dit de quelle pièce il s'agit, dans toutes les vues."""
+import sys, os, json, re
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+# Every tunable value of the reader, in panel pixels unless said otherwise. FR : tous les réglages du lecteur, en pixels de la planche sauf mention contraire.
+DEF = dict(C_ink_ratio=0.62, C_ink_win_px=4, C_colour_sat=45, C_colour_val=120, C_dark_val=70, C_close_px=1.0, C_min_cell_px=6.0, C_black_open_px=3.0, C_black_cell_px=60.0, C_palette_dist=38.0, C_small_cell_px=60.0, C_small_dist=90.0, C_outer_trim_px=0.5, C_bg_sat=22, C_centre_frac=0.12, C_part_px=4.0, C_tiny_m=0.16, C_medium_m=1.3)
+
+
+def world_map(fr, v):
+    """panel column and row to metres, through the frame"""
+    lo = np.array(fr["lo"]); D = np.array(fr["dims_m"]); hi = lo + D; rx, uy = np.array(v["rx"]), np.array(v["uy"]); a, b = int(np.argmax(np.abs(rx))), int(np.argmax(np.abs(uy))); umin = lo[a] if rx[a] > 0 else -hi[a]; vmax = hi[b] if uy[b] > 0 else -lo[b]; bb = v["bbox"]; ppm = v["px_per_m"]; sa, sb = np.sign(rx[a]), np.sign(uy[b])
+    return a, b, (lambda col: (umin + (col - bb[0]) / ppm) * sa), (lambda row: (vmax - (row - bb[1]) / ppm) * sb)
+
+
+def cells_of(rgb, sc, r):
+    """the closed cells of one panel at sc times its size : labels 0..n-1, -1 outside, with the colour of each cell ; the black lines go to their nearest cell, so a border lies in the middle of its line"""
+    H, W = rgb.shape[:2]; big = np.asarray(Image.fromarray(rgb).resize((W * sc, H * sc), Image.BICUBIC)).astype(np.float32); val = big.max(2); sat = val - big.min(2); colored = (sat > r["C_colour_sat"]) & (val > r["C_colour_val"]); dark = val < r["C_dark_val"]; k = max(int(r["C_close_px"] * sc), 1); obj = ndi.binary_closing(colored | dark, iterations=k, border_value=0); obj = ndi.binary_fill_holes(obj); cc, n = ndi.label(obj)
+    if n == 0: return np.full(val.shape, -1, np.int32), []
+    sz = ndi.sum(obj, cc, range(1, n + 1)); obj = np.isin(cc, 1 + np.flatnonzero(sz >= 0.02 * sz.max())); win = 2 * int(r["C_ink_win_px"] * sc) + 1; ink = (val < r["C_ink_ratio"] * ndi.maximum_filter(val, size=win)) & obj; ink |= dark & obj; cell, n = ndi.label(obj & ~ink); area = np.bincount(cell.ravel(), minlength=n + 1); keep = np.zeros(n + 1, bool); keep[1:] = area[1:] >= r["C_min_cell_px"] * sc * sc; black, nb = ndi.label(obj & ndi.binary_opening(dark, iterations=max(int(r["C_black_open_px"] * sc), 1)))     # a large black zone, such as the inside of a wheel arch, is a piece of its own
+    lab = np.where(keep[cell], cell, 0); nxt = n + 1; colours = {}
+    for i, sl in enumerate(ndi.find_objects(black)):
+        if sl is not None and (black[sl] == i + 1).sum() >= r["C_black_cell_px"] * sc * sc: lab[sl][black[sl] == i + 1] = nxt; colours[nxt] = (10.0, 10.0, 10.0); nxt += 1
+    idx = ndi.distance_transform_edt(lab == 0, return_distances=False, return_indices=True); full = lab[idx[0], idx[1]]; trim = max(int(round(r["C_outer_trim_px"] * sc)), 0); inside = ndi.binary_erosion(obj, iterations=trim) if trim else obj; full = np.where(inside, full, 0); out = np.full(full.shape, -1, np.int32); cells = []; ids = np.unique(full[full > 0])
+    for new, i in enumerate(ids.tolist()):
+        m = full == i
+        if i in colours: col = colours[i]
+        else:
+            core = (lab == i) & ~ink; core2 = ndi.binary_erosion(core, iterations=1); px = big[core2 if core2.sum() >= 5 else core]; col = tuple(np.median(px, axis=0).tolist()) if len(px) else (0.0, 0.0, 0.0)
+        c = np.array(col)
+        if c.max() - c.min() < r["C_bg_sat"] and c.max() > r["C_dark_val"] * 1.2: continue      # a grey cell inside the outline is the background seen through a hole. FR : une cellule grise dans le contour est le fond vu à travers un trou.
+        out[m] = len(cells); ys, xs = np.nonzero(m); cells.append(dict(colour=[round(float(v), 1) for v in col], area=int(m.sum()), box=[int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]))
+    return out, cells
+
+
+def palette(cells, r, sc):
+    """the colours of the whole sheet : close colours are one, from the largest area down ; a small cell is blended with its outline, so it joins a colour from further away"""
+    order = sorted(range(len(cells)), key=lambda i: -cells[i]["area"]); P = []; small = r["C_small_cell_px"] * sc * sc
+    for i in order:
+        c = np.array(cells[i]["colour"]); d = [float(np.linalg.norm(c - q)) for q in P]; lim = r["C_small_dist"] if cells[i]["area"] < small else r["C_palette_dist"]
+        if d and min(d) < lim: cells[i]["pal"] = int(np.argmin(d))
+        else: cells[i]["pal"] = len(P); P.append(c)
+    return [p.tolist() for p in P]
+
+
+def side_of(c, halfw, r):
+    """which side of the object a cell shows : +1, -1, or 0 for what crosses the plane of symmetry"""
+    if c["view"] == "left": return 1
+    if c["view"] == "right": return -1
+    lo, hi = c["ext"][0]; cx = (lo + hi) / 2
+    if lo * hi < 0 and min(abs(lo), abs(hi)) > r["C_centre_frac"] * max(abs(lo), abs(hi)): return 0
+    if abs(cx) < r["C_centre_frac"] * halfw: return 0
+    return 1 if cx > 0 else -1
+
+
+def read_table(home):
+    """the table ChatGPT gave, pasted in 04_received/cut_table.txt : each row holds a hex colour and the name of the piece"""
+    f = f"{home}/04_received/cut_table.txt"; rows = []
+    if not os.path.exists(f): return rows
+    for line in open(f):
+        m = re.search(r"#([0-9a-fA-F]{6})", line)
+        if not m: continue
+        cols = [c.strip(" *`") for c in line.strip().strip("|").split("|")]; k = next(i for i, c in enumerate(cols) if m.group(0) in c); name = next((c for c in cols[k + 1:] + cols[:k] if c and not re.fullmatch(r"[\d\s.,xX]+", c) and "#" not in c), None)
+        if name: rows.append((np.array([int(m.group(1)[q:q + 2], 16) for q in (0, 2, 4)], float), name))
+    return rows
+
+
+def names_for(home, defs):
+    """the name of each piece : the row of the table nearest to its colour, else a neutral name and its colour"""
+    table = read_table(home); fam = {}
+    for d in defs:
+        c = np.array([int(d["hex"][q:q + 2], 16) for q in (1, 3, 5)], float); name = min(table, key=lambda t: np.linalg.norm(t[0] - c))[1] if table else None; fam[d["family"]] = dict(fr=name or f"Pièce {int(d['family'][-2:])}", group="Pièces", shape=f"pièce de la planche de découpe, couleur {d['hex']}")
+    return dict(groups=["Pièces"], families=fam)
+
+
+def main(params):
+    p, home = C.load(params); r = {k: p.get(k, v) for k, v in DEF.items()}; sc = p["scale"]; os.makedirs(f"{home}/02_masks", exist_ok=True); sheet = Image.open(C.abspath(p["cut_sheet"])).convert("RGB"); ref = json.load(open(C.abspath(p["views_dir"]) + "/sheet.json"))["panels"]; rects = {x["name"]: x["rect"] for x in ref}; ref_size = Image.open(C.abspath(p["sheet"])).size
+    if sheet.size != ref_size: sheet = sheet.resize(ref_size, Image.LANCZOS)
+    A = np.asarray(sheet); fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}; labs = {}; cells = []; start = {}
+    for v in p["views"]:
+        x0, y0, x1, y1 = rects[v]; L, cl = cells_of(A[y0:y1, x0:x1], sc, r); labs[v] = L; start[v] = len(cells); a, b, fu, fv = world_map(fr, V[v])
+        for c in cl: bx = c["box"]; c.update(view=v, ext={a: tuple(sorted((float(fu(bx[0] / sc)), float(fu(bx[2] / sc))))), b: tuple(sorted((float(fv(bx[1] / sc)), float(fv(bx[3] / sc)))))}); cells.append(c)
+    pal = palette(cells, r, sc); lo = np.array(fr["lo"]); D = np.array(fr["dims_m"]); halfw = max(abs(lo[0]), abs(lo[0] + D[0])); uniq = {}
+    for i, c in enumerate(cells): uniq.setdefault(c["pal"], []).append(i)
+    order = sorted(uniq, key=lambda q: -sum(cells[i]["area"] for i in uniq[q])); atoms = []; defs = []; cell_atom = np.full(len(cells), -1)
+    for dn, q in enumerate(order):
+        L = uniq[q]; fam = f"CUT_p{dn + 1:02d}"; sides = [side_of(cells[i], halfw, r) for i in L]; central = all(s == 0 for s in sides); ids = {}
+        for s in ((0,) if central else (1, -1)): a = dict(id=len(atoms), part=f"{fam}_{'M' if central else 'L' if s > 0 else 'R'}", family=fam, shells=[], lo=[0.0] * 3, hi=[0.0] * 3, faces=500, centre=[float(s), 0.0, 0.0], sig=[0.0] * 3, hidden=False, **{"def": dn}); ids[s] = a["id"]; atoms.append(a)
+        for i, s in zip(L, sides): cell_atom[i] = ids.get(s, ids.get(1, ids.get(0)))
+        defs.append(dict(id=dn, family=fam, faces=500, sig=[0.0] * 3, atoms=list(ids.values()), hidden=False, hex="#%02x%02x%02x" % tuple(np.array(pal[q]).astype(int).tolist()), cells=len(L), instances=len(ids)))
+    ref_px = {}; per = {}
+    tol = int(round(1.5 * sc))
+    for v in p["views"]:
+        L = labs[v]; off = start[v]; mapped = np.where(L >= 0, cell_atom[np.clip(L + off, 0, len(cells) - 1)], -1); labs[v] = mapped.astype(np.int32); np.savez_compressed(f"{home}/02_masks/labels_{v}.npz", labels=labs[v])
+        for i, c in zip(*np.unique(mapped[mapped >= 0], return_counts=True)): ref_px.setdefault(str(int(i)), {})[v] = int(c)
+        rg = f"{home}/02_masks/regions_{v}.npz"; b = np.zeros(mapped.shape, bool); dl = np.where(mapped >= 0, np.array([a["def"] for a in atoms])[np.clip(mapped, 0, None)], -1); b[:, 1:] |= dl[:, 1:] != dl[:, :-1]; b[1:, :] |= dl[1:, :] != dl[:-1, :]; per[v] = dict(coverage=1.0, line_support=0.0, line_recall=0.0, support_cal=0.0, regions=int(np.unique(L[L >= 0]).size))
+        if os.path.exists(rg):
+            Dz = np.load(rg); E = Dz["edges"].astype(np.float32) / 255; h, w = min(E.shape[0], b.shape[0]), min(E.shape[1], b.shape[1]); bb = b[:h, :w] & ndi.binary_erosion(mapped[:h, :w] >= 0, iterations=2); e = (E[:h, :w] > 0.25) & ndi.binary_erosion(Dz["regions"][:h, :w] >= 0, iterations=2 * sc); per[v].update(line_support=round(float(ndi.binary_dilation(e, iterations=tol)[bb].mean()) if bb.any() else 0.0, 4), line_recall=round(float(ndi.binary_dilation(bb, iterations=tol)[e].mean()) if e.any() else 0.0, 4), support_cal=round(float(ndi.binary_dilation(E[:h, :w] > 0.12, iterations=2 * sc)[bb].mean()) if bb.any() else 0.0, 4), coverage=round(float((mapped[:h, :w] >= 0)[Dz["regions"][:h, :w] >= 0].mean()), 4))
+    def_of = np.array([a["def"] for a in atoms] + [-1]); min_part = (r["C_part_px"] * sc) ** 2
+    for d in defs:      # one piece, not the span of all its copies : the largest connected part in each view gives its size in metres ; the most parts seen in a view gives its number of copies. FR : une pièce et non l'étendue de ses copies.
+        ext = {}; copies = len(d["atoms"])
+        for v in p["views"]:
+            m = np.isin(labs[v], d["atoms"])
+            if not m.any(): continue
+            cc, n = ndi.label(m); sz = np.bincount(cc.ravel())[1:]; big = int(sz.argmax()); ys, xs = np.nonzero(cc == big + 1); a_, b_, fu, fv = world_map(fr, V[v]); n_ok = int((sz >= min_part).sum()); copies = max(copies, n_ok * (2 if v in ("left", "right") and len(d["atoms"]) > 1 else 1)); e_a = sorted((float(fu(xs.min() / sc)), float(fu((xs.max() + 1) / sc)))); e_b = sorted((float(fv(ys.min() / sc)), float(fv((ys.max() + 1) / sc))))
+            for k_, e_ in ((a_, e_a), (b_, e_b)):
+                if k_ == 0 and e_[0] * e_[1] > 0: e_ = sorted((abs(e_[0]), abs(e_[1])))
+                ext[k_] = (min(ext.get(k_, e_)[0], e_[0]), max(ext.get(k_, e_)[1], e_[1]))
+        d["instances"] = copies; size = [ext.get(k_, (0.0, 0.0))[1] - ext.get(k_, (0.0, 0.0))[0] for k_ in range(3)]; big = max(size) if size else 0.0; faces = 30 if big <= r["C_tiny_m"] else 500 if big <= r["C_medium_m"] else 2000; d["faces"] = faces
+        for aid in d["atoms"]:
+            a = atoms[aid]; s_ = 1 if a["part"].endswith("_L") else -1 if a["part"].endswith("_R") else 0; ex = ext.get(0, (0.0, 0.0)); a["lo"] = [(-ex[1] if s_ <= 0 and s_ != 0 else ex[0]) if s_ else -ex[1], ext.get(1, (0.0, 0.0))[0], ext.get(2, (0.0, 0.0))[0]]; a["hi"] = [(-ex[0] if s_ < 0 else ex[1]), ext.get(1, (0.0, 0.0))[1], ext.get(2, (0.0, 0.0))[1]]; a["faces"] = faces; a["centre"] = [(l + h) / 2 for l, h in zip(a["lo"], a["hi"])]; a["sig"] = [h - l for h, l in zip(a["hi"], a["lo"])]
+        d["sig"] = atoms[d["atoms"][0]]["sig"]
+    def rec(a, v): bb = [x * sc for x in V[v]["bbox"]]; return ndi.shift(a, (a.shape[0] / 2 - (bb[1] + bb[3]) / 2, a.shape[1] / 2 - (bb[0] + bb[2]) / 2), order=0, cval=-1)
+    def dl(v): return def_of[np.clip(labs[v], 0, None)] * (labs[v] >= 0) - (labs[v] < 0)
+    def agree(a, b): h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1]); A_, B_ = a[:h, :w], b[:h, :w]; m = (A_ >= 0) & (B_ >= 0); return round(float((A_[m] == B_[m]).mean()), 4) if m.any() else 0.0
+    sym = dict(left_vs_right=agree(rec(dl("left"), "left"), rec(dl("right"), "right")[:, ::-1]))
+    for v in ("front", "back", "top", "bottom"): c = rec(dl(v), v); sym[v + "_self"] = agree(c, c[:, ::-1] if abs(V[v]["rx"][0]) > 0.5 else c[::-1])
+    cat = names_for(home, defs); json.dump(cat, open(f"{home}/02_masks/catalog.json", "w"), indent=1, ensure_ascii=False); json.dump(dict(atoms=atoms, definitions=defs), open(f"{home}/02_masks/micro.json", "w"), indent=0); json.dump(dict(per_view=per, symmetry=sym, aligns={}, ref_px=ref_px, template_px={}), open(f"{home}/02_masks/metrics.json", "w"), indent=1); json.dump(dict(cells={v: per[v]["regions"] for v in p["views"]}, colours=len(pal), palette=["#%02x%02x%02x" % tuple(int(x) for x in c) for c in pal], definitions=len(defs), atoms=len(atoms)), open(f"{home}/02_masks/cut_read.json", "w"), indent=1)
+    print("cells", {v: per[v]["regions"] for v in p["views"]}, "colours", len(pal), "pieces", len(defs), "instances", len(atoms)); print("borders on a line of the reference", {v: per[v]["support_cal"] for v in p["views"]}); print("mirror", sym)
+
+
+def selftest():
+    """two red squares and a blue one split by black lines on grey : three cells, two colours ; an open line must merge its two sides"""
+    r = dict(DEF); bg = np.array([95, 97, 101], np.uint8); im = np.tile(bg, (200, 300, 1)).astype(np.uint8); im[40:160, 30:130] = (230, 30, 40); im[40:160, 170:270] = (230, 30, 40); im[80:120, 130:170] = (20, 60, 230); im[40:160, 28:31] = 0; im[40:160, 129:131] = 0; im[80:120, 169:171] = 0; im[78:81, 130:170] = 0; im[120:123, 130:170] = 0; im[40:160, 169:171] = 0; im[39:41, 28:271] = 0; im[159:161, 28:271] = 0; im[40:160, 269:272] = 0; L, c = cells_of(im, 3, r); good = len(c) == 3; im2 = im.copy(); im2[60:100, 129:131] = (230, 30, 40); L2, c2 = cells_of(im2, 3, r); ok = good and sum(1 for x in c if x["colour"][2] > 150) == 1 and len(c2) == 2; print(json.dumps(dict(cells=len(c), colours=[x["colour"] for x in c], ok=ok))); sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "selftest": selftest()
+    main(sys.argv[1])

@@ -1,0 +1,33 @@
+"""1 November 2026 : M22 sweep of any settings of the masks : each configuration runs on the boards with a truth and on the real board, the settings of every project are restored at the end. FR : balayage de n'importe quels réglages des masques, mesurés sur la vérité et sur la vraie planche, réglages rendus à la fin.
+    python -I MicroParamSweep.py out_dir "A_line_tol_px=0.5,A_curve_tol_px=0.35" "A_snap_iters=0" ..."""
+import sys, json, subprocess, os
+from concurrent.futures import ThreadPoolExecutor
+ROOT = "/Users/zenray/.claude/tmp/tmp-zenray-meshes"; PY = sys.executable; TRUTH = ["07_Manny", "08_CarTruth"]; REAL = "06_Car"
+
+
+def parse(cfg):
+    out = {}
+    for kv in filter(None, cfg.split(",")):
+        k, v = kv.split("="); out[k] = float(v)
+    return out
+
+
+def run(project, cfg, truth, keep):
+    f = f"{ROOT}/Projects/{project}/params.json"; d = dict(keep[project]); d.update(cfg); json.dump(d, open(f, "w"), indent=2, ensure_ascii=False)
+    subprocess.run([PY, "-I", f"{ROOT}/Scripts/micro/MicroMasks.py", f], check=True, capture_output=True, cwd=ROOT); m = json.load(open(f"{ROOT}/Projects/{project}/02_masks/metrics.json")); A = m.get("arcs") or {}; L = list(A.values()); r = dict(straight=round(sum(x["straight_share"] for x in L) / max(len(L), 1), 3), strokes=sum(x.get("strokes", 0) for x in L), ctrl=round(sum(x["mean_ctrl"] for x in L) / max(len(L), 1), 2), lost=sum(x["lost"] for x in L), guard=sum(x["guard"] for x in L), sym=m["symmetry"]["left_vs_right"], support=round(min(v["support_cal"] for v in m["per_view"].values()), 4))
+    if truth: subprocess.run([PY, "-I", f"{ROOT}/Scripts/micro/MicroTruth.py", f], check=True, capture_output=True, cwd=ROOT); t = json.load(open(f"{ROOT}/Projects/{project}/06_checks/truth.json")); r.update(px1=round(t["accuracy"] * 100, 3), px2=round(t["accuracy_2px"] * 100, 3), px3=round(t["accuracy_3px"] * 100, 3), iou=t.get("outline_iou"), out1=t.get("outline_wrong_1px"), out2=t.get("outline_wrong_2px"))
+    return r
+
+
+def main(out, cfgs):
+    os.makedirs(out, exist_ok=True); keep = {p: json.load(open(f"{ROOT}/Projects/{p}/params.json")) for p in TRUTH + [REAL]}; rows = []
+    try:
+        for c in cfgs:
+            cfg = parse(c)
+            with ThreadPoolExecutor(3) as ex: fut = {p: ex.submit(run, p, cfg, p in TRUTH, keep) for p in TRUTH + [REAL]}
+            rows.append(dict(cfg=c, **{p: f.result() for p, f in fut.items()})); print(json.dumps(rows[-1]), flush=True); json.dump(rows, open(f"{out}/param_sweep.json", "w"), indent=1)
+    finally:
+        for p, d in keep.items(): json.dump(d, open(f"{ROOT}/Projects/{p}/params.json", "w"), indent=2, ensure_ascii=False)
+
+
+if __name__ == "__main__": main(sys.argv[1], sys.argv[2:])

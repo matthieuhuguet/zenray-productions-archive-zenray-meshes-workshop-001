@@ -1,0 +1,74 @@
+"""1 November 2026, 21:45 : M22, start of the value chain of ZenRay Meshes : the PREVIEW COMPONENTS LOWRES : what the cut sheet should look like, drawn from the best version of the masks exactly as the legend draws them, with one colour per component ; the components with speaking names and a natural description ; and the prompt that asks ChatGPT Images for the perfect cut sheet from the 6 views alone. The preview is only there to check the components, it is not given to the image model. Writes 03_sheets/preview_components_lowres.png, cut_reference.png, cut_components.json, cut_prompt.txt.
+Settings in params.json : cut_object, cut_alpha. Names : 03_sheets/component_names.json, {"<mc>": ["name", "description"]} ; two pieces with the same name are one component.
+    python -I MicroCutPrompt.py Projects/<id>/params.json
+FR : début de la chaîne de valeur : la preview des composants, leur détail en noms parlants, et le prompt qui part de la seule planche 6 vues."""
+import sys, os, json, shutil, colorsys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from skimage.color import rgb2lab
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+LABEL_MIN_PX = 8      # 1 November 2026 : a piece must leave this radius free to carry its number in a view. FR : rayon libre minimal pour porter le numéro dans une vue.
+ALPHA = 0.5; HUES = 96; SHADES = ((0.85, 0.95), (0.85, 0.72), (0.55, 0.95), (0.65, 0.6)); LOWRES_W = 1800; FONT_NUM = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"
+PROMPT = """L'image jointe est une planche technique : 6 vues orthographiques de {cut_object} (face, arrière, gauche, droite, dessus, dessous), avec un cube d'échelle.
+
+Transforme-la en PLANCHE DE DÉCOUPE DES COMPOSANTS. Garde exactement la même image : même format, même cadrage, chaque vue à la même place et à la même taille, mêmes proportions, même fond gris, même cube, mêmes reliefs et mêmes ombrages. Ne redessine pas l'objet, ne change aucune forme, n'ajoute aucun détail.
+
+Découpe l'objet comme le ferait un modeleur 3D qui doit refaire chaque pièce séparément, selon la liste ci-dessous. Les coupes suivent exactement les joints, les arêtes et les traits visibles. Ne coupe jamais une surface continue sans joint visible. Ne réunis jamais deux pièces séparées par un joint.
+
+Pose sur chaque composant un masque semi-transparent de la couleur qui lui est attribuée, à {percent} % d'opacité, de sorte que le relief reste visible dessous, avec un fin contour noir, net et régulier. Bords parfaitement droits quand la pièce est droite, courbes lisses quand elle est courbe, sans zigzag ni bavure. N'invente aucune couleur et ne donne jamais la même couleur à deux composants différents.
+
+Un même composant garde la même couleur dans toutes les vues. Un composant et son symétrique gauche-droite ont la même couleur. Les composants identiques répétés ont la même couleur.
+
+Aucun texte, aucun numéro. Toute la surface de l'objet est couverte. Seuls le fond et le cube restent gris, sans masque.
+
+Composants et couleurs :
+{table}"""
+
+
+def palette(n):
+    """n colours in the spirit of the legend, as far from each other as possible by eye (Lab)"""
+    rgb = np.array([colorsys.hsv_to_rgb(h / HUES, s, v) for h in range(HUES) for s, v in SHADES]); lab = rgb2lab(rgb[None])[0]; pick = [0]; d = np.linalg.norm(lab - lab[0], axis=1)
+    for _ in range(n - 1): k = int(d.argmax()); pick.append(k); d = np.minimum(d, np.linalg.norm(lab - lab[k], axis=1))
+    return (rgb[pick] * 255).round().astype(int), lab[pick]
+
+
+def main(params):
+    p, home = C.load(params); alpha = float(p.get("cut_alpha", ALPHA)); sc = p["scale"]; mc = json.load(open(f"{home}/02_masks/mc.json"))["mc"]; atoms = json.load(open(f"{home}/02_masks/micro.json"))["atoms"]; nf = f"{home}/03_sheets/component_names.json"; given = json.load(open(nf)) if os.path.exists(nf) else {}; comps = []; by_name = {}; piece_of = np.full(len(atoms) + 1, -1)
+    for m in mc:
+        g = given.get(str(m["mc"])); name = g[0] if g else m["fr"]; desc = g[1] if g and len(g) > 1 else m.get("shape", "")
+        if name not in by_name: by_name[name] = len(comps); comps.append(dict(name=name, description=desc, copies=m["instances"], symmetric=len(m["atoms"]) > 1, pieces=[m["mc"]]))
+        else: c = comps[by_name[name]]; c["copies"] = max(c["copies"], m["instances"]); c["symmetric"] = c["symmetric"] or len(m["atoms"]) > 1; c["pieces"].append(m["mc"]); c["description"] = c["description"] or desc
+        piece_of[m["atoms"]] = by_name[name]
+    n = len(comps); labs = {v: np.load(f"{home}/02_masks/labels_{v}.npz")["labels"] for v in p["views"]}; maps = {v: np.where(L >= 0, piece_of[np.clip(L, 0, None)], -1) for v, L in labs.items()}; adj = np.zeros((n, n), bool); area = np.zeros(n)
+    for M in maps.values():
+        for a, b in ((M[:, 1:], M[:, :-1]), (M[1:, :], M[:-1, :])):
+            k = (a != b) & (a >= 0) & (b >= 0); adj[a[k], b[k]] = True; adj[b[k], a[k]] = True
+        ids, cnt = np.unique(M[M >= 0], return_counts=True); area[ids] += cnt
+    rgb, lab = palette(n); free = list(range(n)); colour = np.full(n, -1)
+    for k in np.argsort(-area):      # the largest components first, each takes the free colour furthest from its neighbours. FR : les plus grands d'abord, chacun prend la couleur libre la plus éloignée de ses voisins.
+        done = [colour[j] for j in np.flatnonzero(adj[k]) if colour[j] >= 0]; score = [min((float(np.linalg.norm(lab[c] - lab[d])) for d in done), default=0.0) for c in free]; colour[k] = free.pop(int(np.argmax(score)))
+    for k, c in enumerate(comps): c.update(n=k + 1, hex="#%02x%02x%02x" % tuple(rgb[colour[k]].tolist()))
+    json.dump(dict(alpha=alpha, components=comps), open(f"{home}/03_sheets/cut_components.json", "w"), indent=1, ensure_ascii=False); col = rgb[colour].astype(np.float32); fn = ImageFont.truetype(FONT_NUM, 26); tiles = []
+    spots = {v: {} for v in p["views"]}; best = {}
+    for v in p["views"]:      # where each number goes : in every view where the piece can carry it, and once anyway for a piece too thin everywhere, so that every component can be validated. FR : où va chaque numéro ; une pièce trop fine partout le porte quand même une fois, pour pouvoir la valider.
+        M = maps[v]
+        for i in np.unique(M[M >= 0]):
+            dt = ndi.distance_transform_edt(M == i); y, x = np.unravel_index(dt.argmax(), dt.shape); r = float(dt.max()); i = int(i)
+            if r >= LABEL_MIN_PX: spots[v][i] = (x, y)
+            if r > best.get(i, (0.0,))[0]: best[i] = (r, v, x, y)
+    roomy = {i for s_ in spots.values() for i in s_}
+    for i, (r, v, x, y) in best.items():
+        if i not in roomy: spots[v][i] = (x, y)
+    for k, c in enumerate(comps): c["visible"] = k in best
+    json.dump(dict(alpha=alpha, components=comps), open(f"{home}/03_sheets/cut_components.json", "w"), indent=1, ensure_ascii=False); print("too thin, numbered once", sorted(i + 1 for i in best if i not in roomy), "absent from the 6 views", [c["n"] for c in comps if not c["visible"]])
+    for v in p["views"]:      # exactly the rendering of the legend : the reference enlarged, soft colours, thin dark borders, the numbers. FR : exactement le rendu de la légende.
+        M = maps[v]; H, W = M.shape; base = np.asarray(Image.fromarray(C.panel_rgb(p, v)).resize((W, H), Image.BICUBIC)).astype(np.float32); m = M >= 0; out = base.copy(); out[m] = base[m] * (1 - alpha) + col[M[m]] * alpha; e = np.zeros(M.shape, bool); e[:, 1:] |= M[:, 1:] != M[:, :-1]; e[1:, :] |= M[1:, :] != M[:-1, :]; out[e] = out[e] * 0.25; img = Image.fromarray(out.astype(np.uint8)); d = ImageDraw.Draw(img)
+        for i, (x, y) in spots[v].items():
+            t = str(i + 1); bb = d.textbbox((0, 0), t, font=fn); w_, h_ = bb[2] - bb[0], bb[3] - bb[1]; d.rectangle((x - w_ / 2 - 4, y - h_ / 2 - 5, x + w_ / 2 + 4, y + h_ / 2 + 5), fill=(255, 255, 255)); d.text((x - w_ / 2, y - h_ / 2 - bb[1]), t, font=fn, fill=(0, 0, 0))
+        tiles.append(np.asarray(img))
+    f = f"{home}/03_sheets/preview_components_lowres.png"; C.save_board(tiles, f); im = Image.open(f); im.resize((LOWRES_W, int(im.size[1] * LOWRES_W / im.size[0])), Image.LANCZOS).save(f); shutil.copyfile(C.abspath(p["sheet"]), f"{home}/03_sheets/cut_reference.png")
+    lines = "\n".join(f"{c['n']}. {c['name']}{', ' + c['description'] if c['description'] else ''}{', x' + str(c['copies']) if c['copies'] > 1 else ''} : {c['hex']}" for c in comps); open(f"{home}/03_sheets/cut_prompt.txt", "w").write(PROMPT.format(cut_object=p["cut_object"], percent=int(round(alpha * 100)), table=lines)); L = lab[colour]; D = np.linalg.norm(L[:, None] - L[None], axis=2); np.fill_diagonal(D, 1e9); print("components", n, "closest two colours (delta E)", round(float(D.min()), 1), "closest two neighbours", round(float(D[adj].min()), 1) if adj.any() else None)
+
+
+if __name__ == "__main__": main(sys.argv[1])

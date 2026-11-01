@@ -1,0 +1,322 @@
+"""1 November 2026, 18:00 : M22 FINISH OF THE MASKS : the borders become drawn lines, the three gestures of ZenRay Lines (CarCreaseStraighten.py, ZrlCreaseSnap.py) in two dimensions. Every border between two labels becomes a chain between junctions ; it is cut at its corners ; every piece is a straight line, else a cubic B-spline with as few control points as possible ; every piece is moved onto the line of the image inside a narrow corridor, and junctions and corners go where their lines cross. The labels are then drawn again from those curves, and the curves are kept as code (arcs_<view>.json : control points in panel pixels), never as an image.
+FR : finition des masques : chaque bord entre deux pièces devient un trait dessiné, droit sinon courbe à peu de points de contrôle, calé sur le trait de l'image dans un couloir étroit, puis les masques sont redessinés depuis ces courbes.
+    Used by MicroMasks.py when A_on is 1 in params.json. Self test : python -I MicroArcs.py selftest"""
+import sys, json
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+from scipy import ndimage as ndi
+from scipy.interpolate import make_lsq_spline
+from scipy.spatial import cKDTree
+from skimage.draw import line as draw_line
+# Every tunable value, in panel pixels unless said otherwise. FR : tous les réglages, en pixels de la planche sauf mention contraire.
+DEF = dict(A_on=0, A_island_px=4.0, A_stroke_deg=14.0, A_tangent_px=6.0, A_corner_deg=32.0, A_corner_win_px=3.0, A_line_tol_px=1.0, A_curve_tol_px=0.75, A_free_tol_px=1.0, A_free_share=0.3, A_snap_on=0, A_snap_px=1.5, A_snap_min=0.25, A_snap_share=0.6, A_snap_agree=0.7, A_snap_spread_px=0.5, A_max_move_px=3.0, A_min_len_px=2.0, A_junction_move_px=2.0, A_junction_reg=0.05, A_max_ctrl=8, A_lost_ratio=0.6, A_workers=6)
+
+
+def trace(lab):
+    """the borders of a label image as chains of crack midpoints between junctions, in lattice coordinates (pixel i covers i to i + 1)"""
+    H, W = lab.shape; P = np.pad(lab, 1, constant_values=-1); K = W + 3; adj = {}
+
+    def link(a, b): adj.setdefault(a, []).append(b); adj.setdefault(b, []).append(a)
+    ys, xs = np.nonzero(P[:, 1:] != P[:, :-1])
+    for y, x in zip(ys.tolist(), xs.tolist()): link(y * K + x + 1, (y + 1) * K + x + 1)
+    ys, xs = np.nonzero(P[1:, :] != P[:-1, :])
+    for y, x in zip(ys.tolist(), xs.tolist()): link((y + 1) * K + x, (y + 1) * K + x + 1)
+    junction = {n for n, v in adj.items() if len(v) != 2}; seen = set(); arcs = []
+
+    def walk(a, b):
+        path = [a, b]; seen.add((a, b)); seen.add((b, a))
+        while path[-1] not in junction:
+            n = path[-1]; c = adj[n][0] if adj[n][1] == path[-2] else adj[n][1]
+            if (n, c) in seen: break
+            seen.add((n, c)); seen.add((c, n)); path.append(c)
+            if c == path[0]: break
+        return path
+    for j in junction:
+        for b in adj[j]:
+            if (j, b) not in seen: arcs.append(walk(j, b))
+    for a in adj:
+        for b in adj[a]:
+            if (a, b) not in seen: arcs.append(walk(a, b))
+    out = []
+    for path in arcs:
+        q = np.array([(n // K - 1, n % K - 1) for n in path], np.float64); out.append(dict(nodes=q, start=path[0], end=path[-1], closed=path[0] == path[-1]))
+    return out, junction
+
+
+def midpoints(q):
+    """a staircase of cracks gives a much calmer chain through its midpoints, the two ends stay"""
+    return np.vstack([q[:1], (q[1:] + q[:-1]) / 2, q[-1:]]) if len(q) > 2 else q
+
+
+def chord(q):
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(q, axis=0), axis=1))]; return s
+
+
+def corners(q, win, deg):
+    """indices where the direction turns sharply between the two chords of a window : maxima only, one per window"""
+    s = chord(q); n = len(q)
+    if n < 5 or s[-1] < 2 * win: return []
+    a = np.searchsorted(s, s - win); b = np.minimum(np.searchsorted(s, s + win), n - 1); u = q - q[np.clip(a, 0, n - 1)]; v = q[b] - q; dot = (u * v).sum(1); cr = u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]; ang = np.degrees(np.abs(np.arctan2(cr, dot))); ang[(s < win) | (s > s[-1] - win)] = 0; out = []
+    for i in np.argsort(-ang):
+        if ang[i] < deg: break
+        if all(abs(s[i] - s[j]) >= win for j in out): out.append(int(i))
+    return sorted(out)
+
+
+def wquantile(e, w, f=0.95):
+    o = np.argsort(e); c = np.cumsum(w[o]); return float(e[o][np.searchsorted(c, f * c[-1])]) if len(e) else 0.0
+
+
+def fit_line(q, w, p0=None, p1=None):
+    """a straight line, through its two ends when they are given, else the best one by its weights : returns its ends and its error"""
+    if p0 is None or p1 is None:
+        c = (q * w[:, None]).sum(0) / w.sum(); d = q - c; u = np.linalg.svd(d * np.sqrt(w)[:, None], full_matrices=False)[2][0]; t = d @ u; p0, p1 = c + u * t.min(), c + u * t.max()
+        if (p1 - p0) @ (q[-1] - q[0]) < 0: p0, p1 = p1, p0
+    d = p1 - p0; L = np.linalg.norm(d)
+    if L < 1e-6: return p0, p1, wquantile(np.linalg.norm(q - p0, axis=1), w)      # 1 November 2026 : a closed stroke is never a line. FR : un trait fermé n'est jamais une droite.
+    n = np.array([-d[1], d[0]]) / L; return p0, p1, wquantile(np.abs((q - p0) @ n), w)
+
+
+def fit_spline(q, w, p0, p1, tol, max_ctrl):
+    """a clamped cubic B-spline with as few control points as the tolerance allows ; the ends are held by a large weight, then set exactly"""
+    s = chord(q); keep = np.r_[True, np.diff(s) > 1e-6]; q, w, s = q[keep], w[keep], s[keep]
+    if len(q) < 8 or s[-1] < 1e-6: return None
+    u = s / s[-1]; W = np.sqrt(np.maximum(w, 1e-3)).copy()
+    if p0 is not None: W[0] = 100.0
+    if p1 is not None: W[-1] = 100.0
+    Q = q.copy()
+    if p0 is not None: Q[0] = p0
+    if p1 is not None: Q[-1] = p1
+    best = None; lo, hi = q.min(0), q.max(0); margin = 0.5 * s[-1] + 2.0
+    for nc in range(4, min(max_ctrl, len(q) // 2) + 1):
+        t = np.r_[[0.0] * 4, np.linspace(0, 1, nc - 2)[1:-1], [1.0] * 4]
+        try: sp = make_lsq_spline(u, Q, t, k=3, w=W)
+        except Exception: continue
+        c = sp.c.copy()
+        if p0 is not None: c[0] = p0
+        if p1 is not None: c[-1] = p1
+        sp = type(sp)(t, c, 3)
+        if not np.isfinite(c).all() or (c < lo - margin).any() or (c > hi + margin).any(): continue      # 1 November 2026 : control points far from the data mean a wild curve. FR : des points de contrôle loin des données veulent dire une courbe folle.
+        err = wquantile(np.linalg.norm(sp(u) - q, axis=1), w); best = (sp, err)
+        if err <= tol: break
+    return best
+
+
+def sample(piece, step=0.5):
+    """points along a fitted piece, about step apart"""
+    if piece["kind"] == "multi": return np.vstack([sample(x, step) if k == 0 else sample(x, step)[1:] for k, x in enumerate(piece["parts"])])
+    if piece["kind"] == "line":
+        a, b = piece["p0"], piece["p1"]; n = max(int(np.linalg.norm(b - a) / step), 1); return a + (b - a) * np.linspace(0, 1, n + 1)[:, None]
+    n = max(int(piece["len"] / step), 8); return piece["sp"](np.linspace(0, 1, n + 1))
+
+
+def normals(c):
+    d = np.gradient(c, axis=0); L = np.maximum(np.linalg.norm(d, axis=1), 1e-6)[:, None]; d = d / L; return np.c_[-d[:, 1], d[:, 0]]
+
+
+def snap_whole(c, E, R, a, sc):
+    """the corridor of ZenRay Lines : along the normal of each sample, the strongest line near the curve ; the stroke moves only as a whole, when most of its length lies on a line and agrees on one offset, because a point by point snap jumps to the nearest shading (measured on the truth, 1 November 2026). Returns the moved samples or None, and the share of the stroke on a line"""
+    n = normals(c); off = np.arange(-R, R + 0.01, 0.5); yy = c[:, 0, None] + n[:, 0, None] * off - 0.5; xx = c[:, 1, None] + n[:, 1, None] * off - 0.5; v = ndi.map_coordinates(E, [yy, xx], order=1, mode="nearest"); score = v * np.exp(-0.5 * (off / max(R, 1e-3)) ** 2); b = score.argmax(1); i = np.arange(len(c)); peak = v[i, b]; on = peak >= a["A_snap_min"]; share = float(on.mean())
+    if share < a["A_snap_share"]: return None, share
+    u = chord(c); u = u / max(u[-1], 1e-6); d = off[b]; lim = a["A_snap_spread_px"] * sc; k = on.copy(); ab = np.array([0.0, float(np.median(d[on]))])
+    for _ in range(4):      # 1 November 2026 : a line may need to turn as well as to slide, so the offset is a straight function of the length, fitted without the outliers. FR : un trait peut devoir tourner autant que glisser ; le décalage suit donc une droite le long du trait.
+        if k.sum() < 3: return None, share
+        ab = np.polyfit(u[k], d[k], 1); k = on & (np.abs(np.polyval(ab, u) - d) <= lim)
+    if k.sum() < a["A_snap_agree"] * on.sum(): return None, share
+    return c + n * np.polyval(ab, u)[:, None], share
+
+
+def fit_piece(q, w, p0, p1, line_tol, curve_tol, max_ctrl, depth=0):
+    """the straight line first ; a curve only if the line does not hold ; a curve that does not hold is never accepted, the piece is cut in two at its largest error (1 November 2026 : an accepted bad fit left the car). FR : une courbe qui ne tient pas n'est jamais acceptée, le morceau est coupé en deux à sa plus grande erreur."""
+    a, b, e = fit_line(q, w, p0, p1); line = dict(kind="line", p0=a, p1=b, err=e, len=float(np.linalg.norm(b - a)), ctrl=2)
+    if e <= line_tol or len(q) < 8: return line
+    r = fit_spline(q, w, p0, p1, curve_tol, max_ctrl); cur = None; d = None
+    if r is not None:
+        sp, err = r; c = sp(np.linspace(0, 1, 40))
+        if np.isfinite(c).all() and np.isfinite(err):
+            cur = dict(kind="spline", sp=sp, p0=c[0], p1=c[-1], err=err, len=float(chord(c)[-1]), ctrl=len(sp.c))
+            if err <= curve_tol: return cur
+    if depth >= 8 or len(q) < 16: return cur if cur is not None and cur["err"] < e else line
+    t = (cur["sp"](np.clip(chord(q) / max(chord(q)[-1], 1e-6), 0, 1)) if cur is not None else a + (b - a) * np.clip(chord(q) / max(chord(q)[-1], 1e-6), 0, 1)[:, None]); k = int(np.clip(np.argmax(np.linalg.norm(t - q, axis=1)), len(q) // 5, len(q) - 1 - len(q) // 5)); mid = q[k]; L = fit_piece(q[:k + 1], w[:k + 1], p0, mid, line_tol, curve_tol, max_ctrl, depth + 1); R = fit_piece(q[k:], w[k:], mid, p1, line_tol, curve_tol, max_ctrl, depth + 1); return dict(kind="multi", parts=[L, R], p0=L["p0"], p1=R["p1"], err=max(L["err"], R["err"]), len=L["len"] + R["len"], ctrl=L["ctrl"] + R["ctrl"])
+
+
+def leaves(f):
+    """the simple pieces of a fit"""
+    return [x for p_ in f["parts"] for x in leaves(p_)] if f["kind"] == "multi" else [f]
+
+
+def refine(q, E, a, sc, p0=None, p1=None, known=None):
+    """the straight line first, a curve if it does not hold ; a border with no line of the image along it is arbitrary, so it gets the calmest shape a larger tolerance allows ; with free ends, the whole stroke may settle on the line of the image"""
+    lt, ct = a["A_line_tol_px"] * sc, a["A_curve_tol_px"] * sc; ft = a["A_free_tol_px"] * sc; one = np.ones(len(q)); cur = fit_piece(q, one, p0, p1, lt, ct, a["A_max_ctrl"]); c = sample(cur, step=max(sc / 2, 1.0)); T = None; share = known
+    if known is None and len(c) >= 3: T, share = snap_whole(c, E, a["A_snap_px"] * sc, a, sc)
+    share = share or 0.0
+    if share < a["A_free_share"]: cur = fit_piece(q, one, p0, p1, ft, 0.75 * ft, a["A_max_ctrl"]); cur["support"] = share; return cur
+    cur["support"] = share
+    if not a["A_snap_on"] or p0 is not None or T is None: return cur
+    moved = fit_piece(T, np.ones(len(T)), None, None, lt, ct, a["A_max_ctrl"]); moved["support"] = share
+    if np.percentile(cKDTree(q).query(sample(moved, step=1.0))[0], 99) > a["A_max_move_px"] * sc: cur["guard"] = True; return cur
+    moved["T"] = T; return moved
+
+
+def clean_islands(lab, a, sc):
+    """a tiny island of a label that lives elsewhere is noise, and it chops a long border into pieces : it joins what surrounds it ; a small piece that is whole keeps its place"""
+    thr = (a["A_island_px"] * sc) ** 2; out = lab.copy(); H, W = lab.shape; n_done = 0
+    for i in np.unique(lab).tolist():
+        m = lab == i; cc, n = ndi.label(m)
+        if n < 2: continue
+        sz = np.bincount(cc.ravel())[1:]; big = int(sz.argmax())
+        for k, sl in enumerate(ndi.find_objects(cc)):
+            if k == big or sz[k] >= thr: continue
+            y0, y1, x0, x1 = max(sl[0].start - 2, 0), min(sl[0].stop + 2, H), max(sl[1].start - 2, 0), min(sl[1].stop + 2, W); c = cc[y0:y1, x0:x1] == k + 1; ring = ndi.binary_dilation(c, iterations=2) & ~c; v = out[y0:y1, x0:x1][ring]
+            if len(v) == 0: continue
+            ids, cnt = np.unique(v, return_counts=True); out[y0:y1, x0:x1][c] = ids[cnt.argmax()]; n_done += 1
+    return out, n_done
+
+
+def end_dir(q, reach):
+    """the outward direction of a chain at its first point"""
+    s = chord(q); k = min(int(np.searchsorted(s, reach)), len(q) - 1); return q[k] - q[0]
+
+
+def build_strokes(pieces, a, sc):
+    """two pieces that arrive at a node in line are one stroke, like an edge flow of ZenRay Lines : at each node the most opposite pair is joined while it stays within the angle"""
+    reach = a["A_tangent_px"] * sc; at = {}; lim = np.cos(np.radians(180.0 - a["A_stroke_deg"]))
+    for k, pc in enumerate(pieces):
+        at.setdefault(pc["a"], []).append((k, 0, end_dir(pc["q"], reach))); at.setdefault(pc["b"], []).append((k, 1, end_dir(pc["q"][::-1], reach)))
+    mate = {}
+    for nid, lst in at.items():
+        if nid[0] == "c" or len(lst) < 2: continue
+        pairs = []
+        for i in range(len(lst)):
+            for j in range(i + 1, len(lst)):
+                u, v = lst[i][2], lst[j][2]; L = np.linalg.norm(u) * np.linalg.norm(v)
+                if L > 1e-6 and lst[i][0] != lst[j][0]: pairs.append((float(u @ v / L), i, j))
+        used = set()
+        for c, i, j in sorted(pairs):
+            if c > lim or i in used or j in used: continue
+            used.update((i, j)); mate[(lst[i][0], lst[i][1])] = (lst[j][0], lst[j][1]); mate[(lst[j][0], lst[j][1])] = (lst[i][0], lst[i][1])
+    done = set(); strokes = []
+    def grow(k, end):
+        """from piece k leaving by its end : returns the pieces in order, each with its direction"""
+        seq = []; cur, e = k, end
+        while (cur, e) in mate:
+            nx, ne = mate[(cur, e)]
+            if nx in done: break
+            done.add(nx); seq.append((nx, ne == 1)); cur, e = nx, 1 - ne
+        return seq
+    for k in range(len(pieces)):
+        if k in done: continue
+        done.add(k); back = grow(k, 0); fwd = grow(k, 1); seq = [(p_, not rev) for p_, rev in reversed(back)] + [(k, False)] + fwd; qs = []; passing = []; start = None
+        for idx, (p_, rev) in enumerate(seq):
+            pc = pieces[p_]; q = pc["q"][::-1] if rev else pc["q"]; a_, b_ = (pc["b"], pc["a"]) if rev else (pc["a"], pc["b"]); qs.append(q if idx == 0 else q[1:])
+            if idx == 0: start = a_
+            if idx < len(seq) - 1: passing.append(b_)
+        strokes.append(dict(q=np.vstack(qs), a=start, b=b_, passing=passing))
+    return strokes
+
+
+def solve_ends(strokes, nodes, a, sc):
+    """an end that arrives on a stroke that passes there stops on that stroke ; otherwise the end goes where the lines that arrive cross, held near where it was"""
+    arrive = {}; lam = a["A_junction_reg"]; lim = a["A_junction_move_px"] * sc; out = dict(nodes); span = 2 * sc
+    for st in strokes:
+        c = sample(st["fit"], step=1.0)
+        if len(c) < 2: continue
+        n = min(max(int(span), 2), len(c) - 1); w = (st["fit"].get("support", 0.0) + 0.05) * max(st["fit"]["len"], 1.0); arrive.setdefault(st["a"], []).append((c[0], c[n] - c[0], w)); arrive.setdefault(st["b"], []).append((c[-1], c[-1 - n] - c[-1], w))
+    for nid, lst in arrive.items():
+        if len(lst) < 2: continue
+        A = lam * sum(l[2] for l in lst) / len(lst) * np.eye(2); b = A @ nodes[nid]
+        for pt, t, w in lst:
+            L = np.linalg.norm(t)
+            if L < 1e-6: continue
+            n = np.array([-t[1], t[0]]) / L; A = A + w * np.outer(n, n); b = b + w * np.outer(n, n) @ pt
+        x = np.linalg.solve(A, b); d = x - nodes[nid]; L = np.linalg.norm(d); out[nid] = nodes[nid] + (d * min(lim / L, 1.0) if L > 1e-9 else 0)
+    return out
+
+
+def draw(strokes, links, shape):
+    """the curves as an 8 connected wall, which a 4 connected region cannot cross ; links close the tiny gaps where a stroke stops on another"""
+    H, W = shape; wall = np.zeros(shape, bool)
+
+    def put(c):
+        iy, ix = np.clip(np.floor(c[:, 0]).astype(int), 0, H - 1), np.clip(np.floor(c[:, 1]).astype(int), 0, W - 1)
+        for k in range(len(c) - 1):
+            if abs(iy[k + 1] - iy[k]) > 1 or abs(ix[k + 1] - ix[k]) > 1: r, s_ = draw_line(iy[k], ix[k], iy[k + 1], ix[k + 1]); wall[r, s_] = True
+        wall[iy, ix] = True
+    for st in strokes: put(sample(st["fit"], step=0.5))
+    for u, v in links: put(np.array([u, v]))
+    return wall
+
+
+def repaint(lab, wall, a):
+    """every closed cell takes the label most of its pixels had ; the wall goes to its nearest cell ; a thin piece the curves would swallow keeps its own pixels"""
+    cells, n = ndi.label(~wall); new = np.full(lab.shape, -1, lab.dtype); off = int(lab.min()); hi = int(lab.max()) - off + 1
+    for i, sl in enumerate(ndi.find_objects(cells)):
+        m = cells[sl] == i + 1; new[sl][m] = np.bincount((lab[sl][m] - off).ravel(), minlength=hi).argmax() + off
+    idx = ndi.distance_transform_edt(wall, return_distances=False, return_indices=True); new[wall] = new[idx[0][wall], idx[1][wall]]; lost = 0
+    ids, old = np.unique(lab[lab >= 0], return_counts=True); nw = np.bincount(np.clip(new, 0, None).ravel(), minlength=int(ids.max()) + 1 if len(ids) else 1)
+    for i, c in zip(ids.tolist(), old.tolist()):
+        if nw[i] < a["A_lost_ratio"] * c: new[lab == i] = i; lost += 1
+    return new, lost
+
+
+def finish_view(args):
+    """one view : labels in, labels and curves out"""
+    lab, E, a, sc, name = args; lab, n_islands = clean_islands(lab, a, sc); arcs, junction = trace(lab); win = a["A_corner_win_px"] * sc; deg = a["A_corner_deg"]; nodes = {}; pieces = []; K = 0
+    for arc in arcs:
+        q = midpoints(arc["nodes"])
+        if len(q) < 2: continue
+        ids = corners(q, win, deg); start, end = ("n", arc["start"]), ("n", arc["end"]); nodes.setdefault(start, arc["nodes"][0].copy()); nodes.setdefault(end, arc["nodes"][-1].copy())
+        if arc["closed"] and not ids: ids = [len(q) // 2]
+        cuts = [0] + [i for i in ids if 0 < i < len(q) - 1] + [len(q) - 1]; prev = start
+        for j in range(len(cuts) - 1):
+            nxt = end if j == len(cuts) - 2 else ("c", K, j)
+            if nxt[0] == "c": nodes[nxt] = q[cuts[j + 1]].copy()
+            pieces.append(dict(q=q[cuts[j]:cuts[j + 1] + 1], a=prev, b=nxt)); prev = nxt
+        K += 1
+    strokes = build_strokes(pieces, a, sc); minlen = a["A_min_len_px"] * sc
+    for st in strokes:         # first pass : free ends, to know where the lines really run. FR : extrémités libres, pour savoir où passent vraiment les traits.
+        q = st["q"]; st["fit"] = dict(kind="line", p0=q[0], p1=q[-1], err=0.0, len=float(chord(q)[-1]), ctrl=2, support=0.0) if chord(q)[-1] < minlen else refine(q, E, a, sc)
+    solved = solve_ends(strokes, nodes, a, sc); strokes.sort(key=lambda t: -t["fit"]["len"]); carrier = {}; links = []
+    for st in strokes:         # second pass, longest first : a stroke that passes through a node carries it, the others stop on it. FR : le plus long d'abord, il porte les noeuds qu'il traverse.
+        q = st["fit"].get("T", st["q"]); support = st["fit"].get("support", 0.0); guard = st["fit"].get("guard", False); p0, p1 = solved[st["a"]], solved[st["b"]]; h0, h1 = carrier.get(st["a"]), carrier.get(st["b"])
+        if h0 is not None: p0 = h0[cKDTree(h0).query(p0)[1]]
+        if h1 is not None: p1 = h1[cKDTree(h1).query(p1)[1]]
+        st["fit"] = dict(kind="line", p0=p0, p1=p1, err=0.0, len=float(np.linalg.norm(p1 - p0)), ctrl=2, support=0.0) if chord(q)[-1] < minlen else refine(q, E, a, sc, p0, p1, known=support)
+        st["fit"]["support"] = support; st["fit"]["guard"] = guard; c = sample(st["fit"], step=0.5)
+        for nid in st["passing"]: carrier.setdefault(nid, c)
+    for st in strokes:         # every end touches the node it belongs to, so no cell leaks. FR : chaque extrémité touche son noeud, aucune cellule ne fuit.
+        c = sample(st["fit"], step=0.5)
+        for nid, pt in ((st["a"], c[0]), (st["b"], c[-1])):
+            h = carrier.get(nid); links.append((pt, h[cKDTree(h).query(pt)[1]] if h is not None else solved[nid]))
+    wall = draw(strokes, links, lab.shape); new, lost = repaint(lab, wall, a); doc = []; lv = []
+    for st in strokes:
+        for f in leaves(st["fit"]):
+            ctrl = (np.array([f["p0"], f["p1"]]) if f["kind"] == "line" else f["sp"].c) / sc; doc.append(dict(kind=f["kind"], ctrl=np.round(ctrl, 3).tolist(), knots=None if f["kind"] == "line" else np.round(f["sp"].t, 5).tolist(), support=round(float(st["fit"].get("support", 0.0)), 3))); lv.append((f["len"], f["kind"] == "line", f["ctrl"], float(st["fit"].get("support", 0.0))))
+    A = np.array(lv) if lv else np.zeros((1, 4)); stats = dict(pieces=len(pieces), strokes=len(strokes), curves=len(lv), islands=n_islands, straight_share=round(float(A[A[:, 1] > 0, 0].sum() / max(A[:, 0].sum(), 1e-6)), 3), mean_ctrl=round(float(A[:, 2].mean()), 2), on_line_share=round(float(A[A[:, 3] >= a["A_free_share"], 0].sum() / max(A[:, 0].sum(), 1e-6)), 3), guard=int(sum(1 for t in strokes if t["fit"].get("guard"))), lost=lost)
+    return name, new, doc, stats
+
+
+def finish_views(labels, p, home, sc):
+    """all the views, in parallel on the CPU ; writes arcs_<view>.json"""
+    a = {k: p.get(k, v) for k, v in DEF.items()}
+    if not a["A_on"]: return labels, {}
+    jobs = []
+    for name in p["views"]:
+        D = np.load(f"{home}/02_masks/regions_{name}.npz"); E = D["edges"].astype(np.float32) / 255
+        if "edges_raw" in D: E = np.maximum(E, D["edges_raw"].astype(np.float32) / 255)
+        jobs.append((labels[name], E, a, sc, name))
+    out = dict(labels); stats = {}
+    with ProcessPoolExecutor(int(a["A_workers"])) as ex:
+        for name, new, doc, st in ex.map(finish_view, jobs): out[name] = new; stats[name] = st; json.dump(dict(view=name, unit="panel pixels", pieces=doc), open(f"{home}/02_masks/arcs_{name}.json", "w"))
+    return out, stats
+
+
+def selftest():
+    """a border with noisy steps : it must come back straight and on the line of the image ; a curve with no line must stay a curve ; a closed stroke must stay closed"""
+    a = dict(DEF, A_snap_on=1, A_free_tol_px=1.0); sc = 3; H = W = 300; yy, xx = np.mgrid[:H, :W]; rng = np.random.default_rng(1); noise = ndi.gaussian_filter(rng.normal(size=(H, W)), 2) * 12; lab = ((xx + noise) > 152).astype(np.int32); E = np.zeros((H, W), np.float32); E[:, 150] = 1; E = ndi.gaussian_filter(E, 1); E /= E.max(); _, new, doc, st = finish_view((lab, E, a, sc, "t")); edge = lambda L: (L[20:-20] > 0).argmax(1)
+    wob0, wob1 = float(edge(lab).std()), float(edge(new).std()); where = float(edge(new).mean()); circ = ((yy - 150) ** 2 + (xx - 150) ** 2) < 100 ** 2; lab2 = np.where(circ, 0, -1).astype(np.int32); _, new2, doc2, st2 = finish_view((lab2, np.zeros((H, W), np.float32), a, sc, "c")); iou2 = float(((new2 >= 0) & circ).sum() / ((new2 >= 0) | circ).sum())
+    ok = wob1 < 0.2 * wob0 and abs(where - 150.5) <= 1.0 and st["straight_share"] > 0.95 and st2["straight_share"] < 0.2 and iou2 > 0.98; print(json.dumps(dict(wobble_before=round(wob0, 2), wobble_after=round(wob1, 2), line_at=round(where, 2), straight=st["straight_share"], circle_straight=st2["straight_share"], circle_iou=round(iou2, 4), ok=ok))); sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest": selftest()
