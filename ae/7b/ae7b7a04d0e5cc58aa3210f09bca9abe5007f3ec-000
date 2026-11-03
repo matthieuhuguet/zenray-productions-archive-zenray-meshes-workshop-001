@@ -1,0 +1,23 @@
+#!/bin/zsh
+# 2 November 2026 : line, sweep, then sculpt : the whole mesh sculpted on six views with small brushes, the three other views judge it. FR : ligne, sweep, puis sculpt : le maillage entier sculpté sur six vues à petites brosses, les trois autres vues le jugent.
+cd /Users/zenray/.claude/tmp/tmp-zenray-meshes/work/dracard/v3; PY=/Users/zenray/.venvs/zenray-meshes/bin/python; HY=/Applications/Houdini/Current/Frameworks/Houdini.framework/Versions/Current/Resources/bin/hython; C=../../../Scripts/Dracard/Comp; V=1419,1423,1435,1439,1447,1455; U=1431,1443,1451
+perl -e 'alarm 300; exec @ARGV' $HY $C/TubeBuild.py parts/T_all/fit4.json parts/T_all/h 2>&1 | grep -v Octane | tail -1 | cut -c1-140
+$PY -I $C/CamConvert.py to_comp parts/T_all/fit4.json.cams.json parts/T_all/h/cams.json
+echo BEFORE SCULPT; $PY -I $C/PartBoard.py parts/T_all/h full/ep05 $V parts/T_all/h/board.png --mask grey --tile 420 2>&1 | tail -1 | cut -c1-160
+echo UNSEEN BEFORE; $PY -I $C/CamSearch.py parts/T_all/views parts/T_all/h/part.obj $U parts/T_all/h/cams_unseen.json 2>&1 | head -1 | cut -c1-220
+mkdir -p parts/T_all/s; cp parts/T_all/h/part.obj parts/T_all/s/cage.obj; cp parts/T_all/h/cams.json parts/T_all/s/cams.json; rm -f parts/T_all/s/sculpt.json
+$PY -I $C/CompFit.py parts/T_all/s full/ep05 $V --mask grey --symmetric 1 --levels 0 --minutes ${1:-8} --cam-range 3 --centers 400 --brushes 0.03:0.0015,0.015:0.001,0.008:0.0006 --fair 100 2>&1 | grep -E '^score|Traceback|^cage' | cut -c1-260
+$PY -I - <<'P'
+import json,numpy as np
+V=[];rest=[]
+for l in open('parts/T_all/s/cage.obj'):
+    if l.startswith('v '): V.append([float(x) for x in l.split()[1:4]])
+    elif l.startswith('f '): rest.append(l)
+D=np.array(json.load(open('parts/T_all/s/sculpt.json'))); V=np.array(V)+D; print('moved',int((np.abs(D).sum(1)>1e-6).sum()),'of',len(V),'max',round(float(np.linalg.norm(D,axis=1).max()),3))
+with open('parts/T_all/s/part.obj','w') as o:
+    for v in V: o.write('v %f %f %f\n'%tuple(v))
+    o.writelines(rest)
+P
+echo AFTER SCULPT; $PY -I $C/PartBoard.py parts/T_all/s full/ep05 $V parts/T_all/s/board.png --mask grey --tile 420 2>&1 | tail -1 | cut -c1-160
+echo UNSEEN AFTER; $PY -I $C/CamSearch.py parts/T_all/views parts/T_all/s/part.obj $U parts/T_all/s/cams_unseen.json 2>&1 | head -1 | cut -c1-220
+echo SCULPT_DONE
