@@ -1,0 +1,24 @@
+"""2 November 2026 : a part made in its own frame (the head) is placed in the whole by a grid search on size, height and depth, not by descent : a descent shrank the head into the body. Cameras are refined on the best cells. FR : une partie faite dans son propre repère (la tête) se place dans l'ensemble par une recherche sur grille en taille, hauteur et profondeur, pas par une descente : une descente avait fait rétrécir la tête dans le corps.
+    python -I PlaceHead.py <views folder> <init.json> <out.json> f1,f2,..."""
+import sys, os, json, math, itertools
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE)); import DragonFit as DF
+views, init, out, names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(","); G = json.load(open(f"{views}/gizmo_cams.json")); refs = DF.load_refs(views, names); S = DF.Scene({k: (r["mask"].shape[1], r["mask"].shape[0]) for k, r in refs.items()}); D = json.load(open(init)); T = D["tubes"]; head = [t for t in T if t.get("kind") == "obj"][0]; horns = [t for t in T if t["name"] in ("horn", "horn_base")]; base = json.loads(json.dumps(horns))
+def place(xf):
+    head["xform"] = list(xf); S.set_tube(head)
+    for t, b in zip(horns, base):
+        t["pts"] = [[q[0] * xf[3], q[1] * xf[3] + xf[1], q[2] * xf[3] + xf[2]] for q in b["pts"]]; t["radius"] = b.get("radius", 1.0) * xf[3]; S.set_tube(t)
+for t in T: S.set_tube(t)
+place([0, 1.0, 1.0, 0.8]); cams = {k: DF.coarse_cam(S, k, r, 45.0, (G[k]["yaw"], G[k]["pitch"])) for k, r in refs.items()}
+for k, r in refs.items(): cams[k], _ = DF.refine_cam(S, k, r, cams[k], 45.0, loops=4)
+def total(): return sum(DF.view_cost(S.render(k, cams[k], 45.0), refs[k]) for k in refs)
+best = None
+for rnd, (ss, ys, zs) in enumerate([(np.arange(0.6, 1.25, 0.1), np.arange(-0.5, 2.6, 0.25), np.arange(-1.5, 3.1, 0.25)), (None, None, None), (None, None, None)]):
+    if ss is None: b = best[1]; h = 0.5 ** rnd; ss = b[3] + np.arange(-2, 3) * 0.05 * h; ys = b[1] + np.arange(-2, 3) * 0.12 * h; zs = b[2] + np.arange(-2, 3) * 0.12 * h
+    R = []
+    for s_, y_, z_ in itertools.product(ss, ys, zs): place([0.0, float(y_), float(z_), float(s_)]); R.append((total(), [0.0, float(y_), float(z_), float(s_)]))
+    R.sort(key=lambda a: a[0]); best = R[0]; print("round", rnd, "cells", len(R), "best", round(best[0], 3), [round(x, 3) for x in best[1]], flush=True); place(best[1])
+    for k, r in refs.items(): cams[k], _ = DF.refine_cam(S, k, r, cams[k], 45.0, loops=3)
+    print(" after cameras", round(total(), 3), flush=True)
+place(best[1]); rep = DF.overlay(S, refs, cams, 45.0, out + ".png"); print({k: round(float(v[0]), 3) for k, v in rep.items()}, "mean", round(float(np.mean([v[0] for v in rep.values()])), 4)); head["frozen"] = False
+json.dump(D, open(out, "w"), indent=0); json.dump(cams, open(out + ".cams.json", "w"), default=float)

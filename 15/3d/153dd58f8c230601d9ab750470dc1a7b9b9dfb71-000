@@ -1,0 +1,14 @@
+"""2 November 2026 : the bridge between Houdini and SculptForge : the geometry of a node goes out as OBJ, SculptForge runs its commands without a window, the result comes back as a green File node beside it, the source stays untouched. FR : le pont entre Houdini et SculptForge : la géométrie d'un node sort en OBJ, SculptForge exécute ses commandes sans fenêtre, le résultat revient en node File vert à côté, la source reste intacte.
+    hython SfBridge.py <scene.hip> <sop path> "<commands, without open and save>" <tag> [out.hip]
+    in a live Houdini : import SfBridge; SfBridge.run(hou.node("/obj/geo/OUT"), "deform_smooth amount=30 keep_volume=true", "cheeks")
+Settings : SF_CLI, the path of sculptforge-cli. Every call keeps its OBJ and its command in sf_<tag>/ beside the scene, so a sculpt can be replayed."""
+import os, sys, subprocess, json, time
+SF_CLI = os.environ.get("SF_CLI", "/Users/zenray/.claude/tmp/tmp-zenray-meshes/tools/sculptforge/build/sculptforge-cli")
+def run(node, commands, tag):
+    import hou
+    base = os.path.dirname(hou.hipFile.path()) or os.getcwd(); d = os.path.join(base, f"sf_{tag}"); os.makedirs(d, exist_ok=True); src, dst = f"{d}/in.obj", f"{d}/out.obj"; node.geometry().saveToFile(src); script = f"open path={src}; {commands}; save_obj path={dst}"; t0 = time.time(); p = subprocess.run([SF_CLI, "-q", "-c", script], capture_output=True, text=True, timeout=1800)
+    if p.returncode or not os.path.exists(dst): raise RuntimeError(f"SculptForge failed {p.returncode} : {p.stderr[-500:]} {p.stdout[-300:]}")
+    json.dump(dict(commands=commands, seconds=round(time.time() - t0, 2)), open(f"{d}/command.json", "w"), indent=0); f = node.parent().node(f"sculptforge_{tag}") or node.parent().createNode("file", f"sculptforge_{tag}"); f.parm("file").set(dst); f.setColor(hou.Color((0.2, 0.7, 0.25))); f.setPosition(node.position() + hou.Vector2(0, -1)); f.cook(force=True); return f
+if __name__ == "__main__":
+    import hou
+    hip, path, cmds, tag = sys.argv[1:5]; hou.hipFile.load(hip, suppress_save_prompt=True); f = run(hou.node(path), cmds, tag); print(json.dumps(dict(node=f.path(), points=len(f.geometry().points()), errors=list(f.errors())))); hou.hipFile.save(sys.argv[5] if len(sys.argv) > 5 else hip)

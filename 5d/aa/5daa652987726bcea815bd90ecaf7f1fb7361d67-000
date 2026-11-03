@@ -1,0 +1,48 @@
+"""2 November 2026 : DRACARD, the dragon beside the tutorial : each part rendered in clay from the views of the series, next to the frames it must look like, in a few seconds, without Houdini. FR : le dragon à côté du tuto : chaque partie rendue en argile dans les vues de la série, à côté des images à atteindre, en quelques secondes, sans Houdini.
+    python -I DragonBoard.py <folder with the obj> out.png [frame.jpg ...]"""
+import sys, os
+import numpy as np
+from PIL import Image
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts"); import Raster
+PARTS = dict(body=(0.74, 0.74, 0.74), teeth=(0.95, 0.93, 0.85), eyes=(0.92, 0.9, 0.55), spikes=(0.62, 0.62, 0.62), wings=(0.66, 0.6, 0.58), cloth=(0.34, 0.34, 0.38), mouth=(0.78, 0.4, 0.4)); WIRE = set(os.environ.get("DRAGON_WIRE", "").split(",")) - {""}; WIRE_DARK = 0.62; RES = int(os.environ.get("DRAGON_RES", 620)); PPM = float(os.environ.get("DRAGON_PPM", 190.0)); LIGHT = np.array([0.35, 0.55, 0.76]); BG = (64, 64, 66)
+VIEWS = dict(three_quarter=(52, 8), side=(90, 0), front=(0, 0), back=(180, 0))      # yaw, pitch in degrees, 0 looks at the face. FR : lacet et tangage en degrés, 0 regarde la face.
+
+
+def load_obj(f):
+    V, F, P = [], [], []
+    for line in open(f):
+        if line.startswith("v "): V.append([float(x) for x in line.split()[1:4]])
+        elif line.startswith("f "):
+            idx = [int(x.split("/")[0]) - 1 for x in line.split()[1:]]; P.append(len(idx))
+            for k in range(1, len(idx) - 1): F.append((idx[0], idx[k], idx[k + 1]))
+    return np.array(V, float), np.array(F, int), np.repeat(np.arange(len(P)), np.array(P) - 2), np.array(P)
+
+
+def axes(yaw, pitch):
+    a, b = np.radians(yaw), np.radians(pitch); tz = np.array([np.sin(a) * np.cos(b), np.sin(b), np.cos(a) * np.cos(b)]); rx = np.cross([0, 1, 0], tz); rx /= np.linalg.norm(rx); uy = np.cross(tz, rx); return rx, uy, tz
+
+
+def render(folder):
+    tiles = []; rend, poly = {}, {}; c = (0, 0.95, -0.15)
+    for k in PARTS:
+        if os.path.exists(f"{folder}/{k}.obj"):
+            V, F, pid, sides = load_obj(f"{folder}/{k}.obj"); rend[k] = Raster.Renderer(V, F, smooth_deg=70.0); poly[k] = pid
+            if k in WIRE: print(k, "polygons", len(sides), "quads", round(float((sides == 4).mean()), 4), "triangles", int((sides == 3).sum()), "more", int((sides > 4).sum()))
+    for yaw, pitch in VIEWS.values():
+        A = axes(yaw, pitch); best = np.full((RES, RES), -1e9); out = np.full((RES, RES, 3), BG, np.float32)
+        for k, r in rend.items():
+            m, d, n, fid = r.render(c, PPM, A, RES); near = m & (d > best); best[near] = d[near]; shade = 0.25 + 0.75 * np.clip(n @ LIGHT, 0, 1); out[near] = (np.array(PARTS[k]) * shade[near][:, None] * 255)
+            if k in WIRE:      # 2 November 2026 : the real polygon edges, seen where the polygon number changes from one pixel to the next. FR : les vraies arêtes, là où le numéro de polygone change d'un pixel au suivant.
+                q = np.where(m, poly[k][np.clip(fid, 0, len(poly[k]) - 1)], -1); e = (q != np.roll(q, 1, 0)) | (q != np.roll(q, 1, 1)); out[near & e] *= WIRE_DARK
+        tiles.append(out.astype(np.uint8))
+    for r in rend.values(): r.release()
+    return tiles
+
+
+if __name__ == "__main__":
+    T = render(sys.argv[1]); a = np.concatenate(T[:2], 1); b = np.concatenate(T[2:], 1); im = Image.fromarray(np.concatenate([a, b], 0)); refs = sys.argv[3:]
+    if refs:
+        h = im.size[1] // max(len(refs), 1); col = [Image.open(f).convert("RGB") for f in refs]; col = [c.resize((int(c.size[0] * h / c.size[1]), h), Image.LANCZOS) for c in col]; W = max(c.size[0] for c in col); page = Image.new("RGB", (im.size[0] + W + 8, im.size[1]), (30, 30, 30)); page.paste(im, (0, 0))
+        for k, c in enumerate(col): page.paste(c, (im.size[0] + 8, k * h))
+        im = page
+    im.save(sys.argv[2]); print(im.size)

@@ -1,0 +1,73 @@
+"""2 November 2026 : M22, ONE COMPONENT, ONE IMAGE, ONE PROMPT. A sheet of several pieces fails : the model fills cells and stops reasoning on an object (Matthieu, 04_received/sheet_S01_failed_2-November-2026.png). What worked is what made the car : one image, one object, six views, nothing to fill. So each component gets its own folder, with no grid and no template :
+    reference.png    the 6 view sheet, the piece sharp and outlined, all the rest faded, the only image given to the model
+    prompt.txt       the canonical 6 views template (skill zenray-houdini, 11 and 27 October 2026), filled for this piece
+    crops/<view>.png the real image of the piece in each view where the sheet shows it, cut out by the fitted mask, transparent around
+The agent then crops what comes back (MicroPieceIngest.py) and lists it in the HTML index.
+    python -I MicroPieces.py Projects/<id>/params.json        writes 07_components/C<nn>_<name>/ and 07_components/index.json
+Settings : piece in params.json, see DEF.
+FR : un composant, une image, un prompt. Une feuille de plusieurs pièces échoue : le modèle remplit des cases et ne raisonne plus sur un objet. Chaque composant a son dossier, sans grille ni gabarit ; l'agent découpe ensuite ce qui revient et le range dans l'index HTML."""
+import sys, os, json, re, unicodedata
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+# Every value, in pixels of the sheet unless said otherwise. FR : tous les réglages, en pixels de la planche sauf mention contraire.
+DEF = dict(split_min_copies=6, split_px=6.0, split_similar=0.4, rest_keep=0.22, rest_grey=96, outline_px=2, outline=[255, 106, 0], keep_region=0.15, min_px=30, soft_px=0.4, wire=True)
+WIRE = "topologie = topologie parfaite comme l'aurait faite un tech artist senior hard surface en 2026, rendue en wireframe fin d'un rouge pur vif #FF0000 uniquement (aucun autre rouge ailleurs sur l'image, lignes d'un pixel de large, sans ombre sur le fil) ; "
+PROMPT = ("Entrée = l'image jointe, la planche 6 vues d'une voiture où seule la pièce à isoler est nette et cerclée d'orange ; tout le reste est estompé et ne doit pas être dessiné ; "
+          "cible = {name}, {shape}{copies} ; "
+          "sortie = 6 views 3D de cette seule pièce isolée, comme les six faces d'un cube ; vues = front / back / left / right / top / bottom, disposées comme sur la planche jointe, 2 colonnes et 3 rangées, chacune strictement orthographique, axes alignés d'une case à l'autre, avec l'orientation de la planche jointe ; "
+          "traiter la pièce comme un modèle unique figé : seules les caméras changent ; les 6 vues ont la même échelle en pixels par unité ; proportions de la pièce identiques à la planche, largeur, hauteur et longueur verrouillées d'une vue à l'autre ; la pièce est entière et centrée dans chaque case, avec sa vraie épaisseur ; ce que la planche cache est déduit simplement, sans inventer de détail ; "
+          "affichage = gris mat sans texture, aspect viewport Houdini ; {{WIRE}}fond uni d'une seule couleur grise neutre pour le détourage ; éclairage uniforme ; image carrée ; "
+          "sans le reste de la voiture ; sans cube ; sans perspective ; sans ombre portée ; sans décor ; sans texte ; sans légende ; sans cadre ni grille ; sans étirement ; sans redimensionnement indépendant des vues.")
+
+
+def slug(name):
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower(); return re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+
+
+def one_copy(m, r, sc):
+    """copies joined by a thin bridge, as the spokes of a wheel : the mask is eroded, step by step, the step with the most similar parts wins, and its largest part grows back alone. FR : des copies jointes par un pont fin, comme les branches d'une jante : on érode pas à pas, l'étape qui montre le plus de parties semblables l'emporte, et sa plus grande partie reprend seule sa taille."""
+    best = (1, None, 0, None)
+    for k in range(1, int(r["split_px"] * sc) + 1):
+        e = ndi.binary_erosion(m, iterations=k); cc, n = ndi.label(e)
+        if n < 2: continue
+        sz = ndi.sum(e, cc, range(1, n + 1)); count = int((sz >= r["split_similar"] * sz.max()).sum()); part = cc == 1 + int(np.argmax(sz))
+        if count > best[0] and ndi.distance_transform_edt(part).max() >= k: best = (count, part, k, e)      # 2 November 2026 : what remains must stay thicker than what was removed, or a tyre, a thin ring, falls into arcs. FR : ce qui reste doit rester plus épais que ce qui est retiré, sinon un pneu, anneau fin, tombe en arcs.
+    if best[1] is None: return m
+    _, big, k, e = best; return ndi.binary_dilation(big, iterations=k + 1) & m & ~ndi.binary_dilation(e & ~big, iterations=k)
+
+
+def keep_regions(m, instances, r):
+    """one piece, not all its copies : the largest region of the mask ; a single piece or one side of a pair also keeps its large other parts. FR : une pièce et non toutes ses copies : la plus grande région ; une pièce unique ou un côté de paire garde aussi ses autres grandes parties."""
+    cc, n = ndi.label(m)
+    many = instances >= r["split_min_copies"]
+    if n <= 1: return one_copy(m, r, r["_sc"]) if many else m
+    sz = ndi.sum(m, cc, range(1, n + 1)); big = sz.max()
+    if instances > 2: one = cc == 1 + int(np.argmax(sz)); return one_copy(one, r, r["_sc"]) if many else one
+    return np.isin(cc, 1 + np.flatnonzero(sz >= r["keep_region"] * big))
+
+
+def piece_ids(m, ref_px):
+    """a single piece shows in all its views ; of a mirrored or repeated piece, the atom the sheet shows best. FR : une pièce unique se montre dans toutes ses vues ; d'une pièce répétée, l'exemplaire que la planche montre le mieux."""
+    if m["instances"] <= 1: return list(m["atoms"])
+    return [max(m["atoms"], key=lambda i: (sum(ref_px.get(str(i), {}).values()), -i))]
+
+
+def main(params):
+    p, home = C.load(params); r = {**DEF, **p.get("piece", {})}; sc = p["scale"]; r["_sc"] = sc; MC = sorted(json.load(open(f"{home}/02_masks/mc.json"))["mc"], key=lambda m: m["mc"]); ref_px = json.load(open(f"{home}/02_masks/metrics.json"))["ref_px"]; fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}; rects = {x["name"]: x["rect"] for x in json.load(open(C.abspath(p["views_dir"]) + "/sheet.json"))["panels"]}; sheet = np.asarray(Image.open(C.abspath(p["sheet"])).convert("RGB")).astype(np.float32); labs = {v: np.load(f"{home}/02_masks/labels_{v}.npz")["labels"] for v in p["views"]}; big = {v: np.asarray(Image.fromarray(C.panel_rgb(p, v)).resize((labs[v].shape[1], labs[v].shape[0]), Image.BICUBIC)) for v in p["views"]}; O = f"{home}/07_components"; os.makedirs(O, exist_ok=True); faded = sheet * r["rest_keep"] + r["rest_grey"] * (1 - r["rest_keep"]); index = []
+    for m in MC:
+        ids = piece_ids(m, ref_px); name = m["fr"]; cid = f"C{m['mc']:02d}"; D = f"{O}/{cid}_{slug(name)}"; os.makedirs(f"{D}/crops", exist_ok=True); out = faded.copy(); keep = np.zeros(sheet.shape[:2], bool); shown = {}
+        floor = r["min_px"] * sc * sc if any(np.isin(labs[v], ids).sum() >= r["min_px"] * sc * sc for v in p["views"]) else 1      # 2 November 2026 : a very small piece still shows where the sheet has it. FR : une très petite pièce se montre quand même là où la planche l'a.
+        for v in p["views"]:
+            mk = np.isin(labs[v], ids)
+            if mk.sum() < floor: continue
+            mk = keep_regions(mk, m["instances"], r); ys, xs = np.nonzero(mk); pad = 2 * sc; y0, y1, x0, x1 = max(ys.min() - pad, 0), ys.max() + pad + 1, max(xs.min() - pad, 0), xs.max() + pad + 1; alpha = (ndi.gaussian_filter(mk[y0:y1, x0:x1].astype(np.float32), r["soft_px"] * sc) * 255).astype(np.uint8); Image.fromarray(np.dstack([big[v][y0:y1, x0:x1], alpha])).save(f"{D}/crops/{v}.png")
+            shown[v] = dict(px=int(mk.sum() / sc / sc), size_px=[int(np.ptp(xs) / sc) + 1, int(np.ptp(ys) / sc) + 1]); X0, Y0, X1, Y1 = rects[v]; s_ = mk[::sc, ::sc]; h_, w_ = min(s_.shape[0], Y1 - Y0), min(s_.shape[1], X1 - X0); keep[Y0:Y0 + h_, X0:X0 + w_] |= s_[:h_, :w_]
+        out[keep] = sheet[keep]; edge = ndi.binary_dilation(keep, iterations=int(r["outline_px"])) & ~keep; out[edge] = r["outline"]; Image.fromarray(out.round().astype(np.uint8)).save(f"{D}/reference.png")
+        copies = f" ; cette pièce existe en {m['instances']} exemplaires identiques, n'en dessiner qu'un seul, celui qui est net" if m["instances"] > 1 else ""; tpl = PROMPT.format(name=name, shape=m["shape"], copies=copies);      # 2 November 2026, Matthieu : no measure is forced in a prompt, in 3D the proportions matter and the eye decides. FR : aucune mesure n'est imposée dans un prompt, en 3D les proportions comptent et l'œil tranche.
+        open(f"{D}/prompt.txt", "w").write(tpl.replace("{WIRE}", WIRE if r["wire"] else "")); index.append(dict(id=cid, n=m["mc"], name=name, shape=m["shape"], copies=m["instances"], folder=os.path.basename(D), shown=shown, prompt=tpl))
+    json.dump(dict(wire=WIRE, components=index), open(f"{O}/index.json", "w"), indent=0, ensure_ascii=False); print("components", len(index), "folders in", O); print("views shown per component, mean", round(float(np.mean([len(c["shown"]) for c in index])), 2), "none", [c["name"] for c in index if not c["shown"]]); assert all(c["shown"] for c in index), "a component is not shown on the sheet"
+
+
+if __name__ == "__main__": main(sys.argv[1])

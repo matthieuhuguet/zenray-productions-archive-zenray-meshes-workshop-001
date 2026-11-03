@@ -1,0 +1,24 @@
+"""2 November 2026 : where the percentages are lost : every wrong pixel of every view is given to the zone of the head it touches, too much or missing, so the next task is always the one that costs the most. FR : où se perdent les pourcentages : chaque pixel faux de chaque vue est donné à la zone de la tête qu'il touche, en trop ou manquant, la tâche suivante est toujours celle qui coûte le plus.
+    python -I ErrorMap.py <mesh.obj> <cams.json> <frames folder> f1,f2,... <zones.json>"""
+import sys, os, json, math
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, os.path.dirname(os.path.dirname(HERE))); import Raster, moderngl
+from CompFit import load_quads, cam_matrix, viewport, part_mask, CF
+VS = """#version 330
+in vec3 p; in float zone; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; flat out float z;
+void main(){ vec3 q = R * p + t; z = zone; float Zd = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Zd) / res.x * 2.0 - 1.0, (c.y - f * q.y / Zd) / res.y * 2.0 - 1.0, Zd / 40.0 * 2.0 - 1.0, 1.0); }"""
+FS = "#version 330\nflat in float z; out vec4 o; void main(){ o = vec4(z, 0.0, 0.0, 1.0); }"
+mesh, camf, frames, views, zf = sys.argv[1:6]; Z = json.load(open(zf)); names = [q["name"] for q in Z]; V, Fq = load_quads(mesh); tris = np.array([[f[0], f[k], f[k + 1]] for f in Fq for k in range(1, len(f) - 1)], np.int32)
+zone = np.zeros(len(V), np.float32)
+for i, q in reversed(list(enumerate(Z))):      # first zone in the list wins. FR : la première zone de la liste l'emporte.
+    b = q["box"]; a = np.abs(V[:, 0]); k = (a >= b[0]) & (a <= b[1]) & (V[:, 1] >= b[2]) & (V[:, 1] <= b[3]) & (V[:, 2] >= b[4]) & (V[:, 2] <= b[5]); zone[k] = i
+g = Raster.ctx(); prog = g.program(vertex_shader=VS, fragment_shader=FS); vbo = g.buffer(np.hstack([V, zone[:, None]]).astype(np.float32).tobytes()); ibo = g.buffer(tris.tobytes()); vao = g.vertex_array(prog, [(vbo, "3f 1f", "p", "zone")], ibo); cams = json.load(open(camf)); tot = np.zeros((len(Z), 2)); per = {}; area = 0.0
+for k_ in views.split(","):
+    im = np.asarray(Image.open(f"{frames}/f_{int(k_):05d}.jpg").convert("RGB")); r = viewport(im.max(2).astype(np.float32)); m = part_mask(im, r, "grey"); h, w = m.shape; tex = g.texture((w, h), 4, dtype="f4"); db = g.depth_renderbuffer((w, h)); fb = g.framebuffer([tex], db); fb.use(); fb.clear(0, 0, 0, 0, depth=1.0); g.enable(moderngl.DEPTH_TEST); g.disable(moderngl.CULL_FACE); R, t, fp = cam_matrix(cams[k_], w, h, CF["fov"]); prog["R"].value = tuple(R.T.ravel().tolist()); prog["t"].value = tuple(t.tolist()); prog["f"].value = fp; prog["c"].value = (w / 2.0, h / 2.0); prog["res"].value = (float(w), float(h)); vao.render(moderngl.TRIANGLES); A = np.frombuffer(tex.read(), np.float32).reshape(h, w, 4).copy(); fb.release(); tex.release(); db.release(); mm = A[..., 3] > 0.5; zi = A[..., 0]; idx = ndi.distance_transform_edt(~mm, return_distances=False, return_indices=True); zn = zi[idx[0], idx[1]].astype(int); too = mm & ~m; miss = m & ~mm; area += float((mm | m).sum()); row = np.zeros((len(Z), 2))
+    for i in range(len(Z)): row[i] = float((too & (zn == i)).sum()), float((miss & (zn == i)).sum())
+    tot += row; per[k_] = row.sum(0).tolist()
+print("wrong pixels are", round(100 * tot.sum() / area, 2), "% of the union"); order = np.argsort(-tot.sum(1)); print("zone".ljust(14), "% of union", " too much", " missing")
+for i in order: print(names[i].ljust(14), f"{100 * tot[i].sum() / area:9.2f}", f"{100 * tot[i, 0] / area:9.2f}", f"{100 * tot[i, 1] / area:9.2f}")
+print({k: [int(x) for x in v] for k, v in per.items()})

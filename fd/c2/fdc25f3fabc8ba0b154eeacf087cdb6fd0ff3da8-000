@@ -1,0 +1,125 @@
+"""2 November 2026 : M22, READ ONE COMPONENT RECEIVED : the image of six views of one piece, as ChatGPT Images returns it, is cut into its six views, each cropped tight on its object with a transparent ground, then checked. A model cannot prove its own work ; six views of one object can, by themselves :
+    the same axis must have the same length in every view that shows it (the width in front, back, top and bottom), since the prompt asks one scale ;
+    opposite views must have mirror silhouettes, true for any object in orthographic projection ;
+    where the sheet shows the piece, its real image must lie inside the received silhouette.
+Writes received.png, received/<view>.png and report.json in the folder of the component.
+    python -I MicroPieceIngest.py Projects/<id>/params.json <number> /path/image.png [--out folder]      exit 0 if the piece passes, a report is written in both cases
+    python -I MicroPieceIngest.py selftest                                                              green on a true object, red on a stretched view, a wrong view, a missing view
+Settings : piece_check in params.json, see DEF.
+FR : lire un composant reçu : l'image est coupée en six vues, chacune recadrée sur son objet, puis contrôlée. Six vues d'un même objet se vérifient seules : même longueur d'un axe partout, silhouettes opposées en miroir, et la vraie image de la planche contenue dans la silhouette reçue."""
+import sys, os, json, shutil
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C
+DEF = dict(bg_tol=26.0, line_share=0.8, gutter_search=0.1, min_blob=0.02, pad_px=2, axis_tol=0.06, mirror_min=0.85, ref_cover_min=0.85, grid=128, keep_small=0.02)      # 2 November 2026 : axis_tol as a share of the length, mirror_min and ref_cover_min as overlaps, the rest in pixels or shares of the image. FR : réglages du contrôle.
+VIEWS = ("front", "back", "left", "right", "top", "bottom"); OPPOSITE = (("front", "back"), ("left", "right"), ("top", "bottom"))
+# Default axes of the car sheet : column and row axis of each view, flip of the opposite view. FR : axes par défaut de la planche voiture.
+AXES = dict(front=(0, 1), back=(0, 1), left=(2, 1), right=(2, 1), top=(2, 0), bottom=(2, 0)); FLIP = dict(front="h", left="h", top="v"); AXIS_FR = ("largeur", "hauteur", "longueur")
+
+
+def foreground(a, r):
+    """what is not the ground : the ground is the colour of the image border ; a long thin line drawn across the page is no object. FR : ce qui n'est pas le fond ; un long trait à travers la page n'est pas un objet."""
+    edge = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]]); bg = np.median(edge, axis=0); f = np.linalg.norm(a.astype(np.float32) - bg, axis=2) > r["bg_tol"]; rows = f.mean(1) > r["line_share"]; cols = f.mean(0) > r["line_share"]; f[rows, :] = False; f[:, cols] = False; return f, bg
+
+
+def cut_points(p, n, r):
+    """the n - 1 cuts of a projection, each at the emptiest place near its regular position. FR : les coupes d'une projection, chacune à l'endroit le plus vide près de sa place régulière."""
+    L = len(p); out = []; win = int(r["gutter_search"] * L); s = ndi.uniform_filter1d(p.astype(np.float32), 5)
+    for k in range(1, n):
+        c = k * L // n; a, b = max(c - win, 1), min(c + win, L - 1); v = s[a:b]; z = np.flatnonzero(v <= v.min() + 1e-6); out.append(a + int(z[len(z) // 2]))
+    return [0] + out + [L]
+
+
+def clean(m, r):
+    cc, n = ndi.label(m)
+    if n == 0: return m
+    sz = ndi.sum(m, cc, range(1, n + 1)); return ndi.binary_fill_holes(np.isin(cc, 1 + np.flatnonzero(sz >= r["keep_small"] * sz.max())))
+
+
+def split_views(a, r):
+    """the six views of a 2 x 3 page, in the order of the sheet. FR : les six vues d'une page de 2 colonnes et 3 rangées."""
+    f, bg = foreground(a, r); xs = cut_points(f.sum(0), 2, r); ys = cut_points(f.sum(1), 3, r); out = {}; k = 0
+    for j in range(3):
+        for i in range(2):
+            v = VIEWS[k]; k += 1; m = clean(f[ys[j]:ys[j + 1], xs[i]:xs[i + 1]], r); out[v] = dict(rgb=a[ys[j]:ys[j + 1], xs[i]:xs[i + 1]], mask=m)
+    return out, bg
+
+
+def box_of(m):
+    ys, xs = np.nonzero(m); return int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+
+
+def squeeze(m, n):
+    """a silhouette on a square grid, its box filling the grid, so that shapes compare whatever their scale. FR : une silhouette sur une grille carrée, sa boîte remplissant la grille."""
+    y0, y1, x0, x1 = box_of(m); return np.asarray(Image.fromarray((m[y0:y1, x0:x1] * 255).astype(np.uint8)).resize((n, n), Image.BILINEAR)) > 127
+
+
+def iou(a, b):
+    u = (a | b).sum(); return float((a & b).sum() / u) if u else 0.0
+
+
+def analyse(views, r, axes=AXES, flip=FLIP):
+    """the checks that need no reference. FR : les contrôles qui ne demandent aucune référence."""
+    rep = dict(views={}, axes={}, mirror={}, problems=[]); lengths = {0: {}, 1: {}, 2: {}}
+    for v in VIEWS:
+        m = views[v]["mask"]
+        if not m.any(): rep["views"][v] = dict(empty=True); rep["problems"].append(f"vue {v} vide"); continue
+        y0, y1, x0, x1 = box_of(m); w, h = x1 - x0, y1 - y0; rep["views"][v] = dict(size_px=[w, h], share=round(float(m.mean()), 4)); ca, ra = axes[v]; lengths[ca][v] = w; lengths[ra][v] = h
+    for ax, d in lengths.items():
+        if len(d) < 2: continue
+        vals = np.array(list(d.values()), float); spread = float((vals.max() - vals.min()) / max(np.median(vals), 1.0)); rep["axes"][AXIS_FR[ax]] = dict(px=d, spread=round(spread, 4))
+        if spread > r["axis_tol"]: rep["problems"].append(f"{AXIS_FR[ax]} : {round(spread * 100, 1)} % d'écart entre les vues")
+    for a, b in OPPOSITE:
+        if not (views[a]["mask"].any() and views[b]["mask"].any()): continue
+        A = squeeze(views[a]["mask"], r["grid"]); B = squeeze(views[b]["mask"], r["grid"]); B = B[:, ::-1] if flip[a] == "h" else B[::-1]; v_ = iou(A, B); rep["mirror"][f"{a}/{b}"] = round(v_, 4)
+        if v_ < r["mirror_min"]: rep["problems"].append(f"{a} et {b} ne se répondent pas : {round(v_ * 100)} %")
+    return rep
+
+
+def against_reference(views, folder, r, rep):
+    """where the sheet shows the piece, its real image must lie inside what came back ; a part hidden on the sheet may be larger than what the sheet shows, never smaller. FR : là où la planche montre la pièce, sa vraie image doit tenir dans ce qui est revenu."""
+    rep["reference"] = {}
+    for v in VIEWS:
+        f = f"{folder}/crops/{v}.png"
+        if not os.path.exists(f) or not views[v]["mask"].any(): continue
+        A = np.asarray(Image.open(f).convert("RGBA"))[..., 3] > 127
+        if not A.any(): continue
+        y0, y1, x0, x1 = box_of(A); A = A[y0:y1, x0:x1]; ry0, ry1, rx0, rx1 = box_of(views[v]["mask"]); R = views[v]["mask"][ry0:ry1, rx0:rx1]; k = max(R.shape[0] / A.shape[0], R.shape[1] / A.shape[1]); S = np.asarray(Image.fromarray((A * 255).astype(np.uint8)).resize((max(int(A.shape[1] * k), 1), max(int(A.shape[0] * k), 1)), Image.BILINEAR)) > 127; pad = max(S.shape[0], S.shape[1]) + 2; canvas = np.zeros((R.shape[0] + 2 * pad, R.shape[1] + 2 * pad), bool); canvas[pad:pad + R.shape[0], pad:pad + R.shape[1]] = R; py, px = (canvas.shape[0] - S.shape[0]) // 2, (canvas.shape[1] - S.shape[1]) // 2; cover = float((canvas[py:py + S.shape[0], px:px + S.shape[1]] & S).sum() / max(S.sum(), 1)); shape = float(abs(np.log((A.shape[1] / A.shape[0]) / (R.shape[1] / R.shape[0])))); rep["reference"][v] = dict(cover=round(cover, 4), aspect_gap=round(shape, 4))
+        if cover < r["ref_cover_min"]: rep["problems"].append(f"vue {v} : la vraie pièce ne tient qu'à {round(cover * 100)} % dans ce qui est revenu")
+
+
+def save_crops(views, bg, folder, r):
+    """each view tight on its object, with a transparent ground. FR : chaque vue au plus près de son objet, sur fond transparent."""
+    os.makedirs(f"{folder}/received", exist_ok=True)
+    for v in VIEWS:
+        m = views[v]["mask"]
+        if not m.any(): continue
+        y0, y1, x0, x1 = box_of(m); P = r["pad_px"]; y0, y1, x0, x1 = max(y0 - P, 0), min(y1 + P, m.shape[0]), max(x0 - P, 0), min(x1 + P, m.shape[1]); alpha = (ndi.gaussian_filter(m[y0:y1, x0:x1].astype(np.float32), 0.6) * 255).astype(np.uint8); Image.fromarray(np.dstack([views[v]["rgb"][y0:y1, x0:x1], alpha])).save(f"{folder}/received/{v}.png")
+
+
+def ingest(params, number, path, out=None):
+    p, home = C.load(params); r = {**DEF, **p.get("piece_check", {})}; idx = json.load(open(f"{home}/07_components/index.json"))["components"]; c = next(x for x in idx if x["n"] == int(number)); folder = f"{home}/07_components/{c['folder']}"; dest = out or folder; os.makedirs(dest, exist_ok=True); a = np.asarray(Image.open(path).convert("RGB")); views, bg = split_views(a, r); fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}; axes = {v: (int(np.argmax(np.abs(V[v]["rx"]))), int(np.argmax(np.abs(V[v]["uy"])))) for v in VIEWS}; rep = analyse(views, r, axes); against_reference(views, folder, r, rep); rep.update(id=c["id"], name=c["name"], image=os.path.abspath(path), size=[a.shape[1], a.shape[0]], passed=not rep["problems"])
+    if os.path.abspath(path) != os.path.abspath(f"{dest}/received.png"): Image.fromarray(a).save(f"{dest}/received.png")
+    save_crops(views, bg, dest, r); json.dump(rep, open(f"{dest}/report.json", "w"), indent=1, ensure_ascii=False); print(c["id"], c["name"], "PASS" if rep["passed"] else "TO CHECK"); [print("  ", x) for x in rep["problems"]]; print("  axes", {k: v["spread"] for k, v in rep["axes"].items()}, "mirror", rep["mirror"], "reference", {k: v["cover"] for k, v in rep.get("reference", {}).items()}); return rep["passed"]
+
+
+def page(views, cell=(300, 300), bg=(100, 101, 106)):
+    H, W = cell; a = np.full((3 * H, 2 * W, 3), bg, np.uint8); k = 0
+    for j in range(3):
+        for i in range(2):
+            m = views[VIEWS[k]]; k += 1
+            if m is None or not m.any(): continue
+            y0, x0 = (H - m.shape[0]) // 2, (W - m.shape[1]) // 2; a[j * H + y0:j * H + y0 + m.shape[0], i * W + x0:i * W + x0 + m.shape[1]][m] = (170, 170, 172)
+    return a
+
+
+def selftest():
+    """a true object seen from six sides passes ; a stretched view, a wrong view and a missing view do not, and a line across the page changes nothing. FR : un vrai objet vu de six côtés passe ; une vue étirée, fausse ou absente, non."""
+    r = dict(DEF); n = 90; G = np.zeros((n, n // 2, 2 * n), bool); G[10:80, 6:40, 20:160] = True; G[10:40, 6:40, 120:170] = False; G[30:70, 12:30, 40:90] = False; G[60:80, 6:20, 150:175] = True      # height, width, length
+    F = G.any(2); S = G.any(1); T = G.any(0); pv = dict(front=F, back=F[:, ::-1], left=S, right=S[:, ::-1], top=T, bottom=T[::-1, :]); ax = dict(front=(0, 1), back=(0, 1), left=(2, 1), right=(2, 1), top=(2, 0), bottom=(2, 0)); fl = dict(front="h", left="h", top="v"); run = lambda d: analyse(split_views(page(d), r)[0], r, ax, fl)["problems"]; good = run(pv); stretched = dict(pv); h_, w_ = pv["top"].shape; stretched["top"] = np.asarray(Image.fromarray((pv["top"] * 255).astype(np.uint8)).resize((int(w_ * 1.3), h_))) > 127; wrong = dict(pv); wrong["back"] = np.flipud(pv["left"]); missing = dict(pv); missing["right"] = None; lined = page(pv); lined[:, 300:302] = 20; lined[300:302, :] = 20; with_line = analyse(split_views(lined, r)[0], r, ax, fl)["problems"]; res = dict(good=good, stretched=run(stretched), wrong=run(wrong), missing=run(missing), with_line=with_line); ok = not good and res["stretched"] and res["wrong"] and res["missing"] and not with_line; print(json.dumps(res, ensure_ascii=False)); print("selftest", "GREEN" if ok else "RED"); sys.exit(0 if ok else 1)
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "selftest": selftest()
+    out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None; sys.exit(0 if ingest(sys.argv[1], sys.argv[2], sys.argv[3], out) else 1)

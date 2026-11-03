@@ -1,0 +1,85 @@
+"""2 November 2026 : DRACARD, the head as ep04 builds it, one element after the other : the sculpted base goes to volume (VDB from Polygons, VDB Smooth), the brow and nostril lobes are added, eye sockets, mouth and nostrils are carved with VDB Combine in SDF Difference, the eye domes go back in their sockets, the volume returns to polygons, then teeth are copied along a curve and the ear is a hollow shell. Every position lives in head_features.json ; a point written {"skin": [y, z], "off": d} sits on the skin at that height and depth.
+    hython HeadBuild.py <base.obj> <head_features.json> <out folder>      writes part.obj, skin.obj, teeth.obj, Head.hip, report.json
+FR : la tête telle que l'ep04 la construit, un élément après l'autre : la base sculptée passe en volume, le front et les lobes de narine s'ajoutent, orbites, bouche et narines se creusent, les dômes des yeux reviennent dans leurs orbites, le volume repasse en polygones, puis les dents se copient le long d'une courbe et l'oreille est une coquille creuse."""
+import sys, os, json, time
+import numpy as np, hou
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from DragonShape import dense_curve, radius
+base, fj, OUT = sys.argv[1], sys.argv[2], sys.argv[3]; P = json.load(open(fj)); os.makedirs(OUT, exist_ok=True); RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25)); hou.hipFile.clear(suppress_save_prompt=True); geo = hou.node("/obj").createNode("geo", "Mad_Villain_Head"); T0 = time.time(); B = np.array([[float(x) for x in l.split()[1:4]] for l in open(base) if l.startswith("v ")]); vox = P["voxel"]
+
+
+def skin_x(y, z, r=0.05):
+    d = (B[:, 1] - y) ** 2 + (B[:, 2] - z) ** 2; k = d < r * r
+    return float(B[k, 0].max()) if k.any() else float(B[np.argsort(d)[:30], 0].max())
+
+
+def skin_z(x, y, r=0.05):
+    d = (B[:, 0] - x) ** 2 + (B[:, 1] - y) ** 2; k = d < r * r
+    return float(B[k, 2].max()) if k.any() else float(B[np.argsort(d)[:30], 2].max())
+
+
+def res(q):
+    if isinstance(q, dict) and "snapz" in q: return [q["p"][0], q["p"][1], skin_z(q["p"][0], q["p"][1]) + q["snapz"]]      # 2 November 2026 : a point read on the frames that must stay on the front of the skin. FR : un point lu sur les images qui doit rester sur l'avant de la peau.
+    return [skin_x(q["skin"][0], q["skin"][1]) + q.get("off", 0.0), q["skin"][0] + q.get("dy", 0.0), q["skin"][1] + q.get("dz", 0.0)] if isinstance(q, dict) else q
+
+
+def mk(t, label, *inputs, **parms):
+    n = geo.createNode(t, label)
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items(): n.parm(k).set(v)
+    return n
+
+
+def add_curve(label, pts, closed=False):
+    a = mk("add", label, keep=0); a.parm("points").set(len(pts))
+    for i, q in enumerate(pts):
+        a.parm(f"usept{i}").set(1)
+        for k, ax in enumerate("xyz"): a.parm(f"pt{i}{ax}").set(float(q[k]))
+    a.parm("prims").set(1); a.parm("prim0").set(f"0-{len(pts) - 1}"); a.parm("closed0").set(1 if closed else 0); return a
+
+
+def tube(t):
+    tag = t["name"]; pts = [res(q) for q in t["pts"]]; n = t.get("stations", 30); c = add_curve(f"curve_{tag}", dense_curve(pts, n)); r = mk("resample", f"resample_{tag}", c, length=t.get("seg", 0.02), dolength=1); val = radius(t, 33) / t.get("radius", 1.0); s = mk("sweep::2.0", f"sweep_{tag}", r, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=t.get("radius", 1.0), cols=t.get("cols", 20), applyscale=1); s.parm("scaleramp").set(hou.Ramp([hou.rampBasis.Linear] * 33, np.linspace(0, 1, 33).tolist(), val.tolist())); x = s
+    if t.get("flatten"): k = np.mean(np.asarray(pts, float), 0); x = mk("xform", f"transform_from_centroid_{tag}", s, sx=t["flatten"][0], sy=t["flatten"][1], sz=t["flatten"][2], px=float(k[0]), py=float(k[1]), pz=float(k[2]))
+    if t.get("flatten_n"):      # 2 November 2026 : flatten across a slanted plane, the ear is a shell facing forward, not a plate along the head. FR : aplatir à travers un plan oblique, l'oreille est une coquille tournée vers l'avant, pas une plaque le long de la tête.
+        nx_, ny_, nz_, tf_ = t["flatten_n"]; k = np.mean(np.asarray(pts, float), 0); w_ = mk("attribwrangle", f"flatten_plane_{tag}", x); w_.parm("snippet").set(f"vector n = normalize(set({nx_},{ny_},{nz_})); vector c = set({k[0]},{k[1]},{k[2]}); vector d = @P - c; float h = dot(d, n); @P = c + d - h * n + h * {tf_} * n;"); x = w_
+    return mk("mirror", f"mirror_{tag}", x, dirx=1, diry=0, dirz=0) if t.get("mirror", True) else x
+
+
+def ball(label, c, r, mirror=True, rot=(0, 0, 0)):
+    s = mk("sphere", f"sphere_{label}", type=2, rows=13, cols=24, radx=r[0] if isinstance(r, list) else r, rady=r[1] if isinstance(r, list) else r, radz=r[2] if isinstance(r, list) else r, tx=c[0], ty=c[1], tz=c[2], rx=rot[0], ry=rot[1], rz=rot[2]); return mk("mirror", f"mirror_{label}", s, dirx=1, diry=0, dirz=0) if mirror else s
+
+
+def vol(label, n): return mk("vdbfrompolygons", f"vdbfrompolygons_{label}", n, voxelsize=vox, fillinterior=1, exteriorbandvoxels=P.get("band", 10))
+
+
+def combine(label, a, b, op, k=0.0):
+    c = mk("vdbcombine", f"vdbcombine_{label}", a, b); c.parm("operation").set(op)      # 2 November 2026 : the true operation gives the active voxels : the inside of a union is not active, a soft cut carved nothing in it. FR : la vraie opération donne les voxels actifs : l'intérieur d'une union n'est pas actif, une coupe douce n'y creusait rien.
+    if not k: return c
+    # 2 November 2026 : a soft boolean, the fillet a sculptor leaves by hand : hard unions and cuts left pleats on the nose. k is the width of the fillet. FR : un booléen doux, le congé qu'un sculpteur laisse à la main : les unions et coupes dures laissaient des pliures sur le nez. k est la largeur du congé.
+    w = mk("volumewrangle", f"soft_{label}", c, a, b)
+    body = "float h = clamp(0.5 + 0.5 * (B - A) / K, 0, 1); @surface = lerp(B, A, h) - K * h * (1 - h);" if op == "sdfunion" else "float h = clamp(0.5 - 0.5 * (B + A) / K, 0, 1); @surface = lerp(A, -B, h) + K * h * (1 - h);"
+    w.parm("snippet").set(f'float A = volumesample(1, "surface", @P); float B = volumesample(2, "surface", @P); float K = {k}; ' + body); return w
+
+
+f = mk("file", "file_head_sculpt", file=base); f.setColor(GREEN); v = mk("vdbsmoothsdf", "vdbsmooth_base", vol("base", f), iterations=P["base_smooth"]); v = mk("vdbsmoothsdf", "vdbsmooth_base_wide", v, radius=P.get("base_smooth_radius", 2), iterations=P.get("base_smooth_wide", 2))
+for t in P.get("add", []): v = combine(f"add_{t['name']}", v, vol(f"add_{t['name']}", tube(t)), "sdfunion", t.get("k", 0.0))
+if P.get("blend"): v = mk("vdbsmoothsdf", "vdbsmooth_blend", v, iterations=P["blend"])
+for t in P.get("cut", []): v = combine(f"cut_{t['name']}", v, vol(f"cut_{t['name']}", tube(t)), "sdfdifference", t.get("k", 0.0))
+if P.get("ear") and P["ear"].get("cut_skin"): v = combine("ear_cut", v, vol("ear_cut", tube({**P["ear"]["hollow"], "name": "ear_cut"})), "sdfdifference")      # 2 November 2026 : the hollow of the ear goes on into the head, the series plugs the shell in a hole of the skull. FR : le creux de l'oreille se prolonge dans la tête, la série plante la coquille dans un trou du crâne.
+E = P["eye"]; ce = res(E["center"]); v = combine("eye_cavity", v, vol("eye_cavity", ball("eye_cavity", ce, E["socket"], rot=E.get("rot", (0, 0, 0)))), "sdfdifference", E.get("k_cavity", 0.0))
+M = P["mouth"]; top = [[-M["half_width"], q[0] + q[2], q[1]] for q in M["line"]]; bot = [[-M["half_width"], q[0] - q[2], q[1]] for q in M["line"]][::-1]; mo = add_curve("curve_mouth", top + bot, closed=True); ex = mk("polyextrude::2.0", "polyextrude_mouth", mo, dist=2 * M["half_width"], outputback=1, outputfront=1, outputside=1)
+if ex.geometry().boundingBox().maxvec()[0] < 0: ex.parm("dist").set(-2 * M["half_width"])      # 2 November 2026 : the direction of the extrusion follows the order of the points, the slab must cross the whole head. FR : le sens de l'extrusion suit l'ordre des points, la plaque doit traverser toute la tête.
+before_mouth = v; v = combine("mouth", v, vol("mouth", ex), "sdfdifference")
+if M.get("depth"): v = combine("mouth_gum", v, mk("vdbreshapesdf", "vdbreshape_gum", before_mouth, operation="erode", useworldspaceunits=1, radiusworld=M["depth"]), "sdfunion")      # 2 November 2026 : the slit stops at a fixed depth under the skin, the gums stand behind the teeth : a slab through the whole head left two jaws apart. FR : la fente s'arrête à une profondeur fixe sous la peau, les gencives sont derrière les dents : une plaque à travers toute la tête laissait deux mâchoires séparées.
+for t in P.get("inside", []): v = combine(f"inside_{t['name']}", v, vol(f"inside_{t['name']}", tube(t)), "sdfunion")      # 2 November 2026 : the inside of the mouth, the Mouth_Inside box of the series : without it the cut goes through and the background shows. FR : l'intérieur de la bouche : sans lui la coupe traverse et le fond se voit.
+s1 = mk("vdbsmoothsdf", "vdbsmooth_final", v, iterations=P["final_smooth"]); v2 = combine("eye", s1, vol("eye", ball("eye", [ce[0] + E.get("out", 0.0), ce[1], ce[2]], E["radius"], rot=E.get("rot", (0, 0, 0)))), "sdfunion"); cv = mk("convertvdb", "convertvdb_head", v2, conversion="poly", adaptivity=P.get("adaptivity", 0.0)); out_skin = mk("null", "OUT_HEAD", cv); out_skin.setColor(GREEN)
+# teeth : a box, subdivided, copied on the points of a curve, their size from the curve. FR : une boîte subdivisée, copiée sur les points d'une courbe, la taille venant de la courbe.
+parts = [out_skin]; Tt = P.get("teeth")
+if Tt:
+    bx = mk("box", "box_tooth", sizex=Tt["size"][0], sizey=Tt["size"][1], sizez=Tt["size"][2]); sb = mk("subdivide", "subdivide_tooth", bx, iterations=Tt.get("subdivide", 2)); w = mk("attribwrangle", "attribremap_teeth", add_curve("curve_teeth", [q[:3] for q in Tt["pts"]])); w.parm("snippet").set("float s[] = {" + ",".join(str(q[3]) for q in Tt["pts"]) + "}; f@pscale = s[@ptnum];");      # 2 November 2026 : each tooth stands where the frames show it, with the height they show : the series copies boxes on a curve, its sizes come from that curve. FR : chaque dent est là où les images la montrent, à la hauteur qu'elles montrent.
+    cp = mk("copytopoints::2.0", "copytopoints_teeth", sb, w); mr = mk("mirror", "mirror_teeth", cp, dirx=1, diry=0, dirz=0); ot = mk("null", "OUT_TEETH", mr); ot.setColor(GREEN); parts.append(ot)
+if P.get("ear"):
+    e_ = P["ear"]; ev = combine("ear", vol("ear_shell", tube(e_["shell"])), vol("ear_hollow", tube(e_["hollow"])), "sdfdifference"); eo = mk("null", "OUT_EARS", mk("convertvdb", "convertvdb_ear", mk("vdbsmoothsdf", "vdbsmooth_ear", ev, iterations=1), conversion="poly", adaptivity=0.0)); eo.setColor(GREEN); parts.append(eo)
+mf = mk("merge", "merge_head", *parts); ou = mk("null", "OUT_HEAD_ALL", mf); ou.setDisplayFlag(True); ou.setRenderFlag(True); geo.layoutChildren(); g = ou.geometry(); g.saveToFile(f"{OUT}/part.obj"); out_skin.geometry().saveToFile(f"{OUT}/skin.obj"); [n.geometry().saveToFile(f"{OUT}/{n.name().lower()}.obj") for n in parts[1:]]; errs = [n.path() + " : " + n.errors()[0][:100] for n in geo.children() if n.errors()]; hou.hipFile.save(f"{OUT}/Head.hip"); protect = [[ce[0], ce[1], ce[2], (max(E["socket"]) if isinstance(E["socket"], list) else E["socket"]) + 0.04]] + P.get("protect", []) + [res(q) + [0.14] for c_ in P.get("cut", []) for q in c_["pts"]] + [[skin_x(q[0], q[1]), q[0], q[1], P.get("protect_mouth", 0.05)] for q in M["line"][1:-1]]      # 2 November 2026 : where the final sculpt must not erase what was built. FR : là où le sculpt final ne doit pas effacer ce qui a été construit.
+rep = dict(nodes=len(geo.children()), points=len(g.points()), errors=errs, eye=ce, protect=protect, seconds=round(time.time() - T0, 1)); json.dump(rep, open(f"{OUT}/report.json", "w"), indent=0); print(json.dumps(rep))

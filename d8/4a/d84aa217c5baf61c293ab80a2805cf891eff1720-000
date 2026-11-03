@@ -1,0 +1,25 @@
+"""2 November 2026 : the camera of a frame for a finished model : many starts around the gizmo angles, the best one refined. The shape is not touched, so the score on a frame never used is a real test. A single start stayed in a wrong minimum on one frame out of six. FR : la caméra d'une image pour un modèle fini : plusieurs départs autour des angles de la croix d'axes, le meilleur est affiné. La forme n'est pas touchée, le score sur une image jamais utilisée est donc un vrai test.
+    python -I CamSearch.py <views folder> <mesh.obj or fit.json> f1,f2,... <out.json> [start cams in the format of DragonFit]"""
+import sys, os, json, math
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE)); import DragonFit as DF
+views, model, names, out = sys.argv[1], sys.argv[2], sys.argv[3].split(","), sys.argv[4]; start = json.load(open(sys.argv[5])) if len(sys.argv) > 5 else {}; G = json.load(open(f"{views}/gizmo_cams.json")); refs = DF.load_refs(views, names); S = DF.Scene({k: (r["mask"].shape[1], r["mask"].shape[0]) for k, r in refs.items()})
+T = json.load(open(model))["tubes"] if model.endswith(".json") else [dict(name="m", kind="obj", file=model, pts=[[0, 0, 0]], ramp=[[0, 1]], radius=1.0, mirror=False)]
+for t in T: S.set_tube(t)
+cams = {}
+for k, r in refs.items():
+    y0, p0 = G[k]["yaw"], G[k]["pitch"]; seeds = [start[k]] if k in start else []; ys, xs = np.nonzero(r["mask"]); fp = (r["mask"].shape[1] / 2) / math.tan(math.radians(45.0) / 2); best = None
+    for dy in np.arange(-8, 9, 4):
+        for dp in np.arange(-8, 9, 4):
+            for d_ in (6.5, 8.0, 9.5, 11.0):
+                c = [y0 + dy, p0 + dp, 0.0, float(d_), 0.0, 0.0]; m = S.render(k, c, 45.0); y2, x2 = np.nonzero(m)
+                if len(x2) == 0: continue
+                c[3] *= max(np.ptp(x2), np.ptp(y2)) / max(np.ptp(xs), np.ptp(ys)); m = S.render(k, c, 45.0); y2, x2 = np.nonzero(m)
+                if len(x2): c[4] = float(((xs.min() + xs.max()) - (x2.min() + x2.max())) / 2 * c[3] / fp); c[5] = float(((y2.min() + y2.max()) - (ys.min() + ys.max())) / 2 * c[3] / fp)
+                seeds.append(c)
+    E = sorted((DF.view_cost(S.render(k, c, 45.0), r), i) for i, c in enumerate(seeds))
+    for e, i in E[:6]:
+        c, e2 = DF.refine_cam(S, k, r, seeds[i], 45.0, loops=6)
+        if best is None or e2 < best[0]: best = (e2, c)
+    cams[k] = best[1]
+rep = DF.overlay(S, refs, cams, 45.0, out + ".png"); print({k: [round(float(v[0]), 4), round(float(v[1]), 4)] for k, v in rep.items()}, "mean", round(float(np.mean([v[0] for v in rep.values()])), 4), round(float(np.mean([v[1] for v in rep.values()])), 4)); print({k: [round(float(x), 2) for x in c] for k, c in cams.items()}); json.dump(cams, open(out, "w"), default=float)

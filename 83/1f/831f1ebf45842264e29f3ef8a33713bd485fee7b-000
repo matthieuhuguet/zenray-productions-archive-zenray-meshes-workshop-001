@@ -1,0 +1,46 @@
+"""2 November 2026 : parts made in their own frames are placed in the whole, one set after the other, by grid search on size and position, each set with the sets already placed : first the set that gives the cameras (body, tail, plates), on the half of the image it occupies, then the head, the limbs, the wings. FR : des parties faites dans leur propre repère se placent dans l'ensemble, un groupe après l'autre, par recherche sur grille en taille et position : d'abord le groupe qui donne les caméras (corps, queue, plaques), sur la moitié de l'image qu'il occupe, puis la tête, les membres, les ailes.
+    python -I PlaceAll.py <views folder> <sets.json> <out.json> f1,f2,...
+    sets.json : {"sets": [{"name": "back", "tubes": [...], "cameras": true}, {"name": "head", "tubes": [...], "grid": {"s": [a, b, n], "x": [...], "y": [...], "z": [...]}}]}"""
+import sys, os, json, math, itertools
+import numpy as np
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE)); import DragonFit as DF
+views, setsf, out, names = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].split(","); G = json.load(open(f"{views}/gizmo_cams.json")); refs = DF.load_refs(views, names); S = DF.Scene({k: (r["mask"].shape[1], r["mask"].shape[0]) for k, r in refs.items()}); SETS = json.load(open(setsf))["sets"]; placed = []; cams = {}
+def moved(b, s, t):
+    n = json.loads(json.dumps(b))
+    if n.get("kind") == "obj": x = n.get("xform", [0, 0, 0, 1]); n["xform"] = [x[0] * s + t[0], x[1] * s + t[1], x[2] * s + t[2], x[3] * s]; return n
+    n["pts"] = [[q[k] * s + t[k] for k in range(3)] for q in b["pts"]]
+    if n.get("kind") != "sheet": n["radius"] = b.get("radius", 1.0) * s
+    return n
+def total(care=None):
+    return sum(DF.view_cost(S.render(k, cams[k], 45.0), refs[k] if care is None else care[k]) for k in refs)
+def rng(a): return np.linspace(a[0], a[1], int(a[2])) if len(a) == 3 else np.array(a)
+for st in SETS:
+    tubes = st["tubes"]
+    if st.get("cameras"):
+        care = {}
+        for k, r in refs.items():
+            ys, xs = np.nonzero(r["mask"]); cx = (xs.min() + xs.max()) * st.get("care_from", 0.5); w_ = r["weight"].copy(); w_[:, :int(cx)] = 0; care[k] = dict(r, weight=w_)
+        for t in tubes: S.set_tube(t)
+        for k, r in refs.items():      # distance and shift searched first, the angles come from the gizmo. FR : distance et décalage cherchés d'abord, les angles viennent de la croix d'axes.
+            bestc = None
+            for d_ in np.arange(3.5, 13.0, 0.25):
+                c0 = [G[k]["yaw"], G[k]["pitch"], 0.0, float(d_), 0.0, 0.0]; m0 = S.render(k, c0, 45.0); ys0, xs0 = np.nonzero(m0); ys, xs = np.nonzero(care[k]["mask"])
+                if len(xs0) == 0: continue
+                fp = (r["mask"].shape[1] / 2) / math.tan(math.radians(45.0) / 2); c0[4] = float((xs.max() - xs0.max()) * d_ / fp); c0[5] = float((ys0.max() - ys.max()) * d_ / fp); e0 = DF.view_cost(S.render(k, c0, 45.0), care[k])
+                if bestc is None or e0 < bestc[0]: bestc = (e0, c0)
+            cams[k], _ = DF.refine_cam(S, k, care[k], bestc[1], 45.0, loops=6)
+        placed += tubes; print(st["name"], "cameras", {k: [round(float(x), 2) for x in c] for k, c in cams.items()}, "care cost", round(total(care), 3), flush=True); continue
+    g = st["grid"]; ss, xs_, ys_, zs_ = rng(g.get("s", [1.0])), rng(g.get("x", [0.0])), rng(g.get("y", [0.0])), rng(g.get("z", [0.0])); best = None
+    for rnd in range(3):
+        R = []
+        for s_, x_, y_, z_ in itertools.product(ss, xs_, ys_, zs_):
+            for b in tubes: S.set_tube(moved(b, float(s_), (float(x_), float(y_), float(z_))))
+            R.append((total(), float(s_), float(x_), float(y_), float(z_)))
+        R.sort(key=lambda a: a[0]); best = R[0]; print(st["name"], "round", rnd, "cells", len(R), "best", [round(v, 3) for v in best], flush=True); h = 0.5 ** rnd; dx = lambda a, f: (a + np.arange(-2, 3) * f * h) if f else np.array([a])
+        ss, xs_, ys_, zs_ = dx(best[1], 0.04 if len(rng(g.get("s", [1.0]))) > 1 else 0), dx(best[2], 0.1 if len(rng(g.get("x", [0.0]))) > 1 else 0), dx(best[3], 0.1 if len(rng(g.get("y", [0.0]))) > 1 else 0), dx(best[4], 0.1 if len(rng(g.get("z", [0.0]))) > 1 else 0)
+    new = [moved(b, best[1], (best[2], best[3], best[4])) for b in tubes]
+    for t in new: S.set_tube(t)
+    placed += new
+    for k, r in refs.items(): cams[k], _ = DF.refine_cam(S, k, r, cams[k], 45.0, loops=2)
+    print(" after cameras", round(total(), 3), flush=True)
+rep = DF.overlay(S, refs, cams, 45.0, out + ".png"); print({k: round(float(v[0]), 3) for k, v in rep.items()}, "mean", round(float(np.mean([v[0] for v in rep.values()])), 4), round(float(np.mean([v[1] for v in rep.values()])), 4)); json.dump(dict(tubes=placed), open(out, "w"), indent=0); json.dump(cams, open(out + ".cams.json", "w"), default=float)

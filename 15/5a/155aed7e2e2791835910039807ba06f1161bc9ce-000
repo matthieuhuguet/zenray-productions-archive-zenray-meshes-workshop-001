@@ -1,0 +1,44 @@
+"""2 November 2026 : DRACARD, the silhouette of the grey body in the frames of the tutorial : finds the viewport rectangle (lit background between the dark panels), removes the background row by row, keeps the largest grey region, fills its holes. These masks are the measure of the fit, nothing else reads them.
+    python -I RefMasks.py <refs folder> <out folder> name1 name2 ...      writes masks/<name>.png, views.json, masks_sheet.png
+FR : la silhouette du corps gris dans les images du tuto : trouve la zone de vue, retire le fond rangée par rangée, garde la plus grande région grise, remplit ses trous. Ces masques sont la mesure de l'ajustement."""
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+# Every value of the method, in pixels of the 1280 px video or in 0..255. FR : tous les réglages, en pixels de la vidéo de 1280 px ou de 0 à 255.
+DEF = dict(panel_dark=48, scan_x=24, scan_y=300, top_skip=26, delta=16, saturation=26, open_px=2, regrow_px=3, gap_min_px=80, gap_bright=7, close_px=2, near_px=8, part_px=40, corner_px=70, label_w=230, label_h=26)
+
+
+def viewport(g, r):
+    """the lit rectangle around the scan point : stops where a long dark panel starts. FR : le rectangle clair autour du point de départ, s'arrête où commence un long panneau sombre."""
+    row = np.median(g[r["scan_y"] - 40:r["scan_y"] + 40, :], 0) > r["panel_dark"]; x0 = r["scan_x"]
+    while x0 > 0 and row[x0 - 1]: x0 -= 1
+    x1 = r["scan_x"]
+    while x1 < len(row) - 1 and row[x1 + 1:x1 + 6].any(): x1 += 1
+    col = np.median(g[:, x0 + 2:x0 + 12], 1) > r["panel_dark"]; y0 = r["scan_y"]
+    while y0 > 0 and col[y0 - 1]: y0 -= 1
+    y1 = r["scan_y"]
+    while y1 < len(col) - 1 and col[y1 + 1]: y1 += 1
+    return int(x0), int(y0 + r["top_skip"]), int(x1 + 1), int(y1 + 1)
+
+
+def mask(a, rect, r):
+    x0, y0, x1, y1 = rect; c = a[y0:y1, x0:x1].astype(np.float32); g = c.mean(2); bg = np.percentile(g, 12, axis=1, keepdims=True); sat = c.max(2) - c.min(2); m = (g > bg + r["delta"]) & (sat < r["saturation"]); raw = m; m = ndi.binary_dilation(ndi.binary_opening(raw, iterations=r["open_px"]), iterations=r["regrow_px"]) & raw; h, w = m.shape;      # 2 November 2026 : a stronger opening drops the grid and axis lines, the small regrowth gives back finger tips. FR : une ouverture plus forte retire les lignes de grille et d'axes, la petite repousse rend le bout des doigts.
+    m[-r["corner_px"]:, :r["corner_px"]] = False; m[:r["label_h"], :r["label_w"]] = False; lab, n = ndi.label(ndi.binary_closing(m, iterations=r["close_px"]))      # 2 November 2026 : the dark crease between belly and leg cut a whole leg off the mask ; close first, and keep every large part near the main one. FR : le pli sombre entre ventre et jambe coupait une jambe entière du masque ; fermer d'abord, garder toute grande partie proche de la principale.
+    if n == 0: return m
+    sz = ndi.sum(m, lab, range(1, n + 1)); big = lab == 1 + int(np.argmax(sz)); near = ndi.binary_dilation(big, iterations=r["near_px"]); keep = [i for i in range(1, n + 1) if sz[i - 1] >= r["part_px"] and (near & (lab == i)).any()]; out = ndi.binary_fill_holes(np.isin(lab, keep)); gaps, k = ndi.label(~out)      # 2 November 2026 : a gap that is not background (bright, or tiny) belongs to the model even when it reaches the frame border. FR : un trou qui n'est pas du fond (clair, ou minuscule) appartient au modèle même s'il touche le bord.
+    diff = np.abs(g - bg)
+    for i in range(1, k + 1):
+        z = gaps == i
+        if z.sum() < r["gap_min_px"] or np.median(diff[z]) > r["gap_bright"]: out[z] = True
+    return out
+
+
+if __name__ == "__main__":
+    src, out = sys.argv[1], sys.argv[2]; names = sys.argv[3:]; os.makedirs(f"{out}/masks", exist_ok=True); views = {}; tiles = []
+    for n in names:
+        a = np.asarray(Image.open(f"{src}/{n}.png").convert("RGB")); g = a.mean(2); rect = viewport(g, DEF); m = mask(a, rect, DEF); x0, y0, x1, y1 = rect; Image.fromarray((m * 255).astype(np.uint8)).save(f"{out}/masks/{n}.png"); views[n] = dict(rect=rect, size=[x1 - x0, y1 - y0], area=int(m.sum())); print(n, rect, int(m.sum()))
+        view = a[y0:y1, x0:x1].copy(); e = m ^ ndi.binary_erosion(m); view[e] = (255, 40, 40); t = Image.fromarray(view); t.thumbnail((480, 480)); tiles.append(t)
+    json.dump(views, open(f"{out}/views.json", "w"), indent=0); cols = 5; rows = (len(tiles) + cols - 1) // cols; s = Image.new("RGB", (cols * 480, rows * 480), (20, 20, 20))
+    for k, t in enumerate(tiles): s.paste(t, ((k % cols) * 480, (k // cols) * 480))
+    s.save(f"{out}/masks_sheet.png")

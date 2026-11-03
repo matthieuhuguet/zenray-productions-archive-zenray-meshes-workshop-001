@@ -1,0 +1,23 @@
+"""2 November 2026 : M22, the settings of MicroCutFit.py against the known truth, each candidate on the same degraded masks. FR : les réglages du calage contre la vérité connue, chaque candidat sur les mêmes masques dégradés.
+    python -I MicroFitSweep.py Projects/<truth id>/params.json "F_line=0.2,F_band_px=2" "F_line=0.3" ...       a candidate may set F_method"""
+import sys, json
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0, "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Scripts/micro"); import MicroCommon as C, MicroCutFit as F
+
+
+def parse(s):
+    out = {}
+    for kv in filter(None, s.split(",")): k, v = kv.split("="); out[k] = v if k == "F_method" else float(v)
+    return out
+
+
+def one(a):
+    home, v, r, sc = a; T = np.load(f"{home}/02_masks/truth_{v}.npz")["labels"]; E, inside = F.load_view(home, v, r, sc); h, w = min(T.shape[0], E.shape[0]), min(T.shape[1], E.shape[1]); T = T[:h, :w].astype(np.int32); E = E[:h, :w]; inside = inside[:h, :w]; amb = np.load(f"{home}/02_masks/ambig_{v}.npz")["ambig"][:h, :w]; D = F.degrade(T, r, sc, r["F_sim_seed"] + sum(map(ord, v))); X, info = F.run_view(D, E, inside, r["F_method"], r, sc); return {b: F.truth_accuracy(X, T, amb, sc, b) for b in (1, 2, 3)}, info["score"]["on_1px"]
+
+
+if __name__ == "__main__":
+    p, home = C.load(sys.argv[1]); base = F.settings(p); sc = p["scale"]
+    with ProcessPoolExecutor(6) as ex:
+        for s in sys.argv[2:]:
+            r = {**base, **parse(s)}; res = list(ex.map(one, [(home, v, r, sc) for v in p["views"]])); print(s.ljust(62), " ".join(f"{b}px {sum(x[0][b][0] for x in res) / max(sum(x[0][b][1] for x in res), 1) * 100:.3f}" for b in (1, 2, 3)), "calage", round(float(np.mean([x[1] for x in res])), 4), flush=True)

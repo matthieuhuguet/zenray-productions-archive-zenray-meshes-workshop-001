@@ -1,4 +1,5 @@
 """1 November 2026 : M22 step 3, the GRIDS waiting for the micro-components : pages of 4, 8 or 16 lines of 6 orthographic views, each line one micro-component at one scale, the 6 cells EMPTY (1 November 2026, Matthieu : no pre-generated shape, the image generator gives the geometry), the part shown only as its mask on the reference, name, measured size and description on the left, graduated edges, the prompt printed on the image, four corner squares for the automatic reading of the returned image. Every layout value is in LAYOUTS (HDA). Writes 03_sheets/S<nn>.png, S<nn>.txt (prompt) and sheets.json.
+2 November 2026 : with sheet_crops in params.json, once a real cut is fitted on the sheet, each cell where the piece shows receives its real image, cut out of the reference by its mask, at the scale of the line ; the other cells stay empty. This is no pre-generation : the pixels come from the sheet, nothing is invented. FR : avec sheet_crops, chaque case où la pièce est visible reçoit sa vraie image, découpée dans la référence par son masque, à l'échelle de la ligne ; les autres cases restent vides.
     python -I MicroSheets.py Projects/<id>/params.json        FR : les grilles qui attendent les micro-components, le prompt imprimé sur chaque image."""
 import sys, os, json
 import numpy as np
@@ -9,10 +10,22 @@ sys.path.insert(0, ROOT + "/Scripts"); import Raster
 sys.path.insert(0, ROOT + "/Scripts/micro"); import MicroCommon as C
 FONT_NUM = "/Users/zenray/Library/Fonts/GT-Ultra-Standard-Regular.otf"; FONT_TXT = "/Users/zenray/Library/Fonts/Literata[opsz,wght].ttf"
 LAYOUTS = {4: dict(W=3072, H=2048, blocks=1, rows=4, header=318, cell=386, name=44, text=26, prompt=30), 8: dict(W=2048, H=3072, blocks=1, rows=8, header=352, cell=270, name=32, text=20, prompt=26), 16: dict(W=3072, H=2048, blocks=2, rows=8, header=268, cell=196, name=24, text=16, prompt=28)}
+CROP = dict(min_px=30, soft_px=0.4, margin_px=30)      # 2 November 2026 : the real image in a cell, min_px and soft_px in pixels of the panel, margin_px in pixels of the sheet to fill. FR : la vraie image dans une case.
 INK = (24, 24, 26); CELL = (246, 246, 244); MARGIN = 34; FID = 46
 VIEW_FR = dict(front="FACE", back="ARRIÈRE", left="GAUCHE", right="DROITE", top="DESSUS", bottom="DESSOUS")
 PROMPT = ("REMPLIS CETTE GRILLE, ses cases sont vides. Chaque ligne est UNE pièce seule, isolée de l'objet : à gauche, en couleur sur la planche de référence, tu vois la pièce à dessiner, son nom et ses dimensions. Dans chacune des 6 cases de la ligne, dessine cette pièce vue de face, d'arrière, de gauche, de droite, de dessus et de dessous, en projection orthographique sans aucune perspective, centrée dans la case, à l'échelle indiquée par les graduations de sa ligne. "
           "Rendu : gris mat uniforme type clay render, sans ombre portée, avec le FIL DE FER noir fin en quads visible sur toute la surface. Les six vues d'une ligne montrent le même objet : dimensions et formes doivent concorder entre elles. Garde intacts la grille, le fond clair, les quatre carrés noirs des coins, les graduations, les numéros et tous les textes. Ne dessine rien hors des cases.")
+
+
+PROMPT_CROPS = ("REMPLIS CETTE GRILLE. Chaque ligne est UNE pièce seule, isolée de l'objet, avec son nom et ses dimensions. Dans une case qui montre déjà la pièce, c'est sa vraie image, découpée sur l'objet et à la bonne échelle : garde son contour et ses proportions, complète seulement ce que d'autres pièces cachaient. Dans une case vide, dessine la même pièce vue de cette direction, en projection orthographique sans perspective, centrée, à l'échelle des graduations de sa ligne. "
+                "Rendu dans toutes les cases : gris mat uniforme type clay render, sans ombre portée, avec le FIL DE FER noir fin en quads visible sur toute la surface. Les six vues d'une ligne montrent le même objet. Garde intacts la grille, le fond clair, les quatre carrés noirs des coins, les graduations, les numéros et tous les textes. Ne dessine rien hors des cases.")
+
+
+def piece_crop(p, home, V, ids, vn, s_cell, cell_px, crop_cfg):
+    """the real image of a piece in one view : the largest region of its mask, cut out of the reference, scaled to the line, on a clear ground. None if the view does not show it. FR : la vraie image d'une pièce dans une vue : sa plus grande région, découpée dans la référence, à l'échelle de la ligne, sur fond clair."""
+    lab = np.load(f"{home}/02_masks/labels_{vn}.npz")["labels"]; m = np.isin(lab, ids)
+    if m.sum() < crop_cfg["min_px"] * p["scale"] ** 2: return None
+    cc, n = ndi.label(m); big = 1 + int(np.argmax(ndi.sum(m, cc, range(1, n + 1)))); mm = cc == big; ys, xs = np.nonzero(mm); pad = 2 * p["scale"]; y0, y1, x0, x1 = max(ys.min() - pad, 0), ys.max() + pad + 1, max(xs.min() - pad, 0), xs.max() + pad + 1; rgb = np.asarray(Image.fromarray(C.panel_rgb(p, vn)).resize((lab.shape[1], lab.shape[0]), Image.BICUBIC))[y0:y1, x0:x1]; alpha = (ndi.gaussian_filter(mm[y0:y1, x0:x1].astype(np.float32), crop_cfg["soft_px"] * p["scale"]) * 255).astype(np.uint8); k = s_cell / (V[vn]["px_per_m"] * p["scale"]); w, h = max(int(round(rgb.shape[1] * k)), 1), max(int(round(rgb.shape[0] * k)), 1); lim = cell_px - crop_cfg["margin_px"]; f = min(1.0, lim / max(w, h)); w, h = max(int(w * f), 1), max(int(h * f), 1); return Image.fromarray(rgb).resize((w, h), Image.LANCZOS), Image.fromarray(alpha).resize((w, h), Image.LANCZOS)
 
 
 def font(path, size):
@@ -74,7 +87,7 @@ def capacity(m, p):
 
 
 def main(params):
-    p, home = C.load(params); O = f"{home}/03_sheets"; os.makedirs(O, exist_ok=True); MC = json.load(open(f"{home}/02_masks/mc.json"))["mc"]; micro = json.load(open(f"{home}/02_masks/micro.json")); atoms = micro["atoms"]; fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
+    p, home = C.load(params); crop_cfg = {**CROP, **p.get("sheet_crop", {})}; O = f"{home}/03_sheets"; os.makedirs(O, exist_ok=True); MC = json.load(open(f"{home}/02_masks/mc.json"))["mc"]; micro = json.load(open(f"{home}/02_masks/micro.json")); atoms = micro["atoms"]; fr = json.load(open(C.abspath(p["frame"]))); V = {v["name"]: v for v in fr["views"]}
     def representative(m):
         """the left side instance (x > 0), front first, so a mirrored pair reads like the left panel of the sheet"""
         c = [atoms[a] for a in m["atoms"]]; return max(c, key=lambda a: (a["centre"][0] >= 0, a["centre"][2], a["centre"][1]))
@@ -85,10 +98,10 @@ def main(params):
         for k in range(0, len(groups[cap]), cap): sheets.append(dict(cap=cap, rows=groups[cap][k:k + cap]))
     total = len(sheets); index = []
     for si, S in enumerate(sheets):
-        cap = S["cap"]; L = LAYOUTS[cap]; W, H = L["W"], L["H"]; img = Image.new("RGB", (W, H), (255, 255, 255)); dr = ImageDraw.Draw(img); fT = font(FONT_NUM, int(L["prompt"] * 1.5)); fP = font(FONT_TXT, L["prompt"]); fN = font(FONT_NUM, L["name"]); fX = font(FONT_TXT, L["text"]); fS = font(FONT_NUM, max(L["text"] - 2, 14)); sid = f"S{si + 1:02d}"
+        cap = S["cap"]; L = LAYOUTS[cap]; W, H = L["W"], L["H"]; img = Image.new("RGB", (W, H), (255, 255, 255)); dr = ImageDraw.Draw(img); fT = font(FONT_NUM, int(L["prompt"] * 1.5)); fP = font(FONT_TXT, L["prompt"]); prompt_ = PROMPT_CROPS if p.get("sheet_crops") else PROMPT; fN = font(FONT_NUM, L["name"]); fX = font(FONT_TXT, L["text"]); fS = font(FONT_NUM, max(L["text"] - 2, 14)); sid = f"S{si + 1:02d}"
         for (x, y) in ((MARGIN, MARGIN), (W - MARGIN - FID, MARGIN), (MARGIN, H - MARGIN - FID), (W - MARGIN - FID, H - MARGIN - FID)): dr.rectangle((x, y, x + FID, y + FID), fill=(0, 0, 0))
         tx = MARGIN + FID + 26; dr.text((tx, MARGIN - 4), f"ZenRay Meshes  {p['title']}  feuille {si + 1} sur {total}  {len(S['rows'])} pièces", font=fT, fill=INK); y = MARGIN + int(L["prompt"] * 2.0)
-        for line in wrap(dr, PROMPT, fP, W - 2 * tx): dr.text((tx, y), line, font=fP, fill=INK); y += int(L["prompt"] * 1.32)
+        for line in wrap(dr, prompt_, fP, W - 2 * tx): dr.text((tx, y), line, font=fP, fill=INK); y += int(L["prompt"] * 1.32)
         assert y <= L["header"] + 6, f"prompt overflows the header on {sid} : {y} > {L['header']}"
         avail = H - L["header"] - MARGIN - FID - 8; rh = avail // L["rows"]; bw = (W - 2 * MARGIN) // L["blocks"]; lw = bw - 6 * L["cell"] - 14; rows_json = []
         for ri, m in enumerate(S["rows"]):
@@ -100,20 +113,24 @@ def main(params):
             tx0 = x0 + iw + 12; tw = lw - iw - 20; yy = y0 - 4; inst = f"  x{m['instances']}" if m["instances"] > 1 else ""
             dr.text((tx0, yy), f"{m['mc']}", font=fN, fill=INK); yy += int(L["name"] * 1.16)
             for line in wrap(dr, m["fr"] + inst, fN, tw)[:3]: dr.text((tx0, yy), line, font=fN, fill=INK); yy += int(L["name"] * 1.12)
-            tmpl = (hi - lo).tolist(); msize, measured = measured_size(p, home, V, a, tmpl); size = np.array(msize); s = 0.80 * L["cell"] / max(size.max(), 1e-3); mm = [round(float(v) * 1000) for v in size]; tick = nice_tick((L["cell"] - 4) / s); dims = f"{mm[0]} x {mm[1]} x {mm[2]} mm"; dr.text((tx0, yy + 2), dims, font=fS, fill=INK); yy += int(L["text"] * 1.5); t_mm = tick * 1000; tick_txt = f"{t_mm:.0f} mm" if t_mm >= 1 else f"{t_mm:.1f} mm"; dr.text((tx0, yy), f"1 graduation = {tick_txt}", font=fS, fill=(70, 70, 74)); yy += int(L["text"] * 1.4)
+            tmpl = (hi - lo).tolist(); msize, measured = measured_size(p, home, V, a, tmpl); size = np.array(msize); s = 0.80 * L["cell"] / max(size.max(), 1e-3); mm = [round(float(v) * 1000) for v in size]; tick = nice_tick((L["cell"] - 4) / s); dims = " x ".join(str(v) if v else "?" for v in mm) + " mm";      # 2 November 2026 : an axis no view measures is unknown, never 0. FR : un axe qu'aucune vue ne mesure est inconnu, jamais 0.
+            dr.text((tx0, yy + 2), dims, font=fS, fill=INK); yy += int(L["text"] * 1.5); t_mm = tick * 1000; tick_txt = f"{t_mm:.0f} mm" if t_mm >= 1 else f"{t_mm:.1f} mm"; dr.text((tx0, yy), f"1 graduation = {tick_txt}", font=fS, fill=(70, 70, 74)); yy += int(L["text"] * 1.4)
             for line in wrap(dr, m["shape"], fX, tw):
                 if yy + L["text"] > y0 + L["cell"]: break
                 dr.text((tx0, yy), line, font=fX, fill=(70, 70, 74)); yy += int(L["text"] * 1.22)
-            cells = {}
+            ref_px = json.load(open(f"{home}/02_masks/metrics.json"))["ref_px"]; crop_ids = m["atoms"] if m["instances"] <= 1 else [max(m["atoms"], key=lambda i_: (sum(ref_px.get(str(i_), {}).values()), -i_))]      # 2 November 2026 : a single piece shows in all its views ; of a mirrored pair, one side only, its views then show one object. FR : une pièce unique se montre dans toutes ses vues ; d'une paire miroir, un seul côté.
+            cells = {}; shown = []
             for vi, vn in enumerate(p["views"]):
-                cx = x0 + lw + 8 + vi * L["cell"]; cy = y0; c = L["cell"]; dr.rectangle((cx, cy, cx + c - 2, cy + c - 2), fill=CELL, outline=INK, width=2); dr.text((cx + 8, cy + 5), VIEW_FR[vn], font=fS, fill=(110, 110, 114)); step = tick * s; n_t = int((c - 4) / 2 / step)
+                cx = x0 + lw + 8 + vi * L["cell"]; cy = y0; c = L["cell"]; dr.rectangle((cx, cy, cx + c - 2, cy + c - 2), fill=CELL, outline=INK, width=2); got = piece_crop(p, home, V, crop_ids, vn, s, c, crop_cfg) if p.get("sheet_crops") else None
+                if got: img.paste(got[0], (cx + (c - got[0].size[0]) // 2, cy + (c - got[0].size[1]) // 2), got[1]); shown.append(vn)
+                dr.text((cx + 8, cy + 5), VIEW_FR[vn], font=fS, fill=(110, 110, 114)); step = tick * s; n_t = int((c - 4) / 2 / step)
                 for k in range(-n_t, n_t + 1):     # graduations from the centre of the cell, the same scale in the 6 cells of the line
                     tx_ = cx + c / 2 + k * step; ty_ = cy + c / 2 + k * step; ln = 11 if k % 5 == 0 else 6; dr.line((tx_, cy + c - 2, tx_, cy + c - 2 - ln), fill=INK, width=1)
                     if ty_ > cy + 26: dr.line((cx, ty_, cx + ln, ty_), fill=INK, width=1)      # 1 November 2026 : no tick under the view label
                 cells[vn] = [cx, cy, c]
-            rows_json.append(dict(line=ri + 1, mc=m["mc"], fr=m["fr"], family=m["family"], instances=m["instances"], atom=a["id"], faces=a["faces"], size_mm=mm, size_measured=measured, tick_m=tick, px_per_m=round(s, 3), centre_m=c3.round(4).tolist(), cells=cells, shape=m["shape"]))
-        details = "\n".join(f"Ligne {r['line']} : pièce {r['mc']}, {r['fr']}" + (f", {r['instances']} exemplaires identiques" if r["instances"] > 1 else "") + f". Dimensions {r['size_mm'][0]} x {r['size_mm'][1]} x {r['size_mm'][2]} mm (largeur x hauteur x longueur), proportions {round(r['size_mm'][0] / max(r['size_mm'][1], 1), 2)} : 1 : {round(r['size_mm'][2] / max(r['size_mm'][1], 1), 2)}, 1 graduation = {r['tick_m'] * 1000:g} mm. {r['shape'][0].upper() + r['shape'][1:]}." for r in rows_json)
-        ptxt = PROMPT + "\n\n" + details + "\n"; open(f"{O}/{sid}.txt", "w").write(ptxt); img.save(f"{O}/{sid}.png", optimize=True); index.append(dict(id=sid, cap=cap, size=[W, H], image=f"{sid}.png", prompt=f"{sid}.txt", rows=rows_json, fid=FID, margin=MARGIN)); print(sid, "cap", cap, "lines", len(rows_json), [r["mc"] for r in rows_json])
+            rows_json.append(dict(shown=shown, line=ri + 1, mc=m["mc"], fr=m["fr"], family=m["family"], instances=m["instances"], atom=a["id"], faces=a["faces"], size_mm=mm, size_measured=measured, tick_m=tick, px_per_m=round(s, 3), centre_m=c3.round(4).tolist(), cells=cells, shape=m["shape"]))
+        details = "\n".join(f"Ligne {r['line']} : pièce {r['mc']}, {r['fr']}" + (f", {r['instances']} exemplaires identiques" if r["instances"] > 1 else "") + f". Dimensions {' x '.join(str(v) if v else 'à déduire de la forme' for v in r['size_mm'])} mm (largeur x hauteur x longueur), 1 graduation = {r['tick_m'] * 1000:g} mm. {r['shape'][0].upper() + r['shape'][1:]}." for r in rows_json)
+        ptxt = prompt_ + "\n\n" + details + "\n"; open(f"{O}/{sid}.txt", "w").write(ptxt); img.save(f"{O}/{sid}.png", optimize=True); index.append(dict(id=sid, cap=cap, size=[W, H], image=f"{sid}.png", prompt=f"{sid}.txt", rows=rows_json, fid=FID, margin=MARGIN)); print(sid, "cap", cap, "lines", len(rows_json), [r["mc"] for r in rows_json])
     json.dump(dict(sheets=index, total=total), open(f"{O}/sheets.json", "w"), indent=0, ensure_ascii=False); print("sheets", total, "micro-components", sum(len(s["rows"]) for s in index))
 
 

@@ -1,0 +1,17 @@
+"""2 November 2026 : dorsal plates : the tips read on a side frame are cast on the plane x = 0 ; the base of each plate lies on the contour of the body under its tip. One sheet per plate, a front curve and a back curve meeting at the tip. FR : plaques dorsales : les pointes lues sur une image de profil sont projetées sur le plan x = 0 ; la base de chaque plaque est sur le contour du corps sous sa pointe. Une feuille par plaque, une courbe avant et une courbe arrière qui se rejoignent à la pointe.
+    python -I FinsInit.py <views folder> <frame> <fit.json of the frozen parts> <tips.json> <out.json>      tips.json : [[px, py, width_px], ...] in pixels of the viewport"""
+import sys, os, json, math
+import numpy as np
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE)); import DragonFit as DF
+views, fr, frozen, tipsf, out = sys.argv[1:6]; G = json.load(open(f"{views}/gizmo_cams.json"))[fr]; refs = DF.load_refs(views, [fr]); r = refs[fr]; h, w = r["mask"].shape; S = DF.Scene({fr: (w, h)}); D = json.load(open(frozen)); fz = D["tubes"]
+for t in fz: S.set_tube(t)
+c = DF.coarse_cam(S, fr, r, 45.0, (G["yaw"], G["pitch"])); c, e = DF.refine_cam(S, fr, r, c, 45.0, loops=6); print("camera", [round(x, 3) for x in c], "cost", round(e, 3)); m = S.render(fr, c, 45.0); R, tv, fp = DF.cam_matrix(c, w, h, 45.0)[:3]
+def on_plane(u, v):      # the ray of a pixel meets x = 0. FR : le rayon d'un pixel coupe x = 0.
+    dc = np.array([(u - w / 2) / fp, -(v - h / 2) / fp, 1.0]); o = -R.T @ tv; d = R.T @ dc; s = -o[0] / d[0]; return o + s * d
+edge = m & ~ndi.binary_erosion(m); ys, xs = np.nonzero(edge); pts = np.c_[xs, ys].astype(float); tubes = []
+for i, (u, v, wd) in enumerate(json.load(open(tipsf))):
+    k = np.argmin((pts[:, 0] - u) ** 2 + (pts[:, 1] - v) ** 2); b = pts[k]; near = pts[((pts - b) ** 2).sum(1) < (wd * 1.2) ** 2]; q = near - near.mean(0); tan = np.linalg.svd(q, full_matrices=False)[2][0]; tan = tan if tan[0] * (u - b[0]) + tan[1] * (v - b[1]) >= 0 else -tan; in_ = b - np.array([u, v]); in_ = in_ / max(np.linalg.norm(in_), 1e-6); f0 = b - tan * wd / 2 + in_ * 3; b0 = b + tan * wd / 2 + in_ * 3; T = np.array([u, v]); mf = (f0 + T) / 2 + (T - b) * 0.0 - tan * wd * 0.12; mb = (b0 + T) / 2 - tan * wd * 0.15
+    P = [on_plane(*x) for x in (f0, mf, T, b0, mb, T)]; tubes.append(dict(name=f"plate_{i:02d}", kind="sheet", pts=[[0.0, round(float(a[1]), 3), round(float(a[2]), 3)] for a in P], ramp=[[0, 0.0]], radius=1.0, mirror=False, cols=4, stations=10))
+for t in fz: t["frozen"] = True
+json.dump(dict(tubes=fz + tubes, groups=[]), open(out, "w"), indent=0); json.dump({fr: c}, open(out + ".cams.json", "w")); print(len(tubes), "plates")

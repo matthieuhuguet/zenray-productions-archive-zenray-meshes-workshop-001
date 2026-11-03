@@ -1,0 +1,233 @@
+"""2 November 2026 : DRACARD, the grey body fitted on the frames of the tutorial : the silhouette of a set of tubes is the union of their silhouettes, so no volume is needed to measure it, and the graphics card renders every view in milliseconds. Cameras come from a coarse search, then cameras and shapes improve in turns, one value at a time, a change stays only if the error goes down. The proportions come from the images, never from a number written by hand.
+    python -I DragonFit.py <v3 folder> <init json> <out json> --minutes 8 --views a,b,c
+Writes <out json>, cameras in <out json>.cams.json, and overlays <out json>.png : red = missing, blue = too much.
+FR : le corps gris ajusté sur les images du tuto : la silhouette d'un ensemble de tubes est l'union de leurs silhouettes, donc aucun volume n'est nécessaire pour la mesurer. Les caméras viennent d'une recherche grossière, puis caméras et formes s'améliorent à tour de rôle, une valeur à la fois, un changement ne reste que si l'erreur baisse."""
+import sys, os, json, time, math, argparse, random
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); import Raster, moderngl; from DragonShape import tube_mesh
+# Every value of the fit. FR : tous les réglages de l'ajustement.
+DEF = dict(toolbar_px=18, fov_deg=45.0, cap_px=30.0, target=(0.0, 0.85, -0.1), step_pos=0.03, step_ramp=0.02, step_flat=0.03, step_min=0.0015, grow=1.3, shrink=0.6, cam_every=1, save_seconds=45, gizmo_range=0.0, grey_weight=6.0, grey_blur=1.2)
+GUESS = {}      # 2 November 2026 : yaw and pitch read on the axis gizmo of each frame (GizmoRead.py, gizmo_cams.json). FR : lacet et tangage lus sur la croix d'axes de chaque image.
+VS = """#version 330
+in vec3 p; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; uniform float mir;
+void main(){ vec3 q = R * vec3(p.x * mir, p.y, p.z) + t; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, 0.0, 1.0); }"""
+FS = "#version 330\nout vec4 o; void main(){ o = vec4(1.0); }"
+VS2 = """#version 330
+in vec3 p; in vec3 n; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; uniform float mir; out vec3 vn;
+void main(){ vec3 q = R * vec3(p.x * mir, p.y, p.z) + t; vn = R * vec3(n.x * mir, n.y, n.z); float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, Z / 40.0 * 2.0 - 1.0, 1.0); }"""
+FS2 = """#version 330
+in vec3 vn; uniform float co[9]; out vec4 o;
+void main(){ vec3 n = normalize(vn); if (n.z > 0.0) n = -n; float x = n.x, y = n.y, z = n.z; o = vec4(co[0] + co[1]*x + co[2]*y + co[3]*z + co[4]*x*y + co[5]*x*z + co[6]*y*z + co[7]*(x*x-y*y) + co[8]*(3.0*z*z-1.0), 0.0, 0.0, 1.0); }"""
+
+
+class Scene:
+    def __init__(s, sizes):
+        s.g = Raster.ctx(); s.prog = s.g.program(vertex_shader=VS, fragment_shader=FS); s.prog2 = s.g.program(vertex_shader=VS2, fragment_shader=FS2); s.items = {}; s.fbo = {}; s.fb2 = {}
+        for k, (w, h) in sizes.items():
+            s.fbo[k] = s.g.simple_framebuffer((w, h), components=1, dtype="f1"); tx = s.g.texture((w, h), 4, dtype="f4"); s.fb2[k] = (s.g.framebuffer([tx], s.g.depth_renderbuffer((w, h))), tx)
+
+    def set_tube(s, t):
+        V, F = tube_mesh(t); n = t["name"]; old = s.items.get(n); fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]); N = np.zeros_like(V); np.add.at(N, F[:, 0], fn); np.add.at(N, F[:, 1], fn); np.add.at(N, F[:, 2], fn); N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9); B = np.hstack([V, N]).astype(np.float32).tobytes()
+        if old and old["nv"] == len(V): old["vbo"].write(B); old["mir"] = t.get("mirror", False); return
+        vbo = s.g.buffer(B); ibo = s.g.buffer(F.tobytes()); vao = s.g.vertex_array(s.prog, [(vbo, "3f 12x", "p")], ibo); vao2 = s.g.vertex_array(s.prog2, [(vbo, "3f 3f", "p", "n")], ibo); s.items[n] = dict(vbo=vbo, vao=vao, vao2=vao2, nv=len(V), mir=t.get("mirror", False))
+
+    def render_grey(s, key, cam, fov, coef):
+        f, tx = s.fb2[key]; f.use(); f.clear(0, 0, 0, 0, depth=1.0); w, h = tx.size; R, t, fp = cam_matrix(cam, w, h, fov); P = s.prog2; P["R"].value = tuple(R.T.ravel().tolist()); P["t"].value = tuple(t.tolist()); P["f"].value = fp; P["c"].value = (w / 2.0, h / 2.0); P["res"].value = (float(w), float(h)); P["co"].value = tuple(float(x) for x in coef); s.g.enable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE)
+        for it in s.items.values():
+            P["mir"].value = 1.0; it["vao2"].render(moderngl.TRIANGLES)
+            if it["mir"]: P["mir"].value = -1.0; it["vao2"].render(moderngl.TRIANGLES)
+        a = np.frombuffer(tx.read(), np.float32).reshape(h, w, 4); return a[..., 0], a[..., 3] > 0.5
+
+    def render(s, key, cam, fov):
+        f = s.fbo[key]; f.use(); f.clear(0, 0, 0, 0); w, h = f.size; R, t, fp = cam_matrix(cam, w, h, fov); s.prog["R"].value = tuple(R.T.ravel().tolist()); s.prog["t"].value = tuple(t.tolist()); s.prog["f"].value = fp; s.prog["c"].value = (w / 2.0, h / 2.0); s.prog["res"].value = (float(w), float(h)); s.g.disable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE)
+        for it in s.items.values():
+            s.prog["mir"].value = 1.0; it["vao"].render(moderngl.TRIANGLES)
+            if it["mir"]: s.prog["mir"].value = -1.0; it["vao"].render(moderngl.TRIANGLES)
+        return np.frombuffer(f.read(components=1, alignment=1), np.uint8).reshape(h, w) > 127
+
+
+def cam_matrix(c, w, h, fov):
+    yaw, pitch, roll, dist, px, py = c; a, b, r = math.radians(yaw), math.radians(pitch), math.radians(roll); fw = np.array([-math.sin(a) * math.cos(b), -math.sin(b), -math.cos(a) * math.cos(b)]); rt = np.cross(fw, [0, 1, 0]); rt /= np.linalg.norm(rt); up = np.cross(rt, fw); rt2 = math.cos(r) * rt + math.sin(r) * up; up2 = -math.sin(r) * rt + math.cos(r) * up; R = np.stack([rt2, up2, fw]); T = np.array(DEF["target"]); t = -R @ T + np.array([px, py, dist]); fp = (w / 2.0) / math.tan(math.radians(fov) / 2.0); return R, t, fp
+
+
+def load_refs(folder, names, scale=1.0):
+    V = json.load(open(f"{folder}/views.json")); R = {}
+    for n in names:
+        m = np.asarray(Image.open(f"{folder}/masks/{n}.png")) > 127; m = m[:, :V[n]["size"][0] - DEF["toolbar_px"]]
+        if scale != 1.0: im = Image.fromarray((m * 255).astype(np.uint8)); m = np.asarray(im.resize((max(int(im.size[0] * scale), 8), max(int(im.size[1] * scale), 8)), Image.BILINEAR)) > 127
+        x0, y0, x1, y1 = V[n]["rect"]; x1 -= DEF["toolbar_px"]; g = Image.open(f"{folder}/refs/{n}.png").convert("L").crop((x0, y0, x1, y1)).resize((m.shape[1], m.shape[0]), Image.BILINEAR); gr = ndi.gaussian_filter(np.asarray(g, np.float32), DEF["grey_blur"]); d = ndi.distance_transform_edt(m) + ndi.distance_transform_edt(~m); R[n] = dict(mask=m, grey=gr, weight=np.minimum(d, DEF["cap_px"]).astype(np.float32), band=d <= 1.0, area=float(m.sum()))
+    return R
+
+
+def view_cost(m, r): x = m ^ r["mask"]; return float(r["weight"][x].sum()) / r["area"]
+
+
+def grey_cost(S, key, r, cam, fov, coef):
+    """silhouette and inner grey together : the inner forms are what a silhouette cannot see. FR : silhouette et gris intérieur ensemble : les formes intérieures sont ce qu'une silhouette ne voit pas."""
+    sh, m = S.render_grey(key, cam, fov, coef); inside = m & r["mask"]; e = float(np.abs(sh[inside] - r["grey"][inside]).mean()) / 255.0 if inside.any() else 1.0; return view_cost(m, r) + DEF["grey_weight"] * e
+
+
+def view_scores(m, r):
+    i, u = (m & r["mask"]).sum(), (m | r["mask"]).sum(); k = ~r["band"]; return float(i) / max(u, 1), float((m & r["mask"] & k).sum()) / max(float(((m | r["mask"]) & k).sum()), 1.0)
+
+
+def coarse_cam(S, key, r, fov, guess=None):
+    """a coarse search over yaw, pitch and roll ; distance and pan come from the bounding box. FR : une recherche grossière en lacet, tangage, roulis ; distance et décalage viennent de la boîte englobante."""
+    ys, xs = np.nonzero(r["mask"]); bw = max(np.ptp(xs), np.ptp(ys)); cx, cy = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2; h, w = r["mask"].shape; best = (1e18, None); fp = (w / 2.0) / math.tan(math.radians(fov) / 2.0)
+    # 2 November 2026 : a silhouette seen from the front or the back is the same, so the side comes from the eye : a guess per view, searched around it. FR : une silhouette vue de face ou de dos est la même, le côté vient de l'œil : une estimation par vue, cherchée autour.
+    yaws = [guess[0]] if guess else range(-180, 180, 10); pitches = [guess[1]] if guess else range(-50, 71, 10)
+    for yaw in yaws:
+        for pitch in pitches:
+            for roll in (0,):      # 2 November 2026 : the Houdini viewport keeps the horizon level, a free roll gave wrong cameras. FR : la vue de Houdini garde l'horizon droit, un roulis libre donnait des caméras fausses.
+                c = [yaw, pitch, roll, 5.0, 0.0, 0.0]
+                for _ in range(3):
+                    m = S.render(key, c, fov); ym, xm = np.nonzero(m)
+                    if len(xm) == 0: break
+                    c[3] *= max(np.ptp(xm), np.ptp(ym)) / max(bw, 1); c[4] += (cx - (xm.min() + xm.max()) / 2) * c[3] / fp; c[5] += (((ym.min() + ym.max()) / 2) - cy) * c[3] / fp
+                e = view_cost(S.render(key, c, fov), r)
+                if e < best[0]: best = (e, list(c))
+    return best[1]
+
+
+def refine_cam(S, key, r, c, fov, loops=3, rot=(1.0, 1.0, 0.0)):
+    st = [rot[0], rot[1], 0.0, c[3] * 0.03, c[3] * 0.012, c[3] * 0.012]; e = view_cost(S.render(key, c, fov), r); g = GUESS.get(key)
+    for _ in range(loops):
+        for i in (0, 1, 3, 4, 5):
+            for sg in (1, -1):
+                c2 = list(c); c2[i] += sg * st[i]
+                if g and i < 2 and abs(c2[i] - g[i]) > DEF["gizmo_range"]: continue
+                e2 = view_cost(S.render(key, c2, fov), r)
+                if e2 < e: e, c = e2, c2; break
+        st = [x * 0.7 for x in st]
+    return c, e
+
+
+GROUPS = [("leg", "foot", "toe_a", "toe_b", "toe_c"), ("foot", "toe_a", "toe_b", "toe_c"), ("arm", "finger_a", "finger_b", "finger_c"), ("finger_a", "finger_b", "finger_c"), ("skull", "jaw", "nose", "brow", "ear", "lid", "horn"), ("toe_a", "toe_b", "toe_c")]
+
+
+def leash_set(tubes):
+    """2 November 2026 : a part keeps its structure : hidden from the silhouettes, a foot collapsed, toes wandered, a finger grew a ball at its tip, and the score rose. Each tube with a leash keeps its points near where they were measured, its radii within a ratio, its flatten near 1. FR : une partie garde sa structure : cachés des silhouettes, un pied s'est effondré, des orteils ont erré, un doigt a pris une boule au bout, et le score montait. Chaque tube en laisse garde ses points près de leur mesure, ses rayons dans un rapport, son aplatissement près de 1."""
+    for t in tubes:
+        if t.get("leash") is not None and "_pts0" not in t: t["_pts0"] = json.loads(json.dumps(t["pts"])); t["_ramp0"] = [k[1] * t.get("radius", 1.0) for k in t["ramp"]]; t["_flat0"] = list(t.get("flatten") or [])
+
+
+def leash_broken(t):
+    L = t.get("leash")
+    if L is None or "_pts0" not in t: return False
+    if max(np.linalg.norm(np.array(q) - np.array(q0)) for q, q0 in zip(t["pts"], t["_pts0"])) > L: return True
+    k = t.get("leash_ratio", 1.35); r = t.get("radius", 1.0)
+    for key, r0 in zip(t["ramp"], t["_ramp0"]):
+        v = key[1] * r
+        if v > r0 * k + 0.004 or v < r0 / k - 0.004: return True
+    if t.get("flatten"):
+        for a, b in zip(t["flatten"], t["_flat0"]):
+            if a > b * 1.2 or a < b / 1.2: return True
+    return False
+
+
+def params_of(tubes):
+    P = []
+    for ti, t in enumerate(tubes):
+        if t.get("kind") == "obj" and not t.get("frozen"):      # 2 November 2026 : a finished part only moves as a whole, height, depth and size. FR : une partie finie ne bouge que d'un bloc, hauteur, profondeur et taille.
+            t.setdefault("xform", [0.0, 0.0, 0.0, 1.0])
+            for i_ in (1, 2): P.append(dict(t=ti, kind="xf", i=i_, step=DEF["step_pos"]))
+            P.append(dict(t=ti, kind="xf", i=3, step=0.01)); continue
+        if t.get("group") == "cut" or t.get("frozen"): continue
+        for pi, q in enumerate(t["pts"]):
+            for ax in range(3):
+                if ax == 0 and not t.get("mirror") and not t.get("free_x"): continue      # 2 November 2026 : a tube on the axis stays on the axis, the body is symmetric. FR : un tube sur l'axe reste sur l'axe, le corps est symétrique.
+                P.append(dict(t=ti, kind="pos", i=pi, ax=ax, step=DEF["step_pos"]))
+        for ki in range(len(t["ramp"])): P.append(dict(t=ti, kind="ramp", i=ki, step=DEF["step_ramp"]))
+        if t.get("flatten"):
+            for ax in range(3): P.append(dict(t=ti, kind="flat", i=ax, step=DEF["step_flat"]))
+        for ax in range(3):      # 2 November 2026 : moves of a whole tube, thin parts could not reach their place one point at a time. FR : déplacements d'un tube entier, les parties fines n'atteignaient pas leur place point par point.
+            if ax == 0 and not t.get("mirror") and not t.get("free_x"): continue
+            P.append(dict(t=ti, kind="shift", i=ax, step=DEF["step_pos"]))
+        P.append(dict(t=ti, kind="thick", i=0, step=0.03)); P.append(dict(t=ti, kind="stretch", i=0, step=0.03))
+    for gi, grp in enumerate(GROUPS):
+        idx = [i for i, t in enumerate(tubes) if t["name"] in grp]
+        if not idx: continue
+        for ax in range(3):
+            if ax == 0 and not tubes[idx[0]].get("mirror") and not tubes[idx[0]].get("free_x"): continue
+            P.append(dict(t=idx[0], kind="gshift", group=idx, i=ax, step=DEF["step_pos"]))
+        P.append(dict(t=idx[0], kind="gscale", group=idx, i=0, step=0.01))      # 2 November 2026 : a whole part grows or shrinks about its centre, each part came with its own camera distances. FR : une partie entière grandit ou rétrécit autour de son centre, chaque partie venait avec ses propres distances de caméra.
+    return P
+
+
+def apply(tubes, p, d):
+    if p["kind"] == "xf": tubes[p["t"]]["xform"][p["i"]] += d; return tubes[p["t"]]
+    if p["kind"] == "gscale":
+        ts = [tubes[i] for i in p["group"]]; c_ = np.mean([q for t in ts for q in t["pts"]], 0)
+        for t in ts:
+            t["pts"][:] = [[float(c_[k] + (q[k] - c_[k]) * (1 + d)) for k in range(3)] for q in t["pts"]]
+            if "_pts0" in t: t["_pts0"] = [[float(c_[k] + (q[k] - c_[k]) * (1 + d)) for k in range(3)] for q in t["_pts0"]]; t["_ramp0"] = [v * (1 + d) for v in t["_ramp0"]]
+            if t.get("kind") != "sheet": t["radius"] = t.get("radius", 1.0) * (1 + d)
+        return ts
+    if p["kind"] == "gshift":
+        for i in p["group"]:
+            for q in tubes[i]["pts"]: q[p["i"]] += d
+            for q in tubes[i].get("_pts0", []): q[p["i"]] += d
+        return [tubes[i] for i in p["group"]]
+    t = tubes[p["t"]]
+    if p["kind"] == "pos": t["pts"][p["i"]][p["ax"]] += d
+    elif p["kind"] == "ramp": t["ramp"][p["i"]][1] = max(t["ramp"][p["i"]][1] + d, 0.002)
+    elif p["kind"] == "shift":
+        for q in t["pts"]: q[p["i"]] += d
+    elif p["kind"] == "thick": t["radius"] = max(t.get("radius", 1.0) + d, 0.1)
+    elif p["kind"] == "stretch":      # 2 November 2026 : longer or shorter from its root, the shape stays. FR : plus long ou plus court depuis sa racine, la forme reste.
+        o = list(t["pts"][0]); t["pts"][:] = [[o[k] + (q[k] - o[k]) * (1 + d) for k in range(3)] for q in t["pts"]]
+    else: t["flatten"][p["i"]] = max(t["flatten"][p["i"]] + d, 0.15)
+    return t
+
+
+def overlay(S, refs, cams, fov, out):
+    tiles = []; rep = {}
+    for k, r in refs.items():
+        m = S.render(k, cams[k], fov); im = np.full(m.shape + (3,), 40, np.uint8); im[m & r["mask"]] = (170, 170, 170); im[r["mask"] & ~m] = (240, 50, 40); im[m & ~r["mask"]] = (40, 110, 255); rep[k] = view_scores(m, r); t = Image.fromarray(im); t.thumbnail((440, 440)); tiles.append(t)
+    cols = 4; rows = (len(tiles) + cols - 1) // cols; s = Image.new("RGB", (cols * 440, rows * 440), (15, 15, 15))
+    for i, t in enumerate(tiles): s.paste(t, ((i % cols) * 440, (i // cols) * 440))
+    s.save(out); return rep
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("folder"); ap.add_argument("init"); ap.add_argument("out"); ap.add_argument("--minutes", type=float, default=5.0); ap.add_argument("--views"); ap.add_argument("--fov", type=float, default=DEF["fov_deg"]); ap.add_argument("--cams"); ap.add_argument("--only"); ap.add_argument("--scale", type=float, default=1.0); ap.add_argument("--coarse", action="store_true"); ap.add_argument("--grey"); a = ap.parse_args(); COEF = json.load(open(a.grey)) if a.grey else None
+    names = a.views.split(",")
+    for k, g in json.load(open(f"{a.folder}/gizmo_cams.json")).items():
+        if g: GUESS[k] = (g["yaw"], g["pitch"])
+    refs = load_refs(a.folder, names, a.scale); S = Scene({k: (r["mask"].shape[1], r["mask"].shape[0]) for k, r in refs.items()}); D = json.load(open(a.init)); tubes = D["tubes"]
+    if "groups" in D: GROUPS[:] = D["groups"]      # 2 November 2026 : the groups that move together belong to the part being fitted. FR : les groupes qui bougent ensemble appartiennent à la partie ajustée.
+    leash_set(tubes)
+    for t in tubes:
+        if t.get("group") != "cut": S.set_tube(t)      # 2 November 2026 : a carved part (mouth, nostril, socket) takes matter away, it is built in Houdini and never moved by the fit. FR : une partie creusée enlève de la matière, elle se construit dans Houdini et l'ajustement ne la bouge jamais.
+    cams = json.load(open(a.cams)) if a.cams and os.path.exists(a.cams) else {}
+    for k, r in refs.items():
+        if k not in cams: cams[k] = coarse_cam(S, k, r, a.fov, GUESS.get(k))
+        cams[k], e = refine_cam(S, k, r, cams[k], a.fov, loops=5); print("camera", k, [round(x, 2) for x in cams[k]], "cost", round(e, 3), flush=True)
+    total = (lambda: sum(grey_cost(S, k, refs[k], cams[k], a.fov, COEF) for k in refs)) if COEF else (lambda: sum(view_cost(S.render(k, cams[k], a.fov), refs[k]) for k in refs)); E = total(); P = params_of(tubes); P = [p for p in P if p["kind"] in ("shift", "thick", "stretch", "gshift", "gscale", "xf")] if a.coarse else P; only = set(a.only.split(",")) if a.only else None; T0 = time.time(); last = 0; rnd = 0; print("params", len(P), "start cost", round(E, 3), flush=True); rep = overlay(S, refs, cams, a.fov, a.out + ".png")
+    print("start", {k: [round(x, 3) for x in v] for k, v in rep.items()}, flush=True)
+    while time.time() - T0 < a.minutes * 60:
+        rnd += 1; random.shuffle(P); moved = 0
+        for p in P:
+            if only and tubes[p["t"]]["name"] not in only: continue
+            ok = False
+            for sg in (1, -1):
+                keep = {i: json.dumps(tubes[i]) for i in (p.get("group") or [p["t"]])}      # 2 November 2026 : a refused move is restored from a copy : undoing a stretch by its opposite multiplied by (1+d)(1-d), each refusal shortened the tube, and thousands of refusals collapsed feet, toes and wing bones on a point. FR : un mouvement refusé se restaure depuis une copie : annuler un étirement par son opposé multipliait par (1+d)(1-d), chaque refus raccourcissait le tube, et des milliers de refus ont écrasé pieds, orteils et os de l'aile sur un point.
+                t = apply(tubes, p, sg * p["step"]); ts = t if isinstance(t, list) else [t]
+                if any(leash_broken(x) for x in ts):
+                    for i, b_ in keep.items(): tubes[i].clear(); tubes[i].update(json.loads(b_))
+                    continue
+                [S.set_tube(x) for x in ts]; e = total()
+                if e < E - 1e-6: E = e; ok = True; moved += 1; break
+                for i, b_ in keep.items(): tubes[i].clear(); tubes[i].update(json.loads(b_)); S.set_tube(tubes[i])
+            p["step"] = min(p["step"] * DEF["grow"], 0.08) if ok else max(p["step"] * DEF["shrink"], DEF["step_min"])
+            if time.time() - T0 > a.minutes * 60: break
+        if moved < len(P) * 0.02:      # 2 November 2026 : every step had shrunk to its minimum and nothing moved any more : give the steps back. FR : tous les pas étaient au minimum et plus rien ne bougeait : rendre les pas.
+            for p in P: p["step"] = 0.01 if p["kind"] == "gscale" or (p["kind"] == "xf" and p["i"] == 3) else DEF["step_pos"] if p["kind"] in ("pos", "shift", "stretch", "thick", "gshift", "xf") else DEF["step_ramp"] if p["kind"] == "ramp" else DEF["step_flat"]
+        if rnd % DEF["cam_every"] == 0:
+            for k, r in refs.items(): cams[k], _ = refine_cam(S, k, r, cams[k], a.fov, loops=1, rot=(0.6, 0.6, 0.0))
+            E = total()
+        if time.time() - last > DEF["save_seconds"]:
+            last = time.time(); json.dump(D, open(a.out, "w"), indent=0); json.dump(cams, open(a.out + ".cams.json", "w")); rep = overlay(S, refs, cams, a.fov, a.out + ".png"); iou = np.mean([v[0] for v in rep.values()]); tol = np.mean([v[1] for v in rep.values()]); print(f"round {rnd} t {time.time() - T0:.0f}s cost {E:.3f} moved {moved} mean IoU {iou:.4f} with 1 px tolerance {tol:.4f}", flush=True)
+    json.dump(D, open(a.out, "w"), indent=0); json.dump(cams, open(a.out + ".cams.json", "w")); rep = overlay(S, refs, cams, a.fov, a.out + ".png"); json.dump(rep, open(a.out + ".scores.json", "w"), indent=0); print("final", {k: [round(x, 4) for x in v] for k, v in rep.items()}, "mean", round(float(np.mean([v[0] for v in rep.values()])), 4), round(float(np.mean([v[1] for v in rep.values()])), 4), flush=True)

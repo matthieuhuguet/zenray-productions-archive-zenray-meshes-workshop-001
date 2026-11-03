@@ -1,0 +1,37 @@
+"""2 November 2026 : the volume the frames allow : every voxel is projected in every view, and in its mirror since the body is symmetric ; a voxel outside one silhouette is outside the dragon. The result gives the true 3D layout of the parts, whatever a tube fit believes.
+    python -I DragonHull.py <v3 folder> <cams.json> <views.txt> <out.npz> --voxel 0.012
+FR : le volume que les images autorisent : chaque voxel est projeté dans chaque vue, et son miroir aussi puisque le corps est symétrique ; un voxel hors d'une silhouette est hors du dragon."""
+import sys, os, json, time, argparse
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); from DragonFit import cam_matrix, DEF
+# The box of the dragon and the method settings. FR : la boîte du dragon et les réglages.
+HL = dict(x=(0.0, 2.0), y=(-0.3, 2.6), z=(-3.0, 2.2), fov=45.0, outside_ok=True)
+
+
+def field(folder, cams, names, voxel):
+    VI = json.load(open(f"{folder}/views.json")); X = np.arange(HL["x"][0], HL["x"][1], voxel); Y = np.arange(HL["y"][0], HL["y"][1], voxel); Z = np.arange(HL["z"][0], HL["z"][1], voxel); F = np.full((len(X), len(Y), len(Z)), -1e3, np.float32); gy, gz = np.meshgrid(Y, Z, indexing="ij"); gy = gy.ravel(); gz = gz.ravel()
+    for k in names:
+        m = np.asarray(Image.open(f"{folder}/masks/{k}.png"))[:, :VI[k]["size"][0] - DEF["toolbar_px"]] > 127; sd = (ndi.distance_transform_edt(~m) - ndi.distance_transform_edt(m)).astype(np.float32); h, w = m.shape; R, t, fp = cam_matrix(cams[k], w, h, HL["fov"]); Fv = np.zeros_like(F)
+        for sign in (1.0, -1.0):
+            Fs = np.zeros_like(F)
+            for i, x in enumerate(X):
+                P = np.stack([np.full_like(gy, sign * x), gy, gz], 1); q = P @ R.T + t; zz = np.maximum(q[:, 2], 0.05); px = w / 2 + fp * q[:, 0] / zz; py = h / 2 - fp * q[:, 1] / zz; ok = (px >= 0) & (px < w) & (py >= 0) & (py < h); val = np.full(len(px), -1e3, np.float32); ix, iy = px[ok].astype(int), py[ok].astype(int); val[ok] = sd[iy, ix] * zz[ok] / fp; Fs[i] = val.reshape(len(Y), len(Z))
+            F = np.maximum(F, Fs)
+        print(k, "inside so far", int((F < 0).sum()), flush=True)
+    return F, X, Y, Z
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("folder"); ap.add_argument("cams"); ap.add_argument("views"); ap.add_argument("out"); ap.add_argument("--voxel", type=float, default=0.016); a = ap.parse_args(); T0 = time.time(); F, X, Y, Z = field(a.folder, json.load(open(a.cams)), open(a.views).read().strip().split(","), a.voxel); np.savez_compressed(a.out, F=F, X=X, Y=Y, Z=Z); print("seconds", round(time.time() - T0, 1), "grid", F.shape, "inside", int((F < 0).sum()))
+    # three slices to read the layout : the profile x = 0 and the widths. FR : trois coupes pour lire la disposition : le profil x = 0 et les largeurs.
+    def img(A): return Image.fromarray(((A < 0) * 190 + 40).astype(np.uint8))
+    sx = img(F[0]).transpose(Image.ROTATE_90); sx.save(a.out + "_profile.png"); print("profile size", sx.size)
+    # 2 November 2026 : the skin of that volume, smoothed a little, mirrored, for comparison with the frames. FR : la peau de ce volume, un peu lissée, en miroir, pour la comparer aux images.
+    from skimage import measure
+    C = np.clip(F, -0.08, 0.08); C = np.concatenate([C[::-1], C[1:]], 0); C = ndi.gaussian_filter(C, 1.0); verts, faces, _, _ = measure.marching_cubes(C, 0.0); x0 = -X[-1]; verts = verts * a.voxel + np.array([x0, Y[0], Z[0]]); lab, n = ndi.label(C < 0); print("parts", n)
+    with open(a.out + ".obj", "w") as o:
+        for q in verts: o.write("v %.5f %.5f %.5f\n" % tuple(q))
+        for f in faces: o.write("f %d %d %d\n" % tuple(f[::-1] + 1))
+    print("mesh", len(verts), len(faces))

@@ -1,0 +1,56 @@
+"""2 November 2026 : the honest comparison : a mesh rendered from the camera of each tutorial frame, shaded by the lighting of the frames themselves (a law learned from normal to grey, the same for all views), beside the frame and with their difference. Gives two numbers per view : the silhouette overlap and the grey similarity inside the body.
+    python -I DragonCompare.py <v3 folder> <mesh.obj> <cams.json> <views.txt> <out.png>
+FR : la comparaison honnête : un maillage rendu depuis la caméra de chaque image du tuto, éclairé par la lumière de ces images (une loi apprise de la normale vers le gris, la même pour toutes les vues), à côté de l'image et avec leur écart. Donne deux nombres par vue : le recouvrement de silhouette et la ressemblance de gris à l'intérieur du corps."""
+import sys, os, json, math
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); import Raster, moderngl; from DragonFit import cam_matrix, DEF
+# Settings of the comparison. FR : réglages de la comparaison.
+CMP = dict(tile=430, blur_px=1.2, smooth_deg=75.0, fov=45.0, band_px=2)
+VS = """#version 330
+in vec3 p; in vec3 n; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; out vec3 vn;
+void main(){ vec3 q = R * p + t; vn = R * n; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, Z / 40.0 * 2.0 - 1.0, 1.0); }"""
+FS = "#version 330\nin vec3 vn; out vec4 o; void main(){ o = vec4(normalize(vn), 1.0); }"
+
+
+def load_obj(f):
+    V, F = [], []
+    for line in open(f):
+        if line.startswith("v "): V.append([float(x) for x in line.split()[1:4]])
+        elif line.startswith("f "):
+            idx = [int(x.split("/")[0]) - 1 for x in line.split()[1:]]
+            for k in range(1, len(idx) - 1): F.append((idx[0], idx[k], idx[k + 1]))
+    return np.array(V, np.float32), np.array(F, np.int32)
+
+
+def vertex_normals(V, F):
+    n = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]); N = np.zeros_like(V); np.add.at(N, F[:, 0], n); np.add.at(N, F[:, 1], n); np.add.at(N, F[:, 2], n); return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+
+
+class NormalRender:
+    def __init__(s, V, F):
+        s.g = Raster.ctx(); s.prog = s.g.program(vertex_shader=VS, fragment_shader=FS); N = vertex_normals(V, F); s.vbo = s.g.buffer(np.hstack([V, N]).astype(np.float32).tobytes()); s.ibo = s.g.buffer(F.tobytes()); s.vao = s.g.vertex_array(s.prog, [(s.vbo, "3f 3f", "p", "n")], s.ibo)
+
+    def render(s, cam, w, h, fov):
+        tex = s.g.texture((w, h), 4, dtype="f4"); db = s.g.depth_renderbuffer((w, h)); fb = s.g.framebuffer([tex], db); fb.use(); fb.clear(0, 0, 0, 0, depth=1.0); s.g.enable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE); R, t, fp = cam_matrix(cam, w, h, fov); s.prog["R"].value = tuple(R.T.ravel().tolist()); s.prog["t"].value = tuple(t.tolist()); s.prog["f"].value = fp; s.prog["c"].value = (w / 2.0, h / 2.0); s.prog["res"].value = (float(w), float(h)); s.vao.render(moderngl.TRIANGLES); a = np.frombuffer(tex.read(), np.float32).reshape(h, w, 4).copy(); fb.release(); tex.release(); db.release(); return a[..., :3], a[..., 3] > 0.5
+
+
+def basis(n):
+    x, y, z = n[..., 0], n[..., 1], n[..., 2]; return np.stack([np.ones_like(x), x, y, z, x * y, x * z, y * z, x * x - y * y, 3 * z * z - 1], -1)
+
+
+if __name__ == "__main__":
+    folder, mesh, camf, viewf, out = sys.argv[1:6]; names = open(viewf).read().strip().split(","); V, F = load_obj(mesh); R_ = NormalRender(V, F); cams = json.load(open(camf)); VI = json.load(open(f"{folder}/views.json")); data = []
+    for k in names:
+        x0, y0, x1, y1 = VI[k]["rect"]; x1 -= DEF["toolbar_px"]; g = np.asarray(Image.open(f"{folder}/refs/{k}.png").convert("L"), np.float32)[y0:y1, x0:x1]; m = np.asarray(Image.open(f"{folder}/masks/{k}.png"))[:, :x1 - x0] > 127; h, w = m.shape; n, mm = R_.render(cams[k], w, h, CMP["fov"]); data.append(dict(k=k, g=ndi.gaussian_filter(g, CMP["blur_px"]), raw=g, m=m, n=n, mm=mm))
+    A, B = [], []      # one law for all views, learned where both agree it is the body, away from the edge. FR : une seule loi pour toutes les vues, apprise là où les deux disent que c'est le corps, loin du bord.
+    for d in data:
+        inside = ndi.binary_erosion(d["m"] & d["mm"], iterations=CMP["band_px"] * 2); A.append(basis(d["n"][inside])); B.append(d["g"][inside])
+    coef = np.linalg.lstsq(np.vstack(A), np.concatenate(B), rcond=None)[0]; rep = {}; tiles = []; json.dump([float(x) for x in coef], open(out + ".coef.json", "w")); print("law", [round(float(x), 1) for x in coef])
+    for d in data:
+        pred = basis(d["n"]) @ coef; bg = np.median(d["raw"][~d["m"]]); shade = np.where(d["mm"], pred, bg); shade = np.clip(ndi.gaussian_filter(shade, 0.6), 0, 255); inside = ndi.binary_erosion(d["m"] & d["mm"], iterations=CMP["band_px"]); e = np.abs(shade - d["g"]); iou = float((d["m"] & d["mm"]).sum()) / max(float((d["m"] | d["mm"]).sum()), 1); band = (ndi.distance_transform_edt(d["m"]) + ndi.distance_transform_edt(~d["m"])) <= 1.0; k_ = ~band; iou1 = float((d["m"] & d["mm"] & k_).sum()) / max(float(((d["m"] | d["mm"]) & k_).sum()), 1); corr = float(np.corrcoef(shade[inside], d["g"][inside])[0, 1]); mae = float(e[inside].mean()); rep[d["k"]] = dict(iou=round(iou, 4), iou_1px=round(iou1, 4), grey_corr=round(corr, 4), grey_err=round(mae, 2))
+        row = np.concatenate([np.clip(d["raw"], 0, 255), shade, np.clip(e * 4, 0, 255)], 1).astype(np.uint8); t = Image.fromarray(row); sc = CMP["tile"] * 3 / t.size[0]; t = t.resize((CMP["tile"] * 3, int(t.size[1] * sc))); tiles.append(t)
+    H = sum(t.size[1] for t in tiles); page = Image.new("L", (CMP["tile"] * 3, H), 15); y = 0
+    for t in tiles: page.paste(t, (0, y)); y += t.size[1]
+    page.save(out); mean = {f: round(float(np.mean([v[f] for v in rep.values()])), 4) for f in ("iou", "iou_1px", "grey_corr", "grey_err")}; json.dump(dict(views=rep, mean=mean), open(out + ".json", "w"), indent=0); print(json.dumps(mean)); [print(k, v) for k, v in rep.items()]

@@ -1,0 +1,39 @@
+"""2 November 2026 : DRACARD, the grey body alone, built in Houdini from the fitted tubes : curve, resample, sweep with Apply Scale Along Curve, red Sculpt, mirror, then one volume, smooth, convert, exactly the chain of the series (ep03, ep04, ep07). The curves and ramps come from DragonShape.py, the same code the fit measured. No clothes, no colour.
+    hython DragonBody.py <fit.json> <out folder> [--quads N]        writes Body.hip, body.obj and report.json
+FR : le corps gris seul, construit dans Houdini depuis les tubes ajustés, exactement la chaîne de la série. Les courbes et rampes viennent de DragonShape.py, le même code que celui mesuré. Sans vêtement ni couleur."""
+import sys, os, json, time, argparse
+import numpy as np, hou
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from DragonShape import dense_curve, radius
+ap = argparse.ArgumentParser(); ap.add_argument("fit"); ap.add_argument("out"); ap.add_argument("--quads", type=int, default=0); ap.add_argument("--voxel", type=float, default=0.007); ap.add_argument("--smooth", type=int, default=3); ap.add_argument("--adaptivity", type=float, default=0.0); ap.add_argument("--keys", type=int, default=33); a = ap.parse_args(); D = json.load(open(a.fit)); os.makedirs(a.out, exist_ok=True)
+RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25)); hou.hipFile.clear(suppress_save_prompt=True); geo = hou.node("/obj").createNode("geo", "Mad_Villain_Body"); T0 = time.time()
+
+
+def mk(t, name, *inputs, **parms):
+    n = geo.createNode(t, name)
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items(): n.parm(k).set(v)
+    return n
+
+
+def add_curve(name, pts):
+    n = mk("add", name, keep=0); n.parm("points").set(len(pts))
+    for i, q in enumerate(pts):
+        n.parm(f"usept{i}").set(1)
+        for k, ax in enumerate("xyz"): n.parm(f"pt{i}{ax}").set(float(q[k]))
+    n.parm("prims").set(1); n.parm("prim0").set(f"0-{len(pts) - 1}"); n.parm("closed0").set(0); return n
+
+
+def tube(t):
+    tag = t["name"]; n = t.get("stations", 40); c = add_curve(f"curve_{tag}", dense_curve(t["pts"], n)); r = mk("resample", f"resample_{tag}", c, length=0.012, dolength=1); keys = a.keys; val = radius(t, keys) / t.get("radius", 1.0); s = mk("sweep::2.0", f"sweep_{tag}", r, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=t.get("radius", 1.0), cols=max(t.get("cols", 20), 16), applyscale=1); s.parm("scaleramp").set(hou.Ramp([hou.rampBasis.Linear] * keys, np.linspace(0, 1, keys).tolist(), val.tolist())); x = s
+    if t.get("flatten"):
+        k = np.mean(np.asarray(t["pts"], float), 0); x = mk("xform", f"transform_from_centroid_{tag}", s, sx=t["flatten"][0], sy=t["flatten"][1], sz=t["flatten"][2], px=float(k[0]), py=float(k[1]), pz=float(k[2]))
+    sc = mk("sculpt", f"sculpt_{tag}", x); sc.setColor(RED); return mk("mirror", f"mirror_{tag}", sc, dirx=1, diry=0, dirz=0) if t.get("mirror") else sc
+
+
+parts = [tube(t) for t in D["tubes"] if t.get("group") != "cut"]; m = mk("merge", "merge_body", *parts); v = mk("vdbfrompolygons", "vdbfrompolygons_body", m, voxelsize=a.voxel, fillinterior=1); sd0 = mk("vdbsmoothsdf", "vdbsmooth0", v, iterations=a.smooth); lastv = sd0      # 2 November 2026 : the blend of the parts comes first, then the mouth, nostrils and sockets are carved, then a light smooth, as in ep04. FR : le fondu des parties d'abord, puis bouche, narines et orbites creusées, puis un léger lissage, comme dans ep04.
+for t in D["tubes"]:
+    if t.get("group") == "cut": vc = mk("vdbfrompolygons", f"vdbfrompolygons_{t['name']}", tube(t), voxelsize=a.voxel, fillinterior=1); lastv = mk("vdbcombine", f"vdbcombine_{t['name']}", lastv, vc); lastv.parm("operation").set("sdfdifference")
+sd = mk("vdbsmoothsdf", "vdbsmooth1", lastv, iterations=max(a.smooth // 2, 1)); cv = mk("convertvdb", "convertvdb1", sd, conversion="poly", adaptivity=a.adaptivity); last = cv
+if a.quads: last = mk("quadremesh", "quadremesh1", cv, targetquadcount=a.quads, xaxis=1)
+out = mk("null", "OUT_BODY", last); out.setColor(GREEN); out.setDisplayFlag(True); out.setRenderFlag(True); geo.layoutChildren(); g = out.geometry(); errs = [c.path() + " : " + c.errors()[0][:90] for c in geo.children() if c.errors()]; g.saveToFile(f"{a.out}/body.obj"); hou.hipFile.save(f"{a.out}/Body.hip"); rep = dict(nodes=len(geo.children()), points=len(g.points()), prims=len(g.prims()), errors=errs, seconds=round(time.time() - T0, 1)); json.dump(rep, open(f"{a.out}/report.json", "w"), indent=1); print(json.dumps(rep))

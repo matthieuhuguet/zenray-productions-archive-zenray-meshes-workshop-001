@@ -1,0 +1,22 @@
+"""2 November 2026 : a feature seen in two views or more becomes a 3D point : the rays of its pixels, read with PixelGrid.py, meet at the point that fits them best, and the distance to each ray is printed in pixels. No guess about depth. FR : un détail vu dans deux vues ou plus devient un point 3D : les rayons de ses pixels se rencontrent au point qui les ajuste le mieux, et l'écart à chaque rayon s'affiche en pixels. Aucune supposition sur la profondeur.
+    python -I Tri.py <cams.json> <frames> <points.json>      points.json : {"name": {"2300": [px, py], "2430": [px, py]}} ; writes points_3d.json beside it"""
+import sys, os, json
+import numpy as np
+from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import cam_matrix, viewport, CF
+cams, frames, pj = json.load(open(sys.argv[1])), sys.argv[2], sys.argv[3]; PTS = json.load(open(pj)); C = {}
+def cam(fr):
+    if fr not in C:
+        a = np.asarray(Image.open(f"{frames}/f_{int(fr):05d}.jpg").convert("L")).astype(np.float32); x0, y0, x1, y1 = viewport(a) if False else viewport(np.asarray(Image.open(f"{frames}/f_{int(fr):05d}.jpg").convert("RGB")).max(2).astype(np.float32)); w, h = x1 - x0, y1 - y0; C[fr] = (*cam_matrix(cams[fr], w, h, CF["fov"]), w, h)
+    return C[fr]
+out = {}
+for name, obs in PTS.items():
+    A, b = [], []
+    for key, (u, v) in obs.items():      # 2 November 2026 : a key ending in m reads the mirror of the point : a symmetric creature gives two rays in one frame. FR : une clé finie par m lit le miroir du point : une créature symétrique donne deux rayons dans une seule image.
+        fr = key.rstrip("m"); Rm = cam(fr)[0] * (np.array([-1.0, 1.0, 1.0]) if key.endswith("m") else 1.0); R, t, fp, w, h = cam(fr); dx, dy = (u - w / 2) / fp, -(v - h / 2) / fp      # q = R p + t, u = w/2 + fp qx/qz, v = h/2 - fp qy/qz. FR : mêmes équations que le rendu.
+        A += [Rm[0] - dx * Rm[2], Rm[1] - dy * Rm[2]]; b += [dx * t[2] - t[0], dy * t[2] - t[1]]
+    p = np.linalg.lstsq(np.array(A), np.array(b), rcond=None)[0]; err = {}
+    for key, (u, v) in obs.items():
+        fr = key.rstrip("m"); R, t, fp, w, h = cam(fr); q = R @ (p * (np.array([-1.0, 1.0, 1.0]) if key.endswith("m") else 1.0)) + t; err[key] = round(float(np.hypot(w / 2 + fp * q[0] / q[2] - u, h / 2 - fp * q[1] / q[2] - v)), 1)
+    out[name] = [round(float(x), 3) for x in p]; print(f"{name:18s} x {p[0]:6.3f}  y {p[1]:6.3f}  z {p[2]:6.3f}   px {err}")
+json.dump(out, open(os.path.splitext(pj)[0] + "_3d.json", "w"), indent=0)

@@ -1,0 +1,269 @@
+"""2 November 2026 : DRACARD, the sculpt pass of one part, measured on the frames where this part is alone : a brush moves the coarse cage, wide first and narrow after, as a hand does with the Move brush with Mirror Strokes, and a move stays only if the silhouette error goes down. The cage is subdivided as Houdini does, so what is measured is what is built.
+    python -I CompFit.py <part folder> <frames folder> f1,f2,... --mask red --minutes 5
+Writes sculpt.json, cams.json, overlay.png, score.json.
+FR : la passe de sculpt d'une partie, mesurée sur les images où cette partie est seule : une brosse déplace la cage grossière, large d'abord, fine ensuite, comme la main avec la brosse Move et Mirror Strokes, et un mouvement ne reste que si l'erreur de silhouette baisse."""
+import sys, os, json, time, math, argparse
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy import ndimage as ndi, sparse
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, os.path.dirname(os.path.dirname(HERE))); import Raster, moderngl, GizmoRead
+# Every value of the pass. FR : tous les réglages de la passe.
+CF = dict(fov=45.0, toolbar_px=18, top_skip=26, scale=0.5, cap_px=20.0, levels=2, brushes=[(0.55, 0.03), (0.32, 0.02), (0.18, 0.012), (0.1, 0.006)], red_delta=45, white_min=105, solid_min=118, solid_open=5, white_sat=16, grey_delta=16, cam_range=0.0, mirror_eps=1e-3, fair=60.0, center_k=6, mirror_part=False, rigid_step=0.02)
+VS = """#version 330
+in vec3 p; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; uniform float mir;
+void main(){ vec3 q = R * vec3(p.x * mir, p.y, p.z) + t; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, 0.0, 1.0); }"""
+
+
+def load_quads(f):
+    V, F = [], []
+    for line in open(f):
+        if line.startswith("v "): V.append([float(x) for x in line.split()[1:4]])
+        elif line.startswith("f "): F.append([int(x.split("/")[0]) - 1 for x in line.split()[1:]])
+    return np.array(V, float), F
+
+
+def catmull_clark(n, F):
+    """one level, as a sparse matrix from coarse points to fine points, so a move is one matrix product. FR : un niveau, en matrice creuse des points grossiers vers les points fins, un mouvement est un seul produit de matrices."""
+    edges = {}; vf = [[] for _ in range(n)]; ve = [set() for _ in range(n)]
+    for fi, f in enumerate(F):
+        for i, a in enumerate(f):
+            b = f[(i + 1) % len(f)]; k = (min(a, b), max(a, b)); edges.setdefault(k, []).append(fi); vf[a].append(fi); ve[a].add(k)
+    nf = len(F); ek = list(edges); eid = {k: i for i, k in enumerate(ek)}; ne = len(ek); rows, cols, vals = [], [], []
+    def add(r, c, v): rows.append(r); cols.append(c); vals.append(v)
+    for i, f in enumerate(F):      # face points. FR : points de face.
+        for a in f: add(n + i, a, 1.0 / len(f))
+    for k, fs in edges.items():      # edge points. FR : points d'arête.
+        r = n + nf + eid[k]
+        if len(fs) == 2:
+            add(r, k[0], 0.25); add(r, k[1], 0.25)
+            for fi in fs:
+                for a in F[fi]: add(r, a, 0.25 / len(F[fi]))
+        else: add(r, k[0], 0.5); add(r, k[1], 0.5)
+    for v in range(n):      # vertex points. FR : points de sommet.
+        m = len(vf[v])
+        if m == 0: add(v, v, 1.0); continue
+        boundary = [k for k in ve[v] if len(edges[k]) == 1]
+        if boundary:
+            add(v, v, 0.75)
+            for k in boundary[:2]: add(v, k[0] if k[1] == v else k[1], 0.125)
+            continue
+        add(v, v, (m - 3.0) / m)
+        for fi in vf[v]:
+            for a in F[fi]: add(v, a, 1.0 / (m * m * len(F[fi])))
+        for k in ve[v]:
+            add(v, k[0], 1.0 / (m * m)); add(v, k[1], 1.0 / (m * m))
+    S = sparse.coo_matrix((vals, (rows, cols)), shape=(n + nf + ne, n)).tocsr(); G = []
+    for i, f in enumerate(F):
+        for j, a in enumerate(f):
+            b = f[(j + 1) % len(f)]; z = f[j - 1]; G.append([a, n + nf + eid[(min(a, b), max(a, b))], n + i, n + nf + eid[(min(a, z), max(a, z))]])
+    return S, G
+
+
+def cam_matrix(c, w, h, fov):
+    yaw, pitch, px, py, dist = c; a, b = math.radians(yaw), math.radians(pitch); fw = np.array([-math.sin(a) * math.cos(b), -math.sin(b), -math.cos(a) * math.cos(b)]); rt = np.cross(fw, [0, 1, 0]); rt /= np.linalg.norm(rt); up = np.cross(rt, fw); R = np.stack([rt, up, fw]); t = np.array([px, py, dist]); fp = (w / 2.0) / math.tan(math.radians(fov) / 2.0); return R, t, fp
+
+
+VS_N = """#version 330
+in vec3 p; in vec3 n; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res; out vec3 vn;
+void main(){ vec3 q = R * p + t; vn = R * n; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, Z / 40.0 * 2.0 - 1.0, 1.0); }"""
+FS_N = "#version 330\nin vec3 vn; out vec4 o; void main(){ o = vec4(normalize(vn), 1.0); }"
+
+
+def basis(n):
+    x, y, z = n[..., 0], n[..., 1], n[..., 2]; return np.stack([np.ones_like(x), x, y, z, x * y, x * z, y * z, x * x - y * y, 3 * z * z - 1], -1)
+
+
+class Ren:
+    def __init__(s, V, tris):
+        s.g = Raster.ctx(); s.prog = s.g.program(vertex_shader=VS, fragment_shader="#version 330\nout vec4 o; void main(){ o = vec4(1.0); }"); s.vbo = s.g.buffer(V.astype(np.float32).tobytes()); s.ibo = s.g.buffer(tris.astype(np.int32).tobytes()); s.vao = s.g.vertex_array(s.prog, [(s.vbo, "3f", "p")], s.ibo); s.fb = {}; s.tris = tris; s.progN = s.g.program(vertex_shader=VS_N, fragment_shader=FS_N); s.nvbo = s.g.buffer(np.zeros((len(V), 3), np.float32).tobytes()); s.vaoN = s.g.vertex_array(s.progN, [(s.vbo, "3f", "p"), (s.nvbo, "3f", "n")], s.ibo); s.fbN = {}
+
+    def update_normals(s, V):
+        t = s.tris; fn = np.cross(V[t[:, 1]] - V[t[:, 0]], V[t[:, 2]] - V[t[:, 0]]); N = np.zeros_like(V)
+        for k in range(3):
+            for c_ in range(3): N[:, k] += np.bincount(t[:, c_], fn[:, k], len(V))
+        N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9); s.nvbo.write(N.astype(np.float32).tobytes())
+
+    def normals(s, c, w, h):
+        got = s.fbN.get((w, h))
+        if got is None: tx = s.g.texture((w, h), 4, dtype="f4"); got = (s.g.framebuffer([tx], s.g.depth_renderbuffer((w, h))), tx); s.fbN[(w, h)] = got
+        f, tx = got; f.use(); f.clear(0, 0, 0, 0, depth=1.0); s.g.enable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE); R, t, fp = cam_matrix(c, w, h, CF["fov"]); P = s.progN; P["R"].value = tuple(R.T.ravel().tolist()); P["t"].value = tuple(t.tolist()); P["f"].value = fp; P["c"].value = (w / 2.0, h / 2.0); P["res"].value = (float(w), float(h)); s.vaoN.render(moderngl.TRIANGLES); a = np.frombuffer(tx.read(), np.float32).reshape(h, w, 4); return a[..., :3], a[..., 3] > 0.5
+
+    def update(s, V): s.vbo.write(V.astype(np.float32).tobytes())
+
+    def add_fixed(s, V, tris):
+        vbo = s.g.buffer(V.astype(np.float32).tobytes()); ibo = s.g.buffer(tris.astype(np.int32).tobytes()); s.fixed = getattr(s, "fixed", []) + [s.g.vertex_array(s.prog, [(vbo, "3f", "p")], ibo)]
+
+    def mask(s, c, w, h, assembled=False):
+        f = s.fb.get((w, h)) or s.g.simple_framebuffer((w, h), components=1, dtype="f1"); s.fb[(w, h)] = f; f.use(); f.clear(0, 0, 0, 0); s.g.disable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE); R, t, fp = cam_matrix(c, w, h, CF["fov"]); s.prog["R"].value = tuple(R.T.ravel().tolist()); s.prog["t"].value = tuple(t.tolist()); s.prog["f"].value = fp; s.prog["c"].value = (w / 2.0, h / 2.0); s.prog["res"].value = (float(w), float(h)); s.prog["mir"].value = 1.0; s.vao.render(moderngl.TRIANGLES)
+        if assembled:
+            for v_ in getattr(s, "fixed", []): v_.render(moderngl.TRIANGLES); s.prog["mir"].value = -1.0; v_.render(moderngl.TRIANGLES); s.prog["mir"].value = 1.0      # 2 November 2026 : each fixed part with its mirror, the body is symmetric. FR : chaque partie fixe avec son miroir, le corps est symétrique.
+            if CF["mirror_part"]: s.prog["mir"].value = -1.0; s.vao.render(moderngl.TRIANGLES)
+        return np.frombuffer(f.read(components=1, alignment=1), np.uint8).reshape(h, w) > 127
+
+
+def viewport(g):
+    row = np.median(g[260:340, :], 0) > 48; x0 = 24
+    while x0 > 0 and row[x0 - 1]: x0 -= 1
+    x1 = 24
+    while x1 < len(row) - 1 and row[x1 + 1:x1 + 6].any(): x1 += 1
+    col = np.median(g[:, x0 + 2:x0 + 12], 1) > 48; y0 = 300
+    while y0 > 0 and col[y0 - 1]: y0 -= 1
+    y1 = 300
+    while y1 < len(col) - 1 and col[y1 + 1]: y1 += 1
+    return x0, y0 + CF["top_skip"], x1 + 1 - CF["toolbar_px"], y1 + 1
+
+
+def part_mask(a, rect, mode):
+    x0, y0, x1, y1 = rect; c = a[y0:y1, x0:x1].astype(np.float32); r, g_, b = c[..., 0], c[..., 1], c[..., 2]; gr = c.mean(2); m = None
+    if mode == "solid": pass
+    elif mode == "red": m = (r - np.maximum(g_, b)) > CF["red_delta"]
+    elif mode == "white": m = (c.min(2) > CF["white_min"]) & ((c.max(2) - c.min(2)) < CF["white_sat"])      # 2 November 2026 : the part is neutral white, the template reference behind it is a cream wireframe. FR : la partie est blanc neutre, la référence en gabarit derrière elle est un filaire crème.
+    else: bg = np.percentile(gr, 12, axis=1, keepdims=True); m = gr > bg + CF["grey_delta"]
+    if mode == "solid":      # 2 November 2026 : a solid white part in front of the cream wireframe of the template : the wire is thin, a strong opening removes it, a small regrowth gives the edge back. FR : une partie blanche pleine devant le filaire crème du gabarit : le fil est fin, une forte ouverture le retire, une petite repousse rend le bord.
+        raw = (c.min(2) > CF["solid_min"]) & ((c.max(2) - c.min(2)) < CF["white_sat"]); raw = ndi.binary_closing(raw, iterations=1); core = ndi.binary_opening(raw, iterations=CF["solid_open"]); lab, n = ndi.label(core)
+        if n == 0: return core
+        sz = ndi.sum(core, lab, range(1, n + 1)); big = lab == 1 + int(np.argmax(sz)); return ndi.binary_fill_holes(ndi.binary_dilation(big, iterations=2) & raw)
+    m = ndi.binary_opening(m, iterations=1); lab, n = ndi.label(m)
+    if n == 0: return m
+    sz = ndi.sum(m, lab, range(1, n + 1)); return ndi.binary_fill_holes(lab == 1 + int(np.argmax(sz)))
+
+
+def scores(mm, r):
+    u = float((mm | r["m"]).sum()); k = ~r["band"]; return float((mm & r["m"]).sum()) / max(u, 1), float((mm & r["m"] & k).sum()) / max(float(((mm | r["m"]) & k).sum()), 1)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("part"); ap.add_argument("frames"); ap.add_argument("views"); ap.add_argument("--mask", default="grey"); ap.add_argument("--minutes", type=float, default=3.0); ap.add_argument("--symmetric", type=int, default=1); ap.add_argument("--fresh", action="store_true"); ap.add_argument("--fixed", default=""); ap.add_argument("--assembled", default=""); ap.add_argument("--mirror-part", type=int, default=0); ap.add_argument("--brushes", default=""); ap.add_argument("--no-scale", type=int, default=0); ap.add_argument("--check", type=int, default=0); ap.add_argument("--protect", default=""); ap.add_argument("--cam-range", type=float, default=0.0); ap.add_argument("--grey", type=float, default=0.0); ap.add_argument("--levels", type=int, default=CF["levels"]); ap.add_argument("--centers", type=int, default=0); ap.add_argument("--fair", type=float, default=CF["fair"]); ap.add_argument("--tie", default=""); ap.add_argument("--relax", type=int, default=0); ap.add_argument("--cams-only", default=""); ap.add_argument("--landmarks", default=""); ap.add_argument("--lm", type=float, default=0.0); a = ap.parse_args(); TIE = dict(x.split("=") for x in a.tie.split(",") if x); T0 = time.time(); CF["mirror_part"] = bool(a.mirror_part); ASM = [x for x in a.assembled.split(",") if x]
+    if a.brushes: CF["brushes"] = [tuple(float(y) for y in x.split(":")) for x in a.brushes.split(",")]
+    CF["fair"] = a.fair; V0, F0 = load_quads(f"{a.part}/cage.obj"); n0 = len(V0); S = sparse.identity(n0, format="csr"); F = F0
+    for _ in range(a.levels): s, F = catmull_clark(S.shape[0], F); S = s @ S
+    tris = np.array([[f[0], f[k], f[k + 1]] for f in F for k in range(1, len(f) - 1)], np.int32); D = np.array(json.load(open(f"{a.part}/sculpt.json"))) if os.path.exists(f"{a.part}/sculpt.json") and not a.fresh else np.zeros_like(V0); R_ = Ren(S @ (V0 + D), tris); refs = {}; cams = json.load(open(f"{a.part}/cams.json")) if os.path.exists(f"{a.part}/cams.json") and not a.fresh else {}
+    for f_ in [x for x in a.fixed.split(",") if x]:
+        Vf, Ff = load_quads(f_); R_.add_fixed(Vf, np.array([[f[0], f[k], f[k + 1]] for f in Ff for k in range(1, len(f) - 1)], np.int32))
+    MODE = {}
+    for nm in [x for x in a.views.split(",") if x] + ASM:
+        if ":" in nm: nm, MODE[nm] = nm.split(":")      # 2 November 2026 : a frame can say how to read it, 938:solid. FR : une image peut dire comment la lire, 938:solid.
+        im = np.asarray(Image.open(f"{a.frames}/f_{int(nm):05d}.jpg").convert("RGB")); rect = viewport(im.max(2).astype(np.float32)); g = GizmoRead.read(im)      # 2 November 2026 : the brightest channel, a dark red body cut the viewport in two on the mean. FR : le canal le plus clair, un corps rouge sombre coupait la vue en deux sur la moyenne.
+        for off_ in (1, -1, 2, -2, 3, -3):      # 2 November 2026 : a gizmo hidden on one frame is read on its neighbour, the camera has not moved. FR : une croix d'axes illisible sur une image se lit sur sa voisine, la caméra n'a pas bougé.
+            if g is not None: break
+            pn_ = f"{a.frames}/f_{int(nm) + off_:05d}.jpg"
+            if os.path.exists(pn_): g = GizmoRead.read(np.asarray(Image.open(pn_).convert("RGB")))
+        assert g is not None, f"no gizmo near frame {nm}"
+        m = part_mask(im, rect, "grey" if nm in ASM else MODE.get(nm, a.mask)); small = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((int(m.shape[1] * CF["scale"]), int(m.shape[0] * CF["scale"])), Image.BILINEAR)) > 127; d = ndi.distance_transform_edt(small) + ndi.distance_transform_edt(~small); gr_ = ndi.gaussian_filter(np.asarray(Image.fromarray(im[rect[1]:rect[3], rect[0]:rect[2]]).convert("L").resize((small.shape[1], small.shape[0]), Image.BILINEAR), np.float32), 0.8); refs[nm] = dict(asm=nm in ASM, grey=gr_, m=small, weight=np.minimum(d, CF["cap_px"]).astype(np.float32), band=d <= 1.0, area=float(small.sum()), yaw=g[0], pitch=g[1], rect=rect, image=im[rect[1]:rect[3], rect[0]:rect[2]]); print(nm, "rect", rect, "gizmo", round(g[0], 1), round(g[1], 1), "area", int(small.sum()), flush=True)
+    def fit_cam(k, r):
+        h, w = r["m"].shape; c = list(cams.get(k) or [r["yaw"], r["pitch"], 0.0, 0.0, 5.0])
+        if not a.cam_range: c[0], c[1] = r["yaw"], r["pitch"]
+        fp = (w / 2.0) / math.tan(math.radians(CF["fov"]) / 2.0); ys, xs = np.nonzero(r["m"]); bw = max(np.ptp(xs), np.ptp(ys))
+        if k not in cams:
+            for _ in range(4):
+                mm = R_.mask(c, w, h, r["asm"]); y2, x2 = np.nonzero(mm)
+                if len(x2) == 0: c[4] *= 1.5; continue
+                c[4] *= max(np.ptp(x2), np.ptp(y2)) / max(bw, 1); c[2] += ((xs.min() + xs.max()) / 2 - (x2.min() + x2.max()) / 2) * c[4] / fp; c[3] += ((y2.min() + y2.max()) / 2 - (ys.min() + ys.max()) / 2) * c[4] / fp
+        st = [c[4] * 0.01, c[4] * 0.01, c[4] * 0.02, 1.0, 1.0]; e = float(r["weight"][R_.mask(c, w, h, r["asm"]) ^ r["m"]].sum()) / r["area"]
+        for _ in range(6):
+            for i, j in enumerate((2, 3, 4, 0, 1) if a.cam_range else (2, 3, 4)):
+                for sg in (1, -1):
+                    c2 = list(c); c2[j] += sg * st[i]
+                    if j < 2 and abs(c2[j] - (r["yaw"] if j == 0 else r["pitch"])) > a.cam_range: continue      # 2 November 2026 : the gizmo holds the angle, the silhouettes polish it within a small range. FR : la croix tient l'angle, les silhouettes le polissent dans une petite plage.
+                    e2 = float(r["weight"][R_.mask(c2, w, h, r["asm"]) ^ r["m"]].sum()) / r["area"]
+                    if e2 < e: e, c = e2, c2; break
+            st = [x * 0.7 for x in st]
+        cams[k] = c
+    tie_refs = {}
+    for k_, nb in TIE.items():
+        im = np.asarray(Image.open(f"{a.frames}/f_{int(nb):05d}.jpg").convert("RGB")); rect = viewport(im.max(2).astype(np.float32)); g = GizmoRead.read(im); m = part_mask(im, rect, "grey"); small = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((int(m.shape[1] * CF["scale"]), int(m.shape[0] * CF["scale"])), Image.BILINEAR)) > 127; d = ndi.distance_transform_edt(small) + ndi.distance_transform_edt(~small); tie_refs[nb] = dict(asm=True, m=small, weight=np.minimum(d, CF["cap_px"]).astype(np.float32), area=float(small.sum()), yaw=g[0], pitch=g[1])
+    for k, r in refs.items():
+        if k not in TIE: fit_cam(k, r)
+    if a.cams_only:      # 2 November 2026 : only the cameras of these frames, the shape is not touched, to read joints on them. FR : seulement les caméras de ces images, la forme n'est pas touchée, pour y lire des articulations.
+        json.dump(cams, open(a.cams_only, "w")); print({k: [round(float(x), 2) for x in v] for k, v in cams.items()}); sys.exit(0)
+    if TIE:      # 2 November 2026 : the neighbour shows the whole body with the same camera, its fixed parts give that camera, so the part alone gets its true size and place. FR : la voisine montre le corps entier avec la même caméra, ses parties fixes donnent cette caméra, la partie seule reçoit sa vraie taille et sa vraie place.
+        keep = R_.vao; R_.vao = type("Nothing", (), {"render": staticmethod(lambda *x: None)})()
+        for k_, nb in TIE.items():
+            r = tie_refs[nb]; cams.pop(nb, None); fit_cam(nb, r); h0, w0 = r["m"].shape; assert refs[k_]["m"].shape == r["m"].shape, "the two frames have different views"; cams[k_] = list(cams[nb]); print("tied", k_, "to", nb, [round(float(x), 3) for x in cams[k_]], flush=True)
+        R_.vao = keep
+    e_ = np.array([(a_, f[(i + 1) % len(f)]) for f in F0 for i, a_ in enumerate(f)]); Adj = sparse.coo_matrix((np.ones(len(e_)), (e_[:, 0], e_[:, 1])), shape=(n0, n0)); Adj = ((Adj + Adj.T) > 0).astype(np.float64).tocsr(); Deg = np.maximum(np.asarray(Adj.sum(1)).ravel(), 1)[:, None]; size0 = float(np.ptp(V0, axis=0).max())
+    def bend(Dx):      # 2 November 2026 : a silhouette does not see a dent inside the body ; a move that makes a bump pays for it, as a hand keeps its strokes smooth. FR : une silhouette ne voit pas un creux à l'intérieur ; un mouvement qui fait une bosse le paie, comme la main garde ses gestes lisses.
+        return CF["fair"] * float(((Adj @ Dx) / Deg - Dx).__pow__(2).sum(1).mean()) / (size0 * size0) * len(refs)
+    def silhouette():
+        return sum(float(r["weight"][R_.mask(cams[k], r["m"].shape[1], r["m"].shape[0], r["asm"]) ^ r["m"]].sum()) / r["area"] for k, r in refs.items())
+    LAW = {}
+    def learn_law():      # 2 November 2026 : the light of a frame is learned from the frame : one law per view, from normal to grey. FR : la lumière d'une image s'apprend sur l'image : une loi par vue, de la normale au gris.
+        if not a.grey: return
+        for k, r in refs.items():
+            h, w = r["m"].shape; n_, mk = R_.normals(cams[k], w, h); ins = ndi.binary_erosion(mk & r["m"], iterations=2)
+            if ins.sum() > 50: LAW[k] = np.linalg.lstsq(basis(n_[ins]), r["grey"][ins], rcond=None)[0]
+    def grey_term():
+        if not a.grey or not LAW: return 0.0
+        e = 0.0
+        for k, r in refs.items():
+            if k not in LAW: continue
+            h, w = r["m"].shape; n_, mk = R_.normals(cams[k], w, h); ins = mk & r["m"]; e += float(np.abs(basis(n_[ins]) @ LAW[k] - r["grey"][ins]).mean()) / 255.0
+        return a.grey * e
+    LM = np.array(list(json.load(open(a.landmarks)).values()), float) if a.landmarks else None; VF = [None]
+    def lm_term():      # 2 November 2026 : features triangulated on the frames must lie on the skin : this sees the width of the snout, which no silhouette sees. FR : les détails triangulés sur les images doivent être sur la peau : cela voit la largeur du museau, qu'aucune silhouette ne voit.
+        if LM is None or VF[0] is None: return 0.0
+        return a.lm * float(np.sqrt(((VF[0][None, :, :] - LM[:, None, :]) ** 2).sum(2)).min(1).mean()) / size0
+    def total(Dx=None): return silhouette() + bend(D if Dx is None else Dx) + grey_term() + lm_term()
+    def push(Dx):
+        Vf = S @ (V0 + Dx); R_.update(Vf); VF[0] = Vf
+        if a.grey: R_.update_normals(Vf)
+    push(D); learn_law(); size = float(np.ptp(V0, axis=0).max()); E = total(); print("cage points", n0, "fine points", S.shape[0], "size", round(size, 3), "start cost", round(E, 4), flush=True); N0 = V0 - V0.mean(0); N0 /= np.maximum(np.linalg.norm(N0, axis=1, keepdims=True), 1e-9); mirror = np.array([int(np.argmin(np.linalg.norm(V0 * np.array([-1, 1, 1]) - q, axis=1))) for q in V0]) if a.symmetric else None; half = [i for i in range(n0) if (not a.symmetric) or V0[i, 0] >= -CF["mirror_eps"]]; stage = 0
+    rigid = CF["rigid_step"] * size; cen = V0.mean(0)
+    for _ in range(0 if a.check else 40):      # 2 November 2026 : the whole part first, as the transform from centroid of the series, then the brush. FR : la partie entière d'abord, comme le transform from centroid de la série, puis la brosse.
+        moved = 0
+        for ax in range(4):
+            if ax == 0 and a.symmetric: continue      # 2 November 2026 : a symmetric part stays on the axis, a free move had shifted the torso by a quarter of its width. FR : une partie symétrique reste sur l'axe, un déplacement libre avait décalé le torse d'un quart de sa largeur.
+            if ax == 3 and a.no_scale: continue
+            for sg in (1, -1):
+                Dn = D.copy()
+                if ax < 3: Dn[:, ax] += sg * rigid
+                else: Dn = Dn + (V0 + D - cen) * (sg * rigid / size)
+                push(Dn); e = total(Dn)
+                if e < E - 1e-5: E = e; D = Dn; moved += 1; break
+        if not moved: rigid *= 0.5
+        if rigid < 0.0005 * size: break
+    push(D)
+    for k, r in refs.items():
+        if k not in TIE: fit_cam(k, r)
+    learn_law(); E = total(); print("after moving the whole part, cost", round(E, 4), flush=True)
+    KEEP = np.ones(n0)
+    if a.protect:      # 2 November 2026 : the Active Mask of the Sculpt node : the brush does not reach what was built on purpose, a nostril erased by the final pass stays erased otherwise. FR : le masque actif du node Sculpt : la brosse n'atteint pas ce qui a été construit exprès, une narine effacée par la dernière passe le reste sinon.
+        for x_, y_, z_, r_ in json.load(open(a.protect))["protect"]:
+            for sx_ in (1, -1): KEEP *= np.clip(np.linalg.norm(V0 - np.array([sx_ * x_, y_, z_]), axis=1) / r_, 0, 1) ** 2
+        print("points protected", int((KEEP < 0.5).sum()), "of", n0, flush=True)
+    if a.relax:      # 2 November 2026 : the moves are relaxed over the surface, what the sculpt built by chance goes away and the shape under it stays : bumps on a cheek are not form. FR : les mouvements se relâchent sur la surface, ce que le sculpt a bâti par hasard s'en va et la forme dessous reste : des bosses sur une joue ne sont pas de la forme.
+        for _ in range(a.relax): D = D + 0.5 * ((Adj @ D) / Deg - D) * KEEP[:, None]
+        push(D); learn_law(); E = total(); print("relaxed", a.relax, "cost", round(E, 4), flush=True)
+    while time.time() - T0 < a.minutes * 60 and not a.check:
+        rad, st = CF["brushes"][min(stage, len(CF["brushes"]) - 1)]; rad *= size; st *= size; Vc_ = V0 + D; fn_ = np.zeros_like(Vc_)
+        for f_ in F0:
+            nf_ = np.cross(Vc_[f_[1]] - Vc_[f_[0]], Vc_[f_[-1]] - Vc_[f_[0]])
+            for j_ in f_: fn_[j_] += nf_
+        Vnorm = fn_ / np.maximum(np.linalg.norm(fn_, axis=1, keepdims=True), 1e-9)
+        if float(((Vc_ - Vc_.mean(0)) * Vnorm).sum()) < 0: Vnorm = -Vnorm
+        moved = 0; np.random.shuffle(half); centers = half[:min(len(half), max(a.centers, int(CF["center_k"] * (size / rad) ** 2)))] if a.centers else half
+        for i in centers:
+            w_ = np.clip(1 - (np.linalg.norm(V0 + D - (V0[i] + D[i]), axis=1) / rad) ** 2, 0, 1) ** 2 * KEEP
+            if a.symmetric: w_m = w_[mirror]
+            for dirn in ((Vnorm[i],) if a.centers else (N0[i], np.array([0, 1.0, 0]), np.array([0, 0, 1.0]), np.array([1.0, 0, 0]))):
+                ok = False
+                for sg in (1, -1):
+                    move = w_[:, None] * (sg * st * dirn)
+                    if a.symmetric: move = 0.5 * (move + move[mirror] * np.array([-1, 1, 1])) * 2 if False else move + (w_m[:, None] * (sg * st * dirn * np.array([-1, 1, 1]))); move[np.abs(V0[:, 0]) < CF["mirror_eps"], 0] = 0
+                    Dn = D + move; push(Dn); e = total(Dn)
+                    if e < E - 1e-5: E = e; D = Dn; moved += 1; ok = True; break
+                if ok: break
+            if time.time() - T0 > a.minutes * 60: break
+        push(D)
+        for k, r in refs.items():
+            if k not in TIE: fit_cam(k, r)
+        learn_law(); E = total(); print(f"stage {stage} brush {rad:.3f} moved {moved} cost {E:.4f} t {time.time() - T0:.0f}s", flush=True)
+        if moved < max(len(centers) * 0.03, 2): stage += 1      # 2 November 2026 : measured on the centers tried, a part with many points and few centers left at once. FR : mesuré sur les centres essayés, une partie à beaucoup de points et peu de centres repartait aussitôt.
+        if stage >= len(CF["brushes"]) + 2: break
+    if not a.check: json.dump(D.tolist(), open(f"{a.part}/sculpt.json", "w")); json.dump(cams, open(f"{a.part}/cams.json", "w"))
+    R_.update(S @ (V0 + D)); rep = {}; tiles = []
+    for k, r in refs.items():
+        h, w = r["m"].shape; mm = R_.mask(cams[k], w, h, r["asm"]); rep[k] = [round(x, 4) for x in scores(mm, r)]; im = np.full(mm.shape + (3,), 40, np.uint8); im[mm & r["m"]] = (170, 170, 170); im[r["m"] & ~mm] = (240, 50, 40); im[mm & ~r["m"]] = (40, 110, 255); p = np.asarray(Image.fromarray(r["image"]).resize((w, h))); tiles.append(np.concatenate([p, im], 1))
+    H = max(t.shape[0] for t in tiles); W = max(t.shape[1] for t in tiles); cols = 2; rows = (len(tiles) + 1) // 2; page = Image.new("RGB", (cols * W, rows * H), (15, 15, 15))
+    for i, t in enumerate(tiles): page.paste(Image.fromarray(t), ((i % cols) * W, (i // cols) * H))
+    page.save(f"{a.part}/overlay.png"); mean = [round(float(np.mean([v[0] for v in rep.values()])), 4), round(float(np.mean([v[1] for v in rep.values()])), 4)]; json.dump(dict(views=rep, mean_iou=mean[0], mean_iou_1px=mean[1]), open(f"{a.part}/score.json", "w"), indent=0); print("score", rep, "mean", mean, flush=True)

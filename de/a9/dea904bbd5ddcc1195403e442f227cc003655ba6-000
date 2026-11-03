@@ -1,0 +1,32 @@
+"""2 November 2026 : a part seen in one view has no depth : it slides along the axis of that camera, and the frames seen from other angles choose where it stops. The size and the place on the image do not change.
+    python -I SlideDepth.py <part folder> <frames folder> <camera frame> f1,f2,... --fixed a.obj [--grey 1]
+FR : une partie vue dans une seule vue n'a pas de profondeur : elle glisse le long de l'axe de cette caméra, et les images vues d'autres angles choisissent où elle s'arrête."""
+import sys, os, json, argparse
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi, sparse
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); import CompFit as C, GizmoRead
+ap = argparse.ArgumentParser(); ap.add_argument("part"); ap.add_argument("frames"); ap.add_argument("cam"); ap.add_argument("views"); ap.add_argument("--fixed", default=""); ap.add_argument("--range", type=float, default=2.0); ap.add_argument("--step", type=float, default=0.02); a = ap.parse_args(); C.CF["mirror_part"] = True
+V0, F0 = C.load_quads(f"{a.part}/cage.obj"); n0 = len(V0); S = sparse.identity(n0, format="csr"); F = F0
+for _ in range(C.CF["levels"]): s, F = C.catmull_clark(S.shape[0], F); S = s @ S
+tris = np.array([[f[0], f[k], f[k + 1]] for f in F for k in range(1, len(f) - 1)], np.int32); D = np.array(json.load(open(f"{a.part}/sculpt.json"))); R_ = C.Ren(S @ (V0 + D), tris)
+for f_ in [x for x in a.fixed.split(",") if x]:
+    Vf, Ff = C.load_quads(f_); R_.add_fixed(Vf, np.array([[f[0], f[k], f[k + 1]] for f in Ff for k in range(1, len(f) - 1)], np.int32))
+cams = json.load(open(f"{a.part}/cams.json")); h, w = 100, 100; Rc, _, _ = C.cam_matrix(cams[a.cam], w, h, C.CF["fov"]); axis = Rc[2]; print("camera axis", axis.round(3), flush=True); refs = {}; keep = R_.vao; nothing = type("N", (), {"render": staticmethod(lambda *x: None)})(); R_.vao = nothing
+for nm in a.views.split(","):
+    im = np.asarray(Image.open(f"{a.frames}/f_{int(nm):05d}.jpg").convert("RGB")); rect = C.viewport(im.max(2).astype(np.float32)); g = GizmoRead.read(im); m = C.part_mask(im, rect, "grey"); small = np.asarray(Image.fromarray((m * 255).astype(np.uint8)).resize((int(m.shape[1] * C.CF["scale"]), int(m.shape[0] * C.CF["scale"])), Image.BILINEAR)) > 127; d = ndi.distance_transform_edt(small) + ndi.distance_transform_edt(~small); hh, ww = small.shape; c = [g[0], g[1], 0.0, 0.0, 5.0]; ys, xs = np.nonzero(small); bw = max(np.ptp(xs), np.ptp(ys)); fp = (ww / 2.0) / np.tan(np.radians(C.CF["fov"]) / 2.0)
+    for _ in range(5):
+        mm = R_.mask(c, ww, hh, True); y2, x2 = np.nonzero(mm); c[4] *= max(np.ptp(x2), np.ptp(y2)) / max(bw, 1); c[2] += ((xs.min() + xs.max()) / 2 - (x2.min() + x2.max()) / 2) * c[4] / fp; c[3] += ((y2.min() + y2.max()) / 2 - (ys.min() + ys.max()) / 2) * c[4] / fp
+    wt = np.minimum(d, C.CF["cap_px"]).astype(np.float32); st = [c[4] * 0.01, c[4] * 0.01, c[4] * 0.02]; e = float(wt[R_.mask(c, ww, hh, True) ^ small].sum())
+    for _ in range(8):
+        for i, j in enumerate((2, 3, 4)):
+            for sg in (1, -1):
+                c2 = list(c); c2[j] += sg * st[i]; e2 = float(wt[R_.mask(c2, ww, hh, True) ^ small].sum())
+                if e2 < e: e, c = e2, c2; break
+        st = [x * 0.7 for x in st]
+    refs[nm] = dict(m=small, w=wt, c=c, area=float(small.sum()), shape=(ww, hh)); print(nm, "gizmo", round(g[0], 1), round(g[1], 1), "cam", [round(float(x), 2) for x in c], flush=True)
+R_.vao = keep; best = (1e18, 0.0); table = []
+for s_ in np.arange(-a.range, a.range + 1e-9, a.step):
+    R_.update(S @ (V0 + D + s_ * axis)); e = sum(float(r["w"][R_.mask(r["c"], r["shape"][0], r["shape"][1], True) ^ r["m"]].sum()) / r["area"] for r in refs.values()); table.append((round(float(s_), 3), round(e, 3)))
+    if e < best[0]: best = (e, float(s_))
+print("best slide", round(best[1], 3), "cost", round(best[0], 3), "no slide", [t for t in table if abs(t[0]) < 1e-6]); D2 = D + best[1] * axis; Vn = V0 + D2; print("part min", Vn.min(0).round(3), "max", Vn.max(0).round(3)); json.dump(D2.tolist(), open(f"{a.part}/sculpt.json", "w"))

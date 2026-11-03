@@ -1,0 +1,55 @@
+"""2 November 2026 : are the views coherent ? Without any model : the volume carved by all the other views must fill the silhouette of a view. Gives a number per view, and moves each camera (distance, pan, then yaw and pitch a little) to raise it. A view that stays low is rejected : it shows another pose or another stage of the model.
+    python -I HullCalib.py <v3 folder> <cams.json> <views.txt> <out cams.json> --voxel 0.024 --rounds 6 --rot 0.0
+FR : les vues sont-elles cohérentes ? Sans aucun modèle : le volume taillé par toutes les autres vues doit remplir la silhouette d'une vue. Donne un nombre par vue et déplace chaque caméra pour le monter. Une vue qui reste basse est écartée : elle montre une autre pose ou un autre état du modèle."""
+import sys, os, json, time, argparse
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); from DragonFit import cam_matrix, DEF
+HC = dict(x=(0.0, 2.2), y=(-0.8, 2.4), z=(-3.0, 2.2), fov=45.0, scale=0.5, splat=1)
+
+
+class Fields:
+    def __init__(s, folder, names, voxel):
+        VI = json.load(open(f"{folder}/views.json")); s.names = names; s.X = np.arange(HC["x"][0], HC["x"][1], voxel); s.Y = np.arange(HC["y"][0], HC["y"][1], voxel); s.Z = np.arange(HC["z"][0], HC["z"][1], voxel); gx, gy, gz = np.meshgrid(s.X, s.Y, s.Z, indexing="ij"); s.P = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], 1); s.ref = {}
+        for k in names:
+            m = np.asarray(Image.open(f"{folder}/masks/{k}.png"))[:, :VI[k]["size"][0] - DEF["toolbar_px"]] > 127; im = Image.fromarray((m * 255).astype(np.uint8)); m = np.asarray(im.resize((int(im.size[0] * HC["scale"]), int(im.size[1] * HC["scale"])), Image.BILINEAR)) > 127; sd = ndi.distance_transform_edt(~m) - ndi.distance_transform_edt(m); s.ref[k] = dict(m=m, inside=sd <= 1.0)
+
+    def carve(s, k, cam):
+        """which voxels this view allows, a voxel off its frame is allowed. FR : les voxels que cette vue autorise, un voxel hors cadre est autorisé."""
+        r = s.ref[k]; h, w = r["m"].shape; R, t, fp = cam_matrix(cam, w, h, HC["fov"]); ok = np.ones(len(s.P), bool)
+        for sign in (1.0, -1.0):
+            P = s.P * np.array([sign, 1, 1]); q = P @ R.T + t; z = np.maximum(q[:, 2], 0.05); x = (w / 2 + fp * q[:, 0] / z).astype(np.int32); y = (h / 2 - fp * q[:, 1] / z).astype(np.int32); inf = (x >= 0) & (x < w) & (y >= 0) & (y < h); a = np.ones(len(P), bool); a[inf] = r["inside"][y[inf], x[inf]]; ok &= a
+        return ok
+
+    def project(s, k, cam, vox):
+        r = s.ref[k]; h, w = r["m"].shape; R, t, fp = cam_matrix(cam, w, h, HC["fov"]); im = np.zeros((h, w), bool)
+        for sign in (1.0, -1.0):
+            P = s.P[vox] * np.array([sign, 1, 1]); q = P @ R.T + t; z = np.maximum(q[:, 2], 0.05); x = (w / 2 + fp * q[:, 0] / z).astype(np.int32); y = (h / 2 - fp * q[:, 1] / z).astype(np.int32); inf = (x >= 0) & (x < w) & (y >= 0) & (y < h); im[y[inf], x[inf]] = True
+        return ndi.binary_closing(im, iterations=HC["splat"] + 1)
+
+
+def coherence(pr, m): return float((pr & m).sum()) / max(float((pr | m).sum()), 1)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("folder"); ap.add_argument("cams"); ap.add_argument("views"); ap.add_argument("out"); ap.add_argument("--voxel", type=float, default=0.024); ap.add_argument("--rounds", type=int, default=4); ap.add_argument("--rot", type=float, default=0.0); a = ap.parse_args(); names = open(a.views).read().strip().split(","); cams = json.load(open(a.cams)); Fd = Fields(a.folder, names, a.voxel); C = {k: Fd.carve(k, cams[k]) for k in names}; T0 = time.time(); print("voxels", len(Fd.P), flush=True)
+    def others(k):
+        v = np.ones(len(Fd.P), bool)
+        for j in names:
+            if j != k: v &= C[j]
+        return v
+    rep = {k: round(coherence(Fd.project(k, cams[k], others(k)), Fd.ref[k]["m"]), 4) for k in names}; print("start", rep, "mean", round(float(np.mean(list(rep.values()))), 4), flush=True)
+    for rnd in range(a.rounds):
+        for k in names:
+            v = others(k); m = Fd.ref[k]["m"]; c = list(cams[k]); st = {3: c[3] * 0.01, 4: c[3] * 0.005, 5: c[3] * 0.005}
+            if a.rot: st[0] = a.rot; st[1] = a.rot
+            e = coherence(Fd.project(k, c, v), m)
+            for _ in range(3):
+                for i in st:
+                    for sg in (1, -1):
+                        c2 = list(c); c2[i] += sg * st[i]; e2 = coherence(Fd.project(k, c2, v), m)
+                        if e2 > e: e, c = e2, c2; break
+                st = {i: x * 0.6 for i, x in st.items()}
+            cams[k] = c; C[k] = Fd.carve(k, c)
+        rep = {k: round(coherence(Fd.project(k, cams[k], others(k)), Fd.ref[k]["m"]), 4) for k in names}; print("round", rnd, rep, "mean", round(float(np.mean(list(rep.values()))), 4), "inside", int(np.logical_and.reduce([C[k] for k in names]).sum()), f"t {time.time() - T0:.0f}s", flush=True); json.dump(cams, open(a.out, "w"))

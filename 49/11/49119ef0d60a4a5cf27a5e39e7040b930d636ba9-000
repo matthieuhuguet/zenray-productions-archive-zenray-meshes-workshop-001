@@ -1,0 +1,18 @@
+"""2 November 2026 : what the video itself allows : the same mask read with a threshold a little lower and a little higher, the same camera on two neighbour frames, and the loss when a perfect contour moves by half a pixel or one pixel. Below this floor a score measures the blur of the video, not the model. FR : ce que la vidéo permet : le même masque lu avec un seuil un peu plus bas et un peu plus haut, la même caméra sur deux images voisines, et la perte quand un contour parfait bouge d'un demi-pixel ou d'un pixel. Sous ce plancher, un score mesure le flou de la vidéo, pas le modèle.
+    python -I NoiseFloor.py <frames> f1,f2,... [--pairs a=b,c=d]"""
+import sys, os
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import part_mask, viewport, CF
+def load(fr, frames):
+    a = np.asarray(Image.open(f"{frames}/f_{int(fr):05d}.jpg").convert("RGB")); return a, viewport(a.max(2).astype(np.float32))
+def iou(a, b): return float((a & b).sum()) / max(float((a | b).sum()), 1)
+frames = sys.argv[1]; R = []
+for fr in sys.argv[2].split(","):
+    a, r = load(fr, frames); d0 = CF["grey_delta"]; m = part_mask(a, r, "grey"); CF["grey_delta"] = d0 - 6; lo = part_mask(a, r, "grey"); CF["grey_delta"] = d0 + 6; hi = part_mask(a, r, "grey"); CF["grey_delta"] = d0
+    big = np.kron(m, np.ones((4, 4), bool)); e2 = iou(big, ndi.binary_dilation(big, iterations=2)); e4 = iou(big, ndi.binary_dilation(big, iterations=4)); row = [iou(lo, hi), e2, e4, int(m.sum())]; R.append(row); print(fr, "threshold -6 vs +6", round(row[0], 4), " half pixel", round(e2, 4), " one pixel", round(e4, 4), " area", row[3])
+print("mean threshold", round(float(np.mean([x[0] for x in R])), 4), "half pixel", round(float(np.mean([x[1] for x in R])), 4), "one pixel", round(float(np.mean([x[2] for x in R])), 4))
+if len(sys.argv) > 3:
+    for pr in sys.argv[3].split("=", 1)[1].split(",") if sys.argv[3].startswith("--pairs=") else sys.argv[4].split(","):
+        x, y = pr.split("="); a, r = load(x, frames); b, s = load(y, frames); print("neighbours", x, y, round(iou(part_mask(a, r, "grey"), part_mask(b, r, "grey")), 4))

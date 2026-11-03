@@ -1,0 +1,19 @@
+"""2 November 2026 : Matthieu : never flattened parts, always something smooth. This finds them : regions of faces whose normals barely turn, bounded by a crease, the mark of a plate on an organic shape. It prints their share of the area and where the largest are. FR : Matthieu : jamais de parties aplaties, toujours du lisse. Cet outil les trouve : des régions de faces dont les normales tournent à peine, bordées d'un pli, la marque d'une plaque sur une forme organique.
+    python -I FlatCheck.py <mesh.obj> [--flat-deg 1.2] [--crease-deg 25] [--min-area 0.004]"""
+import sys, argparse
+import numpy as np
+from scipy import sparse
+from scipy.sparse.csgraph import connected_components
+ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("--flat-deg", type=float, default=1.2); ap.add_argument("--crease-deg", type=float, default=25.0); ap.add_argument("--min-area", type=float, default=0.004); a = ap.parse_args()
+V, F = [], []
+for l in open(a.mesh):
+    if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+    elif l.startswith("f "):
+        i = [int(q.split("/")[0]) - 1 for q in l.split()[1:]]; F += [(i[0], i[k], i[k + 1]) for k in range(1, len(i) - 1)]
+V = np.array(V); F = np.array(F); N = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]); A = np.linalg.norm(N, axis=1) / 2; N = N / np.maximum(2 * A[:, None], 1e-12); C = V[F].mean(1)
+e = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1); fid = np.tile(np.arange(len(F)), 3); o = np.lexsort((e[:, 1], e[:, 0])); e = e[o]; fid = fid[o]; same = (e[1:] == e[:-1]).all(1); f1, f2 = fid[:-1][same], fid[1:][same]
+ang = np.degrees(np.arccos(np.clip((N[f1] * N[f2]).sum(1), -1, 1))); keep = ang < a.flat_deg; n = len(F); G = sparse.coo_matrix((np.ones(keep.sum()), (f1[keep], f2[keep])), shape=(n, n)); nc, lab = connected_components(G, directed=False); area = np.bincount(lab, A, nc); total = float(A.sum())
+crease = np.zeros(nc, bool); hit = ang > a.crease_deg; crease[lab[f1[hit]]] = True; crease[lab[f2[hit]]] = True; big = np.flatnonzero((area > a.min_area * total))
+print(f"faces {n} area {total:.3f} flat regions over {a.min_area * 100:.2f} percent : {len(big)}, share of the area {100 * area[big].sum() / total:.2f} percent, with a crease around {int(crease[big].sum())}")
+for r in big[np.argsort(-area[big])][:12]:
+    k = lab == r; print(f"  {100 * area[r] / total:.2f} percent at {np.round(C[k].mean(0), 2).tolist()} crease {bool(crease[r])}")

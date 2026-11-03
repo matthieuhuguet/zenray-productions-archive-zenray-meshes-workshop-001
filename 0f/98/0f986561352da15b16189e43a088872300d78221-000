@@ -1,0 +1,77 @@
+"""2 November 2026 : DRACARD, the sculpt pass, done from the frames instead of by hand : every vertex on the outline of a view moves toward the outline of the frame, the displacement spreads over the skin, the body stays symmetric. This is what the red Sculpt nodes of the series do by eye.
+    python -I DragonSculpt.py <v3 folder> <in.obj> <cams.json> <views.txt> <out.obj> --loops 40
+FR : la passe de sculpt, faite depuis les images au lieu de la main : chaque sommet sur le contour d'une vue va vers le contour de l'image, le déplacement se répand sur la peau, le corps reste symétrique. C'est ce que font à l'œil les nodes Sculpt rouges de la série."""
+import sys, os, json, math, argparse, time
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi, sparse
+from scipy.spatial import cKDTree
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); import Raster, moderngl; from DragonFit import cam_matrix, DEF, Scene
+from DragonCompare import load_obj, vertex_normals
+# Every value of the pass. FR : tous les réglages de la passe.
+SC = dict(fov=45.0, rim_dot=0.35, rim_px=2.5, cap_px=5.0, spread=60, spread_alpha=0.5, step=0.6, step_min=0.05, fair=0.01, fair_iter=1, cam_every=5)
+
+
+class MaskRender:
+    def __init__(s, V, F):
+        s.g = Raster.ctx(); VS = """#version 330
+in vec3 p; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res;
+void main(){ vec3 q = R * p + t; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, 0.0, 1.0); }"""
+        s.prog = s.g.program(vertex_shader=VS, fragment_shader="#version 330\nout vec4 o; void main(){ o = vec4(1.0); }"); s.vbo = s.g.buffer(V.astype(np.float32).tobytes()); s.ibo = s.g.buffer(F.tobytes()); s.vao = s.g.vertex_array(s.prog, [(s.vbo, "3f", "p")], s.ibo); s.fb = {}
+
+    def update(s, V): s.vbo.write(V.astype(np.float32).tobytes())
+
+    def render(s, cam, w, h, fov):
+        f = s.fb.get((w, h)) or s.g.simple_framebuffer((w, h), components=1, dtype="f1"); s.fb[(w, h)] = f; f.use(); f.clear(0, 0, 0, 0); s.g.disable(moderngl.DEPTH_TEST); s.g.disable(moderngl.CULL_FACE); R, t, fp = cam_matrix(cam, w, h, fov); s.prog["R"].value = tuple(R.T.ravel().tolist()); s.prog["t"].value = tuple(t.tolist()); s.prog["f"].value = fp; s.prog["c"].value = (w / 2.0, h / 2.0); s.prog["res"].value = (float(w), float(h)); s.vao.render(moderngl.TRIANGLES); return np.frombuffer(f.read(components=1, alignment=1), np.uint8).reshape(h, w) > 127
+
+
+def signed_distance(m): return ndi.distance_transform_edt(~m) - ndi.distance_transform_edt(m)
+
+
+def save_obj(f, V, faces):
+    with open(f, "w") as o:
+        for q in V: o.write("v %.6f %.6f %.6f\n" % tuple(q))
+        for tri in faces: o.write("f " + " ".join(str(int(i) + 1) for i in tri) + "\n")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("folder"); ap.add_argument("mesh"); ap.add_argument("cams"); ap.add_argument("views"); ap.add_argument("out"); ap.add_argument("--loops", type=int, default=40); a = ap.parse_args()
+    names = open(a.views).read().strip().split(","); V, F = load_obj(a.mesh); V = V.astype(np.float64); cams = json.load(open(a.cams)); VI = json.load(open(f"{a.folder}/views.json")); refs = {}
+    for k in names:
+        m = np.asarray(Image.open(f"{a.folder}/masks/{k}.png"))[:, :VI[k]["size"][0] - DEF["toolbar_px"]] > 127; refs[k] = dict(m=m, sd=signed_distance(m).astype(np.float32), band=(ndi.distance_transform_edt(m) + ndi.distance_transform_edt(~m)) <= 1.0)
+    n = len(V); e = np.vstack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]); A = sparse.coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])), shape=(n, n)); A = ((A + A.T) > 0).astype(np.float64).tocsr(); deg = np.maximum(np.asarray(A.sum(1)).ravel(), 1)[:, None]; tree = cKDTree(V * np.array([-1, 1, 1])); dist, pair = tree.query(V); print("vertices", n, "mirror mean distance", round(float(dist.mean()), 5), flush=True); R_ = MaskRender(V, F); T0 = time.time()
+    def score(Vx):
+        R_.update(Vx); c = 0.0; I = []; It = []
+        for k in names:
+            r = refs[k]; h, w = r["m"].shape; mm = R_.render(cams[k], w, h, SC["fov"]); u = float((mm | r["m"]).sum()); I.append(float((mm & r["m"]).sum()) / max(u, 1)); k_ = ~r["band"]; It.append(float((mm & r["m"] & k_).sum()) / max(float(((mm | r["m"]) & k_).sum()), 1))
+        return float(np.mean(I)), float(np.mean(It))
+    def refine_cams():
+        for k in names:
+            r = refs[k]; h, w = r["m"].shape; c = list(cams[k]); st = [c[3] * 0.004, c[3] * 0.002, c[3] * 0.002]; f = lambda cc: float((R_.render(cc, w, h, SC["fov"]) ^ r["m"]).sum()); e = f(c)
+            for _ in range(2):
+                for i, j in enumerate((3, 4, 5)):
+                    for sg in (1, -1):
+                        c2 = list(c); c2[j] += sg * st[i]; e2 = f(c2)
+                        if e2 < e: e, c = e2, c2; break
+            cams[k] = c
+    best = score(V); step = SC["step"]; print("start", [round(x, 4) for x in best], flush=True)
+    for loop in range(a.loops):
+        Sum = np.zeros_like(V); W = np.zeros(n); R_.update(V); N = vertex_normals(V.astype(np.float32), F).astype(np.float64)
+        for k in names:
+            r = refs[k]; h, w = r["m"].shape; mm = R_.render(cams[k], w, h, SC["fov"]); R, t, fp = cam_matrix(cams[k], w, h, SC["fov"]); q = V @ R.T + t; Z = np.maximum(q[:, 2], 0.05); x = w / 2.0 + fp * q[:, 0] / Z; y = h / 2.0 - fp * q[:, 1] / Z; inside = (x >= 0) & (x < w - 1) & (y >= 0) & (y < h - 1); ix = x.clip(0, w - 1).astype(int); iy = y.clip(0, h - 1).astype(int); dm = ndi.distance_transform_edt(mm) + ndi.distance_transform_edt(~mm); nc = N @ R.T; vd = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-9); dot = np.abs((nc * vd).sum(1)); rim = inside & (dot < SC["rim_dot"]) & (dm[iy, ix] <= SC["rim_px"]); n2 = nc[:, :2].copy(); n2 /= np.maximum(np.linalg.norm(n2, axis=1, keepdims=True), 1e-9); sd = np.clip(r["sd"][iy, ix], -SC["cap_px"], SC["cap_px"]); move = -sd[:, None] * n2 * (Z / fp)[:, None]; world = np.hstack([move, np.zeros((n, 1))]) @ R; wt = np.where(rim, (1 - dot / SC["rim_dot"]) + 0.05, 0.0); Sum += world * wt[:, None]; W += wt
+        D = Sum / np.maximum(W, 1e-6)[:, None]; Wn = (W > 0).astype(np.float64)[:, None]; Dv = D * Wn; Ws = Wn.copy()
+        for _ in range(SC["spread"]):      # the rim moves spread to their neighbours, weighted so that a sparse rim still moves the skin around it. FR : les mouvements du contour se répandent vers leurs voisins, pondérés pour qu'un contour clairsemé entraîne la peau autour.
+            Dv = (1 - SC["spread_alpha"]) * Dv + SC["spread_alpha"] * (A @ Dv) / deg; Ws = (1 - SC["spread_alpha"]) * Ws + SC["spread_alpha"] * (A @ Ws) / deg
+        D2 = Dv / np.maximum(Ws, 1e-6); mir = D2[pair] * np.array([-1, 1, 1]); D2 = 0.5 * (D2 + mir)
+        while step >= SC["step_min"]:      # 2 November 2026 : a step stays only if the overlap rises, it went back down without this. FR : un pas ne reste que si le recouvrement monte, il redescendait sans cela.
+            Vn = V + step * D2
+            for _ in range(SC["fair_iter"]): Vn = Vn + SC["fair"] * ((A @ Vn) / deg - Vn)
+            sc = score(Vn)
+            if sc[0] > best[0]: V = Vn; best = sc; step = min(step * 1.2, SC["step"]); break
+            step *= 0.5
+        else:
+            R_.update(V); refine_cams(); best = score(V); step = SC["step"] * 0.5
+        if loop % SC["cam_every"] == SC["cam_every"] - 1: R_.update(V); refine_cams(); best = score(V)
+        if loop % 5 == 0 or loop == a.loops - 1: print(f"loop {loop} IoU {best[0]:.4f} with 1 px tolerance {best[1]:.4f} step {step:.3f} t {time.time() - T0:.0f}s", flush=True)
+    json.dump(cams, open(a.out + ".cams.json", "w"))
+    save_obj(a.out, V, F)

@@ -1,0 +1,49 @@
+"""2 November 2026 : the camera of a Houdini viewport frame, read on the axis gizmo in its corner : the green, red and blue discs give yaw and pitch directly, so nothing has to be guessed. FR : la caméra d'une image de vue Houdini, lue sur la croix d'axes de son coin : les disques vert, rouge et bleu donnent directement le lacet et le tangage, rien à deviner.
+    python -I GizmoRead.py <frames folder> [--every 1] > cameras.jsonl"""
+import sys, os, glob, json, math
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from scipy.optimize import least_squares
+# Values for a frame 1024 px wide ; they scale with the frame. FR : valeurs pour une image de 1024 px, elles suivent l'échelle de l'image.
+DEF = dict(axis_len=9.3, search_w=90, search_h=90, x0=8, sat=45, min_px=8, panel_dark=48, scan_y=240)
+
+
+def blobs(c):
+    r, g, b = c[..., 0].astype(float), c[..., 1].astype(float), c[..., 2].astype(float); out = {}
+    for name, m in (("y", (g > r + DEF["sat"]) & (g > b + DEF["sat"])), ("x", (r > g + DEF["sat"]) & (r > b + DEF["sat"])), ("z", (b > r + DEF["sat"]) & (b > g + 25))):
+        lab, n = ndi.label(m)
+        if n == 0: return None
+        sz = ndi.sum(m, lab, range(1, n + 1)); i = int(np.argmax(sz))
+        if sz[i] < DEF["min_px"]: return None
+        # 2 November 2026 : the centre weighted by how strong the colour is, a plain mask moved the pitch by 8 degrees between two sizes of the same frame. FR : le centre pondéré par la force de la couleur, un simple masque déplaçait le tangage de 8 degrés entre deux tailles de la même image.
+        weight = np.maximum({"y": g - np.maximum(r, b), "x": r - np.maximum(g, b), "z": b - np.maximum(r, g)}[name], 0) * ndi.binary_dilation(lab == i + 1, iterations=2); cy, cx = ndi.center_of_mass(weight); out[name] = (cx, cy)
+    return out
+
+
+def solve(B, fixed_L=None):
+    """orthographic axes of one length L around an origin O. FR : axes orthographiques de longueur unique L autour d'une origine O."""
+    gx, gy, gz = np.array(B["x"]), np.array(B["y"]), np.array(B["z"])
+    def res(v):
+        ox, oy, L, a, b = v; L = fixed_L or L; sa, ca, sb, cb = math.sin(a), math.cos(a), math.sin(b), math.cos(b); return [ox + L * ca - gx[0], oy + L * sa * sb - gx[1], ox - L * sa - gz[0], oy + L * ca * sb - gz[1], ox - gy[0], oy - L * cb - gy[1]]
+    best = None
+    for a0 in (-2.4, -0.8, 0.8, 2.4):
+        for b0 in (-0.6, 0.0, 0.6):
+            s = least_squares(res, [gy[0], gy[1] + 10, 11.0, a0, b0], bounds=([-1e4, -1e4, 2.0, -3.3, -1.6], [1e4, 1e4, 200.0, 3.3, 1.6]))      # 2 November 2026 : the length stays positive and the pitch within a quarter turn, or the same picture gets a mirrored answer. FR : la longueur reste positive et le tangage dans le quart de tour, sinon une même image reçoit une réponse miroir.
+            if best is None or s.cost < best.cost: best = s
+    return math.degrees(best.x[3]), math.degrees(best.x[4]), float(best.x[2]), float(best.cost)
+
+
+def read(a):
+    h, w = a.shape[:2]; k = w / 1024.0; g = a.mean(2); row = np.median(g[int(DEF["scan_y"] * k) - 20:int(DEF["scan_y"] * k) + 20, :], 0) > DEF["panel_dark"]; x0 = int(20 * k)
+    while x0 > 0 and row[x0 - 1]: x0 -= 1
+    col = np.median(g[:, x0 + 2:x0 + 12], 1) > DEF["panel_dark"]; y1 = int(DEF["scan_y"] * k)
+    while y1 < h - 1 and col[y1 + 1]: y1 += 1
+    c = a[y1 - int(DEF["search_h"] * k):y1, x0:x0 + int(DEF["search_w"] * k)]; B = blobs(c)
+    return solve(B, DEF["axis_len"] * k) if B else None      # 2 November 2026 : the gizmo has one length on screen, measured over the frames, leaving it free let the pitch absorb the noise. FR : la croix a une seule longueur à l'écran, mesurée sur les images, la laisser libre faisait absorber le bruit au tangage.
+
+
+if __name__ == "__main__":
+    for f in sorted(glob.glob(sys.argv[1] + "/f_*.jpg")):
+        a = np.asarray(Image.open(f).convert("RGB")); r = read(a)
+        if r and r[3] < 1.5: print(json.dumps(dict(f=os.path.basename(f), yaw=round(r[0], 1), pitch=round(r[1], 1), L=round(r[2], 1), cost=round(r[3], 2))), flush=True)

@@ -1,0 +1,80 @@
+"""2 November 2026 : DRACARD, the dragon itself, episode after episode, with the nodes of the series and the shapes read on its frames : curve, resample, smooth, sweep with Apply Scale Along Curve, sculpt left empty in red, mirror (ep03) ; head by volume, mouth cut, teeth and eyes copied (ep04) ; wings and back spikes (ep05) ; VDB from polygons, smooth, convert, Quad Remesh (ep07). Every shape lives in dragon_params.json, the graph is its instance. The old graphs of Dracard.hip kept the proportions of the Otto test skeleton, which gave a stick figure : the tutorial pushes the scale ramp by hand into a pear.
+Runs without the interface, on its own scene, so it never touches a scene open in Houdini.
+    hython DragonBuild.py [params.json] [out folder]       writes Dragon.hip, body.obj, teeth.obj, eyes.obj, spikes.obj, wings.obj and report.json
+FR : le dragon lui-même, épisode après épisode, avec les nodes de la série et les formes lues sur ses images. Tourne sans interface, sur sa propre scène, sans jamais toucher une scène ouverte."""
+import sys, os, json, time
+import hou
+HERE = os.path.dirname(os.path.abspath(__file__)); P = json.load(open(sys.argv[1] if len(sys.argv) > 1 else f"{HERE}/dragon_params.json")); OUT = sys.argv[2] if len(sys.argv) > 2 else "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/dracard/v2"; os.makedirs(OUT, exist_ok=True)
+RED = hou.Color((0.9, 0.15, 0.15)); GREEN = hou.Color((0.2, 0.7, 0.25)); hou.hipFile.clear(suppress_save_prompt=True); geo = hou.node("/obj").createNode("geo", "Mad_Villain")
+
+
+def mk(t, name, *inputs, **parms):
+    n = geo.createNode(t, name)
+    for i, x in enumerate(inputs):
+        if x is not None: n.setInput(i, x)
+    for k, v in parms.items(): n.parm(k).set(v)
+    return n
+
+
+def add_curve(name, pts):
+    """the Curve of the tutorial is drawn by clicks, which no script can do : an Add node holds the same points. FR : la Curve du tuto se dessine à la souris, un Add porte les mêmes points."""
+    a = mk("add", name, keep=0); a.parm("points").set(len(pts))
+    for i, q in enumerate(pts):
+        a.parm(f"usept{i}").set(1)
+        for k, ax in enumerate("xyz"): a.parm(f"pt{i}{ax}").set(q[k])
+    a.parm("prims").set(1); a.parm("prim0").set(f"0-{len(pts) - 1}"); a.parm("closed0").set(0); return a
+
+
+def ramp(keys):
+    return hou.Ramp([hou.rampBasis.CatmullRom] * len(keys), [float(k[0]) for k in keys], [float(k[1]) for k in keys])
+
+
+def tube(t):
+    """line, sweep, sculpt : the backbone of the series. FR : ligne, sweep, sculpt, la colonne de la série."""
+    tag = t["name"]; c = add_curve(f"curve_{tag}", t["pts"]); r = mk("resample", f"resample_{tag}", c, length=0.012, dolength=1); m = mk("smooth::2.0", f"smooth_curve_{tag}", r, strength=40); s = mk("sweep::2.0", f"sweep_{tag}", m, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=t["radius"], cols=t.get("cols", 24), applyscale=1); s.parm("scaleramp").set(ramp(t["ramp"])); x = s
+    if t.get("flatten"):
+        cx = [sum(q[k] for q in t["pts"]) / len(t["pts"]) for k in range(3)]; x = mk("xform", f"transform_from_centroid_{tag}", s, sx=t["flatten"][0], sy=t["flatten"][1], sz=t["flatten"][2], px=cx[0], py=cx[1], pz=cx[2])
+    sc = mk("sculpt", f"sculpt_{tag}", x); sc.setColor(RED)
+    return mk("mirror", f"mirror_{tag}", sc, dirx=1, diry=0, dirz=0) if t.get("mirror") else sc
+
+
+T0 = time.time(); tubes = {t["name"]: tube(t) for t in P["tubes"] if not t.get("group")}; extra = {t["group"]: [] for t in P["tubes"] if t.get("group")}
+for t in P["tubes"]:
+    if t.get("group"): extra[t["group"]].append(tube(t))
+# ep03 and ep04 : one volume, one skin. FR : un seul volume, une seule peau.
+mrg = mk("merge", "merge_body")
+for i, n in enumerate(tubes.values()): mrg.setInput(i, n)
+vox = P["voxel"]; v = mk("vdbfrompolygons", "vdbfrompolygons_body", mrg, voxelsize=vox, fillinterior=1)
+M = P["mouth"]; cm = add_curve("curve_mouth", M["pts"]); rm = mk("resample", "resample_mouth", cm, length=0.012, dolength=1); sm_ = mk("smooth::2.0", "smooth_mouth", rm, strength=20); sw = mk("sweep::2.0", "sweep_mouth", sm_, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=M["thickness"], cols=12, applyscale=1); sw.parm("scaleramp").set(ramp(M["ramp"])); xm = mk("xform", "transform_mouth", sw, sx=M["half_width"] / M["thickness"], px=0); vm = mk("vdbfrompolygons", "vdbfrompolygons_mouth", xm, voxelsize=vox, fillinterior=1); cut = mk("vdbcombine", "vdbcombine_mouth", v, vm); cut.parm("operation").set("sdfdifference"); last = cut
+for i, c_ in enumerate(extra.get("cut", [])): vc = mk("vdbfrompolygons", f"vdbfrompolygons_cut{i}", c_, voxelsize=vox, fillinterior=1); last = mk("vdbcombine", f"vdbcombine_cut{i}", last, vc); last.parm("operation").set("sdfdifference")
+sd = mk("vdbsmoothsdf", "vdbsmooth1", last, iterations=P["vdb_iterations"]); cv = mk("convertvdb", "convertvdb1", sd, conversion="poly", adaptivity=P["adaptivity"]); body_out = cv
+if P.get("retopo_on"):      # ep07 : the topology comes from here. FR : la topologie vient d'ici.
+    body_out = mk("quadremesh", "quadremesh1", cv, targetquadcount=P["retopo_quads"], xaxis=1)
+out_body = mk("null", "OUT_BODY", body_out); out_body.setColor(GREEN)
+# ep04 : teeth along the mouth, eyes. FR : dents le long de la bouche, yeux.
+tooth_out = []
+for Te in P["teeth"]:
+    tg = Te["name"]; ct = add_curve(f"curve_teeth_{tg}", Te["pts"]); rt = mk("resample", f"resample_teeth_{tg}", ct, dolength=0, dosegs=1, segs=Te["count"] - 1); wt = mk("attribwrangle", f"teeth_vary_{tg}", rt); wt.parm("snippet").set('f@pscale = fit01(rand(@ptnum * 3.17 + 1.3), 0.78, 1.16);')      # 2 November 2026 : uneven teeth, as the tutorial places them by hand. FR : des dents inégales, comme le tuto les place à la main.
+    sign = 1 if Te.get("up") else -1; ctooth = add_curve(f"curve_tooth_{tg}", [[0, 0, 0], [0, sign * Te["length"], 0]]); rtooth = mk("resample", f"resample_tooth_{tg}", ctooth, length=0.01, dolength=1); st = mk("sweep::2.0", f"sweep_tooth_{tg}", rtooth, surfaceshape="tube", surfacetype="quads", endcaptype="grid", radius=Te["radius"], cols=10, applyscale=1); st.parm("scaleramp").set(ramp([[0, 1], [0.55, 0.9], [1, 0.08]])); cp = mk("copytopoints::2.0", f"copytopoints_teeth_{tg}", st, wt); tooth_out.append(cp)
+mt0 = mk("merge", "merge_teeth", *tooth_out); mt = mk("mirror", "mirror_teeth", mt0, dirx=1, diry=0, dirz=0); out_t = mk("null", "OUT_TEETH", mt); out_t.setColor(GREEN)
+E = P["eye"]; sp = mk("sphere", "sphere_eye", type=2, radx=E["radius"], rady=E["radius"], radz=E["radius"], tx=E["pos"][0], ty=E["pos"][1], tz=E["pos"][2]); me = mk("mirror", "mirror_eye", sp, dirx=1, diry=0, dirz=0); out_e = mk("null", "OUT_EYES", me); out_e.setColor(GREEN)
+# ep05 : spikes along the back. FR : les crêtes du dos.
+def fins(tag, S):
+    cs = add_curve(f"curve_{tag}", S["pts"]); rs = mk("resample", f"resample_{tag}", cs, dolength=0, dosegs=1, segs=S["count"] - 1); ry = mk("ray", f"ray_{tag}", rs, cv, method="minimum"); w = mk("attribwrangle", f"orient_{tag}", ry); w.parm("snippet").set(f'int n = npoints(0); int a = max(@ptnum - 1, 0), b = min(@ptnum + 1, n - 1); v@N = normalize(point(0, "P", b) - point(0, "P", a)); v@up = normalize(cross(v@N, {{-1, 0, 0}})); f@pscale = fit(float(@ptnum), 0, n - 1, {S["size"]}, {S["end_size"]});'); fin = add_curve(f"curve_fin_{tag}", [[0, q[0], q[1]] for q in S["profile"]]); fin.parm("closed0").set(1); fx = mk("polyextrude::2.0", f"polyextrude_fin_{tag}", fin, dist=S["thickness"], outputback=1); fc = mk("xform", f"transform_fin_{tag}", fx, tx=-S["thickness"] / 2, ty=-0.03); sb = mk("subdivide", f"subdivide_fin_{tag}", fc, iterations=2); return mk("copytopoints::2.0", f"copytopoints_{tag}", sb, w)
+out_s = mk("null", "OUT_SPIKES", mk("merge", "merge_fins", fins("plates", P["plates"]), fins("spikes", P["spikes"]))); out_s.setColor(GREEN)
+# ep05 : wings, bones and a membrane scalloped between the fingers. FR : ailes, os et membrane festonnée entre les doigts.
+W = P["wing"]; parts = []; R0 = W["arm"][0]; sc_ = W.get("scale", 1.0); W["fingers"] = [[[R0[k] + (q[k] - R0[k]) * sc_ for k in range(3)] for q in f] for f in W["fingers"]]; W["arm"] = [[R0[k] + (q[k] - R0[k]) * sc_ for k in range(3)] for q in W["arm"]]; bones = [W["arm"]] + W["fingers"]      # one number for the size of the wing. FR : un seul nombre pour la taille de l'aile.
+for i, b in enumerate(bones): parts.append(tube(dict(name=f"wing_bone{i}", pts=b, radius=W["bone_radius"], ramp=[[0, 1.5], [0.2, 1.0], [1, 0.25 if i else 0.9]], cols=12)))
+for i in range(len(W["fingers"]) - 1):
+    A, B = W["fingers"][i], W["fingers"][i + 1]; arr = lambda L: "{" + ",".join("{%f,%f,%f}" % tuple(q) for q in L) + "}"; g = mk("grid", f"grid_membrane{i}", rows=W["membrane_rows"], cols=W["membrane_rows"], sizex=1, sizey=1, tx=0.5, tz=0.5); wm = mk("attribwrangle", f"membrane{i}", g); wm.parm("snippet").set(f'function vector samp(vector a[]; float t){{ float f = t * (len(a) - 1); int k = min(int(f), len(a) - 2); return lerp(a[k], a[k + 1], f - k); }}\nvector A[] = {arr(A)}; vector B[] = {arr(B)}; float s = @P.x; float t = @P.z * (1 - {W["scallop"]} * sin(s * PI)); @P = lerp(samp(A, t), samp(B, t), s);'); parts.append(wm)
+mw = mk("merge", "merge_wing")
+for i, n in enumerate(parts): mw.setInput(i, n)
+mrw = mk("mirror", "mirror_wing", mw, dirx=1, diry=0, dirz=0); out_w = mk("null", "OUT_WINGS", mrw); out_w.setColor(GREEN)
+# ep06 : the jacket grows on the body itself, the small hat sits on the head. FR : la veste pousse sur le corps lui-même, le petit chapeau se pose sur la tête.
+J = P["jacket"]; vj = mk("vdbfrompolygons", "vdbfrompolygons_jacket", mrg, voxelsize=vox, fillinterior=1, exteriorbandvoxels=J["band"]); jw = mk("volumewrangle", "jacket_shell", vj); jw.parm("snippet").set(f'float s = @surface; float o = fit(@P.y, {J["y_low"]}, {J["y_high"]}, {J["open_low"]}, {J["open_high"]}); float d[] = array(s - {J["offset"]}, -s - 0.004, {J["y_low"]} + {J["hem_slope"]} * @P.z - @P.y, @P.y - ({J["y_high"]} + {J["collar_slope"]} * @P.z), min(o - abs(@P.x), @P.z - ({J["z0"]})), abs(@P.x) - {J["arm_end"]}, ({J["z_back"]}) - @P.z); @surface = max(d);'); js = mk("vdbsmoothsdf", "vdbsmooth_jacket", jw, iterations=J["smooth"]); jp = mk("convertvdb", "convertvdb_jacket", js, conversion="poly", adaptivity=P["adaptivity"])
+if P.get("retopo_on"): jp = mk("quadremesh", "quadremesh_jacket", jp, targetquadcount=P["retopo_jacket_quads"], xaxis=1)
+mc = mk("merge", "merge_cloth", jp, *extra.get("cloth", [])); out_c = mk("null", "OUT_CLOTH", mc); out_c.setColor(GREEN); mg = mk("merge", "merge_mouth", *extra.get("mouth", [])); out_m = mk("null", "OUT_MOUTH", mg); out_m.setColor(GREEN)
+final = mk("merge", "merge_final", out_body, out_t, out_e, out_s, out_w, out_c, out_m); final.setDisplayFlag(True); final.setRenderFlag(True); geo.layoutChildren(); report = dict(nodes=len(geo.children()), parts={})
+for name, n, f in (("body", out_body, "body.obj"), ("teeth", out_t, "teeth.obj"), ("eyes", out_e, "eyes.obj"), ("spikes", out_s, "spikes.obj"), ("wings", out_w, "wings.obj"), ("cloth", out_c, "cloth.obj"), ("mouth", out_m, "mouth.obj")):
+    t0 = time.time(); g = n.geometry(); errs = [c.path() + " : " + c.errors()[0][:90] for c in geo.children() if c.errors()]; g.saveToFile(f"{OUT}/{f}"); report["parts"][name] = dict(points=len(g.points()), prims=len(g.prims()), seconds=round(time.time() - t0, 2))
+report["errors"] = errs; report["seconds"] = round(time.time() - T0, 1); hou.hipFile.save(f"{OUT}/Dragon.hip"); json.dump(report, open(f"{OUT}/report.json", "w"), indent=1); print(json.dumps(report))

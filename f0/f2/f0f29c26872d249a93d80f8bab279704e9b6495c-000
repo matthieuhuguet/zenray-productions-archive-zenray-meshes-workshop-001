@@ -1,0 +1,24 @@
+"""2 November 2026 : is a feature consistent with the skin : the pixel read in one view is cast on the mesh, the hit is projected in the other views and compared with the pixels read there. A large gap means the surface is at the wrong depth there, or the reading is not the same point. FR : un détail est-il cohérent avec la peau : le pixel lu dans une vue est projeté sur le maillage, le point touché est reprojeté dans les autres vues et comparé aux pixels lus. Un grand écart veut dire que la surface n'est pas à la bonne profondeur, ou que la lecture n'est pas le même point.
+    python -I SurfaceCheck.py <mesh.obj> <cams.json> <frames> <points.json> [names]"""
+import sys, os, json
+import numpy as np
+from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import cam_matrix, viewport, CF
+V = np.array([[float(x) for x in l.split()[1:4]] for l in open(sys.argv[1]) if l.startswith("v ")]); cams = json.load(open(sys.argv[2])); frames = sys.argv[3]; PTS = json.load(open(sys.argv[4])); only = set(sys.argv[5].split(",")) if len(sys.argv) > 5 else None; C = {}
+def cam(fr):
+    if fr not in C:
+        x0, y0, x1, y1 = viewport(np.asarray(Image.open(f"{frames}/f_{int(fr):05d}.jpg").convert("RGB")).max(2).astype(np.float32)); w, h = x1 - x0, y1 - y0; C[fr] = (*cam_matrix(cams[fr], w, h, CF["fov"]), w, h)
+    return C[fr]
+def proj(P, fr):
+    R, t, fp, w, h = cam(fr); q = P @ R.T + t; return np.c_[w / 2 + fp * q[:, 0] / q[:, 2], h / 2 - fp * q[:, 1] / q[:, 2]], q[:, 2]
+for name, obs in PTS.items():
+    if only and name not in only: continue
+    print(name)
+    for fr, uv in obs.items():
+        p, d = proj(V, fr); k = np.hypot(p[:, 0] - uv[0], p[:, 1] - uv[1]) < 1.5
+        if not k.any(): print("  from", fr, "no hit"); continue
+        hit = V[np.flatnonzero(k)[np.argmin(d[k])]]; s = f"  from {fr} hit {np.round(hit, 3).tolist()} :"
+        for f2, uv2 in obs.items():
+            if f2 == fr: continue
+            q, _ = proj(hit[None], f2); s += f"  {f2} pred {np.round(q[0], 0).tolist()} read {uv2} gap {np.hypot(*(q[0] - uv2)):.0f}"
+        print(s)

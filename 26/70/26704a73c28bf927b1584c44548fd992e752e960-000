@@ -1,0 +1,26 @@
+"""2 November 2026 : points and cameras found together, for a part with no model yet : the axis gizmo gives yaw and pitch, the pixels read on several views give the rest (bundle adjustment). The first view fixes scale and place. FR : points et caméras trouvés ensemble, pour une partie sans modèle : la croix d'axes donne lacet et tangage, les pixels lus sur plusieurs vues donnent le reste. La première vue fixe l'échelle et la place.
+    python -I Bundle.py <views.json> <points.json> <out.json> [--dist 4.7]
+    views.json {"430": [yaw, pitch, viewport width, viewport height], ...} ; points.json {"name": {"430": [px, py], ...}} ; writes points and cameras [yaw, pitch, px, py, dist]"""
+import sys, os, json, math, argparse
+import numpy as np
+from scipy.optimize import least_squares
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import cam_matrix, CF
+ap = argparse.ArgumentParser(); ap.add_argument("views"); ap.add_argument("points"); ap.add_argument("out"); ap.add_argument("--dist", type=float, default=4.7); ap.add_argument("--angle-weight", type=float, default=1.0); ap.add_argument("--px0", type=float, default=0.0); a = ap.parse_args(); V = json.load(open(a.views)); P = json.load(open(a.points)); vn = list(V); pn = list(P); n, m = len(pn), len(vn)
+def unpack(x): return x[:3 * n].reshape(n, 3), x[3 * n:].reshape(m, 5)
+def res(x):
+    Q, C = unpack(x); r = []
+    for i, name in enumerate(pn):
+        for key, uv in P[name].items():      # 2 November 2026 : a key ending in m reads the mirror of the point, a name starting with c_ lies on x = 0 : symmetry fixes the place of the plane x = 0, without it the depth of a side view is free and the scale runs away. FR : une clé finie par m lit le miroir du point, un nom commençant par c_ est sur x = 0 : la symétrie fixe le plan x = 0, sans elle la profondeur d'une vue de profil est libre et l'échelle s'emballe.
+            f = key.rstrip("m"); j = vn.index(f); y, p, W, H = V[f]; px, py, d, dy, dp = C[j]; Qi = Q[i] * np.array([0.0 if name.startswith("c_") else (-1.0 if key.endswith("m") else 1.0), 1.0, 1.0])
+            if j == 0: px, py, d = (a.px0, 0.0, a.dist)
+            R, t, fp = cam_matrix([y + dy, p + dp, px, py, d], W, H, CF["fov"])[:3]; q = R @ Qi + t; r += [W / 2 + fp * q[0] / q[2] - uv[0], H / 2 - fp * q[1] / q[2] - uv[1]]
+    for j in range(m): r += [C[j, 3] * a.angle_weight, C[j, 4] * a.angle_weight]
+    return np.array(r)
+x0 = np.zeros(3 * n + 5 * m); x0[3 * n:] = np.tile([0.0, 0.0, a.dist, 0.0, 0.0], m); x0[:3 * n] = np.random.RandomState(1).normal(0, 0.05, 3 * n); s = least_squares(res, x0, method="trf", max_nfev=400); Q, C = unpack(s.x); cams = {}
+for j, f in enumerate(vn):
+    px, py, d, dy, dp = C[j]
+    if j == 0: px, py, d = a.px0, 0.0, a.dist
+    cams[f] = [float(V[f][0] + dy), float(V[f][1] + dp), float(px), float(py), float(d)]
+r = res(s.x); print("rms px", round(float(np.sqrt((r[:-2 * m] ** 2).mean())), 2), "max", round(float(np.abs(r[:-2 * m]).max()), 1)); print({f: [round(x, 2) for x in c] for f, c in cams.items()})
+for i, name in enumerate(pn): print(f"{name:12s}", np.round(Q[i], 3).tolist())
+json.dump(dict(points={pn[i]: [float(v) for v in Q[i]] for i in range(n)}, cams=cams), open(a.out, "w"), indent=0)
