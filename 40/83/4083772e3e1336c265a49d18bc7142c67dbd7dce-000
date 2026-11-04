@@ -133,8 +133,11 @@ def params_of(tubes):
         if t.get("kind") == "obj" and not t.get("frozen"):      # 2 November 2026 : a finished part only moves as a whole, height, depth and size. FR : une partie finie ne bouge que d'un bloc, hauteur, profondeur et taille.
             t.setdefault("xform", [0.0, 0.0, 0.0, 1.0])
             for i_ in (1, 2): P.append(dict(t=ti, kind="xf", i=i_, step=DEF["step_pos"]))
-            P.append(dict(t=ti, kind="xf", i=3, step=0.01)); continue
+            P.append(dict(t=ti, kind="xf", i=3, step=0.01))
+            for i_ in range(3): P.append(dict(t=ti, kind="rot", i=i_, step=0.8))
+            continue
         if t.get("group") == "cut" or t.get("frozen"): continue
+        if t.get("kind") == "sheet" and t.get("width") is not None: P.append(dict(t=ti, kind="width", i=0, step=0.01))
         for pi, q in enumerate(t["pts"]):
             for ax in range(3):
                 if ax == 0 and not t.get("mirror") and not t.get("free_x"): continue      # 2 November 2026 : a tube on the axis stays on the axis, the body is symmetric. FR : un tube sur l'axe reste sur l'axe, le corps est symétrique.
@@ -157,6 +160,8 @@ def params_of(tubes):
 
 
 def apply(tubes, p, d):
+    if p["kind"] == "width": tubes[p["t"]]["width"] = float(np.clip(tubes[p["t"]]["width"] + d, 0.005, 0.3)); return tubes[p["t"]]
+    if p["kind"] == "rot": tubes[p["t"]].setdefault("rot", [0.0, 0.0, 0.0]); tubes[p["t"]]["rot"][p["i"]] += d; return tubes[p["t"]]
     if p["kind"] == "xf": tubes[p["t"]]["xform"][p["i"]] += d; return tubes[p["t"]]
     if p["kind"] == "gscale":
         ts = [tubes[i] for i in p["group"]]; c_ = np.mean([q for t in ts for q in t["pts"]], 0)
@@ -205,7 +210,7 @@ if __name__ == "__main__":
     for k, r in refs.items():
         if k not in cams: cams[k] = coarse_cam(S, k, r, a.fov, GUESS.get(k))
         cams[k], e = refine_cam(S, k, r, cams[k], a.fov, loops=5); print("camera", k, [round(x, 2) for x in cams[k]], "cost", round(e, 3), flush=True)
-    total = (lambda: sum(grey_cost(S, k, refs[k], cams[k], a.fov, COEF) for k in refs)) if COEF else (lambda: sum(view_cost(S.render(k, cams[k], a.fov), refs[k]) for k in refs)); E = total(); P = params_of(tubes); P = [p for p in P if p["kind"] in ("shift", "thick", "stretch", "gshift", "gscale", "xf")] if a.coarse else P; only = set(a.only.split(",")) if a.only else None; T0 = time.time(); last = 0; rnd = 0; print("params", len(P), "start cost", round(E, 3), flush=True); rep = overlay(S, refs, cams, a.fov, a.out + ".png")
+    total = (lambda: sum(grey_cost(S, k, refs[k], cams[k], a.fov, COEF) for k in refs)) if COEF else (lambda: sum(view_cost(S.render(k, cams[k], a.fov), refs[k]) for k in refs)); E = total(); P = params_of(tubes); P = [p for p in P if p["kind"] in ("shift", "thick", "stretch", "gshift", "gscale", "xf", "rot")] if a.coarse else P; only = set(a.only.split(",")) if a.only else None; T0 = time.time(); last = 0; rnd = 0; print("params", len(P), "start cost", round(E, 3), flush=True); rep = overlay(S, refs, cams, a.fov, a.out + ".png")
     print("start", {k: [round(x, 3) for x in v] for k, v in rep.items()}, flush=True)
     while time.time() - T0 < a.minutes * 60:
         rnd += 1; random.shuffle(P); moved = 0
@@ -224,7 +229,7 @@ if __name__ == "__main__":
             p["step"] = min(p["step"] * DEF["grow"], 0.08) if ok else max(p["step"] * DEF["shrink"], DEF["step_min"])
             if time.time() - T0 > a.minutes * 60: break
         if moved < len(P) * 0.02:      # 2 November 2026 : every step had shrunk to its minimum and nothing moved any more : give the steps back. FR : tous les pas étaient au minimum et plus rien ne bougeait : rendre les pas.
-            for p in P: p["step"] = 0.01 if p["kind"] == "gscale" or (p["kind"] == "xf" and p["i"] == 3) else DEF["step_pos"] if p["kind"] in ("pos", "shift", "stretch", "thick", "gshift", "xf") else DEF["step_ramp"] if p["kind"] == "ramp" else DEF["step_flat"]
+            for p in P: p["step"] = 0.01 if p["kind"] == "gscale" or (p["kind"] == "xf" and p["i"] == 3) else 0.8 if p["kind"] == "rot" else DEF["step_pos"] if p["kind"] in ("pos", "shift", "stretch", "thick", "gshift", "xf") else DEF["step_ramp"] if p["kind"] == "ramp" else DEF["step_flat"]
         if rnd % DEF["cam_every"] == 0:
             for k, r in refs.items(): cams[k], _ = refine_cam(S, k, r, cams[k], a.fov, loops=1, rot=(0.6, 0.6, 0.0))
             E = total()

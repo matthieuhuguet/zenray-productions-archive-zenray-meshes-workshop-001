@@ -5,8 +5,8 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage as ndi, sparse
 from scipy.spatial import cKDTree
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import Ren, cam_matrix, viewport, part_mask, CF
-ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("frames"); ap.add_argument("cams"); ap.add_argument("views"); ap.add_argument("out"); ap.add_argument("--unseen", nargs=2, default=None); ap.add_argument("--rounds", type=int, default=20); ap.add_argument("--step", type=float, default=0.6); ap.add_argument("--cap", type=float, default=0.03); ap.add_argument("--smooth", type=int, default=4); ap.add_argument("--maxpx", type=float, default=6.0); ap.add_argument("--mirror", type=int, default=1); ap.add_argument("--normal-gate", type=float, default=0.6); a = ap.parse_args()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from CompFit import Ren, cam_matrix, viewport, part_mask, CF
+ap = argparse.ArgumentParser(); ap.add_argument("mesh"); ap.add_argument("frames"); ap.add_argument("cams"); ap.add_argument("views"); ap.add_argument("out"); ap.add_argument("--unseen", nargs=2, default=None); ap.add_argument("--rounds", type=int, default=20); ap.add_argument("--step", type=float, default=0.6); ap.add_argument("--cap", type=float, default=0.03); ap.add_argument("--smooth", type=int, default=4); ap.add_argument("--maxpx", type=float, default=6.0); ap.add_argument("--mirror", type=int, default=1); ap.add_argument("--normal-gate", type=float, default=0.6); ap.add_argument("--polish", type=int, default=1); ap.add_argument("--fit", default=""); ap.add_argument("--total-cap", type=float, default=0.06); ap.add_argument("--freeze-head", type=int, default=1); a = ap.parse_args()
 V = []; Fq = []
 for l in open(a.mesh):
     if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
@@ -22,6 +22,20 @@ def load_views(camf, names):
         im = np.asarray(Image.open(f"{a.frames}/f_{int(nm):05d}.jpg").convert("RGB")); rect = viewport(im.max(2).astype(np.float32)); m = part_mask(im, rect, "grey"); h, w = m.shape; sd = ndi.distance_transform_edt(~m) - ndi.distance_transform_edt(m); sds = ndi.gaussian_filter(sd, 1.0); gy, gx = np.gradient(sds)
         R[nm] = dict(m=m, sd=sd, gx=gx, gy=gy, w=w, h=h, cam=C[nm], band=np.abs(sd) <= 1.0)
     return R
+# 4 November 2026 : snapping crumpled the head, the wing membranes and the feet (seen in a clay turntable while the scores rose) : its moves fade to zero near the thin parts and the head, and the total move of a vertex is capped. FR : le calage froissait la tête, les membranes d'aile et les pieds (vu en rotation d'argile alors que les scores montaient) : ses mouvements s'effacent près des pièces fines et de la tête, et le déplacement total d'un sommet est plafonné.
+W = np.ones(n)
+if a.fit:
+    from DragonShape import tube_mesh
+    KEEP = {"torso", "body_ep05", "tail", "thigh", "calf"}; Pt = []
+    for t in json.load(open(a.fit))["tubes"]:
+        if t["name"] in KEEP: continue
+        if t.get("kind") == "obj":
+            if not a.freeze_head: continue
+            Wh = np.array([[float(x) for x in l.split()[1:4]] for l in open(t["file"]) if l.startswith("v ")]) * t["xform"][3] + np.array(t["xform"][:3]); Pt.append(Wh[::4]); continue
+        Vt, _ = tube_mesh(t); Pt.append(Vt)
+        if t.get("mirror"): Pt.append(Vt * np.array([-1, 1, 1], np.float32))
+    dd, _ = cKDTree(np.vstack(Pt)).query(V); W = np.clip((dd - 0.03) / 0.07, 0, 1); print("snap weight : free", int((W > 0.999).sum()), "faded", int(((W > 0) & (W < 0.999)).sum()), "frozen", int((W == 0).sum()), flush=True)
+V0 = V.copy()
 used = load_views(a.cams, a.views.split(",")); unseen = load_views(a.unseen[0], a.unseen[1].split(",")) if a.unseen else {}; ren = Ren(V, tris)
 def score(mm, r):
     u = float((mm | r["m"]).sum()); k = ~r["band"]; return float((mm & r["m"]).sum()) / max(u, 1), float((mm & r["m"] & k).sum()) / max(float((mm | r["m"]) & k).sum(), 1) if False else float((mm & r["m"] & k).sum()) / max(float(((mm | r["m"]) & k).sum()), 1)
@@ -32,9 +46,22 @@ def vertex_normals(V):
     for k in range(3):
         for c_ in range(3): N[:, k] += np.bincount(tris[:, c_], fn[:, k], n)
     return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+def polish(views, passes=2):
+    """4 November 2026 : cameras follow the mesh each round : without it the views disagree by a pixel or two and the mesh crumples to please all of them. FR : les caméras suivent le maillage à chaque tour : sans cela les vues se contredisent d'un pixel ou deux et le maillage se froisse pour les contenter toutes."""
+    for r in views.values():
+        c = list(r["cam"]); h, w = r["m"].shape; best = float((ren.mask(c, w, h) & r["m"]).sum()) / max(float((ren.mask(c, w, h) | r["m"]).sum()), 1); st = [0.3, 0.3, 0.004, 0.004, 0.02]
+        for _ in range(passes):
+            for i in range(5):
+                for sg in (1, -1):
+                    c2 = list(c); c2[i] += sg * st[i]; mm = ren.mask(c2, w, h); e = float((mm & r["m"]).sum()) / max(float((mm | r["m"]).sum()), 1)
+                    if e > best: best, c = e, c2
+            st = [x * 0.5 for x in st]
+        r["cam"] = c
 print("round 0 used", [round(x, 4) for x in evaluate(used)], "unseen", [round(x, 4) for x in evaluate(unseen)] if unseen else "", flush=True)
 for rd in range(1, a.rounds + 1):
-    ren.update(V); N = vertex_normals(V); acc = np.zeros((n, 3)); cnt = np.zeros(n)
+    ren.update(V)
+    if a.polish: polish(used); polish(unseen)
+    N = vertex_normals(V); acc = np.zeros((n, 3)); cnt = np.zeros(n)
     for r in used.values():
         mm = ren.mask(r["cam"], r["w"], r["h"]); bd = mm & ~ndi.binary_erosion(mm); near = ndi.distance_transform_edt(~bd) <= 1.5; R, t, fp = cam_matrix(r["cam"], r["w"], r["h"], CF["fov"]); q = V @ R.T + t; u = r["w"] / 2 + fp * q[:, 0] / q[:, 2]; v = r["h"] / 2 - fp * q[:, 1] / q[:, 2]; ok = (u >= 0) & (u < r["w"] - 1) & (v >= 0) & (v < r["h"] - 1) & (q[:, 2] > 0.1)
         ui = np.clip(np.round(u).astype(int), 0, r["w"] - 1); vi = np.clip(np.round(v).astype(int), 0, r["h"] - 1); fw = R[2]; sil = ok & near[vi, ui] & (np.abs(N @ fw) < a.normal_gate)
@@ -47,9 +74,10 @@ for rd in range(1, a.rounds + 1):
     for _ in range(a.smooth): D = 0.65 * D + 0.35 * (A @ D) / Deg
     if mir is not None:
         ok2 = mir >= 0; Dm = D[np.where(ok2, mir, 0)] * np.array([-1, 1, 1]); D = np.where(ok2[:, None], 0.5 * (D + Dm), D)
-    m_ = np.linalg.norm(D, axis=1); D = D * np.minimum(1, a.cap / np.maximum(m_, 1e-9))[:, None]; V = V + a.step * D
+    D = D * W[:, None]; m_ = np.linalg.norm(D, axis=1); D = D * np.minimum(1, a.cap / np.maximum(m_, 1e-9))[:, None]; V = V + a.step * D; T_ = V - V0; tn = np.linalg.norm(T_, axis=1); V = V0 + T_ * np.minimum(1, a.total_cap / np.maximum(tn, 1e-9))[:, None]
     print(f"round {rd} moved {int(fixed.sum())} mean {float(m_[fixed].mean()) if fixed.any() else 0:.4f} used", [round(x, 4) for x in evaluate(used)], "unseen", [round(x, 4) for x in evaluate(unseen)] if unseen else "", flush=True)
     if rd % 5 == 0 or rd == a.rounds:
+        json.dump({k: [float(x) for x in r["cam"]] for k, r in used.items()}, open(a.out + ".cams.json", "w")); json.dump({k: [float(x) for x in r["cam"]] for k, r in unseen.items()}, open(a.out + ".cams_unseen.json", "w"))
         with open(a.out, "w") as o:
             for p_ in V: o.write("v %f %f %f\n" % tuple(p_))
             for f in Fq: o.write("f " + " ".join(str(i + 1) for i in f) + "\n")
