@@ -1,0 +1,29 @@
+"""4 November 2026 : is the lens right : for several fields of view, every camera is refitted on the same fixed mesh by coordinate descent on the IoU, and the mean is printed for the views used and the views never used. A wrong lens shows as a shift that no part can cure. FR : la focale est-elle juste : pour plusieurs champs de vue, chaque caméra est réajustée sur le même maillage fixe par descente de coordonnées sur l'IoU, et la moyenne est imprimée pour les vues utilisées et les vues jamais utilisées.
+    python -I FovProbe.py <mesh.obj> <frames> <cams.json> f1,f2,... [fov list]"""
+import sys, os, json
+import numpy as np
+from PIL import Image
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); from CompFit import Ren, viewport, part_mask, CF
+mesh, frames, camf, names = sys.argv[1:5]; fovs = [float(x) for x in sys.argv[5].split(",")] if len(sys.argv) > 5 else [35, 40, 45, 50, 55]; names = names.split(","); C = json.load(open(camf)); V = []; F = []
+for l in open(mesh):
+    if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+    elif l.startswith("f "):
+        i = [int(q.split("/")[0]) - 1 for q in l.split()[1:]]; F += [(i[0], i[k], i[k + 1]) for k in range(1, len(i) - 1)]
+ren = Ren(np.array(V), np.array(F, np.int32)); R = {}
+for nm in names:
+    im = np.asarray(Image.open(f"{frames}/f_{int(nm):05d}.jpg").convert("RGB")); rect = viewport(im.max(2).astype(np.float32)); R[nm] = part_mask(im, rect, "grey")
+def iou(m, c):
+    h, w = m.shape; mm = ren.mask(c, w, h); return float((mm & m).sum()) / max(float((mm | m).sum()), 1)
+for fov in fovs:
+    CF["fov"] = fov; res = []
+    for nm in names:
+        m = R[nm]; c = list(C[nm]); k = float(np.tan(np.radians(22.5)) / np.tan(np.radians(fov / 2))); c[2] *= k; c[3] *= k; c[4] *= k; best = iou(m, c);      # 4 November 2026 : the same framing at another lens needs a camera scaled by the ratio of the tangents. FR : le même cadrage avec une autre focale demande une caméra mise à l échelle du rapport des tangentes.
+        st = [1.0, 1.0, 0.02, 0.02, 0.05]
+        for _ in range(8):
+            for i in range(5):
+                for sg in (1, -1):
+                    c2 = list(c); c2[i] += sg * st[i]; e = iou(m, c2)
+                    if e > best: best, c = e, c2
+            st = [x * 0.6 for x in st]
+        res.append(best)
+    print("fov", fov, "mean IoU", round(float(np.mean(res)), 4), [round(x, 3) for x in res], flush=True)
