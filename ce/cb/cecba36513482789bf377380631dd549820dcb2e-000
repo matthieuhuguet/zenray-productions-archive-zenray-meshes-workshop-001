@@ -1,0 +1,21 @@
+"""4 November 2026 : the whole-mesh sculpt tore the wing membranes and the plates (seen in a clay turntable, invisible on the frames) : its moves are faded to zero near the thin parts, kept on the body, tail, head, thigh and calf. FR : le sculpt du maillage entier déchirait les membranes d'aile et les plaques (vu sur une rotation en argile, invisible sur les images) : ses mouvements s'effacent près des pièces fines, gardés sur le corps, la queue, la tête, la cuisse et le mollet.
+    python -I SculptMask.py <fit.json> <cage.obj> <sculpt.json> <out part.obj> [radius 0.03] [fade 0.07]"""
+import sys, os, json
+import numpy as np
+from scipy.spatial import cKDTree
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))); from DragonShape import tube_mesh
+fit, cage, sc, out = sys.argv[1:5]; R0 = float(sys.argv[5]) if len(sys.argv) > 5 else 0.03; FD = float(sys.argv[6]) if len(sys.argv) > 6 else 0.07
+KEEP = {"torso", "body_ep05", "tail", "thigh", "calf", "head"}; P = []
+for t in json.load(open(fit))["tubes"]:
+    if t["name"] in KEEP or t.get("kind") == "obj": continue
+    V, F = tube_mesh(t); P.append(V)
+    if t.get("mirror"): P.append(V * np.array([-1, 1, 1], np.float32))
+T = cKDTree(np.vstack(P)); V0 = []; rest = []
+for l in open(cage):
+    if l.startswith("v "): V0.append([float(x) for x in l.split()[1:4]])
+    elif l.startswith("f "): rest.append(l)
+V0 = np.array(V0); D = np.array(json.load(open(sc))); d, _ = T.query(V0); w = np.clip((d - R0) / FD, 0, 1)[:, None]; V = V0 + D * w
+with open(out, "w") as o:
+    for v in V: o.write("v %f %f %f\n" % tuple(v))
+    o.writelines(rest)
+print("points faded", int((w[:, 0] < 0.999).sum()), "of", len(V0), "kept moves", int((np.linalg.norm(D * w, axis=1) > 1e-6).sum()))
