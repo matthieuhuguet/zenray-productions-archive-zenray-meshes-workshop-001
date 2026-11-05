@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# 5 November 2026, 21:05 Europe/Paris: rebuild the short project synthesis (Articles/index.html) after the hood V002 pass.
+# FR : reconstruit la synthèse courte du projet après la passe V002 du capot ; le bilan complet reste à part.
+import base64
+import json
+from pathlib import Path
+
+import build_audit as A
+
+V002 = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/components/hood-panel/v002')
+V001 = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/components/hood-panel/v001')
+
+PARAGRAPHS = [
+    A.CONFIG['summary'][0],
+    A.CONFIG['summary'][1],
+    'Le capot du camion sert de premier composant. Sa deuxième version reconstruit ce que la première ne savait pas faire : '
+    'un panneau central surélevé entre deux plis, des bords latéraux rabattus, un bourrelet avant épais et un profil qui plonge '
+    'presque à la verticale vers l’avant. Les proportions et les silhouettes se règlent par la mesure contre la planche, '
+    'jamais à l’œil, et la pièce attend maintenant la validation visuelle avant le composant suivant.',
+]
+
+
+def ratios(folder):
+    data = json.loads((folder / 'compare' / 'compare.json').read_text())
+    errors = [data['ratios'][k]['errorPercent'] for k in ('front_height_over_width', 'top_length_over_width', 'side_height_over_length')]
+    shapes = [data['views'][k]['shapeIoU'] for k in ('front', 'side', 'top')]
+    return errors, shapes, data['sheetSelfConsistency']['disagreementPercent']
+
+
+def fmt(values, digits):
+    return ' / '.join(f'{v:+.{digits}f}'.replace('.', ',') if digits == 1 else f'{v:.{digits}f}'.replace('.', ',') for v in values)
+
+
+def diagram_v002():
+    e1, s1, disagreement = ratios(V001)
+    e2, s2, _ = ratios(V002)
+    board = base64.b64encode((V002 / 'compare' / 'board.png').read_bytes()).decode()
+    steps = [
+        ('Planche propre', 'Composant seul, quatre vues'),
+        ('Mesure V001', f'Écarts {fmt(e1, 1)} %'),
+        ('Générateur V002', 'Plis, bords rabattus, bourrelet'),
+        ('Ajustement du profil', f'Profil {s1[1]:.2f} vers {s2[1]:.2f}'.replace('.', ',')),
+        ('Composant V002', f'Écarts {fmt(e2, 1)} %'),
+        ('Œil de Matthieu', 'Validation en attente'),
+    ]
+    items = []
+    for i, (title, sub) in enumerate(steps):
+        y = 210 + i * 128
+        items.append(f'<rect x="90" y="{y}" width="700" height="104" rx="18" fill="#eef1e9" stroke="#b6c9bc"/>'
+                     f'<text x="120" y="{y + 46}" font-size="32">{A.escape(title)}</text><text x="120" y="{y + 86}" font-size="24" class="body">{A.escape(sub)}</text>')
+        if i < len(steps) - 1:
+            items.append(f'<path d="M440,{y + 106} v18" stroke="#286853" stroke-width="3" marker-end="url(#arrow2)"/>')
+    rejected = ('<rect x="840" y="980" width="990" height="64" rx="14" fill="none" stroke="#9aa39d" stroke-dasharray="10 8"/>'
+                '<text x="866" y="1021" font-size="22" class="body" fill="#6b746f">Écartés : bord rabattu profond dès le coin avant, coude de profil trop serré</text>')
+    return ('<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1920 1080" role="img" aria-label="Capot V002, de la planche au composant mesuré">'
+            '<defs><marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#286853"/></marker></defs>'
+            '<style>' + A.fonts() + '</style><rect width="1920" height="1080" fill="#f7f5ef"/><g fill="#202b2a" font-family="GT Ultra">'
+            '<text x="90" y="110" font-size="56">Le capot, de la planche au composant</text>'
+            f'<text x="90" y="160" font-size="26" class="body">La planche se contredit de {abs(disagreement):.1f} % entre ses vues, ce qui laisse environ 3,3 % d’écart par vue au mieux.</text>'.replace('.', ',', 1)
+            + ''.join(items) +
+            f'<image x="840" y="200" width="990" height="{int(990 * 816 / 1487)}" preserveAspectRatio="xMidYMid meet" href="data:image/png;base64,{board}"/>'
+            '<text x="840" y="790" font-size="24" class="body">Planche à gauche, composant Houdini à droite : face, profil, dessus.</text>'
+            f'<text x="840" y="830" font-size="24" class="body">Silhouettes {fmt(s2, 2)}, contre {fmt(s1, 2)} pour la première version.</text>'
+            + rejected + '</g></svg>')
+
+
+def build():
+    body = '<h1>' + A.escape(A.CONFIG['title']) + '</h1>' + ''.join('<p>' + A.escape(p) + '</p>' for p in PARAGRAPHS)
+    body += '<div class="diagram">' + A.diagram() + '</div><div class="diagram">' + diagram_v002() + '</div>'
+    body += '<p><a href="meshes-audit-5-November-2026.html">Ouvrir le bilan complet et les essais du nouveau tour</a></p>'
+    target = A.ARTICLES / 'index.html'
+    target.write_text(A.page('ZenRay Meshes', body))
+    (A.ARTICLES / 'hood-v002-chain.svg').write_text(diagram_v002())
+    return {'index': str(target), 'bytes': target.stat().st_size}
+
+
+if __name__ == '__main__':
+    print(json.dumps(build()))
