@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# 5 November 2026, 19:13 Europe/Paris: render four unlabelled views of the actual geometry at one common orthographic scale.
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'Dracard/Comp'))
+import FootBoard as FB
+import moderngl
+
+
+def render(folder, size=640):
+    folder = Path(folder)
+    vertices, faces, ranges = FB.load(folder/'hood_panel.obj')
+    triangles = np.array([[face[0],face[k],face[k+1]] for face in faces for k in range(1,len(face)-1)],dtype=np.int32)
+    face_normals = np.cross(vertices[triangles[:,1]]-vertices[triangles[:,0]],vertices[triangles[:,2]]-vertices[triangles[:,0]])
+    normals = np.zeros_like(vertices)
+    for corner in range(3):
+        np.add.at(normals,triangles[:,corner],face_normals)
+    parents = list(range(len(vertices)))
+    def root(index):
+        while parents[index]!=index:
+            parents[index]=parents[parents[index]]
+            index=parents[index]
+        return index
+    for face in faces:
+        for index in face[1:]:
+            parents[root(index)]=root(face[0])
+    groups = np.array([root(i) for i in range(len(vertices))])
+    triangle_groups = groups[triangles[:,0]]
+    signed_volumes = np.einsum('ij,ij->i',vertices[triangles[:,0]],np.cross(vertices[triangles[:,1]],vertices[triangles[:,2]]))
+    for group in np.unique(groups):
+        if signed_volumes[triangle_groups==group].sum()<0:
+            normals[groups==group]*=-1
+    normals/=np.maximum(np.linalg.norm(normals,axis=1,keepdims=True),1e-12)
+    context = FB.Raster.ctx()
+    program = context.program(vertex_shader=FB.VS,fragment_shader=FB.FS)
+    vertex_buffer = context.buffer(np.hstack([vertices,normals]).astype('f4').tobytes())
+    index_buffer = context.buffer(triangles.tobytes())
+    vertex_array = context.vertex_array(program,[(vertex_buffer,'3f 3f','p','n')],index_buffer)
+    center = (vertices.min(0)+vertices.max(0))*0.5
+    extent = float((vertices.max(0)-vertices.min(0)).max())*0.62
+    rotations = [FB.look(center+[0,0,5],center),FB.look(center+[5,0,0],center),FB.look(center+[0,5,0],center,up=(0,0,-1)),FB.look(center+[3,2.1,4],center)]
+    output = Image.new('RGB',(size*2,size*2))
+    for index,rotation in enumerate(rotations):
+        texture = context.texture((size,size),4,dtype='f1')
+        depth = context.depth_renderbuffer((size,size))
+        frame = context.framebuffer([texture],depth)
+        frame.use();frame.clear(0.22,0.22,0.22,1,depth=1)
+        context.enable(moderngl.DEPTH_TEST);context.disable(moderngl.CULL_FACE)
+        matrix = np.eye(4);matrix[:3,:3]=rotation/extent;matrix[:3,3]=-(rotation@center)/extent;matrix[2,:]*=-0.05
+        program['M'].write(matrix.T.astype('f4').tobytes());program['R'].value=tuple(rotation.T.ravel())
+        program['L1'].value=tuple(rotation@np.array([-0.5,0.8,0.9]));program['L2'].value=tuple(rotation@np.array([0.7,0.2,0.6]))
+        vertex_array.render(moderngl.TRIANGLES)
+        pixels=np.frombuffer(texture.read(),np.uint8).reshape(size,size,4)[::-1,:,:3].copy()
+        output.paste(Image.fromarray(pixels),((index%2)*size,(index//2)*size))
+        frame.release();texture.release();depth.release()
+    output.save(folder/'hood_panel-four-views.png')
+    (folder/'cameras.json').write_text(json.dumps({'projection':'orthographic','sameScaleAllViews':True,'halfExtent':extent,'tileSize':size,'rotations':[r.tolist() for r in rotations]},indent=2)+'\n')
+    return {'path':str(folder/'hood_panel-four-views.png'),'source':'actual exported HDA geometry','size':output.size}
+
+
+if __name__=='__main__':
+    print(json.dumps(render(sys.argv[1])))

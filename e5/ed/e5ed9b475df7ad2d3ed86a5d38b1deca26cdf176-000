@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+# 5 November 2026, 19:06 Europe/Paris: create one editable, self-contained HDA with modeling nodes only.
+import hashlib
+import json
+from pathlib import Path
+
+import hou
+
+
+HERE = Path(__file__).resolve().parent
+
+
+def build(output, parent=None):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    config = json.loads((HERE / 'HoodPanel.json').read_text())
+    module = (HERE / 'HoodPanelGeometry.py').read_text()
+    values = {key: value for category in ['geometry', 'details', 'sampling'] for key, value in config[category].items()}
+    owner = parent or hou.node('/obj').createNode('geo', 'ZRM_HoodPanel_V001')
+    asset = owner.createNode('subnet', 'hood_panel')
+    templates = hou.ParmTemplateGroup()
+    for category in ['geometry', 'details', 'sampling']:
+        folder = hou.FolderParmTemplate(category, category.capitalize(), folder_type=hou.folderType.Simple)
+        for key, value in config[category].items():
+            if isinstance(value, int):
+                template = hou.IntParmTemplate(key, key.replace('_', ' ').capitalize(), 1, default_value=(value,), min=0 if 'fasteners' in key else 4, max=160)
+            else:
+                template = hou.FloatParmTemplate(key, key.replace('_', ' ').capitalize(), 1, default_value=(value,), min=0, max=max(value * 3, 0.05), min_is_strict=True)
+            folder.addParmTemplate(template)
+        templates.append(folder)
+    asset.setParmTemplateGroup(templates)
+    hda_path = output / 'zenray_hood_panel.hda'
+    asset = asset.createDigitalAsset(name=config['assetName'], hda_file_name=str(hda_path), description=config['label'], min_num_inputs=0, max_num_inputs=0, save_as_embedded=False)
+    asset.allowEditingOfContents()
+    definition = asset.type().definition()
+    definition.setParmTemplateGroup(templates)
+    definition.addSection('PythonModule', module)
+    definition.setExtraFileOption('PythonModule/IsPython', True)
+    for child in asset.children():
+        child.destroy()
+
+    def source(name, function):
+        node = asset.createNode('python', name)
+        group = node.parmTemplateGroup()
+        for key, value in values.items():
+            template = hou.IntParmTemplate(key, key, 1) if isinstance(value, int) else hou.FloatParmTemplate(key, key, 1)
+            group.append(template)
+        node.setParmTemplateGroup(group)
+        for key in values:
+            node.parm(key).setExpression('ch("../' + key + '")', hou.exprLanguage.Hscript)
+        node.parm('python').set("node = hou.pwd()\np = {key: node.evalParm(key) for key in " + repr(list(values)) + "}\nnode.parent().hdaModule()." + function + "(node.geometry(), p)\n")
+        return node
+
+    surface = source('panel_surface', 'build_surface')
+    thickness = asset.createNode('polyextrude::2.0', 'sheet_thickness')
+    thickness.setInput(0, surface)
+    thickness.parm('dist').setExpression('-ch("../thickness")', hou.exprLanguage.Hscript)
+    thickness.parm('outputback').set(1)
+    rim = source('front_rolled_edge', 'build_rim')
+    fasteners = source('fasteners', 'build_fasteners')
+    merge = asset.createNode('merge', 'assemble_component')
+    for index, node in enumerate([thickness, rim, fasteners]):
+        merge.setInput(index, node)
+    out = asset.createNode('null', 'OUT')
+    out.setInput(0, merge)
+    out.setDisplayFlag(True)
+    out.setRenderFlag(True)
+    asset.layoutChildren()
+    asset.setDisplayFlag(True)
+    asset.setRenderFlag(True)
+    definition.updateFromNode(asset)
+    definition.save(str(hda_path))
+    asset.matchCurrentDefinition()
+    owner.layoutChildren()
+    asset.cook(force=True)
+    geometry = asset.geometry()
+    geometry.saveToFile(str(output / 'hood_panel.obj'))
+    geometry.saveToFile(str(output / 'hood_panel.bgeo.sc'))
+    hou.node('/obj').saveItemsToFile([owner], str(output / 'hood_panel.nodes.cpio'), save_hda_fallbacks=True)
+    report = {'node':asset.path(),'hda':str(hda_path),'nodeArchive':str(output / 'hood_panel.nodes.cpio'),'hip':None,'points':len(geometry.points()),'faces':len(geometry.prims()),'bbox':{'min':list(geometry.boundingBox().minvec()),'max':list(geometry.boundingBox().maxvec())},'nodes':[{'name':n.name(),'type':n.type().name(),'errors':list(n.errors())} for n in asset.children()],'parameters':values,'fidelity':'NOT_VALIDATED','reopenValidation':'PENDING','hdaSha256':hashlib.sha256(hda_path.read_bytes()).hexdigest()}
+    (output / 'build-report.json').write_text(json.dumps(report, indent=2)+'\n')
+    return report
+
+
+if __name__ == '__main__':
+    import sys
+    print(json.dumps(build(sys.argv[1])))

@@ -1,0 +1,107 @@
+"""5 November 2026, 19:06 Europe/Paris: deterministic, self-contained geometry embedded in the hood HDA."""
+import math
+
+
+def smoothstep(value):
+    value = min(1.0, max(0.0, value))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def position(u, v, p):
+    length = p['length']
+    radius = min(p['corner_radius'], length * 0.24, p['width'] * 0.24)
+    distance = min(v, 1.0 - v) * length
+    corner = radius - math.sqrt(max(0.0, radius * radius - (radius - distance) ** 2)) if distance < radius else 0.0
+    half_width = p['width'] * 0.5 * (1.0 - p['rear_taper'] * v) - corner
+    x = u * half_width
+    y = p['rise'] * (1.0 - (1.0 - v) ** p['profile_power'])
+    y += p['crown'] * (1.0 - u * u)
+    fade = smoothstep(v / 0.075) * (1.0 - smoothstep((v - 0.65) / 0.30))
+    for sign in (-1, 1):
+        center = sign * p['crease_position'] * half_width
+        y -= p['crease_depth'] * math.exp(-((x - center) / max(p['crease_radius'], 0.0001)) ** 2) * fade
+    return (x, y, -v * length)
+
+
+def normal(u, v, p):
+    import hou
+    step = 0.00001
+    a = hou.Vector3(position(min(1, u + step), v, p)) - hou.Vector3(position(max(-1, u - step), v, p))
+    b = hou.Vector3(position(u, min(1, v + step), p)) - hou.Vector3(position(u, max(0, v - step), p))
+    return a.cross(b).normalized()
+
+
+def polygon(geo, points, group):
+    primitive = geo.createPolygon()
+    for point in points:
+        primitive.addVertex(point)
+    group.add(primitive)
+    return primitive
+
+
+def point(geo, location):
+    value = geo.createPoint()
+    value.setPosition(location)
+    return value
+
+
+def build_surface(geo, p):
+    # Add samples at each crease so increasing detail never depends on a lucky grid alignment.
+    values = [-1 + 2.0 * i / int(p['width_segments']) for i in range(int(p['width_segments']) + 1)]
+    for sign in (-1, 1):
+        for offset in (-2, -1, -0.5, 0, 0.5, 1, 2):
+            values.append(sign * p['crease_position'] + offset * p['crease_radius'] / (p['width'] * 0.5))
+    values = sorted(set(round(min(1, max(-1, u)), 10) for u in values))
+    rows = int(p['length_segments'])
+    grid = [[point(geo, position(u, j / float(rows), p)) for u in values] for j in range(rows + 1)]
+    group = geo.createPrimGroup('hood_sheet')
+    for j in range(rows):
+        for i in range(len(values) - 1):
+            polygon(geo, [grid[j][i], grid[j + 1][i], grid[j + 1][i + 1], grid[j][i + 1]], group)
+
+
+def build_rim(geo, p):
+    import hou
+    radius = p['front_roll']
+    if radius <= 0:
+        return
+    count = int(p['width_segments'])
+    sides = int(p['round_segments'])
+    rings = []
+    group = geo.createPrimGroup('front_rolled_edge')
+    for i in range(count + 1):
+        u = -1 + 2.0 * i / count
+        center = hou.Vector3(position(u, 0, p))
+        tangent = (hou.Vector3(position(min(1, u + 0.0001), 0, p)) - hou.Vector3(position(max(-1, u - 0.0001), 0, p))).normalized()
+        vertical = normal(u, 0, p)
+        depth = tangent.cross(vertical).normalized()
+        center -= vertical * radius * 0.55
+        rings.append([point(geo, center + radius * (math.cos(2 * math.pi * k / sides) * vertical + math.sin(2 * math.pi * k / sides) * depth)) for k in range(sides)])
+    for i in range(count):
+        for k in range(sides):
+            polygon(geo, [rings[i][k], rings[i + 1][k], rings[i + 1][(k + 1) % sides], rings[i][(k + 1) % sides]], group)
+    polygon(geo, rings[0], group)
+    polygon(geo, list(reversed(rings[-1])), group)
+
+
+def build_fasteners(geo, p):
+    import hou
+    group = geo.createPrimGroup('visible_fasteners')
+    sites = []
+    for count, v in [(int(p['front_fasteners']), 0.045), (int(p['rear_fasteners']), 0.94)]:
+        for i in range(count):
+            sites.append((0.0 if count == 1 else -0.94 + 1.88 * i / (count - 1), v))
+    sides = int(p['round_segments'])
+    for u, v in sites:
+        center = hou.Vector3(position(u, v, p))
+        up = normal(u, v, p)
+        x_axis = up.cross(hou.Vector3((0, 0, -1))).normalized()
+        z_axis = x_axis.cross(up).normalized()
+        rings = []
+        for scale, height in [(1.15, 0), (1.15, 0.30), (0.78, 0.38), (0.78, 1.0), (0.58, 1.18)]:
+            rings.append([point(geo, center + up * (height * p['fastener_height']) + p['fastener_radius'] * scale * (math.cos(2 * math.pi * k / sides) * x_axis + math.sin(2 * math.pi * k / sides) * z_axis)) for k in range(sides)])
+        polygon(geo, list(reversed(rings[0])), group)
+        for j in range(len(rings) - 1):
+            for k in range(sides):
+                polygon(geo, [rings[j][k], rings[j][(k + 1) % sides], rings[j + 1][(k + 1) % sides], rings[j + 1][k]], group)
+        polygon(geo, rings[-1], group)

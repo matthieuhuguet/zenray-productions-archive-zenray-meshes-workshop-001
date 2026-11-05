@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+# 5 November 2026, 19:13 Europe/Paris: verify the saved HDA in a fresh process, including controls and closed surfaces.
+import collections
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+import hou
+
+
+def fingerprint(geometry):
+    data = {'points':[tuple(point.position()) for point in geometry.points()], 'faces':[[vertex.point().number() for vertex in primitive.vertices()] for primitive in geometry.prims()]}
+    return hashlib.sha256(json.dumps(data,sort_keys=True).encode()).hexdigest()
+
+
+def topology(geometry):
+    edges = collections.Counter()
+    directions = collections.Counter()
+    counts = collections.Counter()
+    for primitive in geometry.prims():
+        indices = [vertex.point().number() for vertex in primitive.vertices()]
+        counts[len(indices)] += 1
+        for a, b in zip(indices,indices[1:]+indices[:1]):
+            key = tuple(sorted((a,b)))
+            edges[key] += 1
+            directions[key] += 1 if a < b else -1
+    return {'openEdges':sum(value == 1 for value in edges.values()),'nonManifoldEdges':sum(value>2 for value in edges.values()),'inconsistentEdgeDirections':sum(directions[key] != 0 for key,value in edges.items() if value==2),'degenerateFaces':sum(primitive.intrinsicValue('measuredarea') < 1e-12 for primitive in geometry.prims()),'finiteCoordinates':all(math.isfinite(value) for point in geometry.points() for value in point.position()),'faceSizes':dict(counts)}
+
+
+def verify(folder):
+    folder = Path(folder)
+    build = json.loads((folder/'build-report.json').read_text())
+    hou.hda.installFile(str(folder/'zenray_hood_panel.hda'))
+    owner = hou.node('/obj').createNode('geo','HoodVerify')
+    first = owner.createNode('zenray::hood_panel::1.0','instance_a')
+    second = owner.createNode('zenray::hood_panel::1.0','instance_b')
+    reference = first.geometry().freeze()
+    original = fingerprint(reference)
+    second.parm('width').set(first.evalParm('width')*1.1)
+    changed = second.geometry().freeze()
+    second.parm('width').set(first.evalParm('width'))
+    reverted = second.geometry().freeze()
+    first.parm('crease_depth').set(0)
+    flat = first.node('panel_surface').geometry().freeze()
+    first.parm('crease_depth').set(build['parameters']['crease_depth'])
+    grooved = first.node('panel_surface').geometry().freeze()
+    differences = [a.position()[1]-b.position()[1] for a,b in zip(flat.points(),grooved.points())]
+    result = {'freshProcess':True,'hdaOnlyInstantiation':True,'geometrySha256':original,'sameDefaultInstances':original==fingerprint(reverted),'parameterChangesGeometry':original!=fingerprint(changed),'parameterRestoreIsExact':original==fingerprint(reverted),'otherInstanceUnchanged':original==fingerprint(first.geometry()),'widthBefore':reference.boundingBox().sizevec()[0],'widthAfter':changed.boundingBox().sizevec()[0],'measuredCreaseDepth':max(differences),'declaredCreaseDepth':build['parameters']['crease_depth'],'topology':topology(reference),'fidelity':'NOT_VALIDATED'}
+    reference.saveToFile(str(folder/'hood_panel-reopened.obj'))
+    (folder/'verification.json').write_text(json.dumps(result,indent=2)+'\n')
+    assert result['sameDefaultInstances'] and result['parameterChangesGeometry'] and result['parameterRestoreIsExact'] and result['otherInstanceUnchanged']
+    assert result['topology']['openEdges']==0 and result['topology']['nonManifoldEdges']==0 and result['topology']['inconsistentEdgeDirections']==0
+    assert result['topology']['degenerateFaces']==0 and result['topology']['finiteCoordinates']
+    assert abs(result['measuredCreaseDepth']-result['declaredCreaseDepth'])<1e-5
+    return result
+
+
+if __name__ == '__main__':
+    print(json.dumps(verify(sys.argv[1])))

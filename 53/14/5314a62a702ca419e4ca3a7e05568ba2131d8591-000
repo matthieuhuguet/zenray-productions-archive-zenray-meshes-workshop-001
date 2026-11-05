@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+# 5 November 2026, 19:18 Europe/Paris: save a complete HIP in a separate process; a node archive is not a HIP scene.
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import hou
+
+from VerifyHoodPanel import fingerprint
+
+
+def save_scene(folder):
+    folder = Path(folder)
+    hou.hipFile.clear(suppress_save_prompt=True)
+    hou.hda.installFile(str(folder/'zenray_hood_panel.hda'))
+    owner = hou.node('/obj').createNode('geo','ZRM_HoodPanel_V001')
+    asset = owner.createNode('zenray::hood_panel::1.0','hood_panel',exact_type_name=True)
+    asset.setDisplayFlag(True);asset.setRenderFlag(True)
+    before = fingerprint(asset.geometry())
+    target = folder/'hood_panel.hip'
+    hou.hipFile.save(str(target))
+    hou.hipFile.load(str(target),suppress_save_prompt=True,ignore_load_warnings=True)
+    reopened = hou.node('/obj/ZRM_HoodPanel_V001/hood_panel')
+    after = fingerprint(reopened.geometry())
+    result = {'hipReopened':True,'node':reopened.path(),'geometrySha256':after,'matchesBeforeSave':before==after,'errors':list(reopened.errors()),'hipSha256':hashlib.sha256(target.read_bytes()).hexdigest()}
+    assert result['matchesBeforeSave'] and not result['errors']
+    (folder/'hip-reopen.json').write_text(json.dumps(result,indent=2)+'\n')
+    report = json.loads((folder/'build-report.json').read_text());report['hip']=str(target);report['hipReopenValidation']='PASSED';report['hdaReopenValidation']='PASSED';(folder/'build-report.json').write_text(json.dumps(report,indent=2)+'\n')
+    return result
+
+
+if __name__=='__main__':
+    print(json.dumps(save_scene(sys.argv[1])))
