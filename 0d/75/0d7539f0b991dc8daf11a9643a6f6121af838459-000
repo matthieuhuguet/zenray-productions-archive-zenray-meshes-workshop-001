@@ -1,0 +1,190 @@
+"""5 November 2026, 19:45 Europe/Paris: hood panel V002, deterministic geometry embedded in the HDA.
+
+V002 adds the forms V001 lacked (measured against clean-views-05.png): a raised centre panel bounded by two
+soft steps, turned-down side flanges with a tangent fillet, a thicker rolled front bead, a narrower rear,
+rounder front corners than rear corners, and visible dome fasteners. Columns follow the cross-section:
+left flange, left fillet, top core, right fillet, right flange, so every region keeps clean quads.
+FR : V002 ajoute le panneau central surélevé, les bords latéraux rabattus, le bourrelet avant épais,
+l'arrière plus étroit et des vis visibles ; les colonnes suivent la section, d'où des quads propres.
+"""
+import math
+
+
+def smoothstep(value):
+    value = min(1.0, max(0.0, value))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def profile(v, p):
+    # Longitudinal arc, a superellipse: near vertical at the front (v = 0), flat at the windscreen (v = 1).
+    # profile_round = 1 gives the plain power curve of V001; 2 gives a quarter ellipse.
+    base = max(0.0, 1.0 - (1.0 - v) ** p['profile_power'])
+    return p['rise'] * base ** (1.0 / max(1.0, p['profile_round']))
+
+
+def half_width(v, p):
+    length = p['length']
+    front = min(p['corner_radius'], length * 0.24, p['width'] * 0.24)
+    rear = front * 0.35
+    corner = 0.0
+    for radius, distance in ((front, v * length), (rear, (1.0 - v) * length)):
+        if distance < radius:
+            corner = max(corner, radius - math.sqrt(max(0.0, radius * radius - (radius - distance) ** 2)))
+    return p['width'] * 0.5 * (1.0 - p['rear_taper'] * v) - corner
+
+
+def top_height(x, v, hw, p):
+    y = profile(v, p) + p['crown'] * (1.0 - (x / hw) ** 2)
+    # The creases are strongest at the front and die out before the windscreen (clean-views-05, front and 3/4 views).
+    fade = smoothstep(v / 0.06) * (1.0 - smoothstep((v - 0.25) / max(0.05, p['crease_fade'] - 0.25)))
+    centre = p['crease_position'] * hw
+    width = max(p['crease_width'], 0.0001)
+    # Raised centre panel: full step inside, zero outside, smooth across the crease width.
+    y += p['crease_step'] * (1.0 - smoothstep((abs(x) - centre) / width + 0.5)) * fade
+    return y
+
+
+def edge_frame(v, p):
+    hw = half_width(v, p)
+    radius = min(p['side_round'], hw * 0.2)
+    core = hw - radius
+    step = core * 0.0005
+    slope = (top_height(core, v, hw, p) - top_height(core - step, v, hw, p)) / step
+    phi = math.atan(max(0.0, -slope))
+    start = (core, top_height(core, v, hw, p))
+    centre = (start[0] - radius * math.sin(phi), start[1] - radius * math.cos(phi))
+    return hw, radius, core, phi, centre
+
+
+def position(column, v, p):
+    region, fraction, side = column
+    hw, radius, core, phi, centre = edge_frame(v, p)
+    z = -v * p['length']
+    if region == 'core':
+        x = fraction * core
+        return (x, top_height(x, v, hw, p), z)
+    if region == 'fillet':
+        angle = phi + (math.pi * 0.5 - phi) * fraction
+        return (side * (centre[0] + radius * math.sin(angle)), centre[1] + radius * math.cos(angle), z)
+    # The turned-down side edge is deepest at the front and thins toward the windscreen (side view of the sheet).
+    # It also grows in from the front corner, so it never hangs below the bead in the front view.
+    drop = p['side_drop'] * smoothstep(v / max(0.01, p['side_drop_ramp'])) * (1.0 - (1.0 - p['side_drop_rear']) * v)
+    drop = max(drop, 0.25 * p['side_round'])
+    bottom = centre[1] - drop * fraction
+    return (side * (centre[0] + radius), bottom, z)
+
+
+def columns(p):
+    hw = p['width'] * 0.5
+    core = hw - p['side_round']
+    count = int(p['width_segments'])
+    values = [-1.0 + 2.0 * i / count for i in range(count + 1)]
+    for sign in (-1, 1):
+        for k in range(-4, 5):
+            values.append(sign * (p['crease_position'] * hw + k * p['crease_width'] / 8.0) / core)
+    values = sorted(set(round(min(1.0, max(-1.0, value)), 10) for value in values))
+    rounds = max(2, int(p['round_segments']) // 2)
+    drops = max(1, int(p['round_segments']) // 4)
+    left = [('flange', 1.0 - i / float(drops), -1) for i in range(drops)] + [('fillet', 1.0 - i / float(rounds), -1) for i in range(rounds)]
+    right = [('fillet', (i + 1) / float(rounds), 1) for i in range(rounds)] + [('flange', (i + 1) / float(drops), 1) for i in range(drops)]
+    return left + [('core', value, 1) for value in values] + right
+
+
+def rows(p):
+    count = int(p['length_segments'])
+    # Denser rows near the front, where the arc bends most and the bead sits.
+    return [1.0 - (1.0 - i / float(count)) ** 1.35 for i in range(count + 1)]
+
+
+def polygon(geo, points, group):
+    primitive = geo.createPolygon()
+    for point in points:
+        primitive.addVertex(point)
+    group.add(primitive)
+    return primitive
+
+
+def point(geo, location):
+    value = geo.createPoint()
+    value.setPosition(location)
+    return value
+
+
+def build_surface(geo, p):
+    cols = columns(p)
+    grid = [[point(geo, position(column, v, p)) for column in cols] for v in rows(p)]
+    group = geo.createPrimGroup('hood_sheet')
+    for j in range(len(grid) - 1):
+        for i in range(len(cols) - 1):
+            polygon(geo, [grid[j][i], grid[j + 1][i], grid[j + 1][i + 1], grid[j][i + 1]], group)
+
+
+def frame(column, v, p, neighbours):
+    import hou
+    here = hou.Vector3(position(column, v, p))
+    along = (hou.Vector3(position(neighbours[1], v, p)) - hou.Vector3(position(neighbours[0], v, p))).normalized()
+    back = (hou.Vector3(position(column, min(1.0, v + 0.002), p)) - here).normalized()
+    up = along.cross(back).normalized()
+    return here, along, up
+
+
+def build_rim(geo, p):
+    import hou
+    radius = p['front_roll']
+    if radius <= 0:
+        return
+    cols = [column for column in columns(p) if column[0] == 'core']
+    sides = int(p['round_segments'])
+    rings = []
+    group = geo.createPrimGroup('front_rolled_edge')
+    for index, column in enumerate(cols):
+        neighbours = (cols[max(0, index - 1)], cols[min(len(cols) - 1, index + 1)])
+        centre, along, up = frame(column, 0.0, p, neighbours)
+        forward = along.cross(up).normalized()
+        centre = centre - up * radius * 0.55 + forward * radius * 0.25
+        rings.append([point(geo, centre + radius * (math.cos(2 * math.pi * k / sides) * up + math.sin(2 * math.pi * k / sides) * forward)) for k in range(sides)])
+        if index in (0, len(cols) - 1):
+            ends = (index, centre, along if index else -along, up, forward)
+            if index == 0:
+                first_end = ends
+            else:
+                last_end = ends
+    # Rounded bead ends: the roll continues past the panel corner and closes like a pebble, not a flat cut.
+    def cap(entry, prepend):
+        _, centre, outward, up, forward = entry
+        extra = []
+        for t in (0.35, 0.65, 0.88):
+            scale = math.sqrt(1.0 - t * t)
+            extra.append([point(geo, centre + outward * (t * radius) + radius * scale * (math.cos(2 * math.pi * k / sides) * up + math.sin(2 * math.pi * k / sides) * forward)) for k in range(sides)])
+        return list(reversed(extra)) if prepend else extra
+    rings = cap(first_end, True) + rings + cap(last_end, False)
+    for i in range(len(rings) - 1):
+        for k in range(sides):
+            polygon(geo, [rings[i][k], rings[i + 1][k], rings[i + 1][(k + 1) % sides], rings[i][(k + 1) % sides]], group)
+    polygon(geo, rings[0], group)
+    polygon(geo, list(reversed(rings[-1])), group)
+
+
+def build_fasteners(geo, p):
+    import hou
+    group = geo.createPrimGroup('visible_fasteners')
+    sites = []
+    for count, v in [(int(p['front_fasteners']), 0.05), (int(p['rear_fasteners']), 0.95)]:
+        for i in range(count):
+            sites.append((0.0 if count == 1 else -0.93 + 1.86 * i / (count - 1), v))
+    sides = int(p['round_segments'])
+    for fraction, v in sites:
+        column = ('core', fraction, 1)
+        neighbours = (('core', fraction - 0.002, 1), ('core', fraction + 0.002, 1))
+        centre, along, up = frame(column, v, p, neighbours)
+        x_axis = along
+        z_axis = x_axis.cross(up).normalized()
+        rings = []
+        # Washer, then a low dome head: reads as a fastener at hood scale without a texture.
+        for scale, height in [(1.25, -0.2), (1.25, 0.25), (1.0, 0.35), (0.92, 0.65), (0.7, 0.9), (0.35, 1.0)]:
+            rings.append([point(geo, centre + up * (height * p['fastener_height']) + p['fastener_radius'] * scale * (math.cos(2 * math.pi * k / sides) * x_axis + math.sin(2 * math.pi * k / sides) * z_axis)) for k in range(sides)])
+        polygon(geo, list(reversed(rings[0])), group)
+        for j in range(len(rings) - 1):
+            for k in range(sides):
+                polygon(geo, [rings[j][k], rings[j][(k + 1) % sides], rings[j + 1][(k + 1) % sides], rings[j + 1][k]], group)
+        polygon(geo, rings[-1], group)

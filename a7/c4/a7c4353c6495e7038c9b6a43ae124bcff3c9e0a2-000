@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# 5 November 2026, 19:58 Europe/Paris: compare a component's rendered orthographic views to a clean sheet, view by view.
+# FR : compare les vues orthographiques rendues d'un composant à la planche propre, vue par vue.
+#
+# It measures proportions only: the bounding-box aspect of each silhouette, the cross-view axis ratios
+# (height/width, length/width, height/length), and the silhouette shape after each mask is normalised to
+# its own box (IoU). It never judges details, creases or finish: those stay Matthieu's visual verdict.
+# It also writes a side-by-side board, reference on the left and model on the right, with no annotation.
+#
+# Usage: CompareSheetViews.py <sheet-check.json> <four-views.png> <out-dir> [--tile 640]
+#        CompareSheetViews.py --selftest
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+# Render tile order of RenderHoodPanel.py: front, side, top, three-quarter.
+TILES = {'front': (0, 0), 'side': (1, 0), 'top': (0, 1)}
+NORMALISED = 256
+
+
+def mask(image, threshold=18):
+    pixels = np.asarray(image.convert('L'), dtype=np.float32)
+    border = np.concatenate([pixels[0], pixels[-1], pixels[:, 0], pixels[:, -1]])
+    return np.abs(pixels - float(np.median(border))) > threshold
+
+
+def box(m):
+    ys, xs = np.nonzero(m)
+    if len(xs) == 0:
+        raise SystemExit('empty silhouette')
+    return xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
+
+
+def normalised(m):
+    x0, y0, x1, y1 = box(m)
+    crop = Image.fromarray((m[y0:y1, x0:x1] * 255).astype(np.uint8))
+    return np.asarray(crop.resize((NORMALISED, NORMALISED), Image.BILINEAR)) > 127
+
+
+def views_from_sheet(sheet, check):
+    out = {}
+    for name, spec in check['views'].items():
+        x0, y0, x1, y1 = spec['crop']
+        out[name] = sheet.crop((x0, y0, x1, y1))
+    return out
+
+
+def views_from_render(render, tile):
+    return {name: render.crop((i * tile, j * tile, (i + 1) * tile, (j + 1) * tile)) for name, (i, j) in TILES.items()}
+
+
+def measure(views):
+    result = {}
+    for name, image in views.items():
+        m = mask(image)
+        x0, y0, x1, y1 = box(m)
+        result[name] = {'w': int(x1 - x0), 'h': int(y1 - y0), 'mask': m}
+    front, side, top = result['front'], result['side'], result['top']
+    ratios = {
+        'front_height_over_width': front['h'] / front['w'],
+        'top_length_over_width': top['h'] / top['w'],
+        'side_height_over_length': side['h'] / side['w'],
+    }
+    return result, ratios
+
+
+def compare(check_path, render_path, out_dir, tile=640):
+    check_path, out_dir = Path(check_path), Path(out_dir)
+    check = json.loads(check_path.read_text())
+    sheet = Image.open(check_path.parent / check['image']).convert('RGB')
+    reference, ref_ratios = measure(views_from_sheet(sheet, check))
+    model, model_ratios = measure(views_from_render(Image.open(render_path).convert('RGB'), tile))
+    report = {'sheet': str(check_path.parent / check['image']), 'render': str(render_path), 'views': {}, 'ratios': {}}
+    for key in ref_ratios:
+        report['ratios'][key] = {'reference': round(ref_ratios[key], 4), 'model': round(model_ratios[key], 4),
+                                 'errorPercent': round(100 * (model_ratios[key] / ref_ratios[key] - 1), 2)}
+    for name in TILES:
+        a, b = normalised(reference[name]['mask']), normalised(model[name]['mask'])
+        report['views'][name] = {'shapeIoU': round(float((a & b).sum() / max(1, (a | b).sum())), 4)}
+    # The sheet itself is not one consistent projection: report its own cross-view disagreement.
+    implied = ref_ratios['front_height_over_width'] / ref_ratios['side_height_over_length']
+    report['sheetSelfConsistency'] = {'length_over_width_from_top': round(ref_ratios['top_length_over_width'], 4),
+                                      'length_over_width_from_front_and_side': round(implied, 4),
+                                      'disagreementPercent': round(100 * (implied / ref_ratios['top_length_over_width'] - 1), 2)}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for name in TILES:
+        left = normalised(reference[name]['mask']); right = normalised(model[name]['mask'])
+        overlay = np.zeros((NORMALISED, NORMALISED, 3), np.uint8)
+        overlay[left & right] = (200, 200, 200); overlay[left & ~right] = (220, 90, 70); overlay[right & ~left] = (70, 140, 230)
+        rows.append(np.hstack([np.dstack([left * 200] * 3).astype(np.uint8), np.dstack([right * 200] * 3).astype(np.uint8), overlay]))
+    Image.fromarray(np.vstack(rows)).save(out_dir / 'silhouettes.png')
+    board(views_from_sheet(sheet, check), views_from_render(Image.open(render_path).convert('RGB'), tile), out_dir / 'board.png')
+    (out_dir / 'compare.json').write_text(json.dumps(report, indent=2) + '\n')
+    return report
+
+
+def tight(image, margin=0.06):
+    x0, y0, x1, y1 = box(mask(image))
+    pad = int(margin * max(x1 - x0, y1 - y0))
+    return image.crop((max(0, x0 - pad), max(0, y0 - pad), min(image.width, x1 + pad), min(image.height, y1 + pad)))
+
+
+def board(reference, model, path, height=260):
+    # Reference on the left, model on the right, each cropped to its own silhouette: shapes compare at one size.
+    rows = []
+    for name in TILES:
+        a, b = tight(reference[name]), tight(model[name])
+        a = a.resize((max(1, int(a.width * height / a.height)), height)); b = b.resize((max(1, int(b.width * height / b.height)), height))
+        row = Image.new('RGB', (a.width + b.width + 16, height), (40, 40, 40)); row.paste(a, (0, 0)); row.paste(b, (a.width + 16, 0)); rows.append(row)
+    out = Image.new('RGB', (max(r.width for r in rows), sum(r.height + 12 for r in rows)), (40, 40, 40))
+    y = 0
+    for r in rows:
+        out.paste(r, (0, y)); y += r.height + 12
+    out.save(path)
+
+
+def selftest():
+    # Green: identical silhouettes give IoU 1 and zero ratio error. Red: a stretched copy is caught.
+    canvas = Image.new('RGB', (640 * 2, 640 * 2), (56, 56, 56))
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(canvas)
+    d.rectangle((100, 200, 500, 300), fill=(180, 180, 180)); d.ellipse((740, 200, 1200, 320), fill=(180, 180, 180)); d.rectangle((100, 840, 500, 1120), fill=(180, 180, 180))
+    a, ra = measure(views_from_render(canvas, 640))
+    stretched = canvas.copy(); ImageDraw.Draw(stretched).rectangle((100, 1120, 500, 1200), fill=(180, 180, 180))
+    b, rb = measure(views_from_render(stretched, 640))
+    twin, rt = measure(views_from_render(canvas.copy(), 640))
+    same = all(abs(ra[k] - rt[k]) < 1e-9 for k in ra) and all(float((normalised(a[n]['mask']) == normalised(twin[n]['mask'])).mean()) == 1.0 for n in TILES)
+    caught = abs(rb['top_length_over_width'] / ra['top_length_over_width'] - 1) > 0.2
+    assert same and caught, (same, caught)
+    return {'selftest': 'passed', 'identical': same, 'stretchCaught': caught}
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--selftest']:
+        print(json.dumps(selftest()))
+    else:
+        tile = int(sys.argv[sys.argv.index('--tile') + 1]) if '--tile' in sys.argv else 640
+        print(json.dumps(compare(sys.argv[1], sys.argv[2], sys.argv[3], tile), indent=1))
