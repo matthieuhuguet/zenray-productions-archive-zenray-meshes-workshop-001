@@ -1,0 +1,62 @@
+"""5 November 2026 : DRACARD plate swap : each fitted plate sheet is replaced by the library plate (from ChatGPT) that best covers its side silhouette, registered by a 2D similarity (translation, rotation, two scales) maximising the overlap, then baked into a world-space obj. Frame : side plane is (q = -z toward the tail, y up), x is the thickness.
+FR : chaque feuille de plaque ajustée est remplacée par la plaque de la bibliothèque qui couvre le mieux sa silhouette, recalée par similitude 2D, puis cuite en obj dans le repère du monde.
+Usage : python PlateSwap.py fit.json plate_lib_folder out_fit.json out_folder [thickness_factor]"""
+import sys, os, json, math
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy.optimize import minimize
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import DragonShape as DS
+
+R_ = 192
+
+
+def load_obj(p):
+    V, F = [], []
+    for l in open(p):
+        if l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("f "): F.append([int(x.split("/")[0]) - 1 for x in l.split()[1:4]])
+    return np.array(V), np.array(F)
+
+
+def raster(P, F, box):
+    """P (n,2) in (q, y), triangles F, box (q0, y0, q1, y1) -> bool mask R_ x R_. FR : masque."""
+    im = Image.new("L", (R_, R_), 0); d = ImageDraw.Draw(im); q0, y0, q1, y1 = box; S = np.stack([(P[:, 0] - q0) / (q1 - q0) * (R_ - 1), (1 - (P[:, 1] - y0) / (y1 - y0)) * (R_ - 1)], 1)
+    for t in F: d.polygon([tuple(S[i]) for i in t], fill=255)
+    return np.array(im) > 0
+
+
+def place(V, c, th, sx, sy, X0):
+    x = (V[:, 0] - X0) * sx; y = V[:, 1] * sy; ct, st = math.cos(th), math.sin(th); return np.stack([c[0] + ct * x - st * y, c[1] + st * x + ct * y], 1)
+
+
+def main():
+    D = json.load(open(sys.argv[1])); lib = json.load(open(os.path.join(sys.argv[2], "lib.json"))); out_fit = sys.argv[3]; out_dir = sys.argv[4]; tzf = float(sys.argv[5]) if len(sys.argv) > 5 else 1.0; os.makedirs(out_dir, exist_ok=True)
+    types = []
+    for t in lib["types"]:
+        V, F = load_obj(os.path.join(sys.argv[2], t["file"])); X0 = (V[:, 0].max() + V[:, 0].min()) / 2; keep = V[:, 2] >= -1e-9; types.append((V, F, X0))
+    report = []; cache_path = os.path.join(out_dir, "reg.json"); cache = json.load(open(cache_path)) if os.path.exists(cache_path) else {}      # registrations are cached, only the thickness changes between runs. FR : les recalages sont mis en cache.
+    for ti, t in enumerate(D["tubes"]):
+        if t.get("kind") != "sheet" or not t["name"].startswith("plate_"): continue
+        R = DS.sheet_rows(t, side=0); m, n_ = R.shape[:2]; P = R.reshape(-1, 3); i0 = (np.arange(m - 1)[:, None] * n_ + np.arange(n_ - 1)[None, :]).ravel(); Fo = np.vstack([np.stack([i0, i0 + 1, i0 + n_], 1), np.stack([i0 + 1, i0 + n_ + 1, i0 + n_], 1)]); Q = np.stack([-P[:, 2], P[:, 1]], 1)
+        lo, hi = Q.min(0), Q.max(0); pad = 0.5 * (hi - lo).max() + 0.02; box = (lo[0] - pad, lo[1] - pad, hi[0] + pad, hi[1] + pad); box = (box[0], box[1], box[0] + (box[3] - box[1]) * 0 + max(box[2] - box[0], box[3] - box[1]), box[1] + max(box[2] - box[0], box[3] - box[1]))
+        if t["name"] in cache: best = (1 - cache[t["name"]][2], cache[t["name"]][0], np.array(cache[t["name"]][1]))
+        else: best = None
+        Mo = raster(Q, Fo, box); lowest = Q[Q[:, 1] <= lo[1] + 0.15 * (hi[1] - lo[1])]; c0 = np.array([lowest[:, 0].mean(), lo[1]])
+        for k, (V, F, X0) in enumerate(types if best is None else []):
+            h_lib = V[:, 1].max(); w_lib = V[:, 0].max() - V[:, 0].min(); x0 = np.array([c0[0], c0[1], 0.0, (hi[1] - lo[1]) / h_lib, (hi[0] - lo[0]) / w_lib])
+            def cost(p):
+                Qn = place(V, p[:2], p[2], p[4], p[3], X0); Mn = raster(Qn, F, box); inter = (Mo & Mn).sum(); uni = (Mo | Mn).sum(); return 1 - inter / max(uni, 1)
+            r = minimize(cost, x0, method="Nelder-Mead", options=dict(maxiter=260, xatol=1e-4, fatol=1e-5, initial_simplex=None))
+            if best is None or r.fun < best[0]: best = (r.fun, k, r.x)
+        iou = 1 - best[0]; k = best[1]; p = best[2]; cache[t["name"]] = [int(k), [float(x) for x in p], float(iou)]; V, F, X0 = types[k]; Qn = place(V, p[:2], p[2], p[4], p[3], X0); sz = abs(p[3]) * tzf
+        W = np.stack([V[:, 2] * sz, Qn[:, 1], -Qn[:, 0]], 1); base = np.array([0.0, p[1], -p[0]]); W = W - base; fn = f"{t['name']}.obj"      # local frame at the base centre so xf and rot act about it. FR : repère local au centre de la base.
+        with open(os.path.join(out_dir, fn), "w") as f:
+            for v in W: f.write("v %.5f %.5f %.5f\n" % tuple(v))
+            for tr in F: f.write("f %d %d %d\n" % (tr[0] + 1, tr[1] + 1, tr[2] + 1))
+        D["tubes"][ti] = dict(name=t["name"], kind="obj", file=os.path.abspath(os.path.join(out_dir, fn)), xform=[0.0, float(base[1]), float(base[2]), 1.0], radius=1.0, mirror=False); report.append((t["name"], k, round(iou, 3)))
+    json.dump(cache, open(cache_path, "w")); D["groups"] = [[n for n in g if not n.startswith("plate_")] for g in D["groups"]]; D["groups"] = [g for g in D["groups"] if g]; json.dump(D, open(out_fit, "w")); print(report)
+    print("mean iou", np.mean([r[2] for r in report]))
+
+
+main()

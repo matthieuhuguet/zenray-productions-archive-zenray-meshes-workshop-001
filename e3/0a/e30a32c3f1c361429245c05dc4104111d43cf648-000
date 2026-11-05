@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# 5 November 2026, 17:39 Europe/Paris: measure modeled groove retention independently from silhouette overlap.
+import json
+import argparse
+from pathlib import Path
+import numpy as np
+from make_implicit import profile,CFG
+
+HERE=Path(__file__).resolve().parent
+
+
+def load_obj(path):
+    vertices=[];triangles=[]
+    for line in path.read_text().splitlines():
+        row=line.split()
+        if row and row[0]=='v':
+            x,y,z=map(float,row[1:4]);vertices.append((x,-z,y))
+        elif row and row[0]=='f':
+            face=[int(item.split('/')[0])-1 for item in row[1:]]
+            triangles.extend((face[0],face[k],face[k+1]) for k in range(1,len(face)-1))
+    return np.array(vertices)[np.array(triangles)]
+
+
+def radii(triangles,stations):
+    centers,_=profile(stations);e1=triangles[:,1]-triangles[:,0];e2=triangles[:,2]-triangles[:,0]
+    direction=np.array([0.,1.,0.]);pvec=np.cross(np.broadcast_to(direction,e2.shape),e2);det=(e1*pvec).sum(1)
+    valid=np.abs(det)>1e-12;inv=np.zeros_like(det);inv[valid]=1/det[valid]
+    out=[]
+    for center in centers:
+        tvec=center-triangles[:,0];u=(tvec*pvec).sum(1)*inv;qvec=np.cross(tvec,e1);v=qvec[:,1]*inv;distance=(e2*qvec).sum(1)*inv
+        hit=valid&(u>=-1e-9)&(v>=-1e-9)&(u+v<=1+1e-9)&(distance>0)
+        out.append(float(distance[hit].min()) if hit.any() else float('nan'))
+    return np.array(out)
+
+
+def depths(stations,radius):
+    grooves=np.linspace(.1,.86,CFG['horn']['grooves']);span=.04
+    return np.array([(np.interp(g-span,stations,radius)+np.interp(g+span,stations,radius))/2-np.interp(g,stations,radius) for g in grooves])
+
+
+if __name__=='__main__':
+    parser=argparse.ArgumentParser();parser.add_argument('--candidate',default='retopology-horn-1000/result.obj');parser.add_argument('--out',default='feature-retention.json');args=parser.parse_args()
+    stations=np.linspace(.04,.93,300);_,truth=profile(stations)
+    synthetic=depths(stations,truth)
+    smooth=CFG['horn']['baseRadius']*(1-stations)**CFG['horn']['taperPower']+CFG['horn']['tipRadius']
+    erased=depths(stations,smooth)
+    assert np.all(synthetic>0.002) and np.max(erased)<0.001
+    reference=radii(load_obj(HERE/'prototypes-v2/horn_implicit-tri.obj'),stations)
+    candidate=radii(load_obj(HERE/args.candidate),stations)
+    before=depths(stations,reference);after=depths(stations,candidate)
+    ratio=after/np.maximum(before,1e-9)
+    result={'scope':'Retention of the seven deliberately modeled grooves, not fidelity to hidden Dracard geometry.',
+            'units':'normalized model units; no real-world scale established','selftest':{'groovedDetected':True,'erasedRejected':True},
+            'grooveDepthBefore':before.tolist(),'grooveDepthAfter':after.tolist(),'retentionRatio':ratio.tolist(),
+            'meanRetention':float(np.nanmean(ratio)),'minimumRetention':float(np.nanmin(ratio)),
+            'missingSurfaceStations':stations[~np.isfinite(candidate)].tolist(),
+            'radialErrorMean':float(np.nanmean(np.abs(reference-candidate))),'radialErrorMax':float(np.nanmax(np.abs(reference-candidate))),
+            'visualVerdict':'PENDING'}
+    def finite(value):
+        if isinstance(value,float) and not np.isfinite(value):return None
+        if isinstance(value,list):return [finite(item) for item in value]
+        if isinstance(value,dict):return {key:finite(item) for key,item in value.items()}
+        return value
+    result=finite(result)
+    (HERE/args.out).write_text(json.dumps(result,indent=2,allow_nan=False));print(json.dumps(result))

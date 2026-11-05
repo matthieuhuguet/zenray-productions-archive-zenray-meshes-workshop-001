@@ -1,0 +1,135 @@
+# 5 November 2026, 17:32 Europe/Paris: isolated native Blender probes, preserving editable curves, cages, and boolean cutters.
+import bpy
+import bmesh
+import collections
+import json
+import math
+import sys
+import time
+from pathlib import Path
+import numpy as np
+from mathutils import Vector
+
+HERE=Path(sys.argv[sys.argv.index('--')+1]).resolve()
+CFG=json.loads((HERE/'prototype-config.json').read_text())
+OUT=HERE/('prototypes-v'+str(CFG['prototypeVersion']));OUT.mkdir(exist_ok=True)
+
+
+def mesh_object(name,vertices,faces):
+    mesh=bpy.data.meshes.new(name);mesh.from_pydata(vertices,[],faces);mesh.update()
+    bm=bmesh.new();bm.from_mesh(mesh);bmesh.ops.recalc_face_normals(bm,faces=bm.faces);bm.to_mesh(mesh);bm.free()
+    obj=bpy.data.objects.new(name,mesh);bpy.context.collection.objects.link(obj);return obj
+
+
+def profile(t):
+    p=CFG['horn'];centers=np.column_stack((p['bend']*t*t,np.zeros_like(t),p['height']*(1.1*t-.1*t*t)))
+    radius=p['baseRadius']*(1-t)**p['taperPower']+p['tipRadius']
+    for station in np.linspace(.1,.86,p['grooves']):radius-=p['grooveDepth']*np.exp(-.5*((t-station)/p['grooveWidth'])**2)
+    return centers,np.maximum(radius,p['tipRadius'])
+
+
+def horn_curve():
+    p=CFG['horn'];m=CFG['mesh'];c,r=profile(np.linspace(0,1,m['hornStations']))
+    data=bpy.data.curves.new('EditableHornCurve','CURVE');data.dimensions='3D';data.resolution_u=m['curveResolution']
+    data.bevel_depth=p['baseRadius'];data.bevel_resolution=m['bevelResolution'];data.use_fill_caps=True
+    spline=data.splines.new('NURBS');spline.points.add(len(c)-1);spline.order_u=4;spline.use_endpoint_u=True
+    for point,xyz,rad in zip(spline.points,c,r):point.co=(*xyz,1);point.radius=float(rad/p['baseRadius'])
+    obj=bpy.data.objects.new('Horn_Curve',data);bpy.context.collection.objects.link(obj);return obj
+
+
+def horn_subdivision():
+    m=CFG['mesh'];c,r=profile(np.linspace(0,1,m['hornStations']));sides=m['hornSides'];vertices=[];faces=[]
+    for i,(center,rad) in enumerate(zip(c,r)):
+        tangent=c[min(i+1,len(c)-1)]-c[max(i-1,0)];tangent/=np.linalg.norm(tangent)
+        across=np.array([tangent[2],0,-tangent[0]])
+        for angle in np.linspace(0,2*math.pi,sides,endpoint=False):vertices.append((center+rad*(math.cos(angle)*across+math.sin(angle)*np.array([0,1,0]))).tolist())
+    for i in range(len(c)-1):
+        for j in range(sides):faces.append((i*sides+j,i*sides+(j+1)%sides,(i+1)*sides+(j+1)%sides,(i+1)*sides+j))
+    faces.extend([tuple(reversed(range(sides))),tuple(range((len(c)-1)*sides,len(c)*sides))])
+    obj=mesh_object('Horn_ControlCage',vertices,faces);mod=obj.modifiers.new('Editable_Subdivision','SUBSURF');mod.levels=2
+    for f in obj.data.polygons:f.use_smooth=True
+    return obj
+
+
+def horn_implicit():
+    bpy.ops.wm.obj_import(filepath=str(HERE/'prototypes/horn-implicit-zup.obj'),forward_axis='Y',up_axis='Z')
+    obj=bpy.context.selected_objects[0];obj.name='Horn_ImplicitMesh'
+    for f in obj.data.polygons:f.use_smooth=True
+    return obj
+
+
+def extrude_polygon(name,points,depth):
+    n=len(points);vertices=[(x,y,z) for y in [-depth/2,depth/2] for x,z in points]
+    faces=[tuple(range(n)),tuple(reversed(range(n,2*n)))]
+    faces += [(i,(i+1)%n,(i+1)%n+n,i+n) for i in range(n)]
+    return mesh_object(name,vertices,faces)
+
+
+def panel_contour():
+    p=CFG['panel'];w=p['width']/2;h=p['height']/2;n=p['notchWidth']/2;s=p['notchSlope'];d=p['notchHeight']
+    return [(-w,-h),(-w,h),(w,h),(w,-h),(n,-h),(n-s,-h+d),(-n+s,-h+d),(-n,-h)]
+
+
+def panel(case):
+    p=CFG['panel']
+    if case=='crate_boolean':
+        w=p['width']/2;h=p['height']/2
+        obj=extrude_polygon('Panel_Solid',[(-w,-h),(-w,h),(w,h),(w,-h)],p['thickness'])
+        n=p['notchWidth']/2;s=p['notchSlope'];d=p['notchHeight']
+        cutter=extrude_polygon('Editable_NotchCutter',[(-n,-h-.05),(-n,-h),(-n+s,-h+d),(n-s,-h+d),(n,-h),(n,-h-.05)],p['thickness']*4)
+        mod=obj.modifiers.new('Editable_Notch','BOOLEAN');mod.operation='DIFFERENCE';mod.solver='EXACT';mod.object=cutter;cutter.hide_set(True);cutter.hide_render=True
+    else:obj=extrude_polygon('Panel_ControlMesh',panel_contour(),p['thickness'])
+    mod=obj.modifiers.new('Editable_EdgeRadius','BEVEL');mod.width=p['bevel'];mod.segments=3
+    if case=='crate_subdivision':
+        mod=obj.modifiers.new('Editable_Subdivision','SUBSURF');mod.levels=p['subdivision']
+        for f in obj.data.polygons:f.use_smooth=True
+    return obj
+
+
+def evaluated(obj,triangles=False):
+    bpy.context.view_layer.update();deps=bpy.context.evaluated_depsgraph_get();value=obj.evaluated_get(deps);mesh=value.to_mesh()
+    v=[value.matrix_world@point.co for point in mesh.vertices]
+    if triangles:
+        mesh.calc_loop_triangles();faces=[list(f.vertices) for f in mesh.loop_triangles]
+    else:faces=[list(f.vertices) for f in mesh.polygons]
+    result=(v,faces);value.to_mesh_clear();return result
+
+
+def export_obj(obj,filename,triangles=False):
+    vertices,faces=evaluated(obj,triangles)
+    with filename.open('w') as f:
+        f.write('o '+obj.name+'\n')
+        for x,y,z in vertices:f.write(f'v {x:.8f} {z:.8f} {-y:.8f}\n')
+        for face in faces:
+            f.write('f '+' '.join(str(i+1) for i in face)+'\n')
+    edges=collections.Counter(tuple(sorted((face[i],face[(i+1)%len(face)]))) for face in faces for i in range(len(face)))
+    return {'vertices':len(vertices),'faces':len(faces),'quads':sum(len(f)==4 for f in faces),
+            'boundaryEdges':sum(v==1 for v in edges.values()),'nonManifoldEdges':sum(v>2 for v in edges.values()),
+            'bounds':[[min(v[i] for v in vertices) for i in range(3)],[max(v[i] for v in vertices) for i in range(3)]]}
+
+
+def save_case(case):
+    started=time.perf_counter();bpy.ops.wm.read_factory_settings(use_empty=True)
+    obj=globals()[case['id']]() if case['id'].startswith('horn_') else panel(case['id'])
+    obj['reference_fidelity']='UNVERIFIED';obj['method']=case['method'];obj['scope']=CFG['scope']
+    text=bpy.data.texts.new('parameters.json');text.write(json.dumps(CFG,indent=2))
+    text=bpy.data.texts.new('construction.py');text.write(Path(__file__).read_text())
+    bpy.context.view_layer.objects.active=obj;obj.select_set(True)
+    for area in bpy.context.screen.areas:
+        if area.type=='VIEW_3D':
+            area.spaces.active.region_3d.view_distance=1.8
+            area.spaces.active.region_3d.view_location=Vector((.2,0,.5)) if case['id'].startswith('horn') else Vector((0,0,0))
+    path=OUT/(case['id']+'.blend');bpy.ops.wm.save_as_mainfile(filepath=str(path))
+    measures=export_obj(obj,OUT/(case['id']+'.obj'))
+    export_obj(obj,OUT/(case['id']+'-tri.obj'),triangles=True)
+    # Reopen the saved native definition and compare the evaluated geometry counts.
+    before=(measures['vertices'],measures['faces']);bpy.ops.wm.open_mainfile(filepath=str(path))
+    reopened=bpy.context.view_layer.objects.active
+    after=export_obj(reopened,OUT/(case['id']+'-reopened.obj'))
+    assert before==(after['vertices'],after['faces'])
+    result={**case,'measures':measures,'nativeReopened':True,'seconds':round(time.perf_counter()-started,3),
+            'fidelity':'UNVERIFIED','fourPhaseStatus':['reference-and-assumptions-recorded','native-built','boards-pending','native-reopened-retopo-pending']}
+    (OUT/(case['id']+'.json')).write_text(json.dumps(result,indent=2));print(json.dumps(result),flush=True)
+
+
+for case in CFG['cases']:save_case(case)

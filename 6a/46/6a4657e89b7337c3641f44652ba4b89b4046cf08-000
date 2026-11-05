@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+# 5 November 2026, 17:20 Europe/Paris: build a complete source catalogue without changing its originals.
+import base64
+import collections
+import hashlib
+import html
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HERE = Path(__file__).resolve().parent
+WORKSHOP = HERE.parents[1]
+SKILL = Path('/Users/zenray/.claude/skills/zenray-meshes')
+MEMORY = Path('/Users/zenray/.claude/Memory1/Projects/zenray-meshes')
+ARTICLES = WORKSHOP / 'Articles'
+CONFIG = json.loads((HERE / 'audit.json').read_text())
+NOW = datetime.now(ZoneInfo('Europe/Paris')).isoformat(timespec='seconds')
+
+
+def escape(value):
+    return html.escape(str(value), quote=True)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def markdown_blocks(text):
+    # Keep source text exact behind a disclosure; it is an archive, not a fresh claim.
+    return '<pre class="original">' + escape(text) + '</pre>'
+
+
+def collect():
+    paths = [SKILL / 'SKILL.md', MEMORY / 'ZenRayMeshes1.md', MEMORY / 'Playbook.md',
+             MEMORY / 'FailedMethods_Car.md', MEMORY / 'Components_latest.md', MEMORY / 'Components_v760.md']
+    paths += sorted((SKILL / 'references').rglob('*.md'))
+    paths += [SKILL / 'templates/component-chain/prompt_component_chain.md',
+              Path('/Users/zenray/.claude/skills/zenray-houdini/templates/zenray-height-basecolor/prompt_basecolor_chain.md')]
+    sources = []
+    for path in dict.fromkeys(paths):
+        raw = path.read_bytes()
+        text = raw.decode('utf-8-sig')
+        lines = text.splitlines(keepends=True)
+        starts = [(i, m.group(1), m.group(2)) for i, line in enumerate(lines)
+                  if (m := re.match(r'^(#{1,6})\s+(.+?)\s*$', line))]
+        sections = []
+        for index, (line, level, title) in enumerate(starts):
+            end = starts[index + 1][0] if index + 1 < len(starts) else len(lines)
+            identifier = digest((str(path) + ':' + str(line + 1) + ':' + title).encode())[:16]
+            body = ''.join(lines[line + 1:end])
+            sections.append({'id': identifier, 'line': line + 1, 'title': title, 'level': len(level), 'body': body})
+        sources.append({'path': str(path), 'name': path.name, 'bytes': len(raw), 'sha256': digest(raw),
+                        'modifiedAt': datetime.fromtimestamp(path.stat().st_mtime, ZoneInfo('Europe/Paris')).isoformat(),
+                        'lineCount': len(lines), 'sections': sections, 'preamble': ''.join(lines[:starts[0][0]]) if starts else text})
+    return sources
+
+
+def fonts():
+    root = Path('/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress/public/fonts')
+    return ''.join("@font-face{font-family:'%s';src:url(data:font/woff2;base64,%s);font-weight:100 900;}" %
+                   (name, base64.b64encode((root / filename).read_bytes()).decode()) for name, filename in
+                   [('GT Ultra', 'GT-Ultra-Regular.woff2'), ('Adobe Clean', 'AdobeClean-Regular.woff2')])
+
+
+def css():
+    return fonts() + """:root{--paper:#f7f5ef;--ink:#202b2a;--muted:#5e6b67;--line:#d4dbd3;--accent:#286853;--space:24px;--text:19px;--width:1120px}
+ *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:400 var(--text)/1.55 'Adobe Clean';font-synthesis:none}
+ main{max-width:var(--width);padding:72px 32px 96px;margin:auto}h1,h2,h3,.number{font-family:'GT Ultra';font-weight:400;line-height:1.12}
+ h1{font-size:clamp(36px,5vw,62px);max-width:950px;margin:0 0 30px}h2{font-size:34px;margin:64px 0 24px}h3{font-size:24px;margin:0 0 12px}
+ p{max-width:86ch;margin:0 0 20px}a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:4px}small,.muted{color:var(--muted)}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}.card{padding:24px 0;border-top:1px solid var(--line);min-width:0}svg{width:100%;height:auto}
+ .diagram{margin:38px 0;overflow:auto}.diagram svg{min-width:760px}table{border-collapse:collapse;width:100%;font-size:17px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:15px 14px 15px 0}th{font-weight:400;color:var(--muted)}
+ .scroll{overflow:auto}details{border-top:1px solid var(--line);padding:15px 0}summary{cursor:pointer;line-height:1.45;overflow-wrap:anywhere}.original{white-space:pre-wrap;overflow-wrap:anywhere;font:400 16px/1.5 'Adobe Clean';background:#eceee8;padding:22px;border-radius:8px}
+ .meta{font-size:16px;color:var(--muted);overflow-wrap:anywhere}.source{margin-bottom:22px}.source>summary{font-family:'GT Ultra';font-size:24px}.section-list{padding-left:18px}.section-list details{padding:12px 0}
+ .pill{display:inline-block;padding:5px 10px;border:1px solid var(--line);border-radius:6px;margin:0 7px 8px 0;font-size:16px}img{max-width:100%;height:auto;display:block}figure{margin:24px 0}figcaption{font-size:16px;color:var(--muted);margin-top:10px}.notice{border-left:3px solid #b89961;padding-left:20px;margin:24px 0}
+ @media(max-width:680px){main{padding:32px 20px}.grid{grid-template-columns:1fr;gap:12px}h2{font-size:28px;margin-top:40px}body{--text:18px}th,td{min-width:130px}}
+ @media print{details{display:block}summary{list-style:none}.original{font-size:11px}main{padding:0}.grid{display:block}}
+ """.replace('\\+ ', '')
+
+
+def diagram():
+    labels = [('Référence', 'Images d’origine conservées'), ('Composant', 'Forme, creux et détails'),
+              ('Planches', 'Vues et coupes vérifiées'), ('Construction', 'Outil choisi par comparaison'),
+              ('Validation', 'Gros plans et vues à part'), ('Production', 'Retopo, UV, textures, essai')]
+    items = []
+    for i, (title, subtitle) in enumerate(labels):
+        x = 90 + (i % 3) * 605
+        y = 240 + (i // 3) * 340
+        items.append(f'<rect x="{x}" y="{y}" width="540" height="220" rx="22" fill="#eef1e9" stroke="#b6c9bc"/><text x="{x+32}" y="{y+70}" font-size="38">{title}</text><text x="{x+32}" y="{y+128}" font-size="26" class="body">{subtitle}</text>')
+        if i % 3 < 2:
+            items.append(f'<path d="M{x+550},{y+110} h44" stroke="#286853" stroke-width="3" marker-end="url(#arrow)"/>')
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" role="img" aria-label="De la référence au composant prêt à tester"><defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#286853"/></marker></defs><style>' + fonts() + '</style><rect width="1920" height="1080" fill="#f7f5ef"/><g fill="#202b2a" font-family="GT Ultra"><text x="90" y="110" font-size="56">Une pièce fidèle avant l’assemblage</text><text x="90" y="172" font-size="28" class="body">Ordre proposé. La fidélité finale et le tour complet restent à valider.</text>' + ''.join(items) + '<path d="M1570,470 v65 H360 v35" fill="none" stroke="#286853" stroke-width="3" marker-end="url(#arrow)"/><text x="90" y="985" font-size="28" class="body">Le contour contrôle les proportions. Les surfaces et les détails se regardent en 3D.</text></g></svg>'
+
+
+def page(title, body):
+    return '<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + escape(title) + '</title><style>' + css() + '</style><main>' + body + '</main></html>'
+
+
+def render(sources):
+    count = sum(len(source['sections']) for source in sources)
+    core = sources[0]
+    top_count = sum(s['level'] == 2 for s in core['sections'])
+    intro = '<h1>' + escape(CONFIG['title']) + '</h1>' + ''.join('<p>' + escape(p) + '</p>' for p in CONFIG['summary'])
+    intro += '<div class="diagram">' + diagram() + '</div>'
+    body = intro + f'<p class="meta">État documentaire du {escape(NOW)}. {len(sources)} documents, {count} titres recensés, dont {top_count} sections principales dans le skill.</p>'
+    body += '<p>' + escape(CONFIG['scope']) + '</p><p><a href="#sources">Toutes les sections et leurs textes</a> · <a href="#round">Nouveau tour</a> · <a href="#evidence">Essais réellement exécutés</a></p>'
+    body += '<h2>Ce que l’audit établit</h2><div class="grid">'
+    for finding in CONFIG['findings']:
+        refs = []
+        for prefix in finding['sections']:
+            match = next((s for s in core['sections'] if s['title'].startswith(prefix)), None)
+            if match:
+                refs.append(f'<a href="#s-{match["id"]}">§ {escape(prefix[:-1])}</a>')
+        body += f'<article class="card"><h3>{escape(finding["title"])}</h3><p>{escape(finding["text"])}</p><small>{" · ".join(refs)}</small></article>'
+    body += '</div><h2>Les objets en cours</h2><div class="grid">'
+    for asset in CONFIG['assets']:
+        body += '<article class="card"><h3>' + escape(asset['name']) + '</h3>' + ''.join('<p>' + escape(asset[k]) + '</p>' for k in ['state','evidence','next']) + '</article>'
+    body += '</div>'
+    media_path=WORKSHOP/'references/artstation-5-November-2026/references.json'
+    if media_path.exists():
+        body += '<h2>Les nouvelles références</h2><p>Les images confirment que 4805XY correspond au talkie radio et EL93Ge à la caisse. Les médias publics sont conservés à leur définition disponible, avec l’attribution à Wizix. Les quatre vidéos donnent 281 images à une seconde d’intervalle, dont 256 en 4K. ZenRay Edit vérifie les temps et relit chaque séquence entière.</p><div class="grid">'
+        for project in json.loads(media_path.read_text())['projects']:
+            image_file=next(f for f in project['files'] if f['name'].endswith('.jpg'))
+            photo=media_path.parent/project['id']/image_file['name']
+            body += '<article class="card"><h3><a href="'+escape(project['urls'][0])+'">'+escape(project['name'])+'</a></h3><img alt="'+escape(project['name'])+' par Wizix" src="data:image/jpeg;base64,'+base64.b64encode(photo.read_bytes()).decode()+'"><p class="meta">Wizix / Romain Chauliac. Référence originale, pas une reproduction ZenRay.</p>'
+            for frame_set in project['frameSets']:
+                relative='../references/artstation-5-November-2026/'+str(Path(frame_set['path']).parent)
+                body += '<p>'+str(frame_set['count'])+' images, '+str(frame_set['width'])+' × '+str(frame_set['height'])+'. <a href="'+escape(relative+'/frames.json')+'">Relevé des instants</a></p>'
+            body += '</article>'
+        body += '</div>'
+    body += '<h2 id="round">Seize principes, quatre phases</h2><p>' + escape(CONFIG['decision']) + '</p><div class="grid">'
+    for phase in CONFIG['phases']:
+        body += '<article class="card"><h3>' + escape(phase['name']) + '</h3><p>' + escape(phase['proof']) + '</p></article>'
+    body += '</div><div class="scroll"><table><thead><tr><th>Méthode</th><th>Construction et outil</th><th>Usage et limite</th></tr></thead><tbody>'
+    for method in CONFIG['methods']:
+        body += f'<tr><td>{method["id"]}<br>{escape(method["name"])}</td><td>{escape(method["principle"])}<br><small>{escape(method["tools"])}</small></td><td>{escape(method["use"])}<br><small>{escape(method["risk"])}</small></td></tr>'
+    body += '</tbody></table></div><p class="notice">' + escape(CONFIG['pending']) + '</p>'
+    body += '<h2>Vérifier une planche avant de construire</h2><p>Conserver la référence originale. Séparer les vues orthographiques de la vue trois quarts, qui comporte une perspective. Fixer les axes, le même sens et une échelle commune ; ne jamais étirer chaque vue pour faire disparaître une contradiction. L’égalité des boîtes englobantes est nécessaire, mais ne garantit pas la même géométrie.</p><p>Suivre les mêmes repères et les mêmes détails dans chaque vue : extrémités, creux, raccords, vis, trous et nervures. Comparer aussi les profondeurs et les épaisseurs par des coupes proposées, en marquant explicitement ce qui est inconnu. Une caméra de contrôle et les vues originales gardées à part ne sont pas réoptimisées pour flatter le modèle.</p><p>La planche CAD souhaitée distingue vues, coupes et détails agrandis. Les coupes générées restent des propositions ; seules des données 3D cohérentes permettent de rendre un ensemble de vues garanti. Les traits de wireframe servent au dessin de construction, puis le vrai modèle fournit son propre filaire.</p>'
+    body += '<h2 id="evidence">État réel du nouveau tour</h2>'
+    result = HERE / 'round-results.json'
+    if result.exists():
+        data = json.loads(result.read_text())
+        body += '<p>' + escape(data['summary']) + '</p>'
+        body += '<details><summary>État des seize candidats</summary><div class="scroll"><table><tr><th>Candidat</th><th>Essai</th><th>Limite actuelle</th></tr>'
+        for method in CONFIG['methods']:
+            status=data['methodStatus'][method['id']]
+            body += '<tr><td>'+method['id']+' · '+escape(method['name'])+'</td><td>'+('Prototype exécuté' if status['status']=='prototype' else 'Non exécuté')+'</td><td>'+escape(status['phases'])+'</td></tr>'
+        body += '</table></div></details>'
+        for item in data.get('experiments', []):
+            body += '<article class="card"><h3>' + escape(item['name']) + '</h3><p>' + escape(item['result']) + '</p>'
+            for picture in item.get('pictures', []):
+                p = HERE / picture
+                mime = 'image/png' if p.suffix == '.png' else 'image/jpeg'
+                body += '<figure><img alt="' + escape(item['name']) + '" src="data:' + mime + ';base64,' + base64.b64encode(p.read_bytes()).decode() + '"><figcaption>' + escape(item.get('caption','Essai local, sans validation humaine de fidélité.')) + '</figcaption></figure>'
+            body += '</article>'
+    else:
+        body += '<p>Audit produit avant les nouvelles constructions. Les essais du nouveau tour ne sont pas encore exécutés à cet instant ; aucune case de tournoi n’est gagnée.</p>'
+    body += '<h2>Logiciels et recherches vérifiés</h2><div class="grid">'
+    for item in CONFIG['research']:
+        body += '<article class="card"><h3><a href="' + escape(item['url']) + '">' + escape(item['name']) + '</a></h3><p>' + escape(item['finding']) + '</p></article>'
+    body += '</div><h2 id="sources">Toutes les sections recensées</h2><p>Chaque titre est conservé dans son ordre d’origine avec son numéro de ligne. Les textes ci-dessous sont les originaux historiques, qui peuvent se corriger ou se contredire. Leur présence ne signifie pas que leurs conclusions sont validées aujourd’hui. Le catalogue est complet pour les documents listés ; les scènes binaires et les conversations ne sont pas présentées comme intégralement relues.</p>'
+    for source in sources:
+        body += f'<details class="source"><summary>{escape(source["name"])} · {len(source["sections"])} titres</summary><p class="meta">{escape(source["path"])}<br>SHA256 {source["sha256"]}<br>Modification mesurée : {escape(source["modifiedAt"])}</p><div class="section-list">'
+        if source['preamble'].strip():
+            body += '<details><summary>Préambule</summary>' + markdown_blocks(source['preamble']) + '</details>'
+        for section in source['sections']:
+            body += f'<details id="s-{section["id"]}"><summary>{escape(section["title"])} <small>· ligne {section["line"]}</small></summary>' + markdown_blocks(section['body']) + '</details>'
+        body += '</div></details>'
+    body += '<p class="meta">Inventaire des sources généré automatiquement ; analyse et limites rédigées pour ce bilan. Le journal des prompts reste dans le feedback canonique, sans duplication de ses conversations dans ce document.</p>'
+    ARTICLES.mkdir(exist_ok=True)
+    (ARTICLES / 'meshes-audit-5-November-2026.html').write_text(page(CONFIG['title'], body))
+    # The short project synthesis stays separate from the explicitly requested complete audit.
+    (ARTICLES / 'index.html').write_text(page('ZenRay Meshes', intro + '<p><a href="meshes-audit-5-November-2026.html">Ouvrir le bilan complet et les essais du nouveau tour</a></p>'))
+    (ARTICLES / 'value-chain.svg').write_text(diagram())
+    catalogue = {'generatedAt':NOW, 'sourceCount':len(sources), 'headingCount':count, 'coreSectionCount':top_count, 'sources':sources}
+    (HERE / 'source-catalogue.json').write_text(json.dumps(catalogue,ensure_ascii=False,indent=2))
+    assert count == sum(len(re.findall(r'^#{1,6}\s+.+', Path(s['path']).read_text(), re.M)) for s in sources)
+    assert len(set(s['id'] for source in sources for s in source['sections'])) == count
+    changed = [s['path'] for s in sources if digest(Path(s['path']).read_bytes()) != s['sha256']]
+    assert not changed, changed
+    print(json.dumps({'sources':len(sources),'headings':count,'coreSections':top_count,'changedDuringBuild':changed,'auditBytes':(ARTICLES/'meshes-audit-5-November-2026.html').stat().st_size},ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    render(collect())

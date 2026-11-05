@@ -1,0 +1,76 @@
+"""5 November 2026 : SILTUBE, every small tapered part of a ChatGPT sheet (horn, claw, tooth, finger, spike) becomes a clean quad tube : its silhouette in the side cell gives the centreline (skeleton, longest path) and the radius (distance transform), the same part in the top cell gives the width ratio of the section. One OBJ per part. FR : chaque petite pièce effilée d'une planche (corne, griffe, dent, doigt, piquant) devient un tube en quads : la silhouette de côté donne la ligne centrale et le rayon, la vue de dessus le rapport de largeur.
+Usage : python SilTube.py sheet.jpg out_folder [--cands 1 --cand 0 --crop 1.0 --n 20 --m 40 --min-area 400 --thr 75]
+Out : out_folder/part_<i>.obj (axis along +X from the base, base centre at the origin, height of the whole sheet row normalised so the largest part is 1), out_folder/parts.json (area, length, base radius, score)."""
+import sys, os, json, argparse
+import numpy as np, scipy.ndimage as ndi
+from PIL import Image
+from skimage.morphology import skeletonize
+import networkx as nx
+
+ap = argparse.ArgumentParser(); ap.add_argument("sheet"); ap.add_argument("out"); ap.add_argument("--cands", type=int, default=1); ap.add_argument("--cand", type=int, default=0); ap.add_argument("--crop", type=float, default=1.0)
+ap.add_argument("--n", type=int, default=20); ap.add_argument("--m", type=int, default=40); ap.add_argument("--min-area", type=int, default=400); ap.add_argument("--thr", type=float, default=75); ap.add_argument("--base-first", type=int, default=1)
+A = ap.parse_args(); os.makedirs(A.out, exist_ok=True)
+im = np.asarray(Image.open(A.sheet).convert("L")).astype(float)
+if A.crop != 1.0: im = im[:int(round(im.shape[0] * A.crop))]
+cw = im.shape[1] // A.cands; cand = im[:, A.cand * cw:(A.cand + 1) * cw]; hy, hx = cand.shape[0] // 2, cand.shape[1] // 2
+side = cand[:hy, :hx]; top = cand[hy:, :hx]
+
+
+def mask(c):
+    m = c > A.thr; m = ndi.binary_opening(m, structure=np.ones((3, 3))); return ndi.binary_fill_holes(m)
+
+
+def longest_path(sk):
+    ys, xs = np.nonzero(sk); idx = {(y, x): i for i, (y, x) in enumerate(zip(ys, xs))}; G = nx.Graph()
+    for (y, x), i in idx.items():
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if (dy or dx) and (y + dy, x + dx) in idx: G.add_edge(i, idx[(y + dy, x + dx)], weight=float(np.hypot(dy, dx)))
+    if G.number_of_nodes() < 2: return None
+    comp = max(nx.connected_components(G), key=len); H = G.subgraph(comp); a = next(iter(comp)); d = nx.single_source_dijkstra_path_length(H, a); b = max(d, key=d.get); d2, path = nx.single_source_dijkstra(H, b); c = max(d2, key=d2.get)
+    return [(ys[i], xs[i]) for i in path[c]]
+
+
+ms = mask(side); mt = mask(top); lab, n = ndi.label(ms); parts = []
+for k in range(1, n + 1):
+    pm = lab == k
+    if pm.sum() < A.min_area: continue
+    ys, xs = np.nonzero(pm); parts.append((xs.min(), xs.max(), ys.min(), ys.max(), pm))
+parts.sort(key=lambda p: p[0]); report = []; scale = max(max(p[1] - p[0], p[3] - p[2]) for p in parts) if parts else 1.0
+for pi, (x0, x1, y0, y1, pm) in enumerate(parts):
+    edt = ndi.distance_transform_edt(pm); sk = skeletonize(pm); path = longest_path(sk)
+    if path is None or len(path) < 4: continue
+    P = np.array(path, float)[:, ::-1]      # (x, y) pixels along the skeleton. FR : le squelette.
+    R = np.array([edt[int(y), int(x)] for x, y in P]); R = ndi.gaussian_filter1d(R, 2.0, mode="nearest"); P = np.stack([ndi.gaussian_filter1d(P[:, 0], 2.0, mode="nearest"), ndi.gaussian_filter1d(P[:, 1], 2.0, mode="nearest")], 1)
+    if R[0] < R[-1]: P = P[::-1]; R = R[::-1]      # base first : the wider end. FR : la base est le bout large.
+    # extend the path to the silhouette tips so the tube reaches the point. FR : prolonge jusqu'aux pointes.
+    d = np.r_[0, np.cumsum(np.hypot(*np.diff(P, axis=0).T))]; u = np.linspace(0, d[-1], A.m); Pu = np.stack([np.interp(u, d, P[:, 0]), np.interp(u, d, P[:, 1])], 1); Ru = np.interp(u, d, R)
+    # width ratio from the top cell : the same x range there. FR : le rapport de largeur depuis la vue de dessus.
+    ratio = 1.0; sub = mt[:, x0:x1 + 1]
+    if sub.any():
+        tl, tn = ndi.label(sub); wsum = [];
+        if tn:
+            big = max(range(1, tn + 1), key=lambda q: (tl == q).sum()); tys, txs = np.nonzero(tl == big); wt = (tys.max() - tys.min()); wsid = (y1 - y0)
+            ratio = float(np.clip((wt / 2.0) / max(Ru.max(), 1.0), 0.4, 2.5))
+    T = np.gradient(Pu, axis=0); T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-9); Nn = np.stack([-T[:, 1], T[:, 0]], 1)
+    V = []; t = np.linspace(0, 2 * np.pi, A.n, endpoint=False)
+    for i in range(A.m):
+        f = Ru[i] * (1.0 if i < A.m - 1 else 0.0)
+        for tt in t: V.append((Pu[i, 0] + Nn[i, 0] * f * np.cos(tt) * 1.0, Pu[i, 1] + Nn[i, 1] * f * np.cos(tt) * 1.0, f * np.sin(tt) * ratio))      # side-plane offset by cos, depth by sin. FR : décalage dans le plan de côté par cos, profondeur par sin.
+    V = np.array(V); V[:, 0] -= Pu[0, 0]; V[:, 1] = -(V[:, 1] - Pu[0, 1])
+    Vn = V / scale; F = []
+    for i in range(A.m - 1):
+        for j in range(A.n): F.append((i * A.n + j, i * A.n + (j + 1) % A.n, (i + 1) * A.n + (j + 1) % A.n, (i + 1) * A.n + j))
+    fn = os.path.join(A.out, "part_%02d.obj" % pi)
+    with open(fn, "w") as fo:
+        for v in Vn: fo.write("v %.5f %.5f %.5f\n" % tuple(v))
+        for q in F: fo.write("f " + " ".join(str(x + 1) for x in q) + "\n")
+    # silhouette IoU of the tube in the side cell, never used to build it beyond the centreline. FR : IoU de la silhouette de côté.
+    from PIL import ImageDraw
+    img = Image.new("L", (pm.shape[1], pm.shape[0]), 0); dr = ImageDraw.Draw(img)
+    for i in range(A.m - 1):
+        a = Pu[i]; b = Pu[i + 1]; ra = Ru[i]; rb = Ru[i + 1]; nA = Nn[i]; nB = Nn[i + 1]
+        dr.polygon([tuple(a + nA * ra), tuple(b + nB * rb), tuple(b - nB * rb), tuple(a - nA * ra)], fill=255)
+    rm = np.asarray(img) > 0; iou = float((rm & pm).sum() / max((rm | pm).sum(), 1))
+    report.append(dict(file=os.path.basename(fn), x=[int(x0), int(x1)], length_px=float(d[-1]), base_radius_px=float(Ru[0]), width_ratio=ratio, side_iou=round(iou, 4)))
+json.dump(dict(parts=report, scale_px=float(scale)), open(os.path.join(A.out, "parts.json"), "w"), indent=1); print(len(report), "parts", [r["side_iou"] for r in report])

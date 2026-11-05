@@ -1,0 +1,41 @@
+"""5 November 2026 : MAKEPARTHDAS, one Houdini digital asset per component of ZrmParts : zrm_<part>.hda, a SOP whose Python node rebuilds the part from sliders (one folder per parameter group, defaults = the current look), one primitive group per piece. FR : un asset Houdini par composant, curseurs regroupés, un groupe de primitives par pièce.
+Usage : hython MakePartHdas.py out_dir [part ...]"""
+import sys, os, json
+import hou
+HERE = os.path.dirname(os.path.abspath(__file__)); SRC = open(os.path.join(HERE, "ZrmParts.py")).read().split('if __name__ == "__main__":')[0]
+NS = {}; exec(compile(SRC, "ZrmParts", "exec"), NS); REG = NS["REGISTRY"]
+WRAP = '''
+node = hou.pwd(); geo = node.geometry(); asset = node.parent(); P = json.loads(json.dumps(REGISTRY[PART]["default"]))
+for g in P:
+    for k, v in P[g].items():
+        val = asset.evalParm(g + "_" + k); P[g][k] = int(val) if isinstance(v, int) else val
+objs = REGISTRY[PART]["build"](P); geo.clear(); geo.addAttrib(hou.attribType.Prim, "piece", "")
+for name, (V, F) in objs.items():
+    pts = [geo.createPoint() for _ in range(len(V))]
+    for p, v in zip(pts, V): p.setPosition((float(v[0]), float(v[1]), float(v[2])))
+    grp = geo.createPrimGroup(name)
+    for q in F:
+        prim = geo.createPolygon()
+        for i in q: prim.addVertex(pts[i])
+        prim.setAttribValue("piece", name); grp.add(prim)
+'''
+
+
+def make(part, out_dir):
+    hou.hipFile.clear(); geo = hou.node("/obj").createNode("geo", "tmp"); sub = geo.createNode("subnet", "zrm_" + part); inner = sub.createNode("python", "gen"); inner.parm("python").set(SRC + "\nPART = %r\n" % part + WRAP); inner.setDisplayFlag(True); inner.setRenderFlag(True)
+    out = os.path.join(out_dir, "zrm_%s.hda" % part); asset = sub.createDigitalAsset(name="zrm_" + part, hda_file_name=out, description="ZRM " + REG[part]["label"], min_num_inputs=0, max_num_inputs=0, save_as_embedded=False)
+    d = asset.type().definition(); ptg = d.parmTemplateGroup()
+    for g, dd in REG[part]["default"].items():
+        fol = hou.FolderParmTemplate("f_" + g, g.capitalize(), folder_type=hou.folderType.Simple)
+        for k, v in dd.items():
+            if isinstance(v, int): t = hou.IntParmTemplate(g + "_" + k, k.replace("_", " ").capitalize(), 1, default_value=(int(v),), min=0, max=max(10, int(v) * 3))
+            else: t = hou.FloatParmTemplate(g + "_" + k, k.replace("_", " ").capitalize(), 1, default_value=(float(v),), min=min(0.0, float(v) * 3), max=max(1.0, float(v) * 3), min_is_strict=False, max_is_strict=False)
+            fol.addParmTemplate(t)
+        ptg.append(fol)
+    d.setParmTemplateGroup(ptg); d.setComment("Parametric component " + part + " : defaults = current look, improved at each iteration of Matthieu's eye."); d.save(out)
+    a = hou.node(asset.path()); n = a.node("gen"); n.cook(force=True); g = n.geometry(); return len(g.points()), len(g.prims()), len(a.parms())
+
+
+for part in (sys.argv[2:] or list(REG)):
+    try: print(part, make(part, sys.argv[1]))
+    except Exception as e: print(part, "ERROR", str(e)[:200])

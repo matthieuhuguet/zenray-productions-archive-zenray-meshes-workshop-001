@@ -1,0 +1,141 @@
+"""5 November 2026 : SHEETLOFT, one component from its ChatGPT sheet (2x2 cells : left side, front, top, 3/4). Stations along one axis, each section a superellipse whose two radii and centre come from the silhouettes, quads only. The third view and the 3/4 view are NEVER used to build, they score the result. FR : un composant depuis sa planche ChatGPT, sections superellipses par stations, quads, la troisième vue sert de note.
+Usage : python SheetLoft.py sheet.jpg out_folder --cand 0 --cands 3 --axis H|L --top-h W|L [--p 2.4] [--n 48] [--m 70] [--open lo,hi] [--aspect 0.962] [--thr 75]
+Out : out_folder/part.obj (X = L side horizontal, Y = H up, Z = W depth, height normalised to 1), out_folder/score.json, out_folder/check.png."""
+import sys, os, json, argparse
+import numpy as np, scipy.ndimage as ndi
+from PIL import Image, ImageDraw
+
+ap = argparse.ArgumentParser(); ap.add_argument("sheet"); ap.add_argument("out")
+ap.add_argument("--cand", type=int, default=0); ap.add_argument("--cands", type=int, default=3); ap.add_argument("--axis", default="H"); ap.add_argument("--top-h", default="W")
+ap.add_argument("--p", type=float, default=2.4); ap.add_argument("--n", type=int, default=48); ap.add_argument("--m", type=int, default=70); ap.add_argument("--open", default="0,0")
+ap.add_argument("--flip-top", type=int, default=0); ap.add_argument("--circ", type=int, default=0); ap.add_argument("--crop", type=float, default=1.0); ap.add_argument("--psigma", type=float, default=3.0); ap.add_argument("--aspect", type=float, default=1.0); ap.add_argument("--thr", type=float, default=75); ap.add_argument("--smooth", type=int, default=5)
+A = ap.parse_args(); os.makedirs(A.out, exist_ok=True)
+
+im = np.asarray(Image.open(A.sheet).convert("L")).astype(float)
+if A.aspect != 1.0:      # the sheet was drawn with squares, undo the stretch. FR : annule l'étirement.
+    im = np.asarray(Image.fromarray(im.astype(np.uint8)).resize((im.shape[1], int(round(im.shape[0] * A.aspect))), Image.LANCZOS)).astype(float)
+if A.crop != 1.0: im = im[:int(round(im.shape[0] * A.crop))]      # the sheet canvas was padded below the images, cut the padding. FR : retire le bord ajouté sous les images.
+H_, W_ = im.shape; cw = W_ // A.cands; cand = im[:, A.cand * cw:(A.cand + 1) * cw]; ch, cwid = cand.shape; hy, hx = ch // 2, cwid // 2
+cells = {"side": cand[:hy, :hx], "front": cand[:hy, hx:], "top": cand[hy:, :hx], "p34": cand[hy:, hx:]}
+
+
+def silhouette(c):
+    m = c > A.thr; m = ndi.binary_opening(m, structure=np.ones((3, 3))); m = ndi.binary_fill_holes(m); lab, n = ndi.label(m)
+    if n == 0: return m
+    sizes = ndi.sum(m, lab, range(1, n + 1)); return lab == (1 + int(np.argmax(sizes)))
+
+
+M = {k: silhouette(v) for k, v in cells.items()}
+box = {}
+for k in ("side", "front", "top", "p34"):
+    ys, xs = np.where(M[k]); box[k] = (xs.min(), ys.min(), xs.max(), ys.max())
+b = box; Hs = b["side"][3] - b["side"][1]; Hf = b["front"][3] - b["front"][1]
+sf = Hs / max(Hf, 1)      # front scale so heights agree. FR : échelle de la vue de face.
+Ls = b["side"][2] - b["side"][0]; Wf = (b["front"][2] - b["front"][0]) * sf
+if A.top_h == "W": Wt = b["top"][2] - b["top"][0]; st = Wf / max(Wt, 1)
+else: Lt = b["top"][2] - b["top"][0]; st = Ls / max(Lt, 1)
+print("cell boxes", {k: [int(x) for x in v] for k, v in b.items()}, "front scale", round(sf, 3), "top scale", round(st, 3), flush=True)
+
+
+def prof_rows(mask, y0, y1):      # horizontal interval per row. FR : intervalle horizontal par ligne.
+    out = np.full((y1 - y0 + 1, 2), np.nan)
+    for i, y in enumerate(range(y0, y1 + 1)):
+        xs = np.where(mask[y])[0]
+        if len(xs): out[i] = (xs.min(), xs.max())
+    return out
+
+
+def prof_cols(mask, x0, x1):
+    out = np.full((x1 - x0 + 1, 2), np.nan)
+    for i, x in enumerate(range(x0, x1 + 1)):
+        ys = np.where(mask[:, x])[0]
+        if len(ys): out[i] = (ys.min(), ys.max())
+    return out
+
+
+def fill_nan(a):
+    for j in range(a.shape[1]):
+        v = a[:, j]; ok = ~np.isnan(v)
+        if ok.any(): v[:] = np.interp(np.arange(len(v)), np.where(ok)[0], v[ok])
+    return ndi.gaussian_filter1d(a, A.psigma, axis=0, mode="nearest") if A.psigma > 0 else a      # remove the pixel staircase before sampling the stations. FR : retire l'escalier des pixels avant d'échantillonner.
+
+
+def smooth(a, k):
+    return ndi.uniform_filter1d(a, size=k, axis=0, mode="nearest") if k > 1 else a
+
+
+# world units : pixels of the side view. X = L, Y = H up, Z = W
+sx0, sy0, sx1, sy1 = b["side"]; ybot = sy1
+m = A.m; n = A.n; p = A.p
+if A.axis == "H":
+    rows = np.linspace(sy1, sy0, m).round().astype(int)      # bottom to top
+    side = fill_nan(prof_rows(M["side"], sy0, sy1)); fr = fill_nan(prof_rows(M["front"], b["front"][1], b["front"][3]))
+    st_L = np.array([side[r - sy0] for r in rows]); fr_rows = ((b["front"][3] - (sy1 - rows) / sf)).round().astype(int).clip(b["front"][1], b["front"][3])
+    st_W = np.array([fr[r - b["front"][1]] for r in fr_rows]) * 1.0
+    st_L = smooth(st_L, A.smooth); st_W = smooth(st_W, A.smooth)
+    cL = (st_L[:, 0] + st_L[:, 1]) / 2 - sx0; rL = (st_L[:, 1] - st_L[:, 0]) / 2
+    fc = (b["front"][0] + b["front"][2]) / 2; cW = ((st_W[:, 0] + st_W[:, 1]) / 2 - fc) * sf; rW = (st_W[:, 1] - st_W[:, 0]) / 2 * sf
+    T = (sy1 - rows).astype(float)      # height of each station in pixels
+    Y = T
+else:      # axis L : stations along the side columns
+    cols = np.linspace(sx0, sx1, m).round().astype(int)
+    side = fill_nan(prof_cols(M["side"], sx0, sx1)); st_H = np.array([side[c - sx0] for c in cols]); st_H = smooth(st_H, A.smooth)
+    if A.top_h == "L":
+        tx0, ty0, tx1, ty1 = b["top"]; tcols = (tx0 + (cols - sx0) / st).round().astype(int).clip(tx0, tx1); tp = fill_nan(prof_cols(M["top"], tx0, tx1)); st_W = np.array([tp[c - tx0] for c in tcols]) * st
+        tc = (ty0 + ty1) / 2 * st; cW = ((st_W[:, 0] + st_W[:, 1]) / 2 - tc); rW = (st_W[:, 1] - st_W[:, 0]) / 2
+    else:
+        tx0, ty0, tx1, ty1 = b["top"]; trows = (ty0 + (cols - sx0) / st).round().astype(int).clip(ty0, ty1); tp = fill_nan(prof_rows(M["top"], ty0, ty1)); st_W = np.array([tp[r - ty0] for r in trows]) * st
+        tc = (tx0 + tx1) / 2 * st; cW = (st_W[:, 0] + st_W[:, 1]) / 2 - tc; rW = (st_W[:, 1] - st_W[:, 0]) / 2
+    st_W = smooth(st_W, 1); cW = smooth(cW[:, None], A.smooth)[:, 0]; rW = smooth(rW[:, None], A.smooth)[:, 0]
+    st_H = smooth(st_H, A.smooth); cH = ybot - (st_H[:, 0] + st_H[:, 1]) / 2; rH = (st_H[:, 1] - st_H[:, 0]) / 2
+    if A.circ: rH = rW.copy(); cH = ybot - st_H[:, 1] + rW      # round section : the top edge (plates, spikes) is ignored, the lower edge plus the width from the top view gives the tube. FR : section ronde, le bord haut (plaques) est ignoré.
+    T = (cols - sx0).astype(float)
+
+o_lo, o_hi = [int(x) for x in A.open.split(",")]
+V = []; F = []; t = np.linspace(0, 2 * np.pi, n, endpoint=False); ct, stt = np.cos(t), np.sin(t); e = 2.0 / p
+sp = lambda c: np.sign(c) * np.abs(c) ** e
+for i in range(m):
+    f = 1.0
+    if not o_lo and i == 0: f = 0.0
+    if not o_hi and i == m - 1: f = 0.0
+    if not o_lo and i == 1: f = 0.6
+    if not o_hi and i == m - 2: f = 0.6
+    if A.axis == "H":
+        for j in range(n): V.append((cL[i] + f * rL[i] * sp(ct[j]), Y[i], cW[i] + f * rW[i] * sp(stt[j])))
+    else:
+        for j in range(n): V.append((T[i], cH[i] + f * rH[i] * sp(ct[j]), cW[i] + f * rW[i] * sp(stt[j])))
+V = np.array(V, float)
+for i in range(m - 1):
+    for j in range(n):
+        a_ = i * n + j; b_ = i * n + (j + 1) % n; c_ = (i + 1) * n + (j + 1) % n; d_ = (i + 1) * n + j; F.append((a_, b_, c_, d_))
+sc = 1.0 / max(Hs, 1)
+with open(os.path.join(A.out, "part.obj"), "w") as fo:
+    for v in V: fo.write("v %.5f %.5f %.5f\n" % (v[0] * sc, v[1] * sc, v[2] * sc))
+    for q in F: fo.write("f %d %d %d %d\n" % tuple(x + 1 for x in q))
+
+
+def raster(view, size):
+    """orthographic silhouette of the quads. FR : silhouette orthographique."""
+    img = Image.new("L", (size[1], size[0]), 0); d = ImageDraw.Draw(img)
+    for q in F:
+        P = V[list(q)]
+        if view == "side": pts = [(sx0 + x, sy1 - y) for x, y, z in P]
+        elif view == "front": pts = [((b["front"][0] + b["front"][2]) / 2 + z / sf, b["front"][3] - y / sf) for x, y, z in P]
+        else:
+            tx0, ty0, tx1, ty1 = b["top"]
+            if A.top_h == "W": pts = [((tx0 + tx1) / 2 + z / st, (ty1 - x / st) if A.flip_top else (ty0 + x / st)) for x, y, z in P]
+            else: pts = [(tx0 + x / st, (ty0 + ty1) / 2 + z / st) for x, y, z in P]
+        d.polygon(pts, fill=255)
+    r = np.asarray(img) > 0; return ndi.binary_fill_holes(r) if False else r
+
+
+S = {}
+for k in ("side", "front", "top"):
+    R = raster(k, M[k].shape); I = (R & M[k]).sum() / max((R | M[k]).sum(), 1); S[k] = round(float(I), 4)
+S["axis"] = A.axis; S["used"] = ["side", "front"] if A.axis == "H" else ["side", "top"]
+json.dump(S, open(os.path.join(A.out, "score.json"), "w")); print("score", S)
+# check board : mask (grey) and reproduction (red) per view. FR : planche de contrôle.
+tiles = []
+for k in ("side", "front", "top"):
+    R = raster(k, M[k].shape); rgb = np.zeros(M[k].shape + (3,), np.uint8); rgb[M[k]] = (90, 90, 90); rgb[R & ~M[k]] = (220, 60, 60); rgb[M[k] & ~R] = (60, 90, 220); rgb[R & M[k]] = (200, 200, 200); tiles.append(rgb)
+Image.fromarray(np.concatenate(tiles, 1)).save(os.path.join(A.out, "check.png"))

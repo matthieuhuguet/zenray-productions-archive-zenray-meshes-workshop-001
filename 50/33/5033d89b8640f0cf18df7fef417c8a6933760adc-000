@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# 5 November 2026, 17:34 Europe/Paris: reuse the existing fast mesh renderer for actual geometry evidence.
+import json
+import sys
+from pathlib import Path
+import numpy as np
+from PIL import Image,ImageDraw,ImageFont
+
+HERE=Path(__file__).resolve().parent
+sys.path.insert(0,'/Users/zenray/.claude/skills/zenray-meshes/scripts/Dracard/Comp')
+import FootBoard as FB
+CFG=json.loads((HERE/'prototype-config.json').read_text());OUT=HERE/('prototypes-v'+str(CFG['prototypeVersion']))
+SIZE=400
+FB.FS='''#version 330
+in vec3 vn; out vec4 o; uniform vec3 L1; uniform vec3 L2;
+void main(){vec3 n=normalize(vn);float d=0.36+0.43*abs(dot(n,normalize(L1)))+0.12*abs(dot(n,normalize(L2)));o=vec4(vec3(d),1.0);}
+'''
+font=ImageFont.truetype('/System/Library/Fonts/Supplemental/Arial.ttf',18)
+g=FB.Raster.ctx();prog=g.program(vertex_shader=FB.VS,fragment_shader=FB.FS)
+for case in CFG['cases']:
+    v,f,ranges=FB.load(OUT/(case['id']+'-tri.obj'));t,n=FB.smooth_normals(v,f,ranges)
+    vb=g.buffer(np.hstack([v,n]).astype('f4').tobytes());ib=g.buffer(t.tobytes())
+    vao=g.vertex_array(prog,[(vb,'3f 3f','p','n')],ib)
+    c=(v.max(0)+v.min(0))/2
+    cameras=[FB.look(c+[0,0,-5],c),FB.look(c+[5,0,0],c),FB.look(c+[0,5,0],c,up=(-1,0,0)),FB.look(c+[3.5,2.2,-3.5],c)]
+    board=Image.new('RGB',(SIZE*2,(SIZE+35)*2),'#f7f5ef');d=ImageDraw.Draw(board)
+    labels=['Side','Front','Top','Three quarter'] if case['id'].startswith('horn') else ['Front','Side','Top','Three quarter']
+    for i,(camera,label) in enumerate(zip(cameras,labels)):
+        x=(i%2)*SIZE;y=(i//2)*(SIZE+35)
+        board.paste(Image.fromarray(FB.render(g,prog,vao,v,camera,SIZE,1)),(x,y+35));d.text((x+12,y+8),label,font=font,fill='#202b2a')
+    board.save(OUT/(case['id']+'-board.jpg'),quality=93)
+    detail=json.loads((OUT/(case['id']+'.json')).read_text());detail['fourPhaseStatus'][2]='four-known-camera-views-rendered-detail-verdict-pending'
+    (OUT/(case['id']+'.json')).write_text(json.dumps(detail,indent=2));vao.release();vb.release();ib.release()
+print(json.dumps({'boards':len(CFG['cases']),'pixels':[SIZE*2,(SIZE+35)*2],'source':'actual evaluated meshes','fidelity':'unverified'}))
+
+# Compare all three meshes through the same cameras and the same frame, so normalization cannot hide a missing tip.
+reference,_,_=FB.load(OUT/'horn_implicit-tri.obj');center=(reference.max(0)+reference.min(0))/2
+comparisons=[('Source',OUT/'horn_implicit-tri.obj'),('4010 quads, before guard',HERE/'retopology-horn-4000-guarded/result.obj'),('4010 quads, preserved',HERE/'retopology-horn-4000-preserved/result.obj')]
+board=Image.new('RGB',(1200,870),'#f7f5ef');draw=ImageDraw.Draw(board)
+for column,(label,path) in enumerate(comparisons):
+    v,f,ranges=FB.load(path);t,n=FB.smooth_normals(v,f,ranges);vb=g.buffer(np.hstack([v,n]).astype('f4').tobytes());ib=g.buffer(t.tobytes());vao=g.vertex_array(prog,[(vb,'3f 3f','p','n')],ib)
+    for row,camera in enumerate([FB.look(center+[0,0,-5],center),FB.look(center+[3.5,2.2,-3.5],center)]):
+        x=column*400;y=row*435;draw.text((x+8,y+9),label,font=font,fill='#202b2a');board.paste(Image.fromarray(FB.render(g,prog,vao,reference,camera,400,1)),(x,y+35))
+    vao.release();vb.release();ib.release()
+board.save(HERE/'retopology-comparison.jpg',quality=95)

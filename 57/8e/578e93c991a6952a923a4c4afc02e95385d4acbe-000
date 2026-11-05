@@ -1,0 +1,322 @@
+"""5 November 2026 : ZRMPARTS, the parametric component library of Dracard (HDA logic) : every part is a generator build(P) -> {piece: (V, quads)} with DEFAULT parameters grouped by category (8 at most), quads only, one object per piece. Tapered parts are curved tubes with sliders for length, bend and base radius ; surfaces are thickened sheets. Length along +X, up +Y, across Z, units relative to the part. FR : la bibliothèque paramétrique des composants de Dracard : chaque pièce est un générateur à curseurs, quads seuls, un objet par pièce.
+Usage : python ZrmParts.py list | build <part> out.obj [params.json] [--mirror]"""
+import sys, json, math
+import numpy as np
+
+
+# ---------------------------------------------------------------- helpers
+def rot_about(v, axis, ang):
+    axis = np.asarray(axis, float) / np.linalg.norm(axis); c, s = math.cos(ang), math.sin(ang); return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+
+def smoothstep(a, b, x): t = np.clip((x - a) / max(b - a, 1e-9), 0, 1); return t * t * (3 - 2 * t)
+
+
+def arc_spine(length, bend_deg, m, twist_deg=0.0, start=(0, 0, 0)):
+    """a spine leaving along +X, bending toward +Y by bend_deg in total (and drifting toward +Z by twist_deg). FR : colonne vertébrale courbe."""
+    pts = [np.array(start, float)]; ds = length / (m - 1); p = pts[0].copy()
+    for i in range(m - 1):
+        s = (i + 0.5) / (m - 1); a = math.radians(bend_deg) * s; b = math.radians(twist_deg) * s; d = np.array([math.cos(a) * math.cos(b), math.sin(a), math.cos(a) * math.sin(b)]); p = p + d * ds; pts.append(p.copy())
+    return np.array(pts)
+
+
+def curve_through(points, m):
+    """Catmull-Rom through control points, m samples. FR : courbe par points de contrôle."""
+    P = np.asarray(points, float); n = len(P); ext = np.vstack([2 * P[0] - P[1], P, 2 * P[-1] - P[-2]]); out = []
+    for i in range(m):
+        t = i / (m - 1) * (n - 1); k = min(int(t), n - 2); u = t - k; p0, p1, p2, p3 = ext[k], ext[k + 1], ext[k + 2], ext[k + 3]
+        out.append(0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u * u + (-p0 + 3 * p1 - 3 * p2 + p3) * u ** 3))
+    return np.array(out)
+
+
+def tube(spine, radii, n=24, flat=None, up=(0.0, 1.0, 0.0)):
+    """swept section along a spine : radius per station, flat = width ratio of the section (1 round). Returns V, quads. FR : section balayée le long d'une courbe."""
+    k = len(spine); T = np.gradient(spine, axis=0); T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-9); up = np.asarray(up, float)
+    ref = up if abs(np.dot(T[0], up)) < 0.9 else np.array([0.0, 0.0, 1.0]); N = np.cross(T[0], ref); N /= np.linalg.norm(N); V = []; t = np.linspace(0, 2 * np.pi, n, endpoint=False); fl = np.ones(k) if flat is None else np.broadcast_to(np.asarray(flat, float), (k,))
+    for i in range(k):
+        if i > 0:
+            ax = np.cross(T[i - 1], T[i]); an = np.linalg.norm(ax)
+            if an > 1e-9: N = rot_about(N, ax, math.asin(min(1.0, an)))
+        Nn = N - T[i] * np.dot(N, T[i]); Nn /= np.linalg.norm(Nn); Bn = np.cross(T[i], Nn)
+        for a in t: V.append(spine[i] + radii[i] * (math.cos(a) * Nn + fl[i] * math.sin(a) * Bn))
+    F = [(i * n + j, i * n + (j + 1) % n, (i + 1) * n + (j + 1) % n, (i + 1) * n + j) for i in range(k - 1) for j in range(n)]
+    return np.array(V), F
+
+
+def merge(*parts):
+    V, F, off = [], [], 0
+    for v, f in parts: V.append(v); F += [tuple(i + off for i in q) for q in f]; off += len(v)
+    return np.vstack(V), F
+
+
+def xf(V, scale=1.0, rot=None, move=(0, 0, 0)):
+    W = V * scale
+    if rot is not None: W = W @ np.asarray(rot).T
+    return W + np.asarray(move, float)
+
+
+def rotz(deg): a = math.radians(deg); return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+def roty(deg): a = math.radians(deg); return np.array([[math.cos(a), 0, math.sin(a)], [0, 1, 0], [-math.sin(a), 0, math.cos(a)]])
+def rotx(deg): a = math.radians(deg); return np.array([[1, 0, 0], [0, math.cos(a), -math.sin(a)], [0, math.sin(a), math.cos(a)]])
+
+
+def ellipsoid(a, b, c, U=24, Vn=36, e1=1.0, e2=1.0, center=(0, 0, 0), u0=-math.pi / 2, u1=math.pi / 2):
+    sp = lambda x, e: np.sign(x) * np.abs(x) ** e; V = []
+    for i in range(U + 1):
+        u = u0 + (u1 - u0) * i / U
+        for j in range(Vn):
+            v = 2 * math.pi * j / Vn; V.append((a * sp(math.cos(u), e1) * sp(math.cos(v), e2), b * sp(math.sin(u), e1), c * sp(math.cos(u), e1) * sp(math.sin(v), e2)))
+    F = [(i * Vn + j, i * Vn + (j + 1) % Vn, (i + 1) * Vn + (j + 1) % Vn, (i + 1) * Vn + j) for i in range(U) for j in range(Vn)]
+    return np.array(V) + np.asarray(center, float), F
+
+
+def grid_faces(nu, nv, wrap=False):
+    F = []
+    for i in range(nu - 1):
+        for j in range(nv if wrap else nv - 1): F.append((i * nv + j, i * nv + (j + 1) % nv, (i + 1) * nv + (j + 1) % nv, (i + 1) * nv + j))
+    return F
+
+
+def thick_sheet(P, t):
+    """a surface grid P (nu, nv, 3) becomes a closed thin shell of thickness t, offset along its own normals, edges closed by quads. FR : une nappe devient une coque fermée."""
+    nu, nv = P.shape[:2]; du = np.gradient(P, axis=0); dv = np.gradient(P, axis=1); N = np.cross(du, dv); N /= np.maximum(np.linalg.norm(N, axis=2, keepdims=True), 1e-9)
+    top = (P + N * (np.broadcast_to(t, (nu, nv))[..., None] / 2)).reshape(-1, 3); bot = (P - N * (np.broadcast_to(t, (nu, nv))[..., None] / 2)).reshape(-1, 3); n0 = nu * nv; F = grid_faces(nu, nv)
+    F += [tuple(i + n0 for i in q[::-1]) for q in grid_faces(nu, nv)]
+    idx = lambda i, j: i * nv + j
+    for j in range(nv - 1): F.append((idx(0, j), idx(0, j + 1), idx(0, j + 1) + n0, idx(0, j) + n0)); F.append((idx(nu - 1, j + 1), idx(nu - 1, j), idx(nu - 1, j) + n0, idx(nu - 1, j + 1) + n0))
+    for i in range(nu - 1): F.append((idx(i + 1, 0), idx(i, 0), idx(i, 0) + n0, idx(i + 1, 0) + n0)); F.append((idx(i, nv - 1), idx(i + 1, nv - 1), idx(i + 1, nv - 1) + n0, idx(i, nv - 1) + n0))
+    return np.vstack([top, bot]), F
+
+
+def cone_part(length, r0, bend, m, n, taper=1.0, tip=0.0, rings=None, blunt=0.0):
+    sp = arc_spine(length, bend, m); s = np.linspace(0, 1, m); r = r0 * ((1 - s) ** taper) * (1 - tip) + r0 * tip * (1 - s)
+    if blunt > 0: r = r0 * np.clip(1 - s ** (1.0 + blunt), 0, 1) ** (1.0 / (1.0 + blunt))      # superellipse profile : a blunt rounded tip. FR : profil à bout arrondi.
+    if rings: r = r * (1 + rings(s))
+    r[-1] = 0.0; return tube(sp, np.maximum(r, 1e-5), n)
+
+
+# ---------------------------------------------------------------- generators
+def horn(P):
+    S, R, L, M = P["shape"], P["rings"], P["layout"], P["mesh"]; m = M["along"]; s = np.linspace(0, 1, m)
+    def rg(s_):
+        u = np.clip((s_ - R["start"]) / max(R["end"] - R["start"], 1e-6), 0, 1); f = (u * R["count"]) % 1.0; w = ((1 - f) ** R["sharp"]) * ((s_ >= R["start"]) & (s_ <= R["end"])); return R["depth"] * (w - 0.35)
+    V, F = cone_part(S["length"], S["base_radius"], S["bend_deg"], m, M["around"], S["taper"], S["tip_radius"], rg); out = {}
+    for k in range(int(L["count"])):
+        z = (k - (L["count"] - 1) / 2) * L["spacing"]; W = V.copy(); W[:, 2] += z
+        if k % 2 == 1 and L["mirror"]: W[:, 2] = 2 * z - W[:, 2] + 0 * z; W[:, 2] -= 0
+        out["horn_%d" % k] = (W, F)
+    return out
+
+
+def ear(P):
+    S, L, M = P["shape"], P["layout"], P["mesh"]; m = M["along"]; sp = arc_spine(S["length"], S["bend_deg"], m, S["twist_deg"]); s = np.linspace(0, 1, m); r = S["base_width"] * np.sin(np.pi * (0.28 + 0.72 * (1 - s) ** S["taper"]) ) ** 0.8 * (1 - s ** 3)
+    V, F = tube(sp, np.maximum(r, 1e-5), M["around"], flat=S["thickness_ratio"]); out = {}
+    for k in range(int(L["count"])): W = V.copy(); W[:, 2] += (k - (L["count"] - 1) / 2) * L["spacing"]; out["ear_%d" % k] = (W, F)
+    return out
+
+
+def eye(P):
+    S, Li, M = P["ball"], P["lids"], P["mesh"]; R = S["radius"]; V, F = ellipsoid(R, R, R, M["rows"], M["cols"])
+    # pupil dimple toward +X. FR : une fossette de pupille vers +X.
+    d = V / np.linalg.norm(V, axis=1, keepdims=True); ang = np.arccos(np.clip(d @ np.array([1.0, 0.0, 0.0]), -1, 1)); V = V * (1 - S["pupil_depth"] * np.exp(-(ang / max(S["pupil_size"], 1e-3)) ** 2))[:, None]
+    out = {"ball": (V, F)}; ph = math.radians(Li["cover_deg"]); U = 14; Vn = M["cols"]; Pu = np.zeros((U + 1, Vn, 3)); tilt = rotz(-Li["tilt_deg"])
+    for i in range(U + 1):
+        phi = ph * i / U; rr = R * (1 + Li["thickness"] * (1 - (i / U) ** 5))
+        for j in range(Vn):
+            th = 2 * math.pi * j / Vn; Pu[i, j] = tilt @ np.array([rr * math.sin(phi) * math.cos(th) * 0 + rr * math.cos(phi) * 0, 0, 0]) + 0
+            # lid cap : pole along +Y tilted, ring around the pole. FR : calotte autour du pôle +Y.
+            v = np.array([rr * math.sin(phi) * math.cos(th), rr * math.cos(phi), rr * math.sin(phi) * math.sin(th)]); Pu[i, j] = tilt @ v
+    Fu = grid_faces(U + 1, Vn, wrap=True); out["lid_upper"] = (Pu.reshape(-1, 3), Fu)
+    return out
+
+
+def nostril(P):
+    S, M = P["shape"], P["mesh"]; a, b, c = S["length"] / 2, S["height"] / 2, S["width"] / 2; U, Vn = M["rows"], M["cols"]
+    Vo, Fo = ellipsoid(a, b, c, U, Vn, 0.8, 0.9, u0=-math.pi * 0.05, u1=math.pi / 2); Vi, Fi = ellipsoid(a - S["wall"], b - S["wall"], c - S["wall"], U, Vn, 0.8, 0.9, u0=-math.pi * 0.05, u1=math.pi / 2)
+    # carve the oval hole : drop the quads whose centre lies inside it. FR : on retire les quads dans l'ovale.
+    def keep(V, F):
+        out = []
+        for q in F:
+            cen = V[list(q)].mean(0); inside = ((cen[0] - S["hole_x"]) / (S["hole_len"] / 2)) ** 2 + (cen[2] / (S["hole_wid"] / 2)) ** 2 < 1.0 and cen[1] > b * 0.2
+            if not inside: out.append(q)
+        return out
+    Fo2 = keep(Vo, Fo); Fi2 = [q[::-1] for q in keep(Vi, Fi)]
+    for W in (Vo, Vi): W[:, 0] += 0
+    V, F = merge((Vo, Fo2), (Vi, Fi2)); return {"nostril": (V, F)}
+
+
+def teeth(P):
+    S, M = P["shape"], P["mesh"]; out = {}
+    for k in range(int(S["count"])):
+        sc = 1.0 - S["size_var"] * (k % 3) * 0.5 - (0.12 * ((k * 7) % 3) if S["jitter"] else 0.0); V, F = cone_part(S["length"] * sc, S["base_radius"] * sc, S["bend_deg"], M["along"], M["around"], S["taper"], 0.0, None, S["blunt"])
+        V = V[:, [1, 0, 2]].copy(); V[:, 2] += (k - (S["count"] - 1) / 2) * S["spacing"]; out["tooth_%d" % k] = (V, [q[::-1] for q in F])      # stand up : axis along +Y, axes swapped so faces reversed. FR : debout, axe vers +Y.
+    return out
+
+
+def mouth(P):
+    """two boat shaped jaws hinged at the back : pointed in front, widest behind, the lower one deeper and opened wider. FR : deux mâchoires en forme de barque articulées à l'arrière, pointues devant, plus larges derrière, la basse plus profonde et plus ouverte."""
+    U, Lw, S, M = P["upper"], P["lower"], P["shape"], P["mesh"]; nu, nv = M["rows"], M["cols"]; out = {}; rd = max(S["round"], 0.6)
+    def jaw(L, W, depth, sgn, fr):
+        G = np.zeros((nu, nv, 3))
+        for i in range(nu):
+            u = i / (nu - 1); w = W / 2 * max(u, 1e-3) ** max(fr, 0.05) * max(1 - u ** rd, 0.0) ** (1.0 / rd); prof = max(math.sin(math.pi * u ** max(S["hump"], 0.3)), 0.0) ** max(S["bowl_pow"], 0.2)
+            for j in range(nv): v = -1 + 2 * j / (nv - 1); G[i, j] = ((u - 1) * L, sgn * depth * (1 - v * v) * prof, v * w)
+        return G
+    Gu = jaw(U["length"], U["width"], U["depth"], 1.0, S["front"]); Gl = jaw(U["length"] * Lw["scale_len"], U["width"] * Lw["scale_width"], Lw["depth"], -1.0, Lw["front_low"])
+    for name, G, th in (("upper", Gu, -U["open_deg"]), ("lower", Gl, Lw["open_deg"])):
+        G2 = (G.reshape(-1, 3) @ rotz(th).T).reshape(G.shape); G2[..., 0] += U["length"]; out[name] = thick_sheet(G2, max(S["thickness"], 1e-3))
+    return out
+
+
+
+def torso(P):
+    S, K, M = P["body"], P["sockets"], P["mesh"]; nr, nc = M["rows"], M["cols"]; H = S["height"]; W = S["width"] / 2; D = W * S["depth_ratio"]
+    prof = np.array([(0.0, S["bottom_radius"]), (0.08, 0.62), (0.22, 0.93), (S["widest_t"], 1.0), (0.66, 0.84), (0.8, 0.68), (0.93, 0.5), (1.0, S["neck_radius"])]); tt = np.linspace(0.02, 1.0, nr); rr = curve_through(prof, 200)
+    ri = np.interp(tt, rr[:, 0] if np.all(np.diff(rr[:, 0]) > 0) else np.linspace(0, 1, 200), rr[:, 1]); G = np.zeros((nr, nc, 3))
+    for i in range(nr):
+        for j in range(nc):
+            a = 2 * math.pi * j / nc; G[i, j] = (D * ri[i] * math.cos(a) + S["lean"] * H * (tt[i] - 0.5) * 0.3, tt[i] * H, W * ri[i] * math.sin(a))
+    F = grid_faces(nr, nc, wrap=True); sockets = [(np.array([0.0, K["arm_height"] * H, +1.0]), K["arm_radius"]), (np.array([0.0, K["arm_height"] * H, -1.0]), K["arm_radius"]), (np.array([-1.0, K["tail_height"] * H, 0.0]), K["tail_radius"])]
+    Vf = G.reshape(-1, 3); keep = []; extra = []
+    for q in F:
+        cen = Vf[list(q)].mean(0); cut = False
+        for dirv, rad in sockets:
+            ax = dirv / np.linalg.norm(dirv); axis_pt = np.array([0.0, dirv[1], 0.0]) if dirv[1] != 0 and abs(dirv[0]) < 1e-9 else np.array([0.0, dirv[1], 0.0])
+            # a socket is a circle on the surface around the point on the body in direction dirv. FR : un orifice = un cercle sur la surface.
+            tgt = np.array([0.0, dirv[1], 0.0]) if False else None
+        keep.append(q)
+    out = {"body": (Vf, F)}
+    for k, (dirv, rad) in enumerate(sockets):
+        ax = dirv.copy(); ax[1] = 0.0; ax /= np.linalg.norm(ax); y = dirv[1]; ang = math.atan2(ax[2], ax[0]); dist = np.linalg.norm(Vf[:, [0, 2]], axis=1)
+        # locate the surface point at that height and azimuth. FR : le point de la surface à cette hauteur et cet azimut.
+        i = int(np.argmin(np.abs(tt * H - y))); j = int(round((ang % (2 * math.pi)) / (2 * math.pi) * nc)) % nc; c0 = G[i, j]; nrm = np.array([c0[0] - 0, 0.0, c0[2]]); nrm /= np.linalg.norm(nrm); sp = np.array([c0 + nrm * 0.0, c0 - nrm * K["depth"]])
+        sp3 = np.array([c0 - nrm * K["depth"], c0, c0 + nrm * K["protrude"]]); sp3 = curve_through(sp3, 8); V, Fq = tube(sp3, np.full(8, rad), 24); out["socket_%d" % k] = (V, Fq)
+    return out
+
+
+def tail(P):
+    S, M = P["shape"], P["mesh"]; m = M["along"]; sp = arc_spine(S["length"], S["bend_deg"], m); s = np.linspace(0, 1, m); r = S["root_radius"] * (1 - s) ** S["taper"] + S["tip_radius"] * s
+    # a thin lip at the open root. FR : une lèvre fine à la base ouverte.
+    r = r * (1 + S["lip"] * np.exp(-(s / 0.03) ** 2)); r[-1] = 1e-5; V, F = tube(sp, r, M["around"]); return {"tail": (V, F)}
+
+
+def plate_blade(L, H, T, tip_x, lead_pow, trail_pow, zc, rows, cols, belly=0.0):
+    """a sickle plate : convex leading edge, hollow trailing edge, the tip swept back by tip_x times the base length. FR : une plaque en faucille, bord d'attaque bombé, bord de fuite creux, la pointe rejetée vers l'arrière."""
+    G = np.zeros((rows, cols, 3)); Tt = np.zeros((rows, cols)); lp = max(lead_pow, 0.3); tp = max(trail_pow, 0.2)
+    for i in range(rows):
+        v = i / (rows - 1); left = tip_x * L * v ** lp; right = L + (tip_x * L - L) * v ** tp - belly * L * math.sin(math.pi * v) ** 1.5
+        for j in range(cols): u = j / (cols - 1); G[i, j] = (left + u * (right - left), H * v, zc * H * (u - 0.5) ** 2 * (1 - v)); Tt[i, j] = T * (4 * u * (1 - u)) ** 0.5 * (1 - v) ** 0.7
+    return thick_sheet(G, Tt + 1e-4)
+
+
+def plates(P):
+    S, B, M = P["row"], P["blade"], P["mesh"]; n = int(S["count"]); Gs = max(int(S["group"]), 1); out = {}; scs = [S["ratio"] ** (k % Gs) * S["restart"] ** (k // Gs) for k in range(n)]; widths = [S["base_length"] * sc * S["spacing"] for sc in scs]; total = sum(widths); arc = math.radians(S["arc_deg"]); Ra = total / arc if arc > 1e-3 else 1e9; a = 0.0
+    for k in range(n):
+        sc = scs[k]; V, F = plate_blade(S["base_length"] * sc, S["base_height"] * sc, B["thickness"] * sc, B["tip_x"], B["lead_pow"], B["trail_pow"], B["z_curve"], M["rows"], M["cols"], B["belly"]); th = a / Ra if arc > 1e-3 else 0.0
+        W = V @ rotz(-math.degrees(th)).T + np.array([Ra * math.sin(th) if arc > 1e-3 else a, -Ra * (1 - math.cos(th)) if arc > 1e-3 else 0.0, 0.0]); out["plate_%02d" % k] = (W, F); a += widths[k]
+    return out
+
+
+
+def arm(P):
+    U, Fo, Pa, Fi, M = P["upper"], P["fore"], P["palm"], P["fingers"], P["mesh"]; n = M["around"]; m = M["along"]; out = {}
+    sp = arc_spine(U["length"], U["bend_deg"], m); s = np.linspace(0, 1, m); out["upper"] = tube(sp, U["r0"] + (U["r1"] - U["r0"]) * s, n)
+    p1 = sp[-1]; sp2 = arc_spine(Fo["length"], Fo["bend_deg"], m, start=p1); out["fore"] = tube(sp2, Fo["r0"] + (Fo["r1"] - Fo["r0"]) * s, n)
+    p2 = sp2[-1]; Vp, Fp = ellipsoid(Pa["length"] / 2, Pa["height"] / 2, Pa["width"] / 2, 14, 24, center=(p2[0] + Pa["length"] / 2 * 0.8, p2[1], p2[2])); out["palm"] = (Vp, Fp)
+    base = np.array([p2[0] + Pa["length"] * 0.85, p2[1], p2[2]])
+    for k, side in enumerate((-1.0, 0.0, 1.0)):
+        ang = math.radians(Fi["spread_deg"]) * side; d = np.array([math.cos(ang), 0.0, math.sin(ang)]); sc = 1.05 if side == 0 else 0.92; pts = [base + np.array([0, 0, side * Fi["gap"]]) + d * (Fi["length"] * sc) * (i / (m - 1)) + np.array([0, -math.sin(math.radians(Fi["curl_deg"]) * (i / (m - 1)) ** 2) * Fi["length"] * 0.3, 0]) for i in range(m)]
+        rad = Fi["radius"] * (1 - 0.25 * s); rad[-1] = 0.0; out["finger_%d" % k] = tube(np.array(pts), np.maximum(rad, 1e-5), n)
+        tip = np.array(pts[-1]); cs = arc_spine(Fi["claw_length"], Fi["claw_bend_deg"], m); cs = cs @ rotz(-Fi["claw_pitch_deg"]).T @ roty(-math.degrees(ang)).T + tip; cr = Fi["claw_radius"] * (1 - s); cr[-1] = 0.0; out["claw_%d" % k] = tube(cs, np.maximum(cr, 1e-5), n)
+    return out
+
+
+def leg(P):
+    T_, C, Ft, M = P["thigh"], P["calf"], P["foot"], P["mesh"]; out = {}
+    V, F = ellipsoid(T_["a"], T_["b"], T_["c"], 24, 36, e1=0.92, e2=0.95, center=(0, T_["b"], 0)); out["thigh"] = (V, F)
+    top = np.array([T_["calf_x"], 0.0, 0.0]); pts = np.array([top + np.array([C["lean"] * (i / 10), -C["length"] * (i / 10), 0.0]) for i in range(11)]); s = np.linspace(0, 1, 11); r = C["r0"] + (C["r1"] - C["r0"]) * s
+    out["calf"] = tube(pts, r, 28, up=(1.0, 0.0, 0.0))
+    import FootGen as FG
+    pf = json.loads(json.dumps(FG.DEFAULT)); pf["mesh"].update(dict(around=20, along=16, pad_u=18, pad_v=28)); fo = FG.build(pf); end = pts[-1]
+    for k, (V_, F_) in fo.items(): out["foot_" + k] = (xf(V_, Ft["scale"], None, (end[0] - Ft["scale"] * 0.18 + Ft["shift_x"], end[1] - Ft["scale"] * 0.2, end[2])), F_)
+    return out
+
+
+def wing_bone(P):
+    S, M = P["shape"], P["mesh"]; m = M["along"]; sp = curve_through([(0, 0, 0), (S["length"] * 0.35, S["length"] * S["bow"], 0), (S["length"] * 0.7, S["length"] * S["bow"] * 0.2, 0), (S["length"], S["length"] * S["lift"], 0)], m); s = np.linspace(0, 1, m)
+    r = S["radius"] * (1 + S["swell"] * np.sin(np.pi * s) ** 2); r = r * (1 - 0.18 * s)
+    for c in (0.0, 1.0): r = r + S["joint"] * np.exp(-((s - c) / 0.07) ** 2)
+    r[-1] = r[-1] * 0.7; V, F = tube(sp, r, M["around"]); return {"bone": (V, F)}
+
+
+def wing_fingers(P):
+    """three long fingers of nearly constant thickness : a flared collar at the base, a rounded tip, the tangent turning from tilt_deg down by bend_deg. FR : trois longs doigts d'épaisseur presque constante, collerette à la base, bout arrondi."""
+    S, Ly, T, M = P["shape"], P["layout"], P["tube"], P["mesh"]; m = M["along"]; out = {}; s = np.linspace(0, 1, m)
+    for k in range(int(S["count"])):
+        L = S["length"] * (S["ratio"] ** k); a0 = math.radians(S["tilt_deg"] - k * Ly["tilt_step"]); bend = math.radians(S["bend_deg"] + k * Ly["bend_step"]); ang = a0 - bend * s ** max(S["curve_pow"], 0.2); ds = L / (m - 1); sp = np.zeros((m, 3))
+        for i in range(1, m): am = 0.5 * (ang[i - 1] + ang[i]); sp[i] = sp[i - 1] + ds * np.array([math.cos(am), math.sin(am), 0.0])
+        sp[:, 0] += k * Ly["x_step"]; sp[:, 1] -= k * Ly["spacing"]
+        r = T["radius"] * math.sqrt(S["ratio"] ** k) * (1 - min(max(T["taper"], 0.0), 0.95) * s ** max(T["taper_pow"], 0.2)) * (1 + T["flare"] * np.exp(-(s / max(T["flare_len"], 0.01)) ** 2)); cap = min(max(T["tip_round"], 0.01), 0.4); u = np.clip((s - (1 - cap)) / cap, 0, 1); r = r * np.sqrt(np.clip(1 - u * u, 0, 1)); r[-1] = 0.0
+        out["finger_%d" % k] = tube(sp, np.maximum(r, 1e-5), M["around"])
+    return out
+
+
+
+def wing_membrane(P):
+    S, M = P["shape"], P["mesh"]; nu, nv = M["rows"], M["cols"]; G = np.zeros((nu, nv, 3))
+    for j in range(nv):
+        a = math.radians(S["fan_deg"]) * (j / (nv - 1) - 0.5) * 2; sc = (1 - S["scallop"] * (math.sin(math.pi * S["scallops"] * j / (nv - 1)) ** 2)); R = S["span"] * sc
+        for i in range(nu):
+            r = R * i / (nu - 1); G[i, j] = (r * math.cos(a), r * math.sin(a) * S["height_ratio"], S["droop"] * (r / max(S["span"], 1e-6)) ** 2 * math.sin(a) * 0.3)
+    return {"membrane": thick_sheet(G, S["thickness"])}
+
+
+# ---------------------------------------------------------------- registry
+REGISTRY = {
+    "horn": dict(label="Cornes", build=horn, ref="horns", default=dict(shape=dict(length=1.0, base_radius=0.23, taper=0.8, bend_deg=70.0, tip_radius=0.0), rings=dict(count=6, depth=0.10, start=0.02, end=0.6, sharp=2.0), layout=dict(count=2, spacing=0.9, mirror=1), mesh=dict(around=32, along=64))),
+    "ear": dict(label="Oreilles", build=ear, ref="ears", default=dict(shape=dict(length=0.85, base_width=0.22, taper=0.9, bend_deg=25.0, twist_deg=0.0, thickness_ratio=0.9), layout=dict(count=2, spacing=0.9), mesh=dict(around=28, along=40))),
+    "eye": dict(label="Yeux", build=eye, ref="eyes", default=dict(ball=dict(radius=0.5, pupil_size=0.30, pupil_depth=0.45), lids=dict(cover_deg=78.0, thickness=0.09, tilt_deg=8.0), mesh=dict(rows=28, cols=40))),
+    "nostril": dict(label="Narines", build=nostril, ref="nostrils", default=dict(shape=dict(length=0.9, height=0.6, width=0.55, wall=0.09, hole_len=0.55, hole_wid=0.26, hole_x=0.12), mesh=dict(rows=28, cols=44))),
+    "teeth": dict(label="Dents", build=teeth, ref="teeth", default=dict(shape=dict(count=4, length=0.75, base_radius=0.3, taper=0.9, bend_deg=4.0, size_var=0.18, spacing=0.75, jitter=1, blunt=0.8), mesh=dict(around=24, along=18))),
+    "mouth": dict(label="Bouche", build=mouth, ref="mouth", default=dict(upper=dict(length=1.5, width=0.7, depth=0.14, open_deg=3.0), lower=dict(scale_len=1.12, scale_width=1.2, depth=0.5, open_deg=33.0, front_low=0.3), shape=dict(front=0.55, round=2.4, hump=1.4, bowl_pow=0.8, thickness=0.06), mesh=dict(rows=34, cols=36))),
+    "torso": dict(label="Torse et ventre", build=torso, ref="torso", default=dict(body=dict(height=1.0, width=1.0, depth_ratio=0.96, bottom_radius=0.3, neck_radius=0.4, widest_t=0.36, lean=0.0), sockets=dict(arm_radius=0.13, arm_height=0.7, tail_radius=0.14, tail_height=0.2, depth=0.06, protrude=0.12), mesh=dict(rows=46, cols=56))),
+    "tail": dict(label="Queue", build=tail, ref="tail", default=dict(shape=dict(length=1.8, root_radius=0.4, tip_radius=0.012, bend_deg=38.0, taper=1.15, lip=0.12), mesh=dict(around=36, along=70))),
+    "plates": dict(label="Plaques dorsales", build=plates, ref="dorsal", default=dict(row=dict(count=12, base_length=0.5, base_height=0.9, ratio=0.82, spacing=1.4, arc_deg=50.0, group=4, restart=0.7), blade=dict(thickness=0.06, tip_x=1.3, lead_pow=1.5, trail_pow=1.0, z_curve=0.2, belly=0.3), mesh=dict(rows=22, cols=16))),
+    "arm": dict(label="Bras", build=arm, ref="arm", default=dict(upper=dict(length=0.55, r0=0.27, r1=0.2, bend_deg=4.0), fore=dict(length=0.5, r0=0.17, r1=0.115, bend_deg=-4.0), palm=dict(length=0.24, width=0.24, height=0.13), fingers=dict(length=0.2, radius=0.05, spread_deg=14.0, gap=0.07, curl_deg=40.0, claw_length=0.12, claw_radius=0.04, claw_bend_deg=40.0, claw_pitch_deg=-5.0), mesh=dict(around=20, along=18))),
+    "leg": dict(label="Jambe", build=leg, ref="leg", default=dict(thigh=dict(a=0.52, b=0.58, c=0.5, calf_x=0.1), calf=dict(length=0.55, r0=0.25, r1=0.19, lean=0.0), foot=dict(scale=0.78, shift_x=0.0), mesh=dict(around=24, along=18))),
+    "wing_bone": dict(label="Os d'aile", build=wing_bone, ref="wingbone", default=dict(shape=dict(length=1.0, radius=0.12, bow=0.1, lift=0.14, swell=0.2, joint=0.06), mesh=dict(around=28, along=60))),
+    "wing_fingers": dict(label="Doigts d'aile", build=wing_fingers, ref="wingfingers", default=dict(shape=dict(count=3, length=2.2, ratio=0.89, tilt_deg=45.0, bend_deg=37.0, curve_pow=1.0), layout=dict(tilt_step=13.5, bend_step=0.0, spacing=0.42, x_step=0.115), tube=dict(radius=0.082, taper=0.45, taper_pow=0.9, flare=0.35, flare_len=0.045, tip_round=0.05), mesh=dict(around=20, along=60))),
+    "wing_membrane": dict(label="Membrane d'aile", build=wing_membrane, ref="wingmembrane", default=dict(shape=dict(span=1.6, fan_deg=55.0, height_ratio=1.0, scallop=0.2, scallops=3.0, thickness=0.012, droop=0.2), mesh=dict(rows=26, cols=60))),
+}
+
+
+import os      # tuned defaults : the sliders found by FitParts replace the hand written defaults, so every HDA starts from the best look so far. FR : les curseurs trouvés par FitParts remplacent les défauts écrits à la main.
+TUNED = os.environ.get("ZRM_TUNED", "/Users/zenray/.claude/skills/zenray-meshes/references/DragonTuned")
+for _n in REGISTRY:
+    _p = os.path.join(TUNED, _n + ".json")
+    if os.path.exists(_p):
+        for _g, _d in json.load(open(_p)).items(): REGISTRY[_n]["default"][_g].update(_d)
+
+
+def build_part(name, overrides=None):
+    P = json.loads(json.dumps(REGISTRY[name]["default"]))
+    for g, d in (overrides or {}).items(): P[g].update(d)
+    return REGISTRY[name]["build"](P), P
+
+
+def write_obj(path, objs, mirror=False):
+    off = 0
+    with open(path, "w") as f:
+        for name, (V, F) in objs.items():
+            f.write("o %s\n" % name); W = V.copy()
+            if mirror: W[:, 0] = -W[:, 0]
+            for v in W: f.write("v %.6f %.6f %.6f\n" % tuple(v))
+            for q in F: q = q[::-1] if mirror else q; f.write("f " + " ".join(str(i + off + 1) for i in q) + "\n")
+            off += len(V)
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, __file__.rsplit("/", 1)[0])
+    if sys.argv[1] == "list": print(" ".join(REGISTRY))
+    else:
+        ov = json.load(open(sys.argv[4])) if len(sys.argv) > 4 and not sys.argv[4].startswith("--") else None; objs, P = build_part(sys.argv[2], ov); write_obj(sys.argv[3], objs, "--mirror" in sys.argv); json.dump(P, open(sys.argv[3] + ".params.json", "w"), indent=1); print(sys.argv[2], {k: len(v[0]) for k, v in objs.items()})

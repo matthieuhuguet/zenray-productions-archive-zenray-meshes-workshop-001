@@ -1,0 +1,61 @@
+"""5 November 2026 : FOOTBOARD, four orthographic-like views of an OBJ (left side, front, top, 3/4) in soft grey clay on dark grey, laid out as the sheet cells, next to a reference image. FR : quatre vues d'un OBJ en argile grise, comme les cellules d'une planche, à côté d'une référence.
+Usage : python FootBoard.py part.obj out.png [reference.png] [--tile 450]"""
+import sys, os, math
+import numpy as np
+from PIL import Image
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+import Raster, moderngl
+
+VS = """#version 330
+in vec3 p; in vec3 n; uniform mat4 M; uniform mat3 R; out vec3 vn;
+void main(){ gl_Position = M * vec4(p, 1.0); vn = R * n; }"""
+FS = """#version 330
+in vec3 vn; out vec4 o; uniform vec3 L1; uniform vec3 L2;
+void main(){ vec3 n = normalize(vn); float d = max(dot(n, normalize(L1)), 0.0) * 0.70 + max(dot(n, normalize(L2)), 0.0) * 0.25 + 0.18; float g = pow(clamp(d, 0.0, 1.0), 0.85) * 0.62 + 0.10; o = vec4(vec3(g), 1.0); }"""
+
+
+def load(p):
+    """returns the whole mesh and the (start, end) vertex ranges of every object, so normals are oriented object by object. FR : les normales sont orientées objet par objet."""
+    V, F, ranges, cur = [], [], [], None
+    for l in open(p):
+        if l.startswith("o "):
+            if cur is not None: ranges.append((cur, len(V)))
+            cur = len(V)
+        elif l.startswith("v "): V.append([float(x) for x in l.split()[1:4]])
+        elif l.startswith("f "): F.append([int(x.split("/")[0]) - 1 for x in l.split()[1:]])
+    ranges.append((cur or 0, len(V))); return np.array(V), F, ranges
+
+
+def smooth_normals(V, F, ranges):
+    T = np.array([[f[0], f[k], f[k + 1]] for f in F for k in range(1, len(f) - 1)], np.int32); fn = np.cross(V[T[:, 1]] - V[T[:, 0]], V[T[:, 2]] - V[T[:, 0]]); N = np.zeros_like(V)
+    for k in range(3): np.add.at(N, T[:, k], fn)
+    N /= np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-9)
+    for a, b in ranges:
+        if b > a and float(np.median(((V[a:b] - V[a:b].mean(0)) * N[a:b]).sum(1))) < 0: N[a:b] = -N[a:b]
+    return T, N
+
+
+def look(eye, target, up=(0, 1, 0)):
+    f = np.array(target, float) - np.array(eye, float); f /= np.linalg.norm(f); s = np.cross(f, up); s /= np.linalg.norm(s); u = np.cross(s, f); return np.array([s, u, -f])
+
+
+def render(g, prog, vao, V, R, size, scale):
+    tex = g.texture((size, size), 4, dtype="f1"); db = g.depth_renderbuffer((size, size)); fb = g.framebuffer([tex], db); fb.use(); fb.clear(0.14, 0.14, 0.15, 1.0, depth=1.0); g.enable(moderngl.DEPTH_TEST); g.disable(moderngl.CULL_FACE)
+    c = (V.max(0) + V.min(0)) / 2; ext = (V.max(0) - V.min(0)).max() * 0.62; Mv = np.eye(4); Mv[:3, :3] = R * (1.0 / ext); Mv[:3, 3] = -(R @ c) / ext; Mv[2, :] *= -0.05      # nearer points get a smaller depth : without the sign the depth test hides the toes behind the pad. FR : sans le signe, le test de profondeur cache les orteils.
+    prog["M"].write(Mv.T.astype("f4").tobytes()); prog["R"].value = tuple(R.T.ravel().tolist()); prog["L1"].value = tuple((R @ np.array([-0.5, 0.8, 0.9])).tolist()); prog["L2"].value = tuple((R @ np.array([0.7, 0.2, 0.6])).tolist()); vao.render(moderngl.TRIANGLES)
+    A = np.frombuffer(tex.read(), np.uint8).reshape(size, size, 4)[::-1, :, :3].copy(); fb.release(); tex.release(); db.release(); return A
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]; size = 450
+    if "--tile" in sys.argv: size = int(sys.argv[sys.argv.index("--tile") + 1]); args = [a for a in args if a != str(size)]
+    V, F, RG = load(args[0]); T, N = smooth_normals(V, F, RG); g = Raster.ctx(); prog = g.program(vertex_shader=VS, fragment_shader=FS); vbo = g.buffer(np.hstack([V, N]).astype("f4").tobytes()); ibo = g.buffer(T.tobytes()); vao = g.vertex_array(prog, [(vbo, "3f 3f", "p", "n")], ibo)
+    c = (V.max(0) + V.min(0)) / 2; tiles = []
+    # views : side (toes to the left, looking along +z), front (toes toward the viewer), top, 3/4. FR : côté, face, dessus, trois quarts.
+    cams = [look(c + [0, 0, -5], c), look(c + [5, 0, 0], c), look(c + [0, 5, 0], c, up=(-1, 0, 0)), look(c + [3.5, 2.2, -3.5], c)]
+    for R in cams: tiles.append(render(g, prog, vao, V, R, size, 1.0))
+    row1 = np.concatenate(tiles[:2], 1); row2 = np.concatenate(tiles[2:], 1); B = np.concatenate([row1, row2], 0)
+    out = Image.fromarray(B)
+    if len(args) > 2:
+        ref = Image.open(args[2]).convert("RGB"); ref = ref.resize((int(ref.size[0] * B.shape[0] / ref.size[1]), B.shape[0]), Image.LANCZOS); W = Image.new("RGB", (ref.size[0] + out.size[0], out.size[1])); W.paste(ref, (0, 0)); W.paste(out, (ref.size[0], 0)); out = W
+    out.save(args[1]); print("board", out.size)

@@ -1,0 +1,134 @@
+"""5 November 2026 : COMPSWAP, replace one part of the fitted dragon by a component rebuilt from its ChatGPT sheet (SheetLoft), registered in 3D (24 cube rotations, then per-axis scales + rotation + translation, Powell) on the silhouettes of the used video frames, scored on the used AND the unseen frames. FR : remplace une partie du dragon par le composant reconstruit depuis sa planche, recalé en 3D sur les silhouettes des images utilisées, noté sur les images utilisées et jamais utilisées.
+Usage : python CompSwap.py fit.json cams_used.json frames used_views cams_unseen.json unseen_views comp.obj drop_names out_folder [--keep-xform]
+  drop_names : comma list of tube names removed from the fit (the replaced part). Out : out_folder/{comp_world.obj, swap_fit.json, part.obj, cams.json, score.json}."""
+import sys, os, json, math, itertools
+import numpy as np
+from PIL import Image
+from scipy.optimize import minimize
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+import Raster, moderngl
+from CompFit import load_quads, cam_matrix, viewport, part_mask, CF
+import DragonShape as DS
+from scipy import ndimage as ndi
+VS = """#version 330
+in vec3 p; uniform mat3 R; uniform vec3 t; uniform float f; uniform vec2 c; uniform vec2 res;
+void main(){ vec3 q = R * p + t; float Z = max(q.z, 0.05); gl_Position = vec4((c.x + f * q.x / Z) / res.x * 2.0 - 1.0, (c.y - f * q.y / Z) / res.y * 2.0 - 1.0, Z / 40.0 * 2.0 - 1.0, 1.0); }"""
+FS = "#version 330\nout vec4 o; void main(){ o = vec4(1.0); }"
+TOL = 1.0
+
+
+def build_fit(D, drop):
+    V, F, off = [], [], 0
+    for t in D["tubes"]:
+        if t["name"] in drop: continue
+        v, f = DS.tube_mesh(t); V.append(v); F.append(f + off); off += len(v)
+        if t.get("mirror"): v2 = v.copy(); v2[:, 0] = -v2[:, 0]; V.append(v2); F.append(f[:, ::-1] + off); off += len(v2)
+    return np.vstack(V), np.vstack(F).astype(np.int32)
+
+
+def tri_of_quads(Fq): return np.array([[f[0], f[k], f[k + 1]] for f in Fq for k in range(1, len(f) - 1)], np.int32)
+
+
+class Scorer:
+    def __init__(self, frames, views, cams):
+        self.g = Raster.ctx(); self.prog = self.g.program(vertex_shader=VS, fragment_shader=FS); self.views = []; self.cams = cams
+        for k in views:
+            im = np.asarray(Image.open(f"{frames}/f_{int(k):05d}.jpg").convert("RGB")); rect = viewport(im.max(2).astype(np.float32)); m = part_mask(im, rect, "grey"); h, w = m.shape
+            tex = self.g.texture((w, h), 4, dtype="f4"); db = self.g.depth_renderbuffer((w, h)); fb = self.g.framebuffer([tex], db); R, t, fp = cam_matrix(cams[k], w, h, CF["fov"])
+            d = ndi.distance_transform_edt(m) + ndi.distance_transform_edt(~m); self.views.append(dict(k=k, m=m, w=w, h=h, tex=tex, fb=fb, R=R, t=t, fp=fp, keep=d > TOL))
+        self.static = None
+
+    def set_static(self, V, T):
+        self.static = (self.g.buffer(V.astype(np.float32).tobytes()), self.g.buffer(T.tobytes()), V, T)
+
+    def masks(self, Vc=None, Tc=None):
+        out = []; g = self.g; prog = self.prog
+        for v in self.views:
+            v["fb"].use(); v["fb"].clear(0.0, 0.0, 0.0, 0.0, depth=1.0); g.enable(moderngl.DEPTH_TEST); g.disable(moderngl.CULL_FACE)
+            prog["R"].value = tuple(v["R"].T.ravel().tolist()); prog["t"].value = tuple(v["t"].tolist()); prog["f"].value = v["fp"]; prog["c"].value = (v["w"] / 2.0, v["h"] / 2.0); prog["res"].value = (float(v["w"]), float(v["h"]))
+            bufs = []
+            if self.static is not None: bufs.append((self.static[0], self.static[1]))
+            tmp = []
+            if Vc is not None:
+                vb = g.buffer(Vc.astype(np.float32).tobytes()); ib = g.buffer(Tc.tobytes()); bufs.append((vb, ib)); tmp += [vb, ib]
+            for vb, ib in bufs:
+                vao = g.vertex_array(prog, [(vb, "3f", "p")], ib); vao.render(moderngl.TRIANGLES); vao.release()
+            A = np.frombuffer(v["tex"].read(), np.float32).reshape(v["h"], v["w"], 4); out.append(A[..., 3] > 0.5)
+            for b_ in tmp: b_.release()
+        return out
+
+    def iou(self, masks):
+        r = []
+        for v, mm in zip(self.views, masks):
+            m = v["m"]; i = float((mm & m).sum()) / max(float((mm | m).sum()), 1); k = v["keep"]; i1 = float((mm & m & k).sum()) / max(float(((mm | m) & k).sum()), 1); r.append((i, i1))
+        return r
+
+
+def rot(rx, ry, rz):
+    cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]]); Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]); Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]); return Rz @ Ry @ Rx
+
+
+def cube_rotations():
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for sg in itertools.product([1, -1], repeat=3):
+            M = np.zeros((3, 3))
+            for i, (j, s) in enumerate(zip(perm, sg)): M[i, j] = s
+            if np.linalg.det(M) > 0: out.append(M)
+    return out
+
+
+def main():
+    MIR = "--mirror" in sys.argv; sys.argv = [a for a in sys.argv if a != "--mirror"]
+    INIT = None      # --init-from obj,fraction : the target region is the lowest fraction (height) of the x>0 half of an obj, for a part added without dropping any tube. FR : région cible = bas d'un obj.
+    for a_ in list(sys.argv):
+        if a_.startswith("--init-from="): INIT = a_.split("=", 1)[1]; sys.argv.remove(a_)      # a symmetric pair : the component is drawn and written twice, x mirrored. FR : une paire symétrique.
+    fit, cams_u, frames, uv, cams_x, xv, comp, drop, out = sys.argv[1:10]; os.makedirs(out, exist_ok=True); D = json.load(open(fit)); drops = [s for s in drop.split(",") if s]
+    Vr, Tr = build_fit(D, drops); Vd = None
+    if drops:
+        D2 = dict(D); D2["tubes"] = [t for t in D["tubes"] if t["name"] in drops]; Vd, _ = build_fit(D2, [])
+    Vc, Fc = load_quads(comp); Tc = tri_of_quads(Fc); c0 = (Vc.max(0) + Vc.min(0)) / 2; V0 = Vc - c0; ext = Vc.max(0) - Vc.min(0); nT = len(V0)
+    cams = json.load(open(cams_u)); S = Scorer(frames, uv.split(","), cams); S.set_static(Vr, Tr)
+    Vh = Vd[Vd[:, 0] > 0.0] if (Vd is not None and MIR) else Vd
+    if INIT:
+        ip, fr = INIT.split(","); Vi, _ = load_quads(ip); Vi = Vi[Vi[:, 0] > 0.0] if MIR else Vi; ylo = Vi[:, 1].min(); Vh = Vi[Vi[:, 1] < ylo + float(fr) * (Vi[:, 1].max() - ylo)]
+    t_c = (Vh.max(0) + Vh.min(0)) / 2 if Vh is not None else Vr.mean(0); e_t = (Vh.max(0) - Vh.min(0)) if Vh is not None else ext
+    MX = np.array([-1.0, 1.0, 1.0])
+    def place(par, R0):
+        s = np.exp(par[:3]); R = rot(*par[3:6]) @ R0; return (V0 * s) @ R.T + par[6:9]
+    def both(W):
+        if not MIR: return W, Tc
+        return np.vstack([W, W * MX]), np.vstack([Tc, Tc[:, ::-1] + nT])
+    REG = 0.6      # penalty on the scale anisotropy : the sheet already carries the right proportions, only a small stretch is allowed. FR : pénalité sur l'anisotropie, la planche porte déjà les bonnes proportions.
+    def cost(par, R0):
+        Wb, Tb = both(place(par, R0)); ls = par[:3]; return 1.0 - float(np.mean([a for a, b in S.iou(S.masks(Wb, Tb))])) + REG * float(np.sum((ls - ls.mean()) ** 2))
+    cand = []
+    for R0 in cube_rotations():
+        s_loc = np.full(3, float(np.log(np.clip(np.max(e_t) / np.max(ext), 0.2, 5.0)))); par = np.concatenate([s_loc, np.zeros(3), t_c]); cand.append((cost(par, R0), par, R0))
+    cand.sort(key=lambda x: x[0]); print("init costs", [round(c[0], 3) for c in cand[:5]], flush=True)
+    res = []
+    for c, par, R0 in cand[:3]:
+        r = minimize(cost, par, args=(R0,), method="Powell", options=dict(maxiter=6, xtol=1e-3, ftol=1e-4)); res.append((r.fun, r.x, R0)); print("refined", round(r.fun, 4), flush=True)
+    res.sort(key=lambda x: x[0]); c, par, R0 = res[0]; W = place(par, R0); Wb, Tb = both(W)
+    Fm = [list(q) for q in Fc]
+    if MIR: Fm = Fm + [[i + nT for i in q[::-1]] for q in Fc]
+    with open(os.path.join(out, "comp_world.obj"), "w") as f:
+        for p in Wb: f.write("v %.5f %.5f %.5f\n" % tuple(p))
+        for q in Fm: f.write("f " + " ".join(str(i + 1) for i in q) + "\n")
+    # the whole part for the verdict tools : rest (triangles) + component quads. FR : la partie entière pour les outils de verdict.
+    with open(os.path.join(out, "part.obj"), "w") as f:
+        for p in np.vstack([Vr, Wb]): f.write("v %.5f %.5f %.5f\n" % tuple(p))
+        for t in Tr: f.write("f %d %d %d\n" % tuple(int(x) + 1 for x in t))
+        for q in Fm: f.write("f " + " ".join(str(i + len(Vr) + 1) for i in q) + "\n")
+    json.dump(cams, open(os.path.join(out, "cams.json"), "w"))
+    D3 = dict(D); D3["tubes"] = [t for t in D["tubes"] if t["name"] not in drops] + [dict(name="swap_" + os.path.basename(os.path.dirname(os.path.abspath(comp))), kind="obj", file=os.path.abspath(os.path.join(out, "comp_world.obj")), xform=[0.0, 0.0, 0.0, 1.0], radius=1.0, mirror=False)]
+    D3["groups"] = [[n for n in g if n not in drops] for g in D["groups"]]; json.dump(D3, open(os.path.join(out, "swap_fit.json"), "w"))
+    used = S.iou(S.masks(Wb, Tb)); sx = Scorer(frames, xv.split(","), json.load(open(cams_x))); sx.set_static(Vr, Tr); unseen = sx.iou(sx.masks(Wb, Tb)); rest = S.iou(S.masks())
+    m_ = lambda r, i: round(float(np.mean([x[i] for x in r])), 4)
+    sc = dict(used=[m_(used, 0), m_(used, 1)], unseen=[m_(unseen, 0), m_(unseen, 1)], without_part=[m_(rest, 0), m_(rest, 1)], params=par.tolist(), mirror=MIR)
+    Vf, Tf = build_fit(D, []); S.set_static(Vf, Tf); bu = S.iou(S.masks()); sx.set_static(Vf, Tf); bx = sx.iou(sx.masks()); sc["baseline_used"] = [m_(bu, 0), m_(bu, 1)]; sc["baseline_unseen"] = [m_(bx, 0), m_(bx, 1)]
+    json.dump(sc, open(os.path.join(out, "score.json"), "w")); print("SWAP", sc)
+
+
+main()

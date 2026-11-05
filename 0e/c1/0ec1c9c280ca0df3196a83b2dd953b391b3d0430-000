@@ -1,0 +1,65 @@
+"""5 November 2026 : DRACARD plate library from a ChatGPT sheet : the side row gives each plate outline, the top row gives its thickness along the base, an inflated double-sided sheet is built from both. Local frame : X along the base toward the tail, Y up, Z thickness. Units are pixels divided by the height of the largest plate.
+FR : bibliothèque de plaques depuis une planche ChatGPT : la rangée de côté donne le contour, la rangée de dessus l'épaisseur le long de la base ; repère local : X le long de la base vers la queue, Y vers le haut, Z l'épaisseur.
+Usage : python PlateLib.py sheet.jpg out_folder"""
+import sys, os, json
+import numpy as np, scipy.ndimage as ndi
+from PIL import Image
+
+
+def components(im, y0, y1):
+    sub = im[y0:y1]; m = ndi.binary_opening(sub > 90, structure=np.ones((5, 5))); m = ndi.binary_fill_holes(m); lab, n = ndi.label(m); out = []
+    for i in range(1, n + 1):
+        ys, xs = np.where(lab == i)
+        if len(xs) > 1500: full = np.zeros(im.shape, bool); full[y0:y1] = lab == i; out.append((xs.min(), ys.min() + y0, xs.max(), ys.max() + y0, full))      # full-size mask so rows and columns are absolute. FR : masque pleine taille.
+    out.sort(key=lambda o: o[0]); return out
+
+
+def build(side, top, im_h, n=48, m=22, p=0.8, front=None):
+    """side, top : (x0, y0, x1, y1, mask) boxes. FR : boîtes et masques."""
+    x0, y0, x1, y1, M = side; tx0, ty0, tx1, ty1, T = top; cols = np.arange(x0, x1 + 1); U = (cols - x0) / max(1, x1 - x0); lo = np.zeros(len(cols)); hi = np.zeros(len(cols)); ok = np.zeros(len(cols), bool)
+    for k, x in enumerate(cols):
+        ys = np.where(M[:, x])[0]
+        if len(ys): ok[k] = True; hi[k] = -ys.min(); lo[k] = -ys.max()      # image y goes down, up is negative y. FR : y image vers le bas.
+    tcols = np.arange(tx0, tx1 + 1); half = np.zeros(len(tcols))
+    for k, x in enumerate(tcols):
+        ys = np.where(T[:, x])[0]
+        if len(ys): half[k] = (ys.max() - ys.min()) / 2.0
+    wf = None
+    if front is not None:      # 5 November 2026 : a third row, the plate seen from the front, gives the width at each height. FR : une troisième rangée, vue de face, donne la largeur à chaque hauteur.
+        fx0, fy0, fx1, fy1, FM = front; rows_ = np.arange(fy0, fy1 + 1); hw = np.array([ (np.where(FM[y])[0].max() - np.where(FM[y])[0].min()) / 2.0 if FM[y].any() else 0.0 for y in rows_]); wf = (np.linspace(0, 1, len(rows_)), hw[::-1] / max(hw.max(), 1e-6))      # row 0 of wf is the base. FR : indice 0 = base.
+    uu = np.linspace(0, 1, n); loI = np.interp(uu, U[ok], lo[ok]); hiI = np.interp(uu, U[ok], hi[ok]); hI = np.interp(uu, (tcols - tx0) / max(1, tx1 - tx0), half)
+    ybase = loI.min(); rows = []
+    for sd in (1, -1):
+        R = []
+        for u_i in range(n):
+            col = []
+            for v in np.linspace(0, 1, m):
+                X = x0 + uu[u_i] * (x1 - x0); Y = loI[u_i] + v * (hiI[u_i] - loI[u_i]) - ybase; hh = (loI[u_i] + v * (hiI[u_i] - loI[u_i]) - ybase) / max(hiI.max() - ybase, 1e-6); Z = sd * hI[u_i] * ((1 - v) ** p if wf is None else float(np.interp(hh, wf[0], wf[1]))); col.append((X, Y, Z))
+            R.append(col)
+        rows.append(np.array(R))
+    return rows, (x1 - x0, hi.max() - lo.min())
+
+
+def write_obj(path, rows, scale, x_origin):
+    V, F, off = [], [], 0
+    for R in rows:
+        nu, nv = R.shape[:2]; Q = R.copy(); Q[..., 0] = (Q[..., 0] - x_origin) / scale; Q[..., 1] /= scale; Q[..., 2] /= scale; V.append(Q.reshape(-1, 3))
+        i0 = (np.arange(nu - 1)[:, None] * nv + np.arange(nv - 1)[None, :]).ravel(); F.append(np.vstack([np.stack([i0, i0 + 1, i0 + nv], 1), np.stack([i0 + 1, i0 + nv + 1, i0 + nv], 1)]) + off); off += nu * nv
+    V = np.vstack(V); F = np.vstack(F)
+    with open(path, "w") as f:
+        for v in V: f.write("v %.5f %.5f %.5f\n" % tuple(v))
+        for t in F: f.write("f %d %d %d\n" % tuple(t + 1))
+
+
+if __name__ == "__main__":
+    im = np.array(Image.open(sys.argv[1]).convert("L")).astype(float); out = sys.argv[2]; os.makedirs(out, exist_ok=True); H = im.shape[0]
+    three = len(sys.argv) > 3 and sys.argv[3] == "3rows"
+    if three: top_row = components(im, 0, int(H * 0.38)); mid_row = components(im, int(H * 0.38), int(H * 0.70)); bot_row = components(im, int(H * 0.70), H)
+    else: top_row = components(im, 0, int(H * 0.60)); bot_row = components(im, int(H * 0.60), H); mid_row = [None] * len(top_row)
+    assert len(top_row) == len(bot_row) == len(mid_row), (len(top_row), len(mid_row), len(bot_row)); lib = []; scale = None
+    for i, (s, t, fr) in enumerate(zip(top_row, bot_row, mid_row)):
+        rows, (w, h) = build(s, t, H, front=fr)
+        if scale is None: scale = float(h)
+        lib.append(dict(file=f"plate_type_{i}.obj", width_px=float(w), height_px=float(h), aspect=float(h / w)))
+        write_obj(os.path.join(out, f"plate_type_{i}.obj"), rows, scale, s[0])
+    json.dump(dict(types=lib, unit_px=scale), open(os.path.join(out, "lib.json"), "w"), indent=1); print(json.dumps(lib))

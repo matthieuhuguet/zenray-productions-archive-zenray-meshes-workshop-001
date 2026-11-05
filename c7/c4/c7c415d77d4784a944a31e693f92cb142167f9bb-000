@@ -1,0 +1,72 @@
+#!/usr/bin/env node
+// 5 November 2026, 17:27 Europe/Paris: sequential, timestamp-verified reference frames at original resolution.
+import fs from 'node:fs'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+
+const args = process.argv.slice(2)
+if (!args.length || args.includes('--help')) {
+  console.log('Usage: zr-edit.mjs frames video.mp4 [--out directory] [--step 1]'); process.exit(0)
+}
+const input = path.resolve(args[0])
+const option = (key, fallback) => args.includes(key) ? args[args.indexOf(key) + 1] : fallback
+const step = Number(option('--step', '1'))
+if (!(step > 0) || !Number.isFinite(step)) throw new Error('Positive --step required')
+const output = path.resolve(option('--out', path.join(path.dirname(input), path.parse(input).name + '-frames')))
+const run = (program, parameters) => {
+  const result = spawnSync(program, parameters, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  if (result.error) throw result.error
+  if (result.status !== 0) throw new Error(`${program} failed (${result.status}): ${result.stderr.slice(-3000)}`)
+  return result
+}
+const sha256 = file => {
+  const hash = crypto.createHash('sha256'); const fd = fs.openSync(file, 'r'); const buffer = Buffer.alloc(1024 * 1024)
+  try { let count; while ((count = fs.readSync(fd, buffer, 0, buffer.length, null))) hash.update(buffer.subarray(0, count)) }
+  finally { fs.closeSync(fd) }
+  return hash.digest('hex')
+}
+const probe = JSON.parse(run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries',
+  'stream=width,height,r_frame_rate,duration:format=duration,size', '-of', 'json', input]).stdout)
+const stream = probe.streams[0]
+if (!stream) throw new Error('No video stream')
+const sourceSha256 = sha256(input)
+fs.mkdirSync(output, { recursive: true })
+const manifestPath = path.join(output, 'frames.json')
+if (fs.existsSync(manifestPath)) {
+  const old = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  if (old.sourceSha256 !== sourceSha256 || old.stepSeconds !== step) throw new Error('Output belongs to a different source or step; choose another --out')
+  for (const frame of old.frames) if (sha256(path.join(output, frame.name)) !== frame.sha256) throw new Error('Changed or missing frame: ' + frame.name)
+  console.log(JSON.stringify({ reused: true, frames: old.frames.length, output, timestampCheck: old.timestampCheck })); process.exit(0)
+}
+if (fs.readdirSync(output).some(name => /^frame-\d+\.jpg$/.test(name))) throw new Error('Partial extraction found; preserve it and choose another --out')
+// Reset timestamps to the first decoded image, keep one sequential pass, select the first frame at or after each grid instant.
+const filter = `setpts=PTS-STARTPTS,showinfo@source,select='isnan(prev_selected_t)+gte(t,(floor(prev_selected_t/${step})+1)*${step})',showinfo@picked`
+const result = run('ffmpeg', ['-hide_banner', '-nostdin', '-i', input, '-an', '-vf', filter,
+  '-fps_mode', 'vfr', '-q:v', '2', '-threads', '2', '-start_number', '0', path.join(output, 'frame-%06d.jpg')])
+fs.writeFileSync(path.join(output, 'extraction.log'), result.stderr)
+const timestamps = name => [...result.stderr.matchAll(new RegExp(`showinfo@${name}[^\\n]*?n:\\s*\\d+[^\\n]*?pts_time:([\\d.e+\\-]+)`, 'g'))].map(match => Number(match[1]))
+const all = timestamps('source'); const picked = timestamps('picked')
+if (!all.length || !picked.length) throw new Error('ffmpeg did not expose verifiable timestamps')
+const names = fs.readdirSync(output).filter(name => /^frame-\d+\.jpg$/.test(name)).sort()
+const expected = Math.floor((all.at(-1) + 1e-7) / step) + 1
+if (names.length !== expected || names.length !== picked.length) throw new Error(`Frame count mismatch: ${names.length}, timestamps ${picked.length}, expected ${expected}`)
+const [num, den] = stream.r_frame_rate.split('/').map(Number)
+const framePeriod = den / num
+const frames = names.map((name, index) => {
+  if (name !== `frame-${String(index).padStart(6, '0')}.jpg`) throw new Error('Non-contiguous numbering')
+  const delta = picked[index] - index * step
+  if (delta < -1e-6 || delta > framePeriod * 1.1 + 1e-5) throw new Error(`Timestamp outside one source frame at ${index}: ${delta}`)
+  return { name, requestedSeconds: index * step, decodedSeconds: picked[index], sha256: sha256(path.join(output, name)) }
+})
+const dimensions = run('ffprobe', ['-v', 'error', '-f', 'image2', '-i', path.join(output, 'frame-%06d.jpg'),
+  '-show_entries', 'stream=width,height', '-of', 'json']).stdout
+const imageStream = JSON.parse(dimensions).streams[0]
+if (imageStream.width !== stream.width || imageStream.height !== stream.height) throw new Error('Source resolution changed')
+// Decode the whole numbered sequence: a successful encoder exit alone does not prove readable image files.
+run('ffmpeg', ['-v', 'error', '-xerror', '-i', path.join(output, 'frame-%06d.jpg'), '-f', 'null', '-'])
+const manifest = { generatedAt: new Date().toISOString(), tool: 'ZenRay Edit frames', source: input, sourceSha256,
+  stepSeconds: step, width: stream.width, height: stream.height, lastSourceSeconds: all.at(-1), expectedCount: expected,
+  timestampCheck: true, fullSequenceDecoded: true, frames }
+fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2))
+console.log(JSON.stringify({ frames: frames.length, width: stream.width, height: stream.height, output, timestampCheck: true, fullSequenceDecoded: true }))

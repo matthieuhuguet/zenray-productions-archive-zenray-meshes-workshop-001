@@ -1,0 +1,52 @@
+"""5 November 2026 : MAKEFOOTHDA, builds the Houdini digital asset zrm_foot (a SOP) from FootGen.py : every FootGen parameter becomes a slider, grouped Pad, Toes, Claws, Mesh (8 per group at most), the geometry is rebuilt by a Python SOP inside the asset, one primitive group per piece. FR : construit l'asset Houdini zrm_foot depuis FootGen.py : chaque paramètre devient un curseur, regroupé en Pad, Toes, Claws, Mesh.
+Usage : hython MakeFootHda.py out.hda"""
+import sys, os, json
+import hou
+
+HERE = os.path.dirname(os.path.abspath(__file__)); SRC = open(os.path.join(HERE, "FootGen.py")).read().split('if __name__ == "__main__":')[0]
+DEF = {}; exec(compile(SRC, "FootGen", "exec"), DEF); D = DEF["DEFAULT"]
+LABELS = dict(length="Length", width="Width", height="Height", top_exp="Top roundness", bottom_exp="Bottom flatness", side_exp="Side roundness", heel_lift="Heel rise", ankle_fill="Ankle fill", spread_deg="Spread (deg)", start_x="Start X",
+              radius="Radius", droop_deg="Droop (deg)", center_scale="Centre toe scale", side_scale="Side toe scale", gap="Gap", base_radius="Base radius", bend_deg="Bend (deg)", pitch_deg="Pitch (deg)", taper="Taper", embed="Embed", tip_round="Tip round",
+              around="Around", along="Along", pad_u="Pad rows", pad_v="Pad columns")
+RANGES = dict(length=(0.1, 1.2), width=(0.2, 1.2), height=(0.1, 0.9), top_exp=(0.3, 1.6), bottom_exp=(0.2, 1.6), side_exp=(0.3, 1.6), heel_lift=(0.0, 1.0), ankle_fill=(0.0, 1.0), spread_deg=(0.0, 40.0), start_x=(0.1, 0.9), radius=(0.04, 0.25), droop_deg=(-10.0, 30.0),
+              center_scale=(0.6, 1.5), side_scale=(0.6, 1.5), gap=(0.05, 0.4), base_radius=(0.02, 0.15), bend_deg=(0.0, 90.0), pitch_deg=(-45.0, 30.0), taper=(0.3, 2.0), embed=(0.0, 0.2), tip_round=(0.0, 1.0))
+
+WRAP = '''
+node = hou.pwd(); geo = node.geometry(); asset = node.parent()
+P = {"pad": {}, "toes": {}, "claws": {}, "mesh": {}}
+for g in P:
+    for k in DEFAULT[g]:
+        P[g][k] = asset.evalParm(g + "_" + k)
+P["mesh"]["around"] = int(P["mesh"]["around"]); P["mesh"]["along"] = int(P["mesh"]["along"]); P["mesh"]["pad_u"] = int(P["mesh"]["pad_u"]); P["mesh"]["pad_v"] = int(P["mesh"]["pad_v"])
+objs = build(P)
+geo.clear(); piece = geo.addAttrib(hou.attribType.Prim, "piece", "")
+for name, (V, F) in objs.items():
+    pts = [geo.createPoint() for _ in range(len(V))]
+    for p, v in zip(pts, V): p.setPosition((float(v[0]), float(v[1]), float(v[2])))
+    grp = geo.createPrimGroup(name)
+    for q in F:
+        prim = geo.createPolygon()
+        for i in q: prim.addVertex(pts[i])
+        prim.setAttribValue("piece", name); grp.add(prim)
+'''
+
+
+def main(out):
+    hou.hipFile.clear(); geo = hou.node("/obj").createNode("geo", "tmp"); sub = geo.createNode("subnet", "zrm_foot"); inner = sub.createNode("python", "foot_gen"); inner.parm("python").set(SRC + "\n" + WRAP); inner.setDisplayFlag(True); inner.setRenderFlag(True)
+    asset = sub.createDigitalAsset(name="zrm_foot", hda_file_name=out, description="ZRM Foot (Dracard)", min_num_inputs=0, max_num_inputs=0, save_as_embedded=False)
+    d = asset.type().definition(); ptg = d.parmTemplateGroup()
+    for g, title in (("pad", "Pad"), ("toes", "Toes"), ("claws", "Claws"), ("mesh", "Mesh")):
+        fol = hou.FolderParmTemplate("f_" + g, title, folder_type=hou.folderType.Simple)
+        for k, v in D[g].items():
+            if g == "mesh": t = hou.IntParmTemplate(g + "_" + k, LABELS[k], 1, default_value=(int(v),), min=4, max=120)
+            else:
+                lo, hi = RANGES.get(k, (0.0, 1.0)); t = hou.FloatParmTemplate(g + "_" + k, LABELS[k], 1, default_value=(float(v),), min=lo, max=hi, min_is_strict=False, max_is_strict=False)
+            fol.addParmTemplate(t)
+        ptg.append(fol)
+    d.setParmTemplateGroup(ptg); d.setComment("Parametric Dracard foot : pad, three toes, three claws, quads only, one primitive group per piece. Defaults = the validated look of 5 November 2026.")
+    asset = hou.node(asset.path()); inner = asset.node("foot_gen"); inner.cook(force=True); g = inner.geometry()
+    print("HDA", out, "points", len(g.points()), "prims", len(g.prims()), "groups", [x.name() for x in g.primGroups()])
+    d.save(out); hou.hipFile.save(os.path.splitext(out)[0] + "_test.hip")
+
+
+main(sys.argv[1])

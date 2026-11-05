@@ -1,0 +1,114 @@
+"""5 November 2026 : FITPARTS, the autonomous iteration of every ZrmParts component against its reference crop : the model is rendered orthographically (silhouette, normals), a camera (rotation, scale, shift) is searched, then the SLIDERS are optimised (Powell) to maximise the silhouette IoU and the shading correlation with the reference picture, with a prior that keeps every slider near its default. Result : tuned parameters (tuned/<part>.json), an overlay picture, the measured IoU before and after. FR : l'itération autonome de chaque composant contre sa vignette : caméra cherchée, puis curseurs optimisés sur la silhouette et l'ombrage.
+Usage : python FitParts.py out_dir [part ...] [--evals 700]"""
+import sys, os, json, math, time
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from scipy.optimize import minimize
+HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+import Raster, moderngl
+import ZrmParts as Z
+REFS = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/work/dracard/v3/lib/refs"; SZ = 256
+VS = "#version 330\nin vec3 p; in vec3 n; out vec3 vn; void main(){ gl_Position = vec4(p.xy, p.z * 0.01, 1.0); vn = n; }"
+FS = "#version 330\nin vec3 vn; out vec4 o; void main(){ o = vec4(normalize(vn) * 0.5 + 0.5, 1.0); }"
+
+
+def ref_target(name):
+    im = Image.open(os.path.join(REFS, name + ".png")).convert("L"); a = np.asarray(im).astype(np.float32); a = ndi.gaussian_filter(a, 0.8)
+    t = float(np.percentile(a, 30)) * 0.55 + float(np.percentile(a, 95)) * 0.45; m = a > t; m = ndi.binary_opening(m, structure=np.ones((5, 5))); m = ndi.binary_fill_holes(m); lab, n = ndi.label(m)
+    if n:
+        sizes = ndi.sum(m, lab, range(1, n + 1)); keep = [i + 1 for i, s_ in enumerate(sizes) if s_ > 0.04 * sizes.max()]; m = np.isin(lab, keep)
+    ys, xs = np.nonzero(m); y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1; pad = 6; y0, x0 = max(y0 - pad, 0), max(x0 - pad, 0); y1, x1 = min(y1 + pad, m.shape[0]), min(x1 + pad, m.shape[1])
+    mc = m[y0:y1, x0:x1]; gc = a[y0:y1, x0:x1]; sc = (SZ - 24) / max(mc.shape); w, h = int(mc.shape[1] * sc), int(mc.shape[0] * sc)
+    M = np.zeros((SZ, SZ), bool); G = np.zeros((SZ, SZ), np.float32); mr = np.asarray(Image.fromarray(mc.astype(np.uint8) * 255).resize((w, h), Image.BILINEAR)) > 127; gr = np.asarray(Image.fromarray(gc).resize((w, h), Image.BILINEAR))
+    oy, ox = (SZ - h) // 2, (SZ - w) // 2; M[oy:oy + h, ox:ox + w] = mr; G[oy:oy + h, ox:ox + w] = gr; return M, G
+
+
+class Renderer:
+    def __init__(self): self.g = Raster.ctx(); self.prog = self.g.program(vertex_shader=VS, fragment_shader=FS); self.tex = self.g.texture((SZ, SZ), 4, dtype="f4"); self.db = self.g.depth_renderbuffer((SZ, SZ)); self.fb = self.g.framebuffer([self.tex], self.db)
+
+    def render(self, V, T, N, cam):
+        R = Z.rotz(cam[2]) @ Z.roty(cam[1]) @ Z.rotx(cam[0]); Vc = V @ R.T; Nc = N @ R.T; s = cam[3]; X = (s * Vc[:, 0] + cam[4]) / (SZ / 2) - 1.0; Y = 1.0 - (cam[5] - s * Vc[:, 1]) / (SZ / 2)      # pixel u = tx + s x, pixel v = ty - s y (image rows grow downward). FR : u = tx + s x, v = ty - s y.
+        P = np.stack([X, Y, -Vc[:, 2] / 400.0], 1)
+        vbo = self.g.buffer(np.hstack([P, Nc]).astype("f4").tobytes()); ibo = self.g.buffer(T.astype("i4").tobytes()); vao = self.g.vertex_array(self.prog, [(vbo, "3f 3f", "p", "n")], ibo)
+        self.fb.use(); self.fb.clear(0, 0, 0, 0, depth=1.0); self.g.enable(moderngl.DEPTH_TEST); self.g.disable(moderngl.CULL_FACE); vao.render(moderngl.TRIANGLES)
+        A = np.frombuffer(self.tex.read(), np.float32).reshape(SZ, SZ, 4)[::-1].copy(); vao.release(); vbo.release(); ibo.release(); return A
+
+
+def mesh_of(objs):
+    V, T, N, off = [], [], [], 0
+    for name, (v, f) in objs.items():
+        t = np.array([[q[0], q[k], q[k + 1]] for q in f for k in range(1, len(q) - 1)], np.int64); fn = np.cross(v[t[:, 1]] - v[t[:, 0]], v[t[:, 2]] - v[t[:, 0]]); nn = np.zeros_like(v)
+        for k in range(3): np.add.at(nn, t[:, k], fn)
+        nn /= np.maximum(np.linalg.norm(nn, axis=1, keepdims=True), 1e-9)
+        if float(np.median(((v - v.mean(0)) * nn).sum(1))) < 0: nn = -nn
+        V.append(v); T.append(t + off); N.append(nn); off += len(v)
+    return np.vstack(V), np.vstack(T), np.vstack(N)
+
+
+def sh_basis(n): x, y, z = n[:, 0], n[:, 1], n[:, 2]; return np.stack([np.ones_like(x), x, y, z, x * y, x * z, y * z, x * x - y * y, 3 * z * z - 1], 1)
+
+
+def score(A, M, G):
+    m = A[..., 3] > 0.5; i = float((m & M).sum()) / max(float((m | M).sum()), 1); both = m & M; corr = 0.0
+    if both.sum() > 200:
+        n = A[..., :3][both] * 2 - 1; g = G[both]; B = sh_basis(n); co = np.linalg.lstsq(B, g, rcond=None)[0]; pr = B @ co
+        if pr.std() > 1e-6 and g.std() > 1e-6: corr = float(np.corrcoef(pr, g)[0, 1])
+    return i, corr
+
+
+def fit_camera(rd, V, T, N, M, G):
+    ys, xs = np.nonzero(M); cxb, cyb = (xs.min() + xs.max()) / 2, (ys.min() + ys.max()) / 2; ext = max(xs.max() - xs.min(), ys.max() - ys.min()); best = []; ph = (1 + 5 ** 0.5) / 2
+    for k in range(240):
+        th = math.acos(1 - 2 * (k + 0.5) / 240); az = 2 * math.pi * k / ph; rx, ry = math.degrees(th) - 90, math.degrees(az) % 360
+        for roll in (0, 90, 180, 270):
+            R = Z.rotz(roll) @ Z.roty(ry) @ Z.rotx(rx); P = V @ R.T; sz = max(np.ptp(P[:, 0]), np.ptp(P[:, 1])); sc = ext / max(sz, 1e-6)
+            cam = np.array([rx, ry, roll, sc, cxb - sc * (P[:, 0].min() + P[:, 0].max()) / 2, cyb + sc * (P[:, 1].min() + P[:, 1].max()) / 2]); A = rd.render(V, T, N, cam); i, c = score(A, M, G); best.append((1 - i - 0.1 * (c if i > 0.5 else 0), cam))
+    best.sort(key=lambda x: x[0]); return best[:4]
+
+
+def refine_camera(rd, V, T, N, M, G, cam0):
+    f = lambda c: 1 - score(rd.render(V, T, N, c), M, G)[0]
+    r = minimize(f, cam0, method="Powell", options=dict(maxiter=4, xtol=0.3, ftol=1e-4)); return r.x, 1 - r.fun
+
+
+def run_part(rd, name, out, evals):
+    M, G = ref_target(Z.REGISTRY[name]["ref"]); P0 = json.loads(json.dumps(Z.REGISTRY[name]["default"])); objs, _ = Z.build_part(name); V, T, N = mesh_of(objs)
+    cands = fit_camera(rd, V, T, N, M, G); best = None
+    for _, c in cands[:4]:
+        cam, iou = refine_camera(rd, V, T, N, M, G, c)
+        if best is None or iou > best[1]: best = (cam, iou)
+    cam, iou0 = best; A0 = rd.render(V, T, N, cam); i0, c0 = score(A0, M, G)
+    keys = [(g, k) for g, d in P0.items() if g != "mesh" for k, v in d.items() if isinstance(v, float) and not isinstance(v, bool)]
+    x0 = np.array([P0[g][k] for g, k in keys]); lo = x0 - 1.6 * np.abs(x0) - 0.05; hi = x0 + 2.0 * np.abs(x0) + 0.1
+    def build(x):
+        P = json.loads(json.dumps(P0))
+        for (g, k), v in zip(keys, x): P[g][k] = float(v)
+        return P
+    def cost(z):
+        x = z[:len(keys)]; c = z[len(keys):]
+        try: objs, _ = Z.build_part(name, {g: {k: float(v) for (gg, k), v in zip(keys, x) if gg == g} for g in P0 if g != "mesh"})
+        except Exception: return 5.0
+        V_, T_, N_ = mesh_of(objs)
+        if not np.all(np.isfinite(V_)): return 5.0
+        i, co = score(rd.render(V_, T_, N_, c), M, G); prior = 0.015 * float(np.sum(((x - x0) / (np.abs(x0) + 0.1)) ** 2) / max(len(x), 1)); return (1 - i) + 0.18 * (1 - max(co, 0)) + prior
+    z0 = np.concatenate([x0, cam]); bounds = [(l, h) for l, h in zip(lo, hi)] + [(cam[0] - 25, cam[0] + 25), (cam[1] - 25, cam[1] + 25), (cam[2] - 25, cam[2] + 25), (cam[3] * 0.7, cam[3] * 1.4), (cam[4] - 25, cam[4] + 25), (cam[5] - 25, cam[5] + 25)]
+    r = minimize(cost, z0, method="Powell", bounds=bounds, options=dict(maxfev=evals, xtol=1e-3, ftol=1e-4)); z = r.x if cost(r.x) <= cost(z0) else z0; x = z[:len(keys)]; c = z[len(keys):]      # never keep a result worse than the start. FR : jamais pire que le départ.
+    Pn = build(x); objs, _ = Z.build_part(name, {g: d for g, d in Pn.items() if g != "mesh"}); V1, T1, N1 = mesh_of(objs); A1 = rd.render(V1, T1, N1, c); i1, c1 = score(A1, M, G)
+    # overlay : reference grey, model, the two masks. FR : la référence, le modèle, les deux masques.
+    m1 = A1[..., 3] > 0.5; ov = np.full((SZ, SZ, 3), 30, np.uint8); ov[m1 & M] = (170, 170, 170); ov[M & ~m1] = (240, 60, 50); ov[m1 & ~M] = (50, 110, 255)
+    rg = np.stack([np.clip(G, 0, 255)] * 3, -1).astype(np.uint8); mo = np.zeros((SZ, SZ, 3), np.uint8); mo[...] = 30
+    if m1.any(): n = A1[..., :3][m1] * 2 - 1; B = sh_basis(n); both = m1 & M; co = np.linalg.lstsq(sh_basis(A1[..., :3][both] * 2 - 1), G[both], rcond=None)[0] if both.sum() > 100 else np.zeros(9); mo[m1] = np.clip((B @ co)[:, None], 0, 255).astype(np.uint8)
+    Image.fromarray(np.concatenate([rg, mo, ov], 1)).resize((SZ * 3 * 2, SZ * 2), Image.LANCZOS).save(os.path.join(out, "fit_%s.png" % name))
+    os.makedirs(os.path.join(out, "tuned"), exist_ok=True); json.dump({g: d for g, d in Pn.items()}, open(os.path.join(out, "tuned", name + ".json"), "w"), indent=1)
+    return dict(part=name, iou_before=round(i0, 4), iou_after=round(i1, 4), shade_before=round(c0, 3), shade_after=round(c1, 3), evals=int(r.nfev))
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]; evals = int(sys.argv[sys.argv.index("--evals") + 1]) if "--evals" in sys.argv else 700; args = [a for a in args if a != str(evals)]
+    out = args[0]; os.makedirs(out, exist_ok=True); names = args[1:] or list(Z.REGISTRY); rd = Renderer(); rep = []
+    for n in names:
+        t0 = time.time()
+        try: r = run_part(rd, n, out, evals); r["seconds"] = round(time.time() - t0); rep.append(r); print(json.dumps(r), flush=True)
+        except Exception as e: print(n, "ERROR", repr(e)[:200], flush=True)
+        json.dump(rep, open(os.path.join(out, "report.json"), "w"), indent=1)

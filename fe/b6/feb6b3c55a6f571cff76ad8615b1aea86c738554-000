@@ -36,6 +36,8 @@ PARAMS = {
     "density_tol": 0.10, "density_retries": 2,             # gate : |quads / target - 1|
     "gate_folded": 0.001, "gate_squashed": 0.005, "gate_straight_deg": 2.0, "gate_symmetry_edges": 0.001,
     "gate_cover": 0.97, "gate_component_recall": 0.9, "cover_tol_edges": 0.75,  # recall : share of the reference surface within this many mean quad edges of the result
+    # 5 November 2026, 17:44 Europe/Paris: average coverage accepted a horn shortened by 11 percent; protect all six extrema first.
+    "gate_envelope_frac": 0.01,       # maximum change of a bounding coordinate, relative to the reference diagonal; not a detail-fidelity proof
     "baseline_pole_margin": 8.0,      # poles per 1000 quads the result may have above the reference before the reference wins
     "baseline_min_quad_share": 0.90, "baseline_guard": 1,              # 1 = an input that is already a quad mesh is judged by the same gates and returned when it beats the result at the same density (never worse than the reference)
     "closure_len_ratio": 0.15,
@@ -302,13 +304,20 @@ def run_pass(mesh, target, out, P, board=True, split=False):
         if use_sym: Vf, Ff, snapped = MIR.mirror_weld(Pb, [list(q) for q in Qq], sym["index"], sym["center"], diag); rep["mirror_snapped_border_vertices"] = snapped
         else: Vf, Ff = Pb, [list(q) for q in Qq]
     Vf, Ff = combine_extras(Vf, Ff, ex)
+    # 5 November 2026, 17:49 Europe/Paris: layout smoothing shortened the horn tip although the raw QuadWild surface kept it.
+    if use_sym: Vr, Fr, _ = MIR.mirror_weld(Vq, [list(q) for q in Qq], sym["index"], sym["center"], diag)
+    else: Vr, Fr = Vq, [list(q) for q in Qq]
+    Vr, Fr = combine_extras(Vr, Fr, ex)
+    if preserve_raw_envelope(V, Vf, Vr, P["gate_envelope_frac"]):
+        rep["envelope_guard"] = {"decision": "raw_quadwild_kept", "smoothed_error_frac": envelope_deviation(V, Vf)[0], "raw_error_frac": envelope_deviation(V, Vr)[0]}
+        Vf, Ff = Vr, Fr
     return finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board)
 
 
 def gate_score(rep):
-    """ordering of two passes : coverage first (a lost piece is the worst failure), then the number of green gates, then the recall."""
-    if "gates" not in rep: return (-1, -1, -1)
-    return (int(rep["gates"]["coverage"]["pass"]), sum(int(g["pass"]) for g in rep["gates"].values()), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))      # straightness below its gate is a tie : only a failing value is compared
+    """5 November 2026: preserve the shape envelope first, then coverage, green gates, and failing straightness."""
+    if "gates" not in rep: return (-1, -1, -1, -1)
+    return (int(rep["gates"].get("envelope", {"pass": True})["pass"]), int(rep["gates"]["coverage"]["pass"]), sum(int(g["pass"]) for g in rep["gates"].values()), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))      # 5 November 2026: preserve extrema before trading topology scores.
 
 
 def run_one(mesh, target, out, P, board=True):
@@ -383,13 +392,14 @@ def read_obj_faces(path):
 
 
 def quality_key(rep):
-    """kept for the tournaments : coverage, then the number of green gates other than density, then the straightness when it is red."""
-    g = rep["gates"]; return (int(g["coverage"]["pass"]), sum(int(v["pass"]) for k, v in g.items() if k != "density"), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))
+    """5 November 2026: tournament order is shape envelope, coverage, green gates apart from density, then failing straightness."""
+    g = rep["gates"]; return (int(g.get("envelope", {"pass": True})["pass"]), int(g["coverage"]["pass"]), sum(int(v["pass"]) for k, v in g.items() if k != "density"), -round(max(rep["measures"]["straight_iso_mean_deg"], GATE_STRAIGHT), 2))
 
 
 def reference_wins(ours, ref, P):
     """30 October 2026 : who keeps the result when the input is already a quad mesh at the same density. Order of Matthieu : never worse than the reference, and a look at the hood showed that the gates alone are not enough (the reference was a clean grid with 2 poles per 1000 and a 0.34 percent folded edge, the result was green on folds but had 18 poles per 1000 and a ragged border). Rules : (1) coverage decides first ; (2) the reference wins when it has more green gates (density apart) ; (3) otherwise, even when the result has MORE green gates, the reference wins when the result is geometrically worse : straightness above both the gate and 1.25 times the reference, or more than 8 poles per 1000 above the reference. Returns (reference_wins, reason)."""
     go, gr = ours["gates"], ref["gates"]
+    if go.get("envelope", {"pass": True})["pass"] != gr.get("envelope", {"pass": True})["pass"]: return (not go.get("envelope", {"pass": True})["pass"]), "shape envelope"
     if go["coverage"]["pass"] != gr["coverage"]["pass"]: return (not go["coverage"]["pass"]), "coverage"
     no, nr = sum(int(v["pass"]) for k, v in go.items() if k != "density"), sum(int(v["pass"]) for k, v in gr.items() if k != "density")
     if nr > no: return True, "green gates %d (result) against %d (reference)" % (no, nr)
@@ -435,6 +445,20 @@ def boundary_loop_report(V, F, tol=0.05):
     return loops, slits
 
 
+def envelope_deviation(reference, result):
+    """5 November 2026: six extremum-coordinate errors in a shared mesh frame, normalized by the input diagonal."""
+    bounds = np.array([reference.min(0), reference.max(0)])
+    actual = np.array([result.min(0), result.max(0)])
+    diagonal = max(float(np.linalg.norm(bounds[1] - bounds[0])), 1e-30)
+    errors = np.abs(actual - bounds) / diagonal
+    return float(errors.max()), errors.tolist()
+
+
+def preserve_raw_envelope(reference, smoothed, raw, tolerance):
+    """Keep a faithful raw surface when smoothing alone violates the configured extrema guard."""
+    return envelope_deviation(reference, smoothed)[0] > tolerance and envelope_deviation(reference, raw)[0] <= tolerance
+
+
 def finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board):
     final = os.path.join(out, "result.obj"); QB.save_obj(final, Vf, Ff); rep["seconds"] = round(time.time() - t0, 1); rep["files"] = {"result": final, "quadwild_raw": raw}
     J = TJ.judge(final, mesh); Qf = np.array(Ff, np.int64); keys = ("quads", "folded_share", "squashed_share", "jac_mean", "angle_dev_mean_deg", "straight_iso_mean_deg", "symmetry_axis", "symmetry_mean_edge", "poles_per_1000_quads", "boundary_edges", "euler", "dev_mean_mm"); rep["measures"] = {k: J.get(k) for k in keys}
@@ -442,6 +466,9 @@ def finish(rep, t0, out, mesh, V, T, Vf, Ff, raw, target, sym, use_sym, P, board
     ca = crease_alignment(V, T, Vf, Qf, P["crease_deg"], edge); rep["measures"].update({"crease_points": ca[2] if ca else 0, "crease_aligned_share": round(ca[0], 3) if ca else None, "crease_mean_edges": round(ca[1], 3) if ca else None})
     bl_, sl_ = boundary_loop_report(Vf, Ff); rep["measures"].update({"boundary_loops": bl_, "zero_area_slit_loops": sl_, "coverage_recall": round(rec, 4), "coverage_precision": round(prec, 4), "worst_component_recall": round(worst, 4), "hidden_components": getattr(coverage, "hidden", 0), "components": components(Ff, len(Vf)), "reference_components": components([list(t) for t in T], len(V)), "boundary_length": round(bl, 4), "reference_boundary_length": round(rl, 4)})
     m = rep["measures"]; g = {}
+    envelope, envelope_axes = envelope_deviation(V, Vf)
+    m.update({"envelope_max_error_frac": envelope, "envelope_axis_errors_frac": envelope_axes})
+    g["envelope"] = (envelope <= P["gate_envelope_frac"], round(envelope, 6), "all six extrema within %s of the input diagonal; detail fidelity still needs separate checks" % P["gate_envelope_frac"])
     g["density"] = (abs(m["quads"] / target - 1) <= P["density_tol"], round(m["quads"] / target, 3), "within %.0f percent" % (100 * P["density_tol"]))
     g["folded"] = (m["folded_share"] < P["gate_folded"], m["folded_share"], "under %s" % P["gate_folded"]); g["squashed"] = (m["squashed_share"] < P["gate_squashed"], m["squashed_share"], "under %s" % P["gate_squashed"])
     g["straightness"] = (m["straight_iso_mean_deg"] < P["gate_straight_deg"], m["straight_iso_mean_deg"], "under %s degrees" % P["gate_straight_deg"])

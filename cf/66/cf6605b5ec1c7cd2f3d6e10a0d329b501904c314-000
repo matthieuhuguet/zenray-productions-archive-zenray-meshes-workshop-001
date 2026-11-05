@@ -1,0 +1,53 @@
+"""5 November 2026 : SHEETPLANE, a thin flat component (wing membrane, fin, leaf) from its ChatGPT sheet : the silhouette of the face-on cell becomes a quad grid snapped to the outline, inflated a little on both sides (thickness zero on the outline so it closes). FR : un composant plat et mince depuis sa planche : la silhouette de la cellule de face devient une grille de quads collée au contour, gonflée un peu des deux côtés.
+Usage : python SheetPlane.py sheet.jpg out_folder [--cell front|side|top|p34] [--thick 0.03] [--step 7] [--thr 75] [--cands 1 --cand 0]
+Out : out_folder/part.obj (X horizontal, Y up, Z thickness; height normalised to 1), out_folder/score.json."""
+import sys, os, json, argparse
+import numpy as np, scipy.ndimage as ndi
+from PIL import Image
+
+ap = argparse.ArgumentParser(); ap.add_argument("sheet"); ap.add_argument("out"); ap.add_argument("--cell", default="front"); ap.add_argument("--thick", type=float, default=0.03); ap.add_argument("--step", type=int, default=7)
+ap.add_argument("--thr", type=float, default=75); ap.add_argument("--cands", type=int, default=1); ap.add_argument("--cand", type=int, default=0); ap.add_argument("--crop", type=float, default=1.0)
+A = ap.parse_args(); os.makedirs(A.out, exist_ok=True)
+im = np.asarray(Image.open(A.sheet).convert("L")).astype(float)
+if A.crop != 1.0: im = im[:int(round(im.shape[0] * A.crop))]
+H_, W_ = im.shape; cw = W_ // A.cands; cand = im[:, A.cand * cw:(A.cand + 1) * cw]; hy, hx = cand.shape[0] // 2, cand.shape[1] // 2
+cell = dict(side=cand[:hy, :hx], front=cand[:hy, hx:], top=cand[hy:, :hx], p34=cand[hy:, hx:])[A.cell]
+m = cell > A.thr; m = ndi.binary_opening(m, structure=np.ones((3, 3))); m = ndi.binary_fill_holes(m); lab, n = ndi.label(m); m = lab == (1 + int(np.argmax(ndi.sum(m, lab, range(1, n + 1)))))
+ys, xs = np.where(m); x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max(); S = A.step
+edt = ndi.distance_transform_edt(m); emax = edt.max(); idx = ndi.distance_transform_edt(~m, return_indices=True)[1]
+gx = np.arange(x0, x1 + 1, S); gy = np.arange(y0, y1 + 1, S); nx, ny = len(gx), len(gy)
+P = np.zeros((ny, nx, 2)); inside = np.zeros((ny, nx), bool)
+for j, y in enumerate(gy):
+    for i, x in enumerate(gx):
+        if m[y, x]: P[j, i] = (x, y); inside[j, i] = True
+        else: P[j, i] = (idx[1][y, x], idx[0][y, x])      # snap to the nearest silhouette pixel. FR : colle au pixel de silhouette le plus proche.
+keep = np.zeros((ny - 1, nx - 1), bool)
+for j in range(ny - 1):
+    for i in range(nx - 1): keep[j, i] = inside[j:j + 2, i:i + 2].any()
+H = float(y1 - y0); T = np.zeros((ny, nx))
+for j in range(ny):
+    for i in range(nx): T[j, i] = A.thick * H * np.sqrt(edt[int(P[j, i, 1]), int(P[j, i, 0])] / emax)
+V = []; vid = {}
+def vert(j, i, side):
+    k = (j, i, side)
+    if k not in vid: vid[k] = len(V); V.append(((P[j, i, 0] - (x0 + x1) / 2) / H, (y1 - P[j, i, 1]) / H, side * T[j, i] / H))
+    return vid[k]
+F = []
+for j in range(ny - 1):
+    for i in range(nx - 1):
+        if not keep[j, i]: continue
+        F.append([vert(j, i, 1), vert(j, i + 1, 1), vert(j + 1, i + 1, 1), vert(j + 1, i, 1)])
+        F.append([vert(j, i, -1), vert(j + 1, i, -1), vert(j + 1, i + 1, -1), vert(j, i + 1, -1)])
+V = np.array(V)
+# weld the two sides on the outline where the thickness is zero. FR : soude les deux faces sur le contour.
+key = {}; remap = {}
+for k, v in enumerate(V):
+    kk = tuple(np.round(v, 5))
+    if kk in key and abs(v[2]) < 1e-9: remap[k] = key[kk]
+    else: key[kk] = k; remap[k] = k
+F = [[remap[v] for v in f] for f in F]; F = [f for f in F if len(set(f)) >= 3]
+used = sorted({v for f in F for v in f}); inv = {v: i for i, v in enumerate(used)}
+with open(os.path.join(A.out, "part.obj"), "w") as fo:
+    for v in used: fo.write("v %.5f %.5f %.5f\n" % tuple(V[v]))
+    for f in F: fo.write("f " + " ".join(str(inv[v] + 1) for v in f) + "\n")
+json.dump(dict(cell=A.cell, quads=len(F), verts=len(used), height_px=H, aspect=float((x1 - x0) / H)), open(os.path.join(A.out, "score.json"), "w")); print("plane", len(F), "faces", len(used), "verts", "aspect", round((x1 - x0) / H, 3))

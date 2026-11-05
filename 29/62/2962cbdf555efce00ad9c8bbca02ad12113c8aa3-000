@@ -1,0 +1,94 @@
+"""5 November 2026 : FOOTGEN, the Dracard foot as a PARAMETRIC component (HDA logic) : a flat bottomed pad (superellipsoid), three toe domes (swept tapered capsules) and three claws (swept curved cones), every number a parameter, quad meshes, one object per piece so they assemble like Lego. FR : le pied de Dracard en composant paramétrique : un coussin à fond plat, trois orteils, trois griffes courbes, tout est paramètre, un objet par pièce.
+Usage : python FootGen.py out.obj [params.json] [--mirror]    (units : total foot length = 1, X forward to the toes, Y up, Z across, the sole on y = 0)
+The defaults come from the foot of the leg sheet (side, front, top and 3/4 views)."""
+import sys, json, math
+import numpy as np
+
+DEFAULT = dict(
+    pad=dict(length=0.64, width=0.70, height=0.36, top_exp=1.00, bottom_exp=0.45, side_exp=0.90, heel_lift=0.25, ankle_fill=0.0),
+    toes=dict(spread_deg=12.0, start_x=0.44, length=0.25, radius=0.125, droop_deg=10.0, center_scale=1.06, side_scale=0.95, gap=0.18),
+    claws=dict(length=0.20, base_radius=0.07, bend_deg=48.0, pitch_deg=-14.0, taper=0.9, embed=0.07, tip_round=0.0),
+    mesh=dict(around=28, along=22, pad_u=26, pad_v=40))      # validated look of 5 November 2026 (foot of the leg sheet). FR : le rendu validé du 5 novembre.
+
+
+def sgn_pow(x, e): return np.sign(x) * np.abs(x) ** e
+
+
+def rot_about(v, axis, ang):
+    axis = axis / np.linalg.norm(axis); c, s = math.cos(ang), math.sin(ang); return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1 - c)
+
+
+def tube(spine, radii, n):
+    """swept circle sections along a spine (parallel transport frame). Returns V (k*n,3), quads. FR : sections circulaires le long d'une courbe."""
+    k = len(spine); T = np.gradient(spine, axis=0); T /= np.maximum(np.linalg.norm(T, axis=1, keepdims=True), 1e-9)
+    ref = np.array([0.0, 1.0, 0.0]) if abs(T[0, 1]) < 0.9 else np.array([0.0, 0.0, 1.0]); N = np.cross(T[0], ref); N /= np.linalg.norm(N); frames = []
+    for i in range(k):
+        if i > 0:
+            ax = np.cross(T[i - 1], T[i]); an = np.linalg.norm(ax)
+            if an > 1e-9: N = rot_about(N, ax, math.asin(min(1.0, an)))
+        Nn = N - T[i] * np.dot(N, T[i]); Nn /= np.linalg.norm(Nn); frames.append((Nn, np.cross(T[i], Nn)))
+    V = []; t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    for i in range(k):
+        Nn, Bn = frames[i]
+        for a in t: V.append(spine[i] + radii[i] * (math.cos(a) * Nn + math.sin(a) * Bn))
+    F = [(i * n + j, i * n + (j + 1) % n, (i + 1) * n + (j + 1) % n, (i + 1) * n + j) for i in range(k - 1) for j in range(n)]
+    return np.array(V), F
+
+
+def capsule_spine(p0, d0, length, droop, m, cap_frac=0.45):
+    """a spine that leaves p0 in direction d0, droops by `droop` radians over its length and ends with a rounded cap : radii profile returned too. FR : colonne vertébrale avec bout arrondi."""
+    pts = []; dirv = d0 / np.linalg.norm(d0); side = np.cross(dirv, np.array([0.0, 1.0, 0.0])); side /= max(np.linalg.norm(side), 1e-9); p = p0.copy()
+    for i in range(m):
+        s = i / (m - 1); pts.append(p.copy()); dv = rot_about(dirv, side, -droop * s); p = p + dv * (length / (m - 1))
+    return np.array(pts)
+
+
+def build(P):
+    n = P["mesh"]["around"]; m = P["mesh"]["along"]; objs = {}
+    pd = P["pad"]; a = pd["length"] / 2; b = pd["width"] / 2; c = pd["height"] / 2; U = P["mesh"]["pad_u"]; Vn = P["mesh"]["pad_v"]
+    V, F = [], []
+    for i in range(U + 1):
+        u = -math.pi / 2 + math.pi * i / U; e1 = pd["top_exp"] if u >= 0 else pd["bottom_exp"]; cu = sgn_pow(math.cos(u), e1); su = sgn_pow(math.sin(u), e1)
+        for j in range(Vn):
+            v = 2 * math.pi * j / Vn; cv = sgn_pow(math.cos(v), pd["side_exp"]); sv = sgn_pow(math.sin(v), pd["side_exp"])
+            x = a * cu * cv + a; y = c * su + c; z = b * cu * sv
+            if su > 0: y *= 1.0 + pd["heel_lift"] * max(0.0, 1.0 - x / (a * 2))      # the top rises toward the heel where the leg attaches. FR : le dessus monte vers le talon où la jambe s'attache.
+            V.append((x, y, z))
+    for i in range(U):
+        for j in range(Vn): F.append((i * Vn + j, i * Vn + (j + 1) % Vn, (i + 1) * Vn + (j + 1) % Vn, (i + 1) * Vn + j))
+    objs["pad"] = (np.array(V), F)
+    T_ = P["toes"]; C_ = P["claws"]; sp = math.radians(T_["spread_deg"]); dr = math.radians(T_["droop_deg"]); tz = [-1.0, 0.0, 1.0]
+    for k, side in enumerate(tz):
+        sc = T_["center_scale"] if side == 0 else T_["side_scale"]; ang = side * sp; d = np.array([math.cos(ang), 0.0, math.sin(ang)])
+        base = np.array([T_["start_x"] + (0.0 if side == 0 else -0.02), T_["radius"] * sc, side * T_["gap"]]); length = T_["length"] * sc; r0 = T_["radius"] * sc
+        spine = capsule_spine(base, d, length, dr, m); s = np.linspace(0, 1, m); rad = np.where(s < 0.55, r0 * (1.0 - 0.10 * s / 0.55), r0 * 0.9 * np.sqrt(np.clip(1 - ((s - 0.55) / 0.45) ** 2, 0, 1)))
+        spine2 = np.vstack([spine, spine[-1] + (spine[-1] - spine[-2]) * 0.0]); Vt, Ft = tube(spine, np.maximum(rad, 1e-4), n); objs["toe_%d" % k] = (Vt, Ft)
+        # claw : leaves the toe tip, bends downward along the toe's side axis. FR : la griffe part du bout de l'orteil et se courbe vers le bas.
+        tip = spine[-1] - d * C_["embed"]; dirc = d.copy(); axis = np.cross(dirc, np.array([0.0, 1.0, 0.0])); axis /= max(np.linalg.norm(axis), 1e-9); dirc = rot_about(dirc, axis, math.radians(C_["pitch_deg"]))      # a negative pitch points the claw down. FR : un tangage négatif baisse la griffe.
+        bend = math.radians(C_["bend_deg"]); pts = []; p = tip.copy(); mm = m
+        for i in range(mm):
+            s_ = i / (mm - 1); pts.append(p.copy()); dv = rot_about(dirc, axis, -bend * s_); p = p + dv * ((C_["length"] + C_["embed"]) / (mm - 1))
+        pts = np.array(pts); s = np.linspace(0, 1, mm); radc = C_["base_radius"] * (1 - s) ** C_["taper"] * (1 + 0.0 * s); radc[-1] = 0.0
+        Vc, Fc = tube(pts, np.maximum(radc, 1e-5), n); objs["claw_%d" % k] = (Vc, Fc)
+    return objs
+
+
+def write(path, objs, mirror=False, scale=1.0):
+    off = 0
+    with open(path, "w") as f:
+        for name, (V, F) in objs.items():
+            f.write("o %s\n" % name); W = V.copy() * scale
+            if mirror: W[:, 0] = -W[:, 0]
+            for v in W: f.write("v %.6f %.6f %.6f\n" % tuple(v))
+            for q in F:
+                q = q[::-1] if mirror else q; f.write("f " + " ".join(str(i + off + 1) for i in q) + "\n")
+            off += len(V)
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]; P = json.loads(json.dumps(DEFAULT))
+    if len(args) > 1:
+        U = json.load(open(args[1]))
+        for g, d in U.items(): P[g].update(d)
+    objs = build(P); write(args[0], objs, mirror="--mirror" in sys.argv); json.dump(P, open(args[0] + ".params.json", "w"), indent=1)
+    print("foot", {k: len(v[0]) for k, v in objs.items()})
