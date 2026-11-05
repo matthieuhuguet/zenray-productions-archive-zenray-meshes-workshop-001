@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+# 6 November 2026, 00:40 Europe/Paris: gather every truck component isolated by ChatGPT into one document.
+# FR : rassemble dans un seul document chaque composant du camion isolé par ChatGPT, avec une mesure indépendante.
+#
+# Input: components.json (the list, one place) and, per component, the folder written by ChatGptImageReceiver.py
+# (gen-NN-WxH.png, conversation.json). Each image is classified as a four-view sheet or an isolated view; the
+# retained sheet is measured again here, with the same rule as the prompt (pixels more than 18 grey levels from the
+# median of the quadrant border), so ChatGPT's own numbers are checked, never trusted.
+# Usage: BuildTruckComponents.py            build summary.json and the document
+#        BuildTruckComponents.py --selftest  green on a coherent sheet, red on a stretched one
+import base64
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+HERE = Path(__file__).resolve().parent
+WORKSHOP = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes')
+DOC = WORKSHOP / 'Articles' / 'truck-components-6-November-2026.html'
+FONTS = Path('/Users/zenray/Create/Build/Productions/GithubProductions/ZenRayProgress/public/fonts')
+THRESHOLD = 18      # grey levels from the border median, the prompt's rule
+MIN_ROW = 3         # a row or column counts as object when it holds at least this many object pixels
+PASS = 0.90         # the prompt's retry threshold
+
+
+def object_mask(pixels):
+    border = np.concatenate([pixels[0], pixels[-1], pixels[:, 0], pixels[:, -1]])
+    return np.abs(pixels - float(np.median(border))) > THRESHOLD
+
+
+def extent(mask):
+    rows = np.nonzero(mask.sum(1) >= MIN_ROW)[0]
+    cols = np.nonzero(mask.sum(0) >= MIN_ROW)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    return int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)
+
+
+def is_sheet(pixels):
+    # A four-view sheet leaves both centre lines empty and fills all four quadrants.
+    h, w = pixels.shape
+    mask = object_mask(pixels)
+    band = max(2, int(0.012 * min(w, h)))
+    centre = mask[:, w // 2 - band:w // 2 + band].sum() + mask[h // 2 - band:h // 2 + band, :].sum()
+    quads = [mask[:h // 2, :w // 2], mask[:h // 2, w // 2:], mask[h // 2:, :w // 2], mask[h // 2:, w // 2:]]
+    return centre < 0.002 * mask.sum() and all(q.mean() > 0.005 for q in quads)
+
+
+def measure_sheet(pixels):
+    h, w = pixels.shape
+    quads = {'front': pixels[:h // 2, :w // 2], 'side': pixels[:h // 2, w // 2:], 'top': pixels[h // 2:, :w // 2]}
+    size = {k: extent(object_mask(q)) for k, q in quads.items()}
+    if None in size.values():
+        return None
+    (fw, fh), (sw, sh), (tw, tl) = size['front'], size['side'], size['top']
+    ratio = lambda a, b: round(min(a, b) / max(a, b), 4)
+    return {'px': {'frontWidth': fw, 'frontHeight': fh, 'sideLength': sw, 'sideHeight': sh, 'topWidth': tw, 'topLength': tl},
+            'agreements': {'width': ratio(fw, tw), 'height': ratio(fh, sh), 'length': ratio(sw, tl)}}
+
+
+def grey(path):
+    return np.asarray(Image.open(path).convert('L'), dtype=np.float32)
+
+
+def chatgpt_numbers(texts):
+    # The agreements ChatGPT printed in its last message, in order of appearance, for comparison only.
+    last = texts[-1] if texts else ''
+    return [float(v.replace(',', '.')) for v in re.findall(r'\b0[,.]\d{3,4}\b', last)]
+
+
+def thumb(src, dst, width=900):
+    image = Image.open(src).convert('RGB')
+    image.thumbnail((width, width))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    image.save(dst, quality=86)
+    return dst
+
+
+def collect():
+    config = json.loads((HERE / 'components.json').read_text())
+    runs = json.loads((HERE / 'runs.json').read_text()) if (HERE / 'runs.json').exists() else {}
+    rows = []
+    for c in config['components']:
+        folder = HERE / c['id']
+        meta_path = folder / 'conversation.json'
+        row = dict(c, state='en attente', conversation=c.get('conversation') or runs.get(c['id'], {}).get('conversation'))
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            images = sorted(folder.glob('gen-*.png'))
+            kinds = [(p, is_sheet(grey(p))) for p in images]
+            sheets = [p for p, s in kinds if s]
+            views = [p for p, s in kinds if not s]
+            row.update(conversation=meta['conversation'], images=[p.name for p in images], sheets=[p.name for p in sheets])
+            row['isolated'] = views[-1].name if views else None
+            row['views'] = [v.name for v in views][-3:]  # the last three isolated views at most
+            row['codeRuns'] = meta.get('pythonMessages')
+            row['sheet'] = sheets[-1].name if sheets else None
+            row['measure'] = measure_sheet(grey(sheets[-1])) if sheets else None
+            row['chatgpt'] = chatgpt_numbers(meta.get('texts', []))
+            row['retries'] = max(0, len(sheets) - 1)
+            row['finalText'] = (meta.get('texts') or [''])[-1]
+            if row['measure']:
+                low = min(row['measure']['agreements'].values())
+                row['state'] = 'accords au-dessus de 0,90' if low >= PASS else 'un accord sous 0,90'
+            else:
+                row['state'] = 'pas de planche lisible'
+        rows.append(row)
+    return config, rows
+
+
+def fonts():
+    return ''.join("@font-face{font-family:'%s';src:url(data:font/woff2;base64,%s);font-weight:100 900;}" %
+                   (name, base64.b64encode((FONTS / file).read_bytes()).decode())
+                   for name, file in [('GT Ultra', 'GT-Ultra-Regular.woff2'), ('Adobe Clean', 'AdobeClean-Regular.woff2')])
+
+
+def esc(value):
+    return str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+
+def num(value):
+    return f'<span class="n">{esc(f"{value:.3f}".replace(".", ","))}</span>'
+
+
+def render(config, rows):
+    out = DOC.parent / 'truck-components-6-November-2026'
+    source = thumb(Path(config['source']), out / 'source.jpg', 1200)
+    done = [r for r in rows if r.get('measure')]
+    css = fonts() + """:root{--paper:#f7f5ef;--ink:#202b2a;--muted:#5e6b67;--line:#d4dbd3;--accent:#286853;--warn:#9a5a1c}
+ *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:400 18px/1.55 'Adobe Clean';font-synthesis:none}
+ main{max-width:1180px;margin:auto;padding:64px 24px 96px}h1,h2,.n{font-family:'GT Ultra';font-weight:400}h1{font-size:clamp(34px,5vw,56px);line-height:1.1;margin:0 0 24px}
+ h2{font-size:28px;margin:0 0 8px}p{max-width:80ch}img{display:block;width:100%;height:auto;border-radius:10px;background:#ddd}
+ .card{border-top:1px solid var(--line);padding:36px 0}.views{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:12px 0}
+ .meta{color:var(--muted);font-size:15px}.ok{color:var(--accent)}.low{color:var(--warn)}a{color:var(--accent)}
+ @media (max-width:720px){.views{grid-template-columns:1fr 1fr}}"""
+    body = '<h1>Les composants du camion, un par un</h1>'
+    body += ('<p>Chaque pièce visible de la même image du camion est isolée seule dans une conversation ChatGPT, puis dessinée '
+             'en quatre vues. Ce document les rassemble pour servir de référence à la modélisation dans Houdini, pièce par pièce.</p>'
+             '<p>ChatGPT mesure sa planche lui-même et la refait si deux vues ne concordent pas. Les accords affichés ici sont '
+             'remesurés à part sur la planche reçue, avec la même règle, pour ne pas dépendre de ses chiffres. '
+             f'{len(done)} pièces sur {len(rows)} sont arrivées.</p>')
+    body += f'<img alt="Image d’origine du camion" src="{esc(source.relative_to(DOC.parent))}"><p class="meta">Image d’origine, la seule donnée à ChatGPT.</p>'
+    for r in rows:
+        body += f'<section class="card" id="{esc(r["id"])}"><h2>{esc(r["name"])}</h2>'
+        body += f'<p class="meta">{esc(r["component"])}</p>'
+        if r.get('measure'):
+            # 6 November 2026: every isolated view is shown, because the last one is not always the step 2 correction.
+            views = [thumb(HERE / r['id'] / v, out / r['id'] / f'view-{i + 1}.jpg', 600) for i, v in enumerate(r.get('views', []))]
+            sheet = thumb(HERE / r['id'] / r['sheet'], out / r['id'] / 'sheet.jpg', 1100)
+            body += f'<img alt="{esc(r["name"])}, planche quatre vues retenue" src="{esc(sheet.relative_to(DOC.parent))}">'
+            if views:
+                body += '<div class="views">' + ''.join(f'<img alt="{esc(r["name"])}, vue isolée {i + 1}" src="{esc(v.relative_to(DOC.parent))}">' for i, v in enumerate(views)) + '</div>'
+            a = r['measure']['agreements']
+            cls = 'ok' if min(a.values()) >= PASS else 'low'
+            body += (f'<p class="{cls}">Accords remesurés sur la planche : largeur {num(a["width"])}, hauteur {num(a["height"])}, longueur {num(a["length"])}. '
+                     f'Reprises de la planche : <span class="n">{r["retries"]}</span>.</p>')
+        else:
+            body += f'<p class="meta">{esc(r["state"])}.</p>'
+        if r.get('conversation'):
+            body += f'<p class="meta"><a href="{esc(r["conversation"])}">Conversation ChatGPT</a></p>'
+        body += '</section>'
+    body += f'<p class="meta">Pièces laissées de côté : {esc(config["skipped"])}</p>'
+    DOC.write_text('<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                   '<title>Composants du camion</title><style>' + css + '</style><main>' + body + '</main></html>')
+    return DOC
+
+
+def selftest():
+    # Green: a coherent synthetic sheet scores 1 on all three agreements and is classified as a sheet.
+    # Red: the top view stretched in length drops the length agreement under 0.90; a single object is not a sheet.
+    canvas = np.full((800, 800), 120, np.float32)
+    canvas[100:200, 60:340] = 200   # front: width 280, height 100
+    canvas[100:200, 460:700] = 200  # side: length 240, height 100
+    canvas[480:720, 60:340] = 200   # top: width 280, length 240
+    canvas[480:700, 460:700] = 200  # three-quarter
+    good = measure_sheet(canvas)
+    stretched = canvas.copy(); stretched[400:480, 60:340] = 200
+    bad = measure_sheet(stretched)
+    single = np.full((800, 800), 120, np.float32); single[200:600, 200:600] = 200
+    ok = (min(good['agreements'].values()) == 1.0 and bad['agreements']['length'] < PASS and is_sheet(canvas) and not is_sheet(single))
+    assert ok, (good, bad)
+    return {'selftest': 'passed', 'good': good['agreements'], 'stretched': bad['agreements']}
+
+
+if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        print(json.dumps(selftest()))
+    else:
+        config, rows = collect()
+        (HERE / 'summary.json').write_text(json.dumps(rows, indent=1, ensure_ascii=False) + '\n')
+        print(json.dumps({'document': str(render(config, rows)), 'arrived': sum(1 for r in rows if r.get('measure')),
+                          'rows': [(r['id'], r['state'], r.get('measure', {}) and r['measure']['agreements']) for r in rows if r.get('measure')]}, ensure_ascii=False))
