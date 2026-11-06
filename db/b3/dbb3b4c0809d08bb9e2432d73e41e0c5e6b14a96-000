@@ -42,6 +42,9 @@ def extent(mask):
 def is_sheet(pixels):
     # A four-view sheet leaves both centre lines empty and fills all four quadrants.
     h, w = pixels.shape
+    # 6 November 2026: the V4.1 sheet is a square image; wide images mix a large view with four small ones.
+    if not 0.9 <= w / h <= 1.1:
+        return False
     mask = object_mask(pixels)
     # 6 November 2026: a thin band and a 1 % tolerance, because large views often graze the centre lines (wheel).
     band = max(2, int(0.006 * min(w, h)))
@@ -118,6 +121,18 @@ def collect():
     return config, rows
 
 
+def overview(rows, path, cell=300, cols=6):
+    # 6 November 2026: every retained sheet in one picture, the first thing to look at.
+    rows = [r for r in rows if r.get('sheet')]
+    out = Image.new('RGB', (cols * cell, ((len(rows) + cols - 1) // cols) * cell), (247, 245, 239))
+    for i, r in enumerate(rows):
+        im = Image.open(HERE / r['id'] / r['sheet']).convert('RGB'); im.thumbnail((cell - 8, cell - 8))
+        out.paste(im, ((i % cols) * cell + 4, (i // cols) * cell + 4))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.save(path, quality=84)
+    return path
+
+
 def fonts():
     return ''.join("@font-face{font-family:'%s';src:url(data:font/woff2;base64,%s);font-weight:100 900;}" %
                    (name, base64.b64encode((FONTS / file).read_bytes()).decode())
@@ -157,6 +172,8 @@ def render(config, rows):
         cells = ''.join(f'<td class="n {"ok" if a[k] >= PASS else "low"}">{num(a[k])}</td>' for k in ('width', 'height', 'length')) if a else '<td colspan="3" class="meta">en attente</td>'
         body += f'<tr><td><a href="#{esc(r["id"])}">{esc(r["name"])}</a></td>{cells}</tr>'
     body += '</table><p class="meta">Accord : plus petite dimension sur plus grande, entre deux vues qui montrent le même axe. En vert à partir de 0,90.</p>'
+    board = overview(rows, out / 'overview.jpg')
+    body += f'<img alt="Toutes les planches retenues" src="{esc(board.relative_to(DOC.parent))}"><p class="meta">Toutes les planches retenues, dans l’ordre du tableau.</p>'
     for r in rows:
         body += f'<section class="card" id="{esc(r["id"])}"><h2>{esc(r["name"])}</h2>'
         body += f'<p class="meta">{esc(r["component"])}</p>'
@@ -194,7 +211,8 @@ def selftest():
     stretched = canvas.copy(); stretched[400:480, 60:340] = 200
     bad = measure_sheet(stretched)
     single = np.full((800, 800), 120, np.float32); single[200:600, 200:600] = 200
-    ok = (min(good['agreements'].values()) == 1.0 and bad['agreements']['length'] < PASS and is_sheet(canvas) and not is_sheet(single))
+    wide = np.full((800, 1600), 120, np.float32); wide[100:200, 60:340] = 200; wide[100:200, 900:1140] = 200; wide[480:720, 60:340] = 200; wide[480:700, 900:1140] = 200
+    ok = (min(good['agreements'].values()) == 1.0 and bad['agreements']['length'] < PASS and is_sheet(canvas) and not is_sheet(single) and not is_sheet(wide))
     assert ok, (good, bad)
     return {'selftest': 'passed', 'good': good['agreements'], 'stretched': bad['agreements']}
 
