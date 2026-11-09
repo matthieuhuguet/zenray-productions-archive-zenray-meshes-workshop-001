@@ -1,0 +1,180 @@
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 19:20 Europe/Paris: ZenRay Meshes V3 synthesis, built from the measured sources, never typed by hand.
+# FR : synthèse de ZenRay Meshes V3, chiffres relus dans les rapports de mesure ; verify et selftest prouvent les deux sens.
+#
+# Usage: BuildSynthesisV3.py build | verify [html] | selftest
+# build: reads the build reports and board measures, draws the chain schema (1920 x 1080 SVG), embeds the proof board,
+#        writes ../index.html and ../v3-thumbnail.jpg. Every text of the schema is measured with the real Adobe Clean
+#        metrics and must fit its box. verify: recomputes the numbers from the sources and finds each one in the HTML.
+import base64
+import io
+import json
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from PIL import Image, ImageFont
+
+HERE = Path(__file__).resolve().parent
+ART = HERE.parent
+TEST = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/research/v3-test-9-November-2026')
+FONTS = Path('/Users/zenray/.claude/skills/zenray-edit/designs/_shared/fonts')
+OTF = '/Users/zenray/Library/Fonts/AdobeClean-Regular.otf'
+OTF_MEDIUM = '/Users/zenray/Library/Fonts/AdobeClean-Bold.otf'
+W, H = 1920, 1080
+INK, MUTED, LINE, ACCENT, RED, PAPER = '#202b2a', '#5e6b67', '#c9d1c8', '#286853', '#d6392f', '#f7f5ef'
+
+
+def fr(x, d=1):
+    return ('%.*f' % (d, x)).replace('.', ',')
+
+
+def numbers():
+    v002 = json.loads((TEST / 'build' / 'build-report.json').read_text())
+    best = json.loads((TEST / 'loop-V_003' / 'best.build-report.json').read_text())
+    rounds = [json.loads((TEST / 'loop-V_003' / ('round%d.board.json' % r)).read_text()) for r in range(4)]
+    side = [next(iter(b['silhouette_error'].values()))['view-side.side_top'] for b in rounds]
+    final = json.loads(Path(TEST / 'final-board.json').read_text())['silhouette_error']
+    return {
+        'v002_length': fr(v002['v002_params']['length'], 3),
+        'v002_px': fr(final['V002 curseurs']['view-side.side_top']['max_px']),
+        'raw_px': fr(side[0]['max_px']),
+        'raw_length': fr(v002['measured_from_blueprint']['length'], 3),
+        'best_px': fr(min(s['max_px'] for s in side)),
+        'best_mean_px': fr(min(side, key=lambda s: s['max_px'])['mean_px']),
+        'best_length': fr(best['measured_from_blueprint']['length'], 3),
+        'build_s': fr(best['build_seconds'], 2),
+        'quads': fr(100 * best['v3']['quad_share'], 1),
+        'prims': '{:,}'.format(best['v3']['prims']).replace(',', ' '),
+    }
+
+
+def text_width(s, size, bold=False):
+    return ImageFont.truetype(OTF_MEDIUM if bold else OTF, size).getlength(s)
+
+
+class Svg:
+    def __init__(self):
+        self.parts, self.fits = [], []
+
+    def box(self, x, y, w, h, title, lines, dashed=False, fill='#ffffff', stroke=INK):
+        self.parts.append('<rect x="%d" y="%d" width="%d" height="%d" rx="18" fill="%s" stroke="%s" stroke-width="3"%s/>'
+                          % (x, y, w, h, fill, stroke, ' stroke-dasharray="14 10"' if dashed else ''))
+        self.text(x + 26, y + 58, title, 30, INK if not dashed else MUTED, True, w - 52)
+        for i, line in enumerate(lines):
+            self.text(x + 26, y + 108 + i * 40, line, 27, MUTED if dashed else INK, False, w - 52)
+
+    def text(self, x, y, s, size, color, bold=False, max_w=None, anchor='start'):
+        if max_w:
+            self.fits.append((s, round(text_width(s, size, bold)), max_w))
+        self.parts.append('<text x="%d" y="%d" font-size="%d" fill="%s" font-weight="%d" text-anchor="%s">%s</text>'
+                          % (x, y, size, color, 500 if bold else 400, anchor, s))
+
+    def arrow(self, x1, y1, x2, y2, color=INK, dashed=False):
+        self.parts.append('<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s" stroke-width="4" marker-end="url(#a)"%s/>'
+                          % (x1, y1, x2, y2, color, ' stroke-dasharray="12 9"' if dashed else ''))
+
+    def raw(self, s):
+        self.parts.append(s)
+
+    def render(self):
+        return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" role="img" font-family="Adobe Clean">'
+                '<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">'
+                '<path d="M0 0L10 5L0 10z" fill="%s"/></marker></defs><rect width="%d" height="%d" fill="%s"/>%s</svg>'
+                % (W, H, INK, W, H, PAPER, ''.join(self.parts)))
+
+
+def schema(n):
+    s = Svg()
+    s.text(60, 92, 'ZenRay Meshes V3 : une seule chaîne, des photos au composant Houdini', 46, INK, True, 1800)
+    s.text(60, 140, 'Ordre logique de la méthode, chiffres mesurés sur le capot du camion le 9 November 2026', 27, MUTED, False, 1800)
+    steps = [
+        ('Photos calées', ['référence d\'origine', 'caméra 80 mm']),
+        ('Relevé', ['quelques points', 'par courbe clé']),
+        ('Plan SVG en mm', ['photo dessous,', 'édité en architecte']),
+        ('HDA Houdini', ['%s s, %s %% quads' % (n['build_s'], n['quads']), '%s faces' % n['prims']]),
+        ('Juge sur photos', ['fil de fer rouge,', 'écart en pixels']),
+        ('Œil de Matthieu', ['valide ou corrige', 'le plan']),
+    ]
+    bw, bh, gap, x0, y0 = 268, 210, 42, 60, 210
+    for i, (t, lines) in enumerate(steps):
+        x = x0 + i * (bw + gap)
+        s.box(x, y0, bw, bh, t, lines, fill='#ffffff' if i != 2 else '#e6efe9', stroke=INK if i != 2 else ACCENT)
+        if i < len(steps) - 1:
+            s.arrow(x + bw + 4, y0 + bh // 2, x + bw + gap - 6, y0 + bh // 2)
+    # Perspective loop: judge (5th) back to the plan (3rd).
+    xj = x0 + 4 * (bw + gap) + bw // 2; xp = x0 + 2 * (bw + gap) + bw // 2
+    s.raw('<path d="M %d %d C %d %d %d %d %d %d" fill="none" stroke="%s" stroke-width="4" marker-end="url(#a)"/>'
+          % (xj, y0 + bh + 6, xj, y0 + bh + 120, xp, y0 + bh + 120, xp, y0 + bh + 10, ACCENT))
+    s.text((xj + xp) // 2, y0 + bh + 150, 'Correction de perspective : %s px puis %s px au pire, en 2 tours' % (n['raw_px'], n['best_px']), 29, ACCENT, True, 900, 'middle')
+    # Comparison: three hoods on the same photos.
+    s.text(60, 680, 'Le même capot sur les vraies photos', 34, INK, True, 900)
+    rows = [('V002, curseurs réglés sur une image générée', n['v002_px'], n['v002_length'], RED),
+            ('V3, plan brut', n['raw_px'], n['raw_length'], RED),
+            ('V3, plan corrigé', n['best_px'], n['best_length'], ACCENT)]
+    for i, (label, px, length, col) in enumerate(rows):
+        y = 730 + i * 62
+        s.text(60, y + 30, label, 27, INK, False, 560)
+        val = float(px.replace(',', '.'))
+        s.raw('<rect x="640" y="%d" width="%d" height="34" rx="6" fill="%s"/>' % (y + 4, int(val * 22), col))
+        s.text(650 + int(val * 22), y + 30, '%s px, %s m de long' % (px, length), 27, INK, False, 400)
+    # Abandoned paths, dashed and quieter.
+    s.box(1300, 640, 560, 160, 'Images générées', ['déprécié : formes trop lisses,', 'vues qui se contredisent'], dashed=True, fill=PAPER, stroke=MUTED)
+    s.box(1300, 830, 560, 160, 'Sommets ajustés aux masques', ['abandonné : plafond 0,97,', 'surface froissée'], dashed=True, fill=PAPER, stroke=MUTED)
+    return s
+
+
+def build():
+    n = numbers()
+    s = schema(n)
+    over = [f for f in s.fits if f[1] > f[2]]
+    assert not over, 'text overflows its box: %s' % over
+    board = Image.open(TEST / 'board-hood-final.png').convert('RGB')
+    buf = io.BytesIO(); board.save(buf, 'JPEG', quality=88)
+    thumb = board.resize((640, 360), Image.LANCZOS); thumb.save(ART / 'v3-thumbnail.jpg', 'JPEG', quality=85)
+    font = base64.b64encode((FONTS / 'AdobeClean-Regular.woff2').read_bytes()).decode()
+    font_m = base64.b64encode((FONTS / 'AdobeClean-Medium.woff2').read_bytes()).decode()
+    paragraphs = [
+        'ZenRay Meshes sert à reconstruire dans Houdini, sans génération par IA, la géométrie d\'un objet à partir de ses photos de référence, qu\'il s\'agisse d\'une pièce de carrosserie ou d\'une forme organique, de sorte que chaque composant sorte à la bonne taille, avec ses proportions et ses détails, et reste modifiable par curseurs.',
+        'La troisième version ramène des mois d\'essais à une seule chaîne. On relève sur les photos calées quelques courbes clés, qui deviennent un plan vectoriel en millimètres posé sur la photo d\'origine ; ce plan pilote le composant paramétrique dans Houdini, puis le modèle, projeté en fil de fer rouge sur les mêmes photos, est jugé au pixel près, et une correction de perspective remet chaque silhouette dans le plan qui la produit avant que l\'œil ne tranche. Éditer le plan, à la parole ou dans un logiciel de dessin, reconstruit le modèle en %s seconde.' % n['build_s'],
+        'Sur le capot du camion, le capot réglé aux curseurs d\'après une image générée mesurait %s m de long quand les photos en donnent %s m, et sa silhouette s\'écartait de %s pixels ; le capot construit depuis le plan corrigé s\'en écarte de %s pixels au pire et de %s en moyenne. Les planches d\'images générées sont donc abandonnées, et tout l\'existant reste conservé comme bibliothèque.' % (n['v002_length'], n['best_length'], n['v002_px'], n['best_px'], n['best_mean_px']),
+    ]
+    html = ('<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>ZenRay Meshes V3</title><style>'
+            "@font-face{font-family:'Adobe Clean';src:url(data:font/woff2;base64,%s) format('woff2');font-weight:100 450}"
+            "@font-face{font-family:'Adobe Clean';src:url(data:font/woff2;base64,%s) format('woff2');font-weight:451 900}"
+            ':root{--paper:%s;--ink:%s;--text:19px;--width:1120px}*{box-sizing:border-box}'
+            "body{margin:0;background:var(--paper);color:var(--ink);font:400 var(--text)/1.6 'Adobe Clean',sans-serif;font-synthesis:none}"
+            'main{max-width:var(--width);margin:auto;padding:72px 32px 96px}h1{font-weight:500;font-size:clamp(34px,5vw,58px);line-height:1.1;margin:0 0 32px}'
+            'p{max-width:80ch;margin:0 0 20px}figure{margin:40px 0}svg,img{display:block;width:100%%;height:auto;border-radius:10px}'
+            '@media(max-width:680px){main{padding:32px 16px}}</style><main><h1>ZenRay Meshes V3</h1>%s'
+            '<figure>%s</figure><figure><img alt="Le capot du camion en fil de fer rouge sur les photos, quatre colonnes" src="data:image/jpeg;base64,%s"></figure>'
+            '</main></html>') % (font, font_m, PAPER, INK, ''.join('<p>%s</p>' % p for p in paragraphs), s.render(), base64.b64encode(buf.getvalue()).decode())
+    (ART / 'index.html').write_text(html)
+    (HERE / 'v3-chain.svg').write_text(s.render())
+    return {'index': str(ART / 'index.html'), 'bytes': len(html), 'texts_checked': len(s.fits), 'numbers': n}
+
+
+def verify(path=None):
+    html = Path(path or ART / 'index.html').read_text()
+    n = numbers()
+    missing = [k for k, v in n.items() if v not in html]
+    return {'verify': 'green' if not missing else 'red', 'missing': missing}
+
+
+def selftest():
+    good = verify()
+    tmp = Path(tempfile.mkdtemp()) / 'broken.html'
+    shutil.copy(ART / 'index.html', tmp)
+    n = numbers()
+    tmp.write_text(tmp.read_text().replace(n['best_px'] + ' px', '9,9 px').replace(n['best_px'] + ' pixels', '9,9 pixels'))
+    bad = verify(tmp)
+    assert good['verify'] == 'green' and bad['verify'] == 'red', (good, bad)
+    return {'selftest': 'passed', 'true_copy': good['verify'], 'broken_copy': bad['verify'], 'broken_missing': bad['missing']}
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'build'
+    print(json.dumps({'build': build, 'verify': lambda: verify(sys.argv[2] if len(sys.argv) > 2 else None), 'selftest': selftest}[cmd](), ensure_ascii=False))
