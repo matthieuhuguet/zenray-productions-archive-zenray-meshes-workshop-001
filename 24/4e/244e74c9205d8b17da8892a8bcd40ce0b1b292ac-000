@@ -1,0 +1,185 @@
+# Lecteur A : sections 1 à 128
+
+Périmètre : lecture intégrale de `/Users/zenray/.claude/skills/zenray-meshes/references/ZenRayMeshes1.md` jusqu'à la fin de la section 128 (journal du 25 au 27 October 2026). Chiffres repris tels qu'écrits. Les numéros renvoient aux sections.
+
+## Méthodes
+
+### 1. Banc à six vues et scores (`Bench.py`)
+- Cible : les deux (calibration).
+- Fait : six vues orthographiques à même échelle ; score 3D (F-score 0,5, 1, 2 %, Chamfer, IoU) ; score cible `iscore` (normales à 10 degrés, cible 0,999).
+- Où : §3, §8 ; `Scripts/Bench.py`, `benchmark/gt/`.
+- Preuves : enveloppe des silhouettes IoU 0,998 pour un score 3D de 0,55 à 0,68 (§3) ; corrélation des scores 0,69 (§8).
+- Verdict : MARCHE (mesure). « Un score de silhouette seul ne valide jamais rien » (§3).
+
+### 2. Méthodes volumiques M00 à M10
+- Cible : organique (arche, eucalyptus, lys, Manny).
+- Fait : oracle de profondeur (M00), gonflage d'une vue (M01), enveloppe puis creusement (M02 à M04), échelles par synthèse (M08) ou par nuages (M09), fusion TSDF (M10).
+- Où : §4, §8, §10, §11.
+- Preuves : M02 Manny 0,609 / 0,824 (§4) ; M08 Manny 0,994 / 0,998 mais lys 0,683 / 0,888 (§10) ; M09 échelles à 0,4 à 4,5 % sur le lys, creusement eucalyptus 0,435 (§10).
+- Verdict : M01, M03, M04 ÉCHEC ; M02 PARTIEL (« socle grossier, plafonné par les creux ») ; M08 ÉCHEC (« aucun objectif ne marche sur les quatre ») ; M09 PARTIEL ; M10 ÉCARTÉE. Volumes ensuite « MESURES intermédiaires » (§11), écartés comme construction (§21).
+
+### 3. Normal maps et optimisation des sommets (M05, M12, M12c)
+- Cible : les deux.
+- Fait : M05 intègre les normal maps par vue ; M12 déplace les sommets vers les normales (trois formulations) ; M12c rendu différentiable Mitsuba (`Scripts/DiffOpt.py`).
+- Où : §4, §9, §10.
+- Preuves : M05 arche 0,774 / 0,897, Manny 0,594 / 0,690 (§4) ; M12 Manny 0,557, puis 0,650 à 5 itérations, puis 0,550 à 40 (§9) ; M12c Manny 0,539 puis 0,594 (§10).
+- Verdict : M05 PARTIEL (« prometteuse », faux sur Manny) ; M12 ÉCHEC (« les cibles des six vues se contredisent ») ; M12c PARTIEL (« gardée pour l'affinage final, pas comme moteur »).
+
+### 4. Mesure et calage de la planche (SheetSplit, SheetFit, SheetHull, SheetScore, FitScale, `Raster.py`)
+- Cible : les deux, depuis une planche générée.
+- Fait : découpe des six vues, masques, échelle commune, plafond d'enveloppe, score contre la planche ; recalages par symétrie, centre et échelle globale (§14) ; ombre portée retirée (`shadow_drop=1`, §43). Rastériseur GPU : 1,2 s par maillage (§9).
+- Où : §9, §12, §14, §43.
+- Preuves : voiture à 1,5 % de résidu, cheval à 3 % sur quatre vues et 8 à 13 % sur dessus et dessous (§12) ; résidu moyen 0,76 % → 0,61 % après retrait de l'ombre (§43) ; rastériseur, recouvrement 0,9999 (§9).
+- Verdict : MARCHE (mesure). Le contrôle miroir du cheval (0,54 et 0,64) désigne une planche incohérente (§12).
+
+### 5. Plafonds de cohérence (enveloppe symétrisée, plafond de symétrie)
+- Cible : symétrique (voiture).
+- Fait : cible = enveloppe visuelle plus son miroir (`HullScore.py`, `frame_hull`) ; plafond de symétrie `(A+B)/(A+2B)`.
+- Où : §16, §19.
+- Preuves : plafond de symétrie, dessus 0,985, dessous 0,979 (§16) ; enveloppe lissée 0,993 face, 0,999 côtés (§19).
+- Verdict : MARCHE comme cible (« RÈGLE GÉNÉRIQUE 6 »).
+
+### 6. Cage à stations puis loft de rangées en B-spline (ArchetypeCar, RowLoft)
+- Cible : hard surface (voiture).
+- Fait : cage de 32 stations × 16 points, 496 quads (§13) ; puis chaque ligne de caractère en B-spline cubique, un nœud tous les 0,9 m (§42).
+- Où : §13, §18, §20, §34, §35, §42, §44.
+- Preuves : silhouette moyenne 0,941 pour un plafond de 0,960 (§13) ; 0,9761 contre l'enveloppe (§18) ; v170, « première caisse propre », silhouette 0,9515, lignes 0,613 (§44) ; inflexions de 20 à 35 par rangée ramenées à 0 à 3 (§42).
+- Verdict : PARTIEL pour la cage et pour le loft sur cage « lissée » (« drap plissé », §34) ; MARCHE pour le loft en B-spline (§42).
+
+### 7. Compensation et ajustement de silhouette (CageComp, SilFit, SubdivMatrix, ArchetypeFit, TreeFit)
+- Fait : apprend contre la mesure les décalages de toit, de largeur et d'extrémités ; surface subdivisée = S × cage (`SubdivMatrix.py`) ; contour poussé vers l'enveloppe (`SilFit.py`) ; recherche par coordonnées sur les règles (`ArchetypeFit.py`, `TreeFit.py`).
+- Où : §14, §16, §19, §20, §21, §26, §37, §45, §51.
+- Preuves : voiture 0,9561 (§14) ; après quatre tours, largeur 2,6 mm, toit 4,5 mm, épaules 12 mm (§16) ; S × P contre P_sub, 0,4 micromètre sur 38 786 points (§19) ; SilFit 0,9847 à 100 tours (§20).
+- Verdict : SubdivMatrix GARDÉ comme outil de réglage. CageComp PARTIEL : `learn_fy` coupé faute de convergence (§45) ; relancé sans sauvegarde, il a réécrit des décalages (§51). SilFit ÉCARTÉ comme construction : « voiture écrasée, sans pièces » (§21).
+
+### 8. Feuille de composants et courbes guides (feuille v1, décalque, LineTrace, GradientProfile, ShapeGen)
+- Cible : hard surface.
+- Fait : feuille de 44 groupes (environ 70 pièces) soumise à validation (§21) ; courbes décalquées depuis contours et zooms (`DesignCurves.py`) ; relevé au gradient (`LineTrace.py`, `GradientProfile.py`) ; générateur déterministe (`ShapeGen.py`).
+- Où : §21, §22, §23, §45, §55, §59.
+- Preuves : 28 panneaux nommés (§23) ; 66 composants nommés (§24) ; courbes « décalées de 1 à 2,5 cm », retracées (§45).
+- Verdict : MARCHE pour le décalque et le relevé. Feuille v1 « EN ATTENTE DE VALIDATION » (§21), suite non consignée. ShapeGen : non mesuré.
+
+### 9. Pièces construites sur la surface (TrimBuild, ChassisBuild, CarCuts, CarPanels, WheelBuild, NoseFacets, TailFace)
+- Fait : garnitures posées sur la surface, plaques et nervures du dessous, ouvertures par panneau sémantique, joints rainurés seulement entre deux panneaux, roues en révolution, nez en bandes planes, poupe en super-ellipse.
+- Où : §24, §25, §29, §36, §38, §40, §42, §43, §50, §54, §68, §70.
+- Preuves : une ouverture géométrique « avait percé le capot » (§25) ; nez, IoU 0,953 stable, « le gain est dans les lignes » (§29) ; poupe, lignes 0,634 → 0,645 (§40) ; dessous 0,698 → 0,713 (§50) ; roues seules, topologie 0,838 → 0,9974 (§68) ; châssis seul 0,366 → 0,988 (§70).
+- Verdict : MARCHE (ouvertures sémantiques, nez, poupe, roues, châssis). ÉCHEC : boîtes droites des garnitures (§24) ; 49 tubes de lignes posés hors surface, retirés, score 0,676 → 0,613, « chiffre honnête » (§42).
+
+### 10. Passages de roue, bombement et doublure (ArchBuild, champ `bulge`, CarLiner, LinerRecess)
+- Fait : passages découpés dans la construction, évasement en anneau, champ de bombement lisse, doublure derrière les joints, recul de la doublure autour des portes.
+- Où : §31, §41, §43, §45, §70, §124, §128.
+- Preuves : passage avant net, lignes 0,628 → 0,637 (§41) ; doublure, IoU brute 0,9608 → 0,9617 (§45) ; 463 et 498 traversées de la doublure dans les portes (§128) ; recul de 43,59 mm au maximum, « le reste est considérable et n'est pas corrigé » (§128) ; anneau d'arche 6,10 % pour une limite de 5 % (§124, §128).
+- Verdict : PARTIEL. Anneau concentrique : le dataset vidéo le contredit (§74, §107) ; essais en bande et en patch rejetés (§74).
+
+### 11. Juge de topologie, relecture et complétion (TopoCheck, TopoFix, AnimReview, ComponentScore, Audit.sh, TopoAudit.sh)
+- Cible : les deux.
+- Fait : juge des quads, n-gones, fissures, non-manifold, pôles, plis, densité ; réparation par pièce ; relecture de 21 portes PASS/FAIL ; complétion par composant.
+- Où : §47, §68, §70, §73 à §77, §86, §124.
+- Preuves : auto-test vert sur un tore (1,0), rouge sur sept défauts injectés (§68) ; relecture 9/20 (§73), 15/21 (§73), 17/21 (§75), 19/21 (§86), 20/21 (§124) ; complétion moyenne 84,3 % sur 39 composants (§76) ; montant B de 59 % à 80 % (§77).
+- Verdict : MARCHE. Le juge se teste dans les deux sens (§66, §68). La règle des pôles sur arête vive revient à Matthieu (§107).
+
+### 12. Chaîne de livraison sans Houdini (FloorRemesh, PlanarizeQuads, RelaxQuads, CleanChain, HillClimb)
+- Fait : plancher caché rebâti en nappe de quads (§118) ; mise à plat, lissage tangent, glissement sur les plis, régularisation des coins, recherche aléatoire ; chaque étape sous garde face par face (§120 à §124).
+- Où : §118 à §124, §127 ; `CleanChain.sh`, `scripts/*.py`.
+- Preuves : fautes absolues 5 566 (v470) → 3 910 (v472) → 3 195 (v477) → 2 698 (v478) → 2 503 (v479) → 2 387 (v480) → 1 919 (v482) ; visibles 1,94 % (limite 2). Silhouette annoncée 0,9696 en §118 à §124, mesurée avant nettoyage ; la livraison v482 donne 0,9693 (§127).
+- Verdict : MARCHE, avec garde. ÉCHECS partiels : `RingRelax` rejeté, anneau 12,59 → 12,49 (§104) ; recherche sans symétrie (v481), 17 portes sur 21 (§124).
+
+### 13. Bouchons et retopologie locale (quad_caps, cap_dome, cap_ladder, split5, TWIST, booléens retirés)
+- Fait : bout ouvert fermé par patch de Coons en dôme ; quads gauchis coupés en triangles au nez ; capot et coffre fermés par `cap_ladder` ; booléens Houdini retirés des pièces finies.
+- Où : §71, §74, §80, §115 ; `TreeBuild.py`, `TopoFix.py`.
+- Preuves : arbre w43 → w45, faces dégénérées 2 560 → 0, score sans faute 0,840 → 0,929 (§115) ; nez, composant 4 de 59 % à 74 % (§80) ; voiture, 0 arête non-manifold après retrait du booléen du nez (§71).
+- Verdict : MARCHE. « Aucun Boolean SOP de Houdini sur une pièce finie » (§71, règle). Le `TWIST` appliqué à la queue est REJETÉ (§80).
+
+### 14. Arbre par étages, mesure par composant (ComponentScore --obj tree, STAGED)
+- Fait : tronc, membres, branches, feuillage, chaque étage mesuré par ses composants, les étages précédents gelés (§89, §90).
+- Où : §89, §90, §91, §108.
+- Preuves : v15 racines 79 %, tronc 92 %, membres 43 %, branches 9 %, brindilles 2 % (§90) ; v35 racines 86, tronc 93, limbes 64, branches 66, feuillage 55, 78, 82 % (§108).
+- Verdict : MARCHE, cadre demandé par Matthieu (§89). Le réglage en bloc qui le précédait est ÉCARTÉ (§91).
+
+### 15. Tronc par contour (TrunkScore, TrunkFit)
+- Fait : x(y), z(y) et rayon médian ajustés sur les quatre vues, bord ligne par ligne.
+- Où : §92, §96.
+- Preuves : erreur médiane de contour 10,9 cm puis 9,1 cm ; les vues se contredisent de ±7 à 10 cm, « aucun modèle ne peut passer sous ce plancher » (§92) ; tronc 94 % (§96).
+- Verdict : MARCHE ; tronc gelé à v17.
+
+### 16. Colonisation de charpentières et touffes de feuillage (TreeGrow, TreeBuild, clump_src=evidence)
+- Fait : charpentières par colonisation d'espace ; feuillage en touffes de cartes quads, sculptées par l'évidence de bois.
+- Où : §15, §16, §83, §85, §88.
+- Preuves : v1 0,767 et v2 0,815 pour un plafond d'environ 0,87 (§15) ; réel 0,616 → 0,70, synthétique 0,742 → 0,80 (§85) ; conifère : règles v14 F 0,832, règles apprises sur le feuillu F 0,525 (§88).
+- Verdict : PARTIEL. Les règles « se règlent par instance » (§88).
+
+### 17. Squelette d'évidence et hybride (WoodSkeleton, limb_src=skeleton / both)
+- Fait : squelette 3D des voxels de bois ; hybride : squelette pour les premiers nœuds, puis colonisation.
+- Où : §83, §87, §94.
+- Preuves : squelette seul, rappel 3D du bois 0,06 (§87) ; hybride : 2D 0,783, rappel 3D 0,79, précision 0,57, chamfer 0,247 m (§87) ; « tronçons épais isolés » qui sortent « comme des saucisses » (§94).
+- Verdict : squelette seul ÉCHEC ; générateur de membres par évidence ÉCARTÉ (§94) ; hybride PARTIEL. Classes binaires de couleur (WoodMask, Evidence3D) ÉCARTÉES comme cible, « une région binaire n'a ni opacité ni relief » (§91).
+
+### 18. Feuillage (leaf_shape, leaf_hang, leaf_tip_w)
+- Où : §102, §110, §115.
+- Preuves : cartes carrées, 1 800 touffes, IoU 0,788 ; feuilles de 0,8 m, 2 400 touffes, IoU 0,774 « (choisi) » (§102) ; `leaf_hang` 0,4 : IoU 0,808 (§110) ; feuilles dégénérées 12 540 → 0 (§115).
+- Verdict : PARTIEL. Pourquoi 0,774 est retenu face à 0,788 : pas clair.
+
+### 19. Ordres procéduraux des branches (TreeWP, WpFit, accord visible)
+- Fait : trois ordres décrits par quelques nombres ; réglage contre l'accord visible opaque ; objectif rayons X écarté (§98).
+- Où : §94 à §100.
+- Preuves : sur `tree_wp1` (vérité connue), F 3D 0,849 (défauts), 0,708 (rayons X), 0,878 (accord visible) (§99) ; ordre 1, rayons X 0,499 → 0,65 (§95) ; ordres 2 et 3 presque immobiles sur l'arbre réel (§100).
+- Verdict : PARTIEL. Validé sur une instance de même famille ; « la vérité n'est pas unique » (§99).
+
+### 20. Banc de crêtes et tournoi des branches (BranchLab, BranchMethods m01 à m20)
+- Fait : cartes de crêtes douces, juge F et G avec budget de longueur ; m20 : chemins minimaux depuis le tronc, limbes puis branches ; une spline par branche entière (§111).
+- Où : §101, §102, §104, §111, §113, §114.
+- Preuves : m20 G 0,52 contre 0,19 pour la grammaire (arbre réel, §101) ; `tree_syn` G 0,26 contre 0,11 (§102) ; branches sans pli de plus de 25 degrés, 33 % → 85 % (§111) ; m15 rejeté, gain 2D non transmis en 3D (§104).
+- Verdict : MARCHE (m20, recette `tau1=0.3 sub1=4 tau2=0.2 sub2=4.5 avg2=0.25 tol=0.08`). Rayons : branches mesurées à 0,080 m contre 0,090 au modèle (§113), « plausibles, pas mesurés à mieux qu'un facteur 2 » (§114).
+
+### 21. Chaînes de commande et lecture de vidéos par Haiku
+- Fait : `BuildCar.sh`, `CarTry.sh`, `Audit.sh` (voiture, environ une minute et demie, §57) ; `TreeFromSheet.sh` (arbre, 15 s, §105) ; `TreeIter.sh` (score de bois, environ 8 s, §94). Agent Haiku pour lire des vidéos de référence (§74, §75).
+- Preuves : quatre instances, même recette : composants 0,75 (réel), 0,80 (tree_syn), 0,75 (tree_wp1), 0,61 (tree_con) (§105) ; 163 et 343 appels d'outil, environ 440 000 jetons (§75).
+- Verdict : MARCHE pour les chaînes. Défaut : `TreeFromSheet.sh` rend le code 0 même si une étape échoue (§116). Haiku : PARTIEL, « Haiku 5.5 effort max seulement, borné », jamais Sonnet ni Opus pour des images (§73).
+
+### 22. Outils de diagnostic
+- Fait : `ViewBlame` (pièces fautives, §27), `ProfileGap` (§26), `LineScore` (traits, §35), `LineGaps`, `LineTrace`, `RowOverlay` (§45), `TwistCheck` (§46), `ShapeCheck` (§42), `RegionCensus` (§41), `GradientProfile` (§59), rendus de contrôle `CompareFace`, `SheetBoard`, `CleanView`.
+- Preuves : `GradientProfile` retrouve les mesures de la nuit et refuse un balayage absent (§59) ; LineScore 0,784 à un seuil de 0,12, 0,797 à 0,05 (§46).
+- Verdict : MARCHE. Un gain de `LineScore` ne compte que si le rendu reste crédible ; « l'œil a un droit de veto » (§41).
+
+## Règles et verdicts de Matthieu
+
+- §1 : créer un modèle 3D depuis une image « sans IA », cible 99,9 % contre la planche six vues ; méthodologie d'abord, au moins 16 méthodes.
+- §11 : « mon logiciel doit créer uniquement des modèles dont la topologie est ultra propre, pour ensuite pouvoir la découper en UV ».
+- §13 (condensé) : reproduire une silhouette à 0,94 avec une grille « n'est pas le but » ; dataset d'archétypes, puis affinage par composant.
+- §21 : « arrête d'essayer de faire des effets de nuage pour obtenir l'objet » ; feuille de composants validée avant la construction.
+- §42 : « finir au moins un seul component propre, et ensuite tu itères ».
+- §66 : la retopologie est un outil de l'algorithme, topologie « prêt à texturer » ; UV et texture hors périmètre.
+- §89 : penser comme SpeedTree, tronc, puis branches, puis feuilles.
+- §91 : les masques de couleurs « ne marcheront jamais » ; semi-opacités ; « le tronc est le plus important ».
+- §101 : « les branches que tu as dessinées, ce n'est pas du tout les bonnes, c'est un contour ; rerun la méthodologie ».
+- §111 : les feuilles uniquement en dernier.
+- §116 : « en cas de doute sur "quel arbre", demander avant de lancer un agent ».
+- §125 : composants séparés « à la manière de Transformers », guides NURBS d'abord ; retrait et repose à 0,01 mm.
+- §126 : Houdini toujours ouvert, MCP avant Python en éditeur fermé.
+- §73 (règle d'agents) : jamais Sonnet ou Opus pour lire des images.
+
+## Décisions contredites ou remplacées plus tard dans ces sections
+
+- §5 : planche en normal map comme « levier », aucune suite mesurée jusqu'à §128 (statut pas clair).
+- §8 à §10 : la « méthode retenue » (normal map, profondeur, M09) est remplacée par §11.
+- §12 et §14 : critère « 0,999 fois le plafond », remplacé par la cible symétrisée (§16), puis par la feuille de composants (§21).
+- §19 et §20 présentaient SilFit comme progrès ; §21 l'écarte comme méthode de construction.
+- §14 : bridage des roues par la caisse, « ABANDONNÉE » (§18).
+- `TAIL_ON` : défaut 0 (§32), 1 (§34), 0 (§35), 1 (§39, §40).
+- §34 : cage « fair » en loft comme défaut ; remplacée par la B-spline (§42).
+- §96 (cartes croisées) et §102 (feuilles lancéolées) : §110 retient `leaf_hang` 0,4.
+- §118 à §124 : silhouette 0,9696, traits 0,887 et 0,810 mesurés avant nettoyage ; §127 donne pour la livraison v482 : silhouette 0,9693, brute 0,9679, traits 0,884, normales seules 0,804. À corriger partout.
+- §107 : anneau concentrique « non écrit » à cause du dataset.
+
+## Points ouverts
+
+- Anneau d'arche de la voiture à 6,10 % pour une limite de 5 % (§124, §128). Pistes : chirurgie de pôles, ou décision de Matthieu sur l'exemption des fins de boucle (§107, §115 : 5,0 % des fautes).
+- Validation de la feuille de composants v1 par Matthieu : jamais consignée (§21).
+- Définition du 99,9 % (tolérance d'angle, part des pixels) à fixer avec Matthieu (§9).
+- Générateur d'images : produit-il des normal maps et profondeurs cohérentes entre vues ? Non testé (§10). Planches contradictoires, épaule à 3 à 5 cm (§45), pare-brise à 4 cm (§52).
+- Précision 3D de m20 sur `tree_syn` : 0,63 (§102), 0,36 (§104), 0,473 (§114). Non alignées, pas clair laquelle fait foi.
+- Dataset des arbres : « n = 1 arbre réel » (§111) ; précision 3D des limbes extérieurs faible (§102, §105).
+- Chaîne GuidePanel : reconstruction complète et généralité sur une seconde instance non prouvées (§127, §128).
+- Anomalies de v470 relevées par l'agent Haiku, non recoupées : 11 256 arêtes à une face, 376 groupes de points superposés (§116).
+- `ComponentScore.py`, mode voiture : lit `work/car/` en dur, écart à « aucun littéral d'instance » (§84).
+- Conifère : essai supprimé (§116). Rayures d'ombrage des feuilles : piste non faite (§115).
