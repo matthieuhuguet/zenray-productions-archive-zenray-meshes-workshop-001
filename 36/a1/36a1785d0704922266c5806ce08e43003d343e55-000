@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+# 10 November 2026: a crop of one reference view, enlarged, with the plan drawn over it (edges white, names).
+# usage: lookplan.py <version> <view> <u0,v0,u1,v1 in view px> <out.png> [scale] [faces to keep, comma separated]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4')
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import ViewGraph as VG
+ver = int(sys.argv[1]); view = sys.argv[2]; u0, v0, u1, v1 = [float(x) for x in sys.argv[3].split(',')]; out = sys.argv[4]
+k = float(sys.argv[5]) if len(sys.argv) > 5 else 4.0; keep = set(sys.argv[6].split(',')) if len(sys.argv) > 6 else None
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); m = VG.vmap(frame, view)
+solved = json.load(open('02_solved/V_%03d/cage.solved.json' % ver))
+rgb = Image.open('%s/%s_rgb.png' % (proj['views'], VG.FILES[view])).convert('RGB')
+crop = rgb.crop((int(u0), int(v0), int(u1), int(v1))).resize((int((u1 - u0) * k), int((v1 - v0) * k)), Image.LANCZOS)
+crop = Image.eval(crop, lambda x: int(x * 0.75)); d = ImageDraw.Draw(crop)
+try:
+    font = ImageFont.truetype('/Users/zenray/Library/Fonts/AdobeClean-Regular.otf', 15)
+except Exception:
+    font = ImageFont.load_default()
+def uv(P):
+    q = VG.to_view(m, np.atleast_2d(np.asarray(P, float))); return (q - np.array([u0, v0])) * k
+names = set()
+if keep:
+    for f in keep:
+        names |= {n.lstrip('~') for n in solved['faces'][f]['loop']}
+for key, poly in solved['edges'].items():
+    a, b = key.split('|')
+    if keep and not (a in names and b in names):
+        continue
+    p = uv(poly); d.line([tuple(x) for x in p], fill=(255, 255, 255), width=1)
+for n, P in solved['vertices'].items():
+    if keep and n not in names:
+        continue
+    x, y = uv(P)[0]
+    if 0 <= x < crop.width and 0 <= y < crop.height:
+        d.ellipse([x - 3, y - 3, x + 3, y + 3], outline=(255, 255, 0)); d.text((x + 5, y - 16), n, fill=(255, 255, 0), font=font)
+crop.save(out); print(out, crop.size)
