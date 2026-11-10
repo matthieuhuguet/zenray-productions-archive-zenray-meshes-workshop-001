@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+# 10 November 2026: which part borders of the model sit off the drawn lines, per pair of parts and per view
+# (the cost of gate F3), and how long each border is. usage: borders.py <version> [view,view] [n]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4'); sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v3')
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+import MeshViews as MV, MaskJudge as MJ, ViewGraph as VG
+ver = int(sys.argv[1]); views = sys.argv[2].split(',') if len(sys.argv) > 2 else list(VG.VIEWS); top = int(sys.argv[3]) if len(sys.argv) > 3 else 12
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); views_dir = proj['views']
+parts = MV.load('03_mesh/V_%03d/car.npz' % ver); names = [p[0] for p in parts]
+for v in views:
+    ref = Image.open('%s/%s_rgb.png' % (views_dir, VG.FILES[v])); W, H = ref.width * VG.S, ref.height * VG.S
+    buf, V, Q, pid, uv, right, up, toward = MV.sheet_view(parts, frame, v, (H, W)); sil = buf >= 0
+    lab = np.where(sil, pid[np.maximum(buf, 0)], -1).astype(np.int32)
+    edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]; inner = MJ.drawn_lines(views_dir, v)[2]
+    h, w = edges.shape; S = VG.S
+    d_l = ndi.distance_transform_edt(~edges); cost = {}; length = {}
+    mn = ndi.minimum_filter(lab, 3); mx = ndi.maximum_filter(lab, 3); b = (mn != mx) & (mn >= 0)
+    ys, xs = np.nonzero(b)
+    for y, x in zip(ys[::2], xs[::2]):
+        yy, xx = min(y // S, h - 1), min(x // S, w - 1)
+        if not inner[yy, xx]:
+            continue
+        a_, b_ = names[mn[y, x]], names[mx[y, x]]
+        key = tuple(sorted((a_.replace('CAR_', ''), b_.replace('CAR_', ''))))
+        length[key] = length.get(key, 0) + 1
+        if d_l[yy, xx] > MJ.TOL:
+            cost[key] = cost.get(key, 0) + 1
+    tot = sum(cost.values()); allb = sum(length.values())
+    print('%s: %d border samples, %d off a line (%.0f%%)' % (v, allb, tot, 100.0 * tot / max(allb, 1)))
+    for key, c in sorted(cost.items(), key=lambda kv: -kv[1])[:top]:
+        print('    %-44s off %5d of %5d (%.0f%% of the border, %.1f%% of the view cost)' % (' | '.join(key), c, length[key], 100.0 * c / length[key], 100.0 * c / max(tot, 1)))
