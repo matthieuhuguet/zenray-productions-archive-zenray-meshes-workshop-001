@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+# 10 November 2026, 08:00: the to-do list of the line gates (F2, F3), in numbers instead of by eye. For every view, the
+# longest drawn lines the model does not find and the longest borders of the model that rest on no drawn line, judged
+# like MeshQA.fidelity (consensus of the sheet). Boxes are given in sheet px (the unit of the plan).
+# usage: missing.py <version> [view,view] [n] [save_dir]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4'); sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v3')
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+import MeshViews as MV, MaskJudge as MJ, ViewGraph as VG, MeshQA as QA
+ver = int(sys.argv[1]); views = sys.argv[2].split(',') if len(sys.argv) > 2 and sys.argv[2] != 'all' else list(VG.VIEWS)
+top = int(sys.argv[3]) if len(sys.argv) > 3 else 10; save = sys.argv[4] if len(sys.argv) > 4 else None
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); views_dir = proj['views']
+parts = MV.load('03_mesh/V_%03d/car.npz' % ver); names = [p[0].replace('CAR_', '') for p in parts]
+opposite = {'left': 'right', 'right': 'left'}; S = VG.S
+ref_lines = {v: (MJ.drawn_lines(views_dir, v)[0], MJ.drawn_lines(views_dir, v, with_edges=True)[0]) for v in VG.VIEWS}
+
+
+def carried(img, m_src, m_dst, shape, mirror):
+    ys, xs = np.nonzero(img); o = np.zeros(shape, bool)
+    if len(xs) == 0:
+        return o
+    wd = VG.to_world(m_src, xs + 0.5, ys + 0.5); X = np.zeros((len(xs), 3))
+    for k, val in wd.items():
+        X[:, k] = val
+    if mirror:
+        X[:, 0] *= -1.0
+    uv = VG.to_view(m_dst, X); iu = np.floor(uv[:, 0]).astype(int); iv = np.floor(uv[:, 1]).astype(int)
+    ok = (iu >= 0) & (iu < shape[1]) & (iv >= 0) & (iv < shape[0]); o[iv[ok], iu[ok]] = True
+    return o
+
+
+for v in views:
+    ref = Image.open('%s/%s_rgb.png' % (views_dir, VG.FILES[v])); W, H = ref.width * S, ref.height * S
+    buf, V, Q, pid, uv, right, up, toward = MV.sheet_view(parts, frame, v, (H, W)); sil = buf >= 0
+    labels = np.where(sil, pid[np.maximum(buf, 0)], -1).astype(np.int32)
+    wheel = np.array([('wheel' in p[0]) for p in parts]); axle = np.array([hash(p[0].rsplit('_', 1)[-1]) % 1000 + 5000 for p in parts])
+    lab2 = np.where(sil & wheel[np.maximum(labels, 0)], axle[np.maximum(labels, 0)], labels)
+    wmask = ndi.binary_dilation(sil & wheel[np.maximum(labels, 0)], iterations=6)
+    line, _, inner = MJ.drawn_lines(views_dir, v); edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]
+    bd = MJ.borders_view(lab2); h, w = min(line.shape[0], bd.shape[0]), min(line.shape[1], bd.shape[1])
+    wm = wmask[:h * S, :w * S].reshape(h, S, w, S).any(axis=(1, 3))
+    line, edges, bd = line[:h, :w] & ~wm, edges[:h, :w], bd[:h, :w] & inner[:h, :w] & ~wm
+    d_b = ndi.distance_transform_edt(~bd); d_l = ndi.distance_transform_edt(~edges)
+    m_v = VG.vmap(frame, v); src = opposite.get(v, v); m_s = VG.vmap(frame, src); mirror = v not in opposite
+    alt_l = carried(ref_lines[src][0], m_s, m_v, (h, w), mirror); alt_e = carried(ref_lines[src][1], m_s, m_v, (h, w), mirror)
+    hit = alt_l & (d_b <= MJ.TOL); d_hit = ndi.distance_transform_edt(~hit) if hit.any() else np.full((h, w), 1e9)
+    d_any = ndi.distance_transform_edt(~(edges | alt_e))
+    miss = line & (d_b > MJ.TOL) & (d_hit > QA.LIM['pair_px']); false = bd & (d_any > MJ.TOL)
+    print('%s: lines %d px, not found %d (recall %.4f) | borders %d px, on no line %d (precision %.4f)' % (v, line.sum(), miss.sum(), 1 - miss.sum() / max(line.sum(), 1), bd.sum(), false.sum(), 1 - false.sum() / max(bd.sum(), 1)))
+    # the part pair of every border pixel (labels of the 3x3 working block around the view pixel)
+    lab_v = lab2[:h * S, :w * S].reshape(h, S, w, S)
+    lo = np.where(lab_v >= 0, lab_v, 10 ** 9).min(axis=(1, 3)); hi = lab_v.max(axis=(1, 3))
+    lo = ndi.minimum_filter(lo, 3); hi = ndi.maximum_filter(hi, 3)
+
+    def nm(i):
+        return 'none' if i < 0 or i >= 10 ** 9 else ('wheel' if i >= 5000 else names[i])
+    for title, mask, pairs in (('lines not found', miss, False), ('borders on no line', false, True)):
+        lab, n = ndi.label(ndi.binary_dilation(mask, iterations=2)); lab = np.where(mask, lab, 0)
+        sizes = np.bincount(lab.ravel())[1:] if n else np.array([])
+        order = np.argsort(-sizes)[:top]
+        print('  %s (longest first; box in sheet px u0,v0,u1,v1):' % title)
+        for k in order:
+            ys, xs = np.nonzero(lab == k + 1)
+            extra = ''
+            if pairs:
+                cnt = {}
+                for y, x in zip(ys, xs):
+                    key = tuple(sorted((nm(lo[y, x]), nm(hi[y, x])))); cnt[key] = cnt.get(key, 0) + 1
+                extra = '  ' + ', '.join('%s|%s %d' % (a, b, c) for (a, b), c in sorted(cnt.items(), key=lambda kv: -kv[1])[:2])
+            print('    %4d px  box %4d,%4d,%4d,%4d  (%.1f%% of the loss)%s' % (sizes[k], xs.min() * S, ys.min() * S, (xs.max() + 1) * S, (ys.max() + 1) * S, 100.0 * sizes[k] / max(mask.sum(), 1), extra))
+    if save:
+        img = np.asarray(ref.convert('L'))[:h, :w].astype(float) * 0.42 + 46
+        img[miss] = 255; img[false] = 0
+        Image.fromarray(img.astype(np.uint8)).resize((w * 3, h * 3), Image.NEAREST).save('%s/consensus_%s.png' % (save, v))

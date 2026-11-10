@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+# 10 November 2026, 08:10: one place of one view, enlarged, in three grey panels: the drawing, its traced lines (white)
+# with the borders of the model over them (black), and the parts of the model (one grey per part, listed on stdout).
+# usage: lookdiag.py <version> <view> <u0,v0,u1,v1 sheet px> <out.png> [scale]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4'); sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v3')
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+import MeshViews as MV, MaskJudge as MJ, ViewGraph as VG
+ver = int(sys.argv[1]); v = sys.argv[2]; u0, v0, u1, v1 = [int(float(x)) for x in sys.argv[3].split(',')]; out = sys.argv[4]; k = int(sys.argv[5]) if len(sys.argv) > 5 else 4
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); views_dir = proj['views']; S = VG.S
+parts = MV.load('03_mesh/V_%03d/car.npz' % ver); names = [p[0].replace('CAR_', '') for p in parts]
+ref = Image.open('%s/%s_rgb.png' % (views_dir, VG.FILES[v])); W, H = ref.width * S, ref.height * S
+buf, V, Q, pid, uv, right, up, toward = MV.sheet_view(parts, frame, v, (H, W)); sil = buf >= 0
+lab = np.where(sil, pid[np.maximum(buf, 0)], -1).astype(np.int32)
+edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]
+big = np.kron(edges, np.ones((S, S), bool))[:H, :W]
+mn = ndi.minimum_filter(lab, 3); mx = ndi.maximum_filter(lab, 3); bd = (mn != mx)
+sl = (slice(v0, v1), slice(u0, u1))
+p1 = np.asarray(ref.convert('L').resize((W, H), Image.LANCZOS))[sl]
+p2 = np.full(p1.shape, 70, np.uint8); p2[big[sl]] = 255; p2[bd[sl]] = 0
+ids = [i for i in np.unique(lab[sl]) if i >= 0]; grey = {i: int(60 + 180 * j / max(len(ids) - 1, 1)) for j, i in enumerate(ids)}
+p3 = np.zeros(p1.shape, np.uint8)
+for i in ids:
+    p3[lab[sl] == i] = grey[i]
+p3[bd[sl]] = 0
+font = ImageFont.truetype(VG.FONT, 13)
+pan = [Image.fromarray(p).resize((p.shape[1] * k, p.shape[0] * k), Image.NEAREST) for p in (p1, p2, p3)]
+d = ImageDraw.Draw(pan[2])
+for i in ids:
+    ys, xs = np.nonzero(lab[sl] == i)
+    if len(xs) > 40:
+        d.text((int(np.median(xs)) * k, int(np.median(ys)) * k), names[i], fill=255 if grey[i] < 150 else 0, font=font)
+for im in pan:                                   # ruler: a tick every 30 sheet px with its value
+    dd = ImageDraw.Draw(im)
+    for u in range((u0 // 30 + 1) * 30, u1, 30):
+        dd.line([((u - u0) * k, 0), ((u - u0) * k, 6)], fill=255); dd.text(((u - u0) * k + 2, 6), str(u), fill=255, font=font)
+    for vv in range((v0 // 30 + 1) * 30, v1, 30):
+        dd.line([(0, (vv - v0) * k), (6, (vv - v0) * k)], fill=255); dd.text((8, (vv - v0) * k - 7), str(vv), fill=255, font=font)
+vert = (u1 - u0) > 1.6 * (v1 - v0)
+Wd = pan[0].width if vert else pan[0].width * 3 + 16; Hd = pan[0].height * 3 + 16 if vert else pan[0].height
+sheet = Image.new('L', (Wd, Hd), 30)
+for j, im in enumerate(pan):
+    sheet.paste(im, (0, j * (im.height + 8)) if vert else (j * (im.width + 8), 0))
+sheet.save(out); print(out, sheet.size, {names[i]: grey[i] for i in ids})
