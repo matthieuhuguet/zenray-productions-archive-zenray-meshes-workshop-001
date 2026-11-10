@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+# 10 November 2026, 11:50: the score of ONE region of one or several views (the rear, the windshield ...), so that a
+# local rework is judged on its own numbers and not diluted in the whole car. For every view and its box (sheet px):
+# silhouette overlap with the traced outline, lines of the drawing found by the model, borders of the model resting on
+# a drawn line (same judge and tolerance as MeshQA.fidelity, plain values of that view), and the mean distance in view
+# px from each drawn line pixel to the nearest border of the model.
+# usage: region.py <version> <view>:<u0,v0,u1,v1> [<view>:<box> ...]      a version may be written 138 or 138_low
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4'); sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v3')
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+import MeshViews as MV, MaskJudge as MJ, ViewGraph as VG
+ver = sys.argv[1]; jobs = [a.split(':') for a in sys.argv[2:]]
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); views_dir = proj['views']; S = VG.S
+mesh = '03_mesh/V_%s/car.npz' % (ver if '_' in ver else '%03d' % int(ver))
+parts = MV.load(mesh); out = {}
+for v, box in jobs:
+    u0, v0, u1, v1 = [int(float(x)) for x in box.split(',')]
+    ref = Image.open('%s/%s_rgb.png' % (views_dir, VG.FILES[v])); W, H = ref.width * S, ref.height * S
+    buf, V, Q, pid, uv, right, up, toward = MV.sheet_view(parts, frame, v, (H, W)); sil = buf >= 0
+    lab = np.where(sil, pid[np.maximum(buf, 0)], -1).astype(np.int32)
+    wheel = np.array([('wheel' in p[0]) for p in parts]); axle = np.array([hash(p[0].rsplit('_', 1)[-1]) % 1000 + 5000 for p in parts])
+    lab2 = np.where(sil & wheel[np.maximum(lab, 0)], axle[np.maximum(lab, 0)], lab)
+    st = np.asarray(Image.open('%s/sil_%s.png' % (proj['graph'], v)).convert('L')) > 127
+    m = np.zeros((H, W), bool); m[v0:v1, u0:u1] = True
+    iou = float((sil & st & m).sum()) / max(int(((sil | st) & m).sum()), 1)
+    line, _, inner = MJ.drawn_lines(views_dir, v); edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]
+    bd = MJ.borders_view(lab2); h, w = min(line.shape[0], bd.shape[0]), min(line.shape[1], bd.shape[1])
+    mv = np.zeros((h, w), bool); mv[v0 // S:v1 // S, u0 // S:u1 // S] = True
+    # the wheels turn freely: their inner lines are left out, as in MeshQA (their disc, grown by 6 working px)
+    wmask = ndi.binary_dilation(sil & wheel[np.maximum(lab, 0)], iterations=6); wm = wmask[:h * S, :w * S].reshape(h, S, w, S).any(axis=(1, 3))
+    line, edges, bd = line[:h, :w] & ~wm, edges[:h, :w], bd[:h, :w] & inner[:h, :w] & ~wm
+    d_b = ndi.distance_transform_edt(~bd); d_l = ndi.distance_transform_edt(~edges)
+    L = line & mv; B = bd & mv
+    out[v] = {'box': [u0, v0, u1, v1], 'silhouette_overlap': round(iou, 4),
+              'lines_found': round(float(1 - (L & (d_b > MJ.TOL)).sum() / max(L.sum(), 1)), 4), 'line_px': int(L.sum()),
+              'borders_on_a_line': round(float(1 - (B & (d_l > MJ.TOL)).sum() / max(B.sum(), 1)), 4), 'border_px': int(B.sum()),
+              'mean_px_line_to_border': round(float(d_b[L].mean()) if L.any() else 0.0, 2), 'p95_px_line_to_border': round(float(np.percentile(d_b[L], 95)) if L.any() else 0.0, 2)}
+    print(v, json.dumps(out[v]))
+print(json.dumps({'version': ver, 'mean_silhouette': round(float(np.mean([o['silhouette_overlap'] for o in out.values()])), 4),
+                  'mean_lines_found': round(float(np.mean([o['lines_found'] for o in out.values()])), 4), 'mean_borders_on_a_line': round(float(np.mean([o['borders_on_a_line'] for o in out.values()])), 4)}))
