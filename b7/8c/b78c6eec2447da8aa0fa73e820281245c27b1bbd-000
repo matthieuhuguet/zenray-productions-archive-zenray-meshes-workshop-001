@@ -1,0 +1,50 @@
+# 11 November 2026: adds the nose band (hood front down to the mouth frame) and the lower lip (white smile under the mouth) to /obj/FRONT_hood_mouth. Native nodes only.
+# FR : ajoute le bandeau de nez et la lèvre inférieure au graphe de l'avant ; le graphe ne contient ni Python ni VEX.
+import hou
+g = hou.node('/obj/FRONT_hood_mouth'); c = g.node('CTRL_front')
+for n in [x for x in g.children() if x.name().startswith(('nose_', 'lip_', 'grey_nose', 'grey_lip'))]: n.destroy()
+ptg = c.parmTemplateGroup()
+for flabel in ('Nose band (bandeau de nez)', 'Lower lip (lèvre)'):
+    if ptg.findFolder(flabel): ptg.remove(ptg.findFolder(flabel))  # 11 November 2026: folders are found by label
+def folder(name, label, items):
+    f = hou.FolderParmTemplate(name, label)
+    for n, lab, v, lo, hi in items: f.addParmTemplate(hou.FloatParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi))
+    ptg.insertBefore(ptg.findFolder('Shade (gris)'), f)
+folder('f_nose', 'Nose band (bandeau de nez)', [('n_hw', 'Half width (m)', 0.55, 0.2, 0.9), ('n_top_c', 'Top edge at the centre (m)', 0.57, 0.3, 1.0), ('n_top_s', 'Top edge at the side (m)', 0.60, 0.3, 1.0), ('n_z_top', 'Top edge z (m)', 2.40, 2.0, 2.7), ('n_z_bot', 'Bottom edge z (m)', 2.35, 2.0, 2.7), ('n_bulge', 'Forward bulge at mid height (m)', 0.012, -0.05, 0.08)])
+folder('f_lip', 'Lower lip (lèvre)', [('l_hw', 'Half width (m)', 0.40, 0.1, 0.8), ('l_top_c', 'Top edge at the centre (m)', 0.200, 0.0, 0.6), ('l_top_s', 'Top edge at the side (m)', 0.284, 0.0, 0.6), ('l_bot_c', 'Bottom edge at the centre (m)', 0.124, 0.0, 0.6), ('l_bot_s', 'Bottom edge at the side (m)', 0.20, 0.0, 0.6), ('l_z_front', 'Front face z (m)', 2.49, 2.0, 2.7), ('l_z_back', 'Back edge z, at the mouth (m)', 2.35, 2.0, 2.7), ('l_round', 'Front rounding height (m)', 0.018, 0.0, 0.06)])
+c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_front/%s")' % p
+FR = [0, 0.295, 0.5, 0.75, 0.875, 1.0]; WT = [0, 0.07, 0.2, 0.47, 0.65, 1.0]   # measured shape of the smile, centre to side, shared by both edges
+def edge(hw, yc, ys, z, dy='0'):
+    half = [('%s*%s' % (hw, f), '%s+(%s-%s)*%s+%s' % (yc, ys, yc, w, dy), z) for f, w in zip(FR, WT)]
+    neg = lambda x: '-' + x
+    return [(neg(x), y, zz) for x, y, zz in reversed(half[1:])] + half
+def curve(name, pts):
+    a = g.createNode('add', name); a.parm('points').set(len(pts))
+    for i, p in enumerate(pts):
+        a.parm('usept%d' % i).set(1)
+        for ax, v in zip('xyz', p): a.parm('pt%d%s' % (i, ax)).setExpression(v)
+    a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(pts))))
+    r = g.createNode('resample', name + '_smooth'); r.setInput(0, a); r.parm('treatpolysas').set('interp'); r.parm('dolength').set(0); r.parm('dosegs').set(1); r.parm('segs').set(30)
+    return r
+def loft(name, curves, levels=1):
+    m = g.createNode('merge', name + '_sections')
+    for i, cv in enumerate(curves): m.setInput(i, cv)
+    s = g.createNode('skin', name + '_skin'); s.setInput(0, m); s.parm('surftype').set('quads'); s.parm('polys').set(1)
+    d = g.createNode('subdivide', name + '_surface'); d.setInput(0, s); d.parm('iterations').set(levels); return d
+# nose band: from the hood front edge down to the top of the mouth frame, with a small forward bulge at mid height
+mt_c, mt_s = K('m_top_c') + '+' + K('m_frame') + '/2', K('m_top_s') + '+' + K('m_frame') + '/2'
+nose = loft('nose', [curve('nose_top', edge(K('n_hw'), K('n_top_c'), K('n_top_s'), K('n_z_top'))),
+                     curve('nose_mid', edge(K('n_hw'), '(%s+%s)/2' % (K('n_top_c'), mt_c), '(%s+%s)/2' % (K('n_top_s'), mt_s), '(%s+%s)/2+%s' % (K('n_z_top'), K('n_z_bot'), K('n_bulge')))),
+                     curve('nose_bottom', edge(K('n_hw'), mt_c, mt_s, K('n_z_bot')))])
+# lower lip: from under the mouth frame forward to a rounded front face, then back under itself
+lip = loft('lip', [curve('lip_back_top', edge(K('l_hw'), K('l_top_c'), K('l_top_s'), K('l_z_back'))),
+                   curve('lip_front_top', edge(K('l_hw'), K('l_top_c') + '-' + K('l_round'), K('l_top_s') + '-' + K('l_round'), K('l_z_front'))),
+                   curve('lip_front_bottom', edge(K('l_hw'), K('l_bot_c') + '+' + K('l_round'), K('l_bot_s') + '+' + K('l_round'), K('l_z_front'))),
+                   curve('lip_back_bottom', edge(K('l_hw'), K('l_bot_c'), K('l_bot_s'), K('l_z_back') + '+0.03'))])
+mg = g.node('front_parts')
+for n in (nose, lip):
+    col = g.createNode('color', 'grey_' + n.name()); col.setInput(0, n)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K('g_body'))
+    mg.setInput(len(mg.inputs()), col)
+g.layoutChildren()
