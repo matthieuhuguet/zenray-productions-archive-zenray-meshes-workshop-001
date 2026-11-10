@@ -1,0 +1,63 @@
+# 11 November 2026: places the native-node graph of the car-2 hood (four smoothed sections, skinned) and mouth (smoothed outline, swept frame, recessed quad grille, centre bar).
+# FR : pose le graphe en nœuds natifs du capot (quatre sections lissées, lissage par skin) et de la bouche (contour lissé, cadre, grille en retrait, barre centrale).
+import hou
+obj = hou.node('/obj')
+if obj.node('FRONT_hood_mouth'): obj.node('FRONT_hood_mouth').destroy()
+g = obj.createNode('geo', 'FRONT_hood_mouth'); c = g.createNode('null', 'CTRL_front')
+ptg = c.parmTemplateGroup()
+def folder(name, label, items):
+    f = hou.FolderParmTemplate(name, label)
+    for n, lab, v, lo, hi in items:
+        f.addParmTemplate(hou.IntParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi) if isinstance(v, int) else hou.FloatParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi))
+    ptg.append(f)
+SEC = [(1.82, 0.886, 0.72, 0.93), (2.05, 0.80, 0.66, 0.85), (2.28, 0.69, 0.56, 0.73), (2.45, 0.57, 0.42, 0.60)]
+for k, (z, yc, hw, ye) in enumerate(SEC, 1):
+    folder('f_s%d' % k, 'Hood section %d%s' % (k, ' (windscreen)' if k == 1 else ' (nose)' if k == 4 else ''), [('z%d' % k, 'Along the car z (m)', z, -2.6, 2.6), ('yc%d' % k, 'Centre height (m)', yc, 0.0, 1.4), ('hw%d' % k, 'Half width (m)', hw, 0.05, 1.2), ('ye%d' % k, 'Edge height (m)', ye, 0.0, 1.4)])
+folder('f_hood', 'Hood shape (capot)', [('side_lift', 'Mid point lift toward the edge (0 to 1)', 0.25, 0.0, 1.0), ('segs', 'Divisions across before smoothing', 12, 4, 48), ('subd', 'Smoothing levels', 2, 0, 4)])
+folder('f_mouth', 'Mouth (bouche)', [('m_z', 'Mouth plane z (m)', 2.42, 2.0, 2.7), ('m_hw', 'Half width to the side tip (m)', 0.645, 0.2, 1.0), ('m_top_c', 'Top edge at the centre (m)', 0.515, 0.1, 1.0), ('m_top_s', 'Top edge at the side (m)', 0.545, 0.1, 1.0), ('m_bot_c', 'Bottom edge at the centre (m)', 0.235, 0.0, 1.0), ('m_bot_s', 'Bottom edge near the tip (m)', 0.43, 0.0, 1.0), ('m_tip_y', 'Side tip height (m)', 0.50, 0.0, 1.0), ('m_frame', 'Frame thickness (m)', 0.022, 0.005, 0.08), ('m_recess', 'Grille recess (m)', 0.08, 0.01, 0.3)])
+folder('f_grey', 'Shade (gris)', [('g_body', 'Body grey', 0.62, 0.0, 1.0), ('g_grille', 'Grille grey', 0.05, 0.0, 1.0), ('g_frame', 'Frame grey', 0.18, 0.0, 1.0)])
+c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_front/%s")' % p
+def curve(name, pts, closed):
+    a = g.createNode('add', name); a.parm('points').set(len(pts))
+    for i, (px, py, pz) in enumerate(pts):
+        a.parm('usept%d' % i).set(1)
+        for ax, v in zip('xyz', (px, py, pz)): a.parm('pt%d%s' % (i, ax)).setExpression(v) if isinstance(v, str) else a.parm('pt%d%s' % (i, ax)).set(v)
+    a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(pts)))); a.parm('closed0').set(1 if closed else 0); return a
+def smooth(node, segs=None, length=None):
+    r = g.createNode('resample', node.name() + '_smooth'); r.setInput(0, node); r.parm('treatpolysas').set('subd')
+    if segs: r.parm('dolength').set(0); r.parm('dosegs').set(1); r.parm('segs').setExpression(segs)
+    else: r.parm('length').set(length)
+    return r
+# hood: one curve per section, five control points across, smoothed as a subdivision curve, then skinned
+secs = []
+for k in range(1, 5):
+    hw, yc, ye, z = K('hw%d' % k), K('yc%d' % k), K('ye%d' % k), K('z%d' % k)
+    mid = '%s+(%s-%s)*%s' % (yc, ye, yc, K('side_lift'))
+    pts = [('-' + hw, ye, z), ('-' + hw + '/2', mid, z), ('0', yc, z), (hw + '/2', mid, z), (hw, ye, z)]
+    secs.append(smooth(curve('hood_section_%d' % k, pts, False), segs=K('segs')))
+hm = g.createNode('merge', 'hood_sections')
+for i, s in enumerate(secs): hm.setInput(i, s)
+sk0 = g.createNode('skin', 'hood_skin'); sk0.setInput(0, hm); sk0.parm('surftype').set('quads'); sk0.parm('polys').set(1)
+sk = g.createNode('subdivide', 'hood_surface'); sk.setInput(0, sk0); sk.parm('iterations').setExpression(K('subd'))  # 11 November 2026: Catmull-Clark smoothing gives the rows the four sections lack
+# mouth: closed smile outline, smoothed
+hwm, tc, ts, bc, bs, mz = K('m_hw'), K('m_top_c'), K('m_top_s'), K('m_bot_c'), K('m_bot_s'), K('m_z')
+tip = K('m_tip_y')
+# 11 November 2026: smile outline through its points: nearly straight top, sharp side tips, round bottom
+outline = [('-' + hwm + '*0.93', ts, mz), ('-' + hwm + '*0.47', '(%s+%s)/2' % (tc, ts), mz), ('0', tc, mz), (hwm + '*0.47', '(%s+%s)/2' % (tc, ts), mz), (hwm + '*0.93', ts, mz), (hwm, tip, mz),
+           (hwm + '*0.93', bs, mz), (hwm + '*0.70', '%s-(%s-%s)*0.5' % (bs, bs, bc), mz), (hwm + '*0.31', bc + '+0.02', mz), ('0', bc, mz),
+           ('-' + hwm + '*0.31', bc + '+0.02', mz), ('-' + hwm + '*0.70', '%s-(%s-%s)*0.5' % (bs, bs, bc), mz), ('-' + hwm + '*0.93', bs, mz), ('-' + hwm, tip, mz)]
+ol = smooth(curve('mouth_outline', outline, True), segs='140'); ol.parm('treatpolysas').set('interp')  # 11 November 2026: an even count, polyfill grid quads needs it
+fr = g.createNode('sweep::2.0', 'mouth_frame'); fr.setInput(0, ol); fr.parm('surfaceshape').set('square'); fr.parm('width').setExpression(K('m_frame')); fr.parm('applyroll').set(1); fr.parm('roll').set(45); fr.parm('cols').set(1)
+ex = g.createNode('polyextrude::2.0', 'mouth_duct'); ex.setInput(0, ol); ex.parm('dist').setExpression('-' + K('m_recess')); ex.parm('outputfront').set(1); ex.parm('outputfrontgrp').set(1); ex.parm('frontgrp').set('duct_front'); ex.parm('outputback').set(0)
+bl = g.createNode('blast', 'open_duct_back'); bl.setInput(0, ex); bl.parm('group').set('duct_front')
+pf = g.createNode('polyfill', 'grille_panel'); pf.setInput(0, bl); pf.parm('fillmode').set('gridquads'); pf.parm('smoothtoggle').set(0); pf.parm('subdivtoggle').set(0); pf.parm('tangentstrength').set(0)  # 11 November 2026: keep the grille flat at the back of the duct
+bar = g.createNode('box', 'centre_bar'); bar.parmTuple('size').set((0.012, 1, 1)); bar.parm('sizey').setExpression('%s-%s' % (tc, bc)); bar.parm('sizez').setExpression(K('m_recess'))
+bar.parm('ty').setExpression('(%s+%s)/2' % (tc, bc)); bar.parm('tz').setExpression('%s-%s/2' % (mz, K('m_recess')))
+parts = [(sk, 'g_body'), (fr, 'g_frame'), (pf, 'g_grille'), (bar, 'g_frame')]
+mg = g.createNode('merge', 'front_parts')
+for i, (n, shade) in enumerate(parts):
+    col = g.createNode('color', 'grey_' + n.name()); col.setInput(0, n)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K(shade))
+    mg.setInput(i, col)
+o = g.createNode('null', 'OUT_front'); o.setInput(0, mg); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
