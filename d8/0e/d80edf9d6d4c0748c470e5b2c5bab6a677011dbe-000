@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+# 10 November 2026: resid.py, the dimensions of the drawing against those of the model, station by station, in
+# metres: side view (top and bottom of the profile by z), plan (half width by z), front and back (half width by y).
+# For every station: inner bound / outer bound of the sheet, then the model. A model value outside [inner, outer] is an error.
+# usage: resid.py <car.npz> [step 0.25]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4')
+import numpy as np, MeshViews as MV, ViewGraph as VG
+from PIL import Image
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); S = VG.S; parts = MV.load(sys.argv[1]); step = float(sys.argv[2]) if len(sys.argv) > 2 else 0.25
+lo = frame['lo']; dims = frame['dims_m']
+def ext(mask, m, fixed_axis, fixed_val, var_axis, side):
+    t = np.arange(lo[var_axis] - 0.1, lo[var_axis] + dims[var_axis] + 0.1, 0.004); X = np.zeros((len(t), 3)); X[:, fixed_axis] = fixed_val; X[:, var_axis] = t
+    uv = VG.to_view(m, X) * S; iu = np.clip(uv[:, 0].astype(int), 0, mask.shape[1] - 1); iv = np.clip(uv[:, 1].astype(int), 0, mask.shape[0] - 1); val = mask[iv, iu]
+    return (float(t[val].max()) if side > 0 else float(t[val].min())) if val.any() else float('nan')
+def table(view, fixed_axis, var_axis, title, stations, sides):
+    band = np.asarray(Image.open('%s/band_%s.png' % (proj['graph'], view)).convert('L')); inner = band >= 200; outer = band >= 100; m = VG.vmap(frame, view)
+    buf, *_ = MV.sheet_view(parts, frame, view, band.shape); M = buf >= 0; print(title)
+    for s in stations:
+        row = '  %5.2f |' % s
+        for sd in sides:
+            a, b, c = ext(inner, m, fixed_axis, s, var_axis, sd), ext(outer, m, fixed_axis, s, var_axis, sd), ext(M, m, fixed_axis, s, var_axis, sd)
+            lo_, hi_ = min(a, b), max(a, b); flag = ' ' if (lo_ - 0.012 <= c <= hi_ + 0.012) else ('+' if (c > hi_) == (sd > 0) else '-')
+            row += ' %s %5.2f/%5.2f model %5.2f %s |' % ('max' if sd > 0 else 'min', a, b, c, flag)
+        print(row)
+zs = np.arange(np.ceil((lo[2] + 0.03) / step) * step, lo[2] + dims[2], step)[::-1]
+table('left', 2, 1, 'SIDE  z | y of the profile: inner/outer of the sheet, model (+ too far out, - too far in)', zs, (1, -1))
+table('top', 2, 0, 'PLAN  z | half width x', zs, (1,))
+ys = np.arange(0.1, dims[1], 0.1)
+table('front', 1, 0, 'FRONT y | half width x', ys, (1,))
+table('back', 1, 0, 'BACK  y | half width (back view, x mirrored)', ys, (1,))
