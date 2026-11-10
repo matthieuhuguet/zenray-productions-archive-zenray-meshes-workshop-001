@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+# 10 November 2026, 13:00: photo.py, the judge of the FORM against the drawing itself (not only its dark lines).
+# The reference sheet is a clay render: every facet edge shows as a step of grey. The model is rendered in the same
+# view with one flat grey per facet orientation, the light being FITTED on the reference (least squares of the grey of
+# the drawing on the normal of the model, inside the box), then both images are compared:
+#   edges_found      share of the edges of the drawing (Canny, inside the eroded silhouette) that have an edge of the
+#                    model render within TOL view px                                  (what the model misses)
+#   edges_justified  share of the edges of the model render that have an edge of the drawing within TOL (what it invents)
+#   edge_f           harmonic mean of the two
+#   grey_fit         1 - mean absolute difference of grey (0..1) between the drawing and the fitted render, wheels out
+# usage: photo.py <version> <view>:<u0,v0,u1,v1> [...] [save=<dir>]      boxes in sheet px ; version 138 or 138_low
+# save=<dir> writes, per view, three grey panels: drawing, fitted render of the model, edges (white = drawing edge
+# found, light grey = drawing edge missed, dark grey = model edge with no drawing edge).
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4'); sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v3')
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import feature
+import MeshViews as MV, MaskJudge as MJ, ViewGraph as VG
+
+P = {'tol_px': 1.5, 'sigma': 1.0, 'sil_band': 3, 'wheel_grow': 6, 'panel_scale': 3}      # the only tunables (view px)
+
+def run(ver, jobs, save=None):
+    proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); views_dir = proj['views']; S = VG.S
+    parts = MV.load('03_mesh/V_%s/car.npz' % (ver if '_' in ver else '%03d' % int(ver))); out = {}
+    for v, box in jobs:
+        u0, v0, u1, v1 = [int(float(x)) for x in box.split(',')]
+        g = np.asarray(Image.open('%s/%s_rgb.png' % (views_dir, VG.FILES[v])).convert('L')).astype(float) / 255.0
+        h, w = g.shape; H, W = h * S, w * S
+        buf, V, Q, pid, uv, right, up, toward = MV.sheet_view(parts, frame, v, (H, W)); vis = buf >= 0
+        n = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+        cam = np.stack([n @ right, n @ up, n @ toward], 1)                                 # normal in camera axes
+        wheel = np.array([('wheel' in p[0]) for p in parts])[pid]; mat = np.array([p[1] for p in parts])[pid]
+        fb = np.maximum(buf, 0)
+        # view-resolution maps: mean camera normal of the visible faces, coverage, wheel share
+        def down(a): return a[:H, :W].reshape(h, S, w, S).mean(axis=(1, 3))
+        cov = down(vis.astype(float)); nx = down(np.where(vis, cam[fb, 0], 0)); ny = down(np.where(vis, cam[fb, 1], 0)); nz = down(np.where(vis, cam[fb, 2], 0))
+        wh = down((vis & wheel[fb]).astype(float)) > 0.02; wh = ndi.binary_dilation(wh, iterations=P['wheel_grow'])
+        dark = down((vis & np.isin(mat[fb], ['glass', 'dark', 'plastic', 'tyre'])[...]).astype(float))
+        sil = np.asarray(Image.open('%s/%s_mask.png' % (views_dir, VG.FILES[v])).convert('L')) > 127
+        inner = ndi.binary_erosion(sil, iterations=P['sil_band']) & (cov > 0.98) & ~wh
+        box_m = np.zeros((h, w), bool); box_m[v0 // S:v1 // S, u0 // S:u1 // S] = True
+        fit = inner & box_m
+        A = np.stack([np.ones(fit.sum()), nx[fit], ny[fit], nz[fit], dark[fit]], 1)
+        coef, *_ = np.linalg.lstsq(A, g[fit], rcond=None)
+        ren = np.clip(coef[0] + coef[1] * nx + coef[2] * ny + coef[3] * nz + coef[4] * dark, 0, 1); ren[cov < 0.5] = g[~sil].mean() if (~sil).any() else 0.3
+        e_ref = feature.canny(g, sigma=P['sigma']) & inner & box_m
+        e_mod = feature.canny(ren, sigma=P['sigma']) & inner & box_m
+        d_mod = ndi.distance_transform_edt(~(feature.canny(ren, sigma=P['sigma']) & inner)); d_ref = ndi.distance_transform_edt(~(feature.canny(g, sigma=P['sigma']) & inner))
+        found = e_ref & (d_mod <= P['tol_px']); just = e_mod & (d_ref <= P['tol_px'])
+        r = float(found.sum()) / max(int(e_ref.sum()), 1); p = float(just.sum()) / max(int(e_mod.sum()), 1)
+        out[v] = {'box': [u0, v0, u1, v1], 'edges_found': round(r, 4), 'edges_justified': round(p, 4), 'edge_f': round(2 * r * p / max(r + p, 1e-9), 4),
+                  'grey_fit': round(1 - float(np.abs(g - ren)[fit].mean()), 4), 'ref_edge_px': int(e_ref.sum()), 'model_edge_px': int(e_mod.sum())}
+        print(v, json.dumps(out[v]))
+        if save:
+            k = P['panel_scale']; sl = (slice(v0 // S, v1 // S), slice(u0 // S, u1 // S))
+            ed = np.full((h, w), 40, np.uint8); ed[e_mod & ~just] = 110; ed[e_ref & ~found] = 185; ed[found] = 255
+            tiles = [Image.fromarray((x[sl] * 255).astype(np.uint8) if x.dtype != np.uint8 else x[sl]) for x in (g, ren, ed)]
+            tiles = [t.resize((t.width * k, t.height * k), Image.NEAREST if i == 2 else Image.LANCZOS) for i, t in enumerate(tiles)]
+            B = Image.new('L', (tiles[0].width, sum(t.height for t in tiles) + 16), 0); y = 0
+            for t in tiles:
+                B.paste(t, (0, y)); y += t.height + 8
+            B.save('%s/photo_%s_%s.png' % (save, ver, v))
+    print(json.dumps({'version': ver, 'mean_edge_f': round(float(np.mean([o['edge_f'] for o in out.values()])), 4), 'mean_edges_found': round(float(np.mean([o['edges_found'] for o in out.values()])), 4),
+                      'mean_edges_justified': round(float(np.mean([o['edges_justified'] for o in out.values()])), 4), 'mean_grey_fit': round(float(np.mean([o['grey_fit'] for o in out.values()])), 4)}))
+    return out
+
+if __name__ == '__main__':
+    args = [a for a in sys.argv[2:] if not a.startswith('save=')]; save = next((a[5:] for a in sys.argv[2:] if a.startswith('save=')), None)
+    run(sys.argv[1], [a.split(':') for a in args], save)
