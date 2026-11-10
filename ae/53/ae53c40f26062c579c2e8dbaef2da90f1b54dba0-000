@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+# 10 November 2026, 14:05: clay.py, the picture that judges a SURFACE (the flat-shaded pictures of MeshViews show every
+# quad as a facet and hide whether the surface itself is smooth). Per pixel normals (interpolated in each quad, split
+# where two quads fold more than crease_deg), a soft studio light, and three modes:
+#   clay    grey studio render, like the references of refs/quality_10-November-2026
+#   zebra   reflection stripes: on a clean surface the stripes are regular and flow without a kink from one panel to the
+#           next; a kink of a stripe = a break of tangency, a wobble = a bump (the test used on car bodies)
+#   curv    grey level of the bend between neighbouring quads (white = fold over 12 degrees, black = flat)
+# usage: clay.py <car.npz> <out.png> <azimuth> <elevation> [mode clay|zebra|curv] [px_per_m 420] [crop x0,y0,x1,y1 in 0..1]
+import sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4')
+import numpy as np
+from PIL import Image
+import MeshViews as MV
+
+P = {'crease_deg': 28.0, 'sample_px': 0.7, 'stripes': 34.0, 'ambient': 0.30, 'bg': 38,
+     'albedo': {'paint': 0.78, 'glass': 0.30, 'rubber': 0.20, 'metal': 0.62, 'dark': 0.14, 'plastic': 0.46, 'tyre': 0.2}}      # the only tunables
+
+
+def raster_ab(uv, depth, Q, shape):
+    """Like MeshViews.raster, and also the place inside the quad (a, b in 0..1) of the sample that won each pixel."""
+    H, W = shape; P4 = uv[Q]; D4 = depth[Q]
+    ext = np.maximum.reduce([np.linalg.norm(P4[:, 1] - P4[:, 0], axis=1), np.linalg.norm(P4[:, 3] - P4[:, 0], axis=1), np.linalg.norm(P4[:, 2] - P4[:, 1], axis=1), np.linalg.norm(P4[:, 2] - P4[:, 3], axis=1)])
+    m = np.clip(np.ceil(ext / P['sample_px']).astype(int) + 1, 2, 400); m[~np.isfinite(ext)] = 2
+    pix = []; dep = []; fid = []; aa = []; bb = []
+    for mm in np.unique(m):
+        sel = np.nonzero(m == mm)[0]; t = np.linspace(0, 1, mm); a, b = np.meshgrid(t, t, indexing='ij'); af = a.ravel(); bf = b.ravel()
+        a3 = af[None, :, None]; b3 = bf[None, :, None]; step = max(1, 3000000 // (mm * mm))
+        for s0 in range(0, len(sel), step):
+            ss = sel[s0:s0 + step]; q = P4[ss]; dq = D4[ss]
+            pts = (1 - a3) * (1 - b3) * q[:, None, 0] + a3 * (1 - b3) * q[:, None, 1] + a3 * b3 * q[:, None, 2] + (1 - a3) * b3 * q[:, None, 3]
+            dd = ((1 - af) * (1 - bf))[None] * dq[:, 0:1] + (af * (1 - bf))[None] * dq[:, 1:2] + (af * bf)[None] * dq[:, 2:3] + ((1 - af) * bf)[None] * dq[:, 3:4]
+            x = np.round(pts[..., 0]).astype(int).ravel(); y = np.round(pts[..., 1]).astype(int).ravel(); ok = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+            pix.append((y * W + x)[ok]); dep.append(dd.ravel()[ok]); fid.append(np.repeat(ss, mm * mm)[ok])
+            aa.append(np.tile(af, len(ss))[ok].astype(np.float32)); bb.append(np.tile(bf, len(ss))[ok].astype(np.float32))
+    buf = np.full(H * W, -1, np.int64); A = np.zeros(H * W, np.float32); B = np.zeros(H * W, np.float32)
+    if pix:
+        pix = np.concatenate(pix); dep = np.concatenate(dep); fid = np.concatenate(fid); aa = np.concatenate(aa); bb = np.concatenate(bb)
+        o = np.argsort(-dep, kind='stable'); buf[pix[o]] = fid[o]; A[pix[o]] = aa[o]; B[pix[o]] = bb[o]
+    return buf.reshape(H, W), A.reshape(H, W), B.reshape(H, W)
+
+
+def corner_normals(V, Q, crease_deg):
+    """One normal per corner of each quad: the area-weighted mean of the quads around the vertex that fold less than
+    crease_deg from this quad (vertices are welded by position first, so panels cut apart still share their light)."""
+    n = np.cross(V[Q[:, 2]] - V[Q[:, 0]], V[Q[:, 3]] - V[Q[:, 1]]); area = np.linalg.norm(n, axis=1); nu = n / np.maximum(area[:, None], 1e-18)
+    key = np.round(V / 0.0004).astype(np.int64); _, wid = np.unique(key, axis=0, return_inverse=True); wid = wid.ravel()
+    vq = wid[Q]; flat_v = vq.ravel(); flat_f = np.repeat(np.arange(len(Q)), 4)
+    order = np.argsort(flat_v, kind='stable'); fv = flat_v[order]; ff = flat_f[order]
+    start = np.searchsorted(fv, np.arange(fv.max() + 2))
+    cnt = np.diff(start); cosc = np.cos(np.radians(crease_deg)); out = np.repeat(nu[:, None, :], 4, 1).copy()
+    # plain mean first (valence up to 8 or so), then the crease-aware mean in chunks by valence
+    for val in np.unique(cnt):
+        if val < 2:
+            continue
+        vs = np.nonzero(cnt == val)[0]; idx = start[vs][:, None] + np.arange(val)[None]; F = ff[idx]                # (nv, val) quads around each vertex
+        N = n[F]; U = nu[F]                                                                                        # area-weighted normals, unit normals
+        cosm = np.einsum('vik,vjk->vij', U, U); wgt = (cosm >= cosc)[..., None]                                    # (nv, val, val)
+        M = (wgt * N[:, None, :, :]).sum(2); M /= np.maximum(np.linalg.norm(M, axis=2, keepdims=True), 1e-18)      # (nv, val, 3): the normal seen by each quad at this vertex
+        fl = F.ravel(); vv = np.repeat(vs, val); corner = (vq[fl] == vv[:, None]).argmax(1)
+        out[fl, corner] = M.reshape(-1, 3)
+    return out, nu
+
+
+def render(npz, out, az, el, mode='clay', ppm=420.0, crop=None):
+    parts = MV.load(npz); V, Q, pid = MV.merge(parts)
+    c = (V.min(0) + V.max(0)) / 2; ext = np.linalg.norm(V.max(0) - V.min(0)); W = int(ext * ppm * 1.02); H = int(ext * ppm * 0.62)
+    azr, elr = np.radians(az), np.radians(el)
+    toward = np.array([np.sin(azr) * np.cos(elr), np.sin(elr), np.cos(azr) * np.cos(elr)]); right = np.cross([0, 1, 0], toward); right /= np.linalg.norm(right); up = np.cross(toward, right)
+    X = V - c; uv = np.stack([W / 2 + (X @ right) * ppm, H / 2 - (X @ up) * ppm], 1)
+    buf, A, B = raster_ab(uv, -(X @ toward), Q, (H, W)); vis = buf >= 0; f = np.maximum(buf, 0)
+    CN, nu = corner_normals(V, Q, P['crease_deg'])
+    a = A[..., None]; b = B[..., None]
+    N = (1 - a) * (1 - b) * CN[f, 0] + a * (1 - b) * CN[f, 1] + a * b * CN[f, 2] + (1 - a) * b * CN[f, 3]; N /= np.maximum(np.linalg.norm(N, axis=2, keepdims=True), 1e-18)
+    facing = (nu @ toward)[f]; N = np.where((facing < 0)[..., None], -N, N)                 # a face seen from its back is lit like its front (no pink): holes show as the dark background
+    alb = np.array([P['albedo'].get(p[1], 0.7) for p in parts])[pid][f]
+    if mode == 'zebra':
+        R = 2 * (N @ toward)[..., None] * N - toward                                         # mirror direction of the eye
+        s = 0.5 + 0.5 * np.sign(np.sin(P['stripes'] * np.arctan2(R @ up, np.sqrt((R @ right) ** 2 + (R @ toward) ** 2) + 1e-9)))
+        img = 0.12 + 0.76 * s
+    elif mode == 'curv':
+        gy, gx = np.gradient(N, axis=(0, 1)); bend = np.degrees(np.sqrt((gx ** 2).sum(2) + (gy ** 2).sum(2))) * 6.0     # degrees over 6 px
+        img = np.clip(bend / 12.0, 0, 1)
+    else:
+        key = toward * 0.55 + up * 0.70 - right * 0.45; key /= np.linalg.norm(key); fill = toward * 0.5 + up * 0.2 + right * 0.85; fill /= np.linalg.norm(fill)
+        lam = 0.72 * np.clip(N @ key, 0, 1) + 0.22 * np.clip(N @ fill, 0, 1) + 0.16 * (0.5 + 0.5 * (N @ up))            # key, fill, sky
+        img = alb * (P['ambient'] + (1 - P['ambient']) * lam)
+    img = np.where(vis, np.clip(img, 0, 1) * 255, P['bg']).astype(np.uint8); im = Image.fromarray(img)
+    if crop:
+        x0, y0, x1, y1 = crop; im = im.crop((int(x0 * W), int(y0 * H), int(x1 * W), int(y1 * H)))
+    im.save(out); print(out, im.size)
+
+
+if __name__ == '__main__':
+    a = sys.argv[1:]
+    render(a[0], a[1], float(a[2]), float(a[3]), a[4] if len(a) > 4 else 'clay', float(a[5]) if len(a) > 5 else 420.0, [float(t) for t in a[6].split(',')] if len(a) > 6 else None)
