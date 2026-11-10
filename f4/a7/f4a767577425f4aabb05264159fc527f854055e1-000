@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+# 10 November 2026: the tracing of a view (white, over the image) with the plan drawn over it (orange) and its corners
+# named, enlarged. usage: lookover.py <version> <view> <u0,v0,u1,v1 view px> <out.png> [scale] [face,face (edges of these faces only)]
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4')
+import numpy as np, ViewGraph as VG
+from PIL import Image, ImageDraw, ImageFont
+ver = int(sys.argv[1]); view = sys.argv[2]; u0, v0, u1, v1 = [float(x) for x in sys.argv[3].split(',')]; out = sys.argv[4]
+k = float(sys.argv[5]) if len(sys.argv) > 5 else 6.0; keep = sys.argv[6].split(',') if len(sys.argv) > 6 else None
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); solved = json.load(open('02_solved/V_%03d/cage.solved.json' % ver)); m = VG.vmap(frame, view)
+font = ImageFont.truetype(VG.FONT, 14)
+ov = Image.open('%s/overlay_%s.png' % (proj['graph'], view)).convert('L')
+crop = ov.crop((int(u0 * 3), int(v0 * 3), int(u1 * 3), int(v1 * 3))).resize((int((u1 - u0) * k), int((v1 - v0) * k)), Image.LANCZOS).convert('RGB'); d = ImageDraw.Draw(crop)
+names = None
+if keep:
+    names = set()
+    for f in keep:
+        lp = [n.lstrip('~') for n in solved['faces'][f]['loop']]; names |= {tuple(sorted(e)) for e in zip(lp, lp[1:] + lp[:1])}
+for key, poly in solved['edges'].items():
+    if names is not None and tuple(sorted(key.split('|'))) not in names:
+        continue
+    P = np.array(poly)
+    for sg in ((1, -1) if 0 in (m['ir'], m['iu']) else (1,)):
+        q = (VG.to_view(m, P * np.array([sg, 1, 1])) - np.array([u0, v0])) * k
+        if (q[:, 0].max() < 0) or (q[:, 0].min() > crop.width) or (q[:, 1].max() < 0) or (q[:, 1].min() > crop.height):
+            continue
+        d.line([tuple(x) for x in q], fill=(255, 150, 0), width=1)
+vn = None if names is None else {n for e in names for n in e}
+for n, Pt in solved['vertices'].items():
+    if vn is not None and n not in vn:
+        continue
+    x, y = (VG.to_view(m, np.array(Pt)[None])[0] - np.array([u0, v0])) * k
+    if 0 <= x < crop.width and 0 <= y < crop.height:
+        d.ellipse([x - 3, y - 3, x + 3, y + 3], outline=(255, 255, 0)); d.text((x + 4, y - 15), n, fill=(255, 255, 0), font=font)
+crop.save(out); print(out, crop.size)
