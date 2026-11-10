@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+# 10 November 2026: numbers of the audit that need no reading: version series of the cage car (11_CarCage), images produced
+# per family and per day (versions/), Houdini files per day, scripts per day. Writes data/numbers.json.
+import json, re, os
+from pathlib import Path
+from datetime import datetime
+from collections import Counter, defaultdict
+A = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_10-November-2026'); T = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes'); K = Path('/Users/zenray/.claude/skills/zenray-meshes'); (A / 'data').mkdir(exist_ok=True)
+out = {}
+# 1. cage car: one row per version run
+rows = []
+for l in open(T / 'Projects/11_CarCage/iterations.jsonl'):
+    try: r = json.loads(l)
+    except Exception: continue
+    m = r.get('measured', {}); g = r.get('gates', '0/27'); gp, gt = (int(x) for x in g.split('/')) if '/' in str(g) else (0, 27)
+    f1 = [v for k, v in m.items() if k.startswith('F1.')]
+    rows.append({'version': r['version'], 'when': r.get('when'), 'gates_passed': gp, 'gates_total': gt, 'quads': r.get('quads'), 'parts': r.get('parts'), 'F1_mean': round(sum(f1) / len(f1), 4) if f1 else None, 'F2': m.get('F2'), 'F3': m.get('F3'), 'plan': r.get('plan'), 'note': (r.get('note') or '')[:140]})
+out['cage_car_versions'] = rows
+# 2. images and files per family and per day
+fam = Counter(); per_day = defaultdict(Counter)
+for p in (T / 'versions').iterdir():
+    f = re.match(r'([A-Za-z]+)', p.name); f = f.group(1) if f else 'other'; d = datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d'); fam[f] += 1; per_day[d][f] += 1
+out['versions_by_family'] = fam.most_common(); out['versions_by_day'] = {d: dict(c) for d, c in sorted(per_day.items())}
+# 3. scripts and Houdini files per day of last change
+sd = Counter(datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d') for p in (K / 'scripts').rglob('*.py')); out['scripts_by_day'] = dict(sorted(sd.items()))
+hd = Counter()
+for root in (K, T):
+    for ext in ('*.hda', '*.otl', '*.hip', '*.hiplc'):
+        for p in root.rglob(ext):
+            if '/backup/' not in str(p): hd[(datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d'), ext[2:])] += 1
+out['houdini_by_day'] = [[d, e, n] for (d, e), n in sorted(hd.items())]
+# 4. second car: band score of the volumes, layers ledger
+out['car2_ledger'] = json.load(open(T / 'Projects/12_Car2Cage/02_cut/ledger.json'))['components']
+json.dump(out, open(A / 'data/numbers.json', 'w'), indent=1, ensure_ascii=False)
+print('versions', len(rows), 'first', rows[0]['version'], rows[0]['gates_passed'], 'last', rows[-1]['version'], rows[-1]['gates_passed'], 'best', max(r['gates_passed'] for r in rows))
+print('families', fam.most_common(8)); print('days', {d: sum(c.values()) for d, c in sorted(per_day.items())})
+print('scripts by day', dict(sorted(sd.items())))

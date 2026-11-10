@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+# 10 November 2026: chartlib.py, the charts of the ZenRay Meshes audit as plain SVG (no library), in grey levels only
+# (Matthieu's rule for diagnostics), status always written beside its mark, hatching for "rejected or failed",
+# Adobe Clean, light surface. Each mark carries a <title> (hover tooltip in a browser).
+from html import escape
+P = {'font': "'Adobe Clean', 'Hiragino Sans W4', sans-serif", 'surface': '#fcfcfb', 'ink': '#0b0b0b', 'ink2': '#52514e', 'muted': '#8a8984', 'grid': '#e6e5e0', 'bar_px': 22, 'gap': 2}
+# outcome classes, darkest = strongest evidence that it works
+OUT = [('valide', 'Validé par Matthieu', '#1f1f1e', None), ('mesure', 'Accepté sur la mesure seule', '#6f6e69', None), ('partiel', 'Partiel', '#b2b1ab', None),
+       ('rejete', 'Rejeté ou échoué', '#f0efea', 45), ('abandon', 'Abandonné ou inconnu', '#dcdbd5', None)]
+def defs():
+    s = '<defs>'
+    for k, _, fill, ang in OUT:
+        if ang is not None:
+            s += '<pattern id="h_%s" patternUnits="userSpaceOnUse" width="7" height="7" patternTransform="rotate(%d)"><rect width="7" height="7" fill="%s"/><line x1="0" y1="0" x2="0" y2="7" stroke="#3b3a37" stroke-width="2"/></pattern>' % (k, ang, fill)
+    return s + '</defs>'
+def fill_of(k):
+    for kk, _, f, ang in OUT:
+        if kk == k: return 'url(#h_%s)' % k if ang is not None else f
+    return '#dcdbd5'
+def head(w, h, title, sub):
+    s = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d" font-family="%s">' % (w, h, w, h, P['font'].replace("'", '&apos;'))
+    s += defs() + '<rect width="%d" height="%d" fill="%s"/>' % (w, h, P['surface'])
+    s += '<text x="24" y="40" font-size="24" font-weight="700" fill="%s">%s</text>' % (P['ink'], escape(title))
+    if sub: s += '<text x="24" y="66" font-size="15" fill="%s">%s</text>' % (P['ink2'], escape(sub))
+    return s
+def legend(x, y, keys=None):
+    s = ''; cx = x
+    for k, lab, _, _ in OUT:
+        if keys and k not in keys: continue
+        s += '<rect x="%d" y="%d" width="14" height="14" rx="3" fill="%s" stroke="#c9c8c2" stroke-width="0.6"/><text x="%d" y="%d" font-size="14" fill="%s">%s</text>' % (cx, y, fill_of(k), cx + 20, y + 12, P['ink2'], escape(lab))
+        cx += 30 + int(len(lab) * 7.3)
+    return s
+def hbar_stacked(title, sub, rows, w=1100, label_w=230, keys=None, note=None):
+    """rows: [(label, {outcome_key: n})]. One bar per row, segments in the order of OUT, value at the tip."""
+    keys = keys or [k for k, *_ in OUT]; n = len(rows); rh = 34; top = 110; h = top + n * rh + 70 + (24 if note else 0)
+    mx = max([sum(r[1].get(k, 0) for k in keys) for r in rows] + [1]); x0 = 24 + label_w; span = w - x0 - 80
+    s = head(w, h, title, sub) + legend(24, 80, keys)
+    for i, (lab, d) in enumerate(rows):
+        y = top + i * rh; s += '<text x="%d" y="%d" font-size="15" fill="%s" text-anchor="end">%s</text>' % (x0 - 12, y + 16, P['ink'], escape(lab)); cx = x0; tot = sum(d.get(k, 0) for k in keys)
+        for k in keys:
+            v = d.get(k, 0)
+            if not v: continue
+            ww = max(v / mx * span - P['gap'], 1.5); s += '<rect x="%.1f" y="%d" width="%.1f" height="%d" rx="3" fill="%s"><title>%s : %s, %d</title></rect>' % (cx, y, ww, P['bar_px'], fill_of(k), escape(lab), escape(dict((a, b) for a, b, *_ in OUT)[k]), v)
+            cx += ww + P['gap']
+        s += '<text x="%.1f" y="%d" font-size="14" fill="%s">%d</text>' % (cx + 8, y + 16, P['ink2'], tot)
+    if note: s += '<text x="24" y="%d" font-size="13" fill="%s">%s</text>' % (h - 22, P['muted'], escape(note))
+    return s + '</svg>'
+def columns_multiples(title, sub, panels, days, w=1100, panel_h=150, note=None):
+    """panels: [(panel_title, {day: n}, unit)]. Small multiples sharing the day axis, each with its own scale (never a second axis)."""
+    top = 96; h = top + len(panels) * (panel_h + 46) + 40 + (20 if note else 0); x0 = 90; span = w - x0 - 30; bw = min(P['bar_px'], span / len(days) - 6)
+    s = head(w, h, title, sub)
+    for pi, (pt, d, unit) in enumerate(panels):
+        y0 = top + pi * (panel_h + 46); mx = max(list(d.values()) + [1]); base = y0 + panel_h
+        s += '<text x="24" y="%d" font-size="16" font-weight="700" fill="%s">%s</text>' % (y0 + 4, P['ink'], escape(pt))
+        s += '<line x1="%d" y1="%d" x2="%d" y2="%d" stroke="%s"/>' % (x0, base, w - 30, base, P['grid'])
+        for j, day in enumerate(days):
+            v = d.get(day, 0); cx = x0 + (j + 0.5) * span / len(days); bh = (v / mx) * (panel_h - 34)
+            if v:
+                s += '<path d="M%.1f %.1f V%.1f Q%.1f %.1f %.1f %.1f H%.1f Q%.1f %.1f %.1f %.1f V%.1f Z" fill="%s"><title>%s : %d %s</title></path>' % (cx - bw / 2, base, base - bh + 4, cx - bw / 2, base - bh, cx - bw / 2 + 4, base - bh, cx + bw / 2 - 4, cx + bw / 2, base - bh, cx + bw / 2, base - bh + 4, base, '#3b3a37', escape(day), v, escape(unit))
+                if v == mx or (v / mx > 0.5 and j % 2 == 0):
+                    s += '<text x="%.1f" y="%.1f" font-size="12" fill="%s" text-anchor="middle">%s</text>' % (cx, base - bh - 6, P['ink2'], '{:,}'.format(v).replace(',', ' '))
+            if pi == len(panels) - 1:
+                s += '<text x="%.1f" y="%d" font-size="12" fill="%s" text-anchor="middle">%s</text>' % (cx, base + 18, P['muted'], escape(day))
+    if note: s += '<text x="24" y="%d" font-size="13" fill="%s">%s</text>' % (h - 16, P['muted'], escape(note))
+    return s + '</svg>'
+def step_series(title, sub, pts, ymax, ylab, marks=(), w=1100, h=420, note=None, ref_line=None):
+    """pts: [(x_label, y)] in order; marks: [(index, text)] drawn as dots with a short label above."""
+    x0, x1, y0, y1 = 70, w - 30, 100, h - 70; n = len(pts); s = head(w, h, title, sub)
+    def X(i): return x0 + i * (x1 - x0) / max(n - 1, 1)
+    def Y(v): return y1 - v / ymax * (y1 - y0)
+    for t in range(0, int(ymax) + 1, max(int(ymax) // 5, 1)):
+        s += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s"/><text x="%d" y="%.1f" font-size="12" fill="%s" text-anchor="end">%d</text>' % (x0, Y(t), x1, Y(t), P['grid'], x0 - 8, Y(t) + 4, P['muted'], t)
+    if ref_line is not None:
+        s += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.5"/><text x="%d" y="%.1f" font-size="13" fill="%s" text-anchor="end">%s</text>' % (x0, Y(ref_line[0]), x1, Y(ref_line[0]), '#8a8984', x1, Y(ref_line[0]) - 6, P['ink2'], escape(ref_line[1]))
+    d = 'M%.1f %.1f' % (X(0), Y(pts[0][1]))
+    for i in range(1, n): d += ' H%.1f V%.1f' % (X(i), Y(pts[i][1]))
+    s += '<path d="%s" fill="none" stroke="%s" stroke-width="2" stroke-linejoin="round"/>' % (d, '#3b3a37')
+    for i, (lab, v) in enumerate(pts):
+        s += '<circle cx="%.1f" cy="%.1f" r="6" fill="transparent"><title>%s : %s %s</title></circle>' % (X(i), Y(v), escape(lab), v, escape(ylab))
+    for k, (i, txt) in enumerate(marks):
+        s += '<circle cx="%.1f" cy="%.1f" r="5" fill="%s" stroke="%s" stroke-width="2"/><line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s"/><text x="%.1f" y="%.1f" font-size="13" fill="%s" text-anchor="middle">%s</text>' % (X(i), Y(pts[i][1]), '#0b0b0b', P['surface'], X(i), Y(pts[i][1]) - 8, X(i), Y(pts[i][1]) - 30 - 16 * (k % 2), P['muted'], X(i), Y(pts[i][1]) - 36 - 16 * (k % 2), P['ink'], escape(txt))
+    for i in range(0, n, max(n // 10, 1)):
+        s += '<text x="%.1f" y="%d" font-size="12" fill="%s" text-anchor="middle">%s</text>' % (X(i), y1 + 20, P['muted'], escape(pts[i][0]))
+    s += '<text x="%d" y="%d" font-size="13" fill="%s">%s</text>' % (x0, y0 - 14, P['ink2'], escape(ylab))
+    if note: s += '<text x="24" y="%d" font-size="13" fill="%s">%s</text>' % (h - 20, P['muted'], escape(note))
+    return s + '</svg>'

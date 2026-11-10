@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+# 10 November 2026: inputs of the ZenRay Meshes audit, extracted once and read by the agents (each agent reads a bounded file).
+import re, os, json, subprocess, hashlib
+from pathlib import Path
+from datetime import datetime
+A = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_10-November-2026/inputs'); K = Path('/Users/zenray/.claude/skills/zenray-meshes'); T = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes'); M = Path('/Users/zenray/.claude/Memory1/Projects/zenray-meshes')
+# 1. journal entries of the project, split in two halves
+t = open('/Users/zenray/.claude/PROGRESS.md', encoding='utf-8').read(); ents = re.split(r'\n(?=\d{4}-\d{2}-\d{2} \d{2}:\d{2})', t)
+z = [e.strip() for e in ents if 'Projet : zenray-meshes' in e or 'zenray-meshes' in e[:400]]
+(A / 'journal_A.md').write_text('\n\n'.join(e for e in z if e[:10] <= '2026-10-27') + '\n'); (A / 'journal_B.md').write_text('\n\n'.join(e for e in z if e[:10] >= '2026-10-28') + '\n')
+# 2. Matthieu's own words: prompt, rule, order events of the feedback, deduplicated, chronological
+fb = open(M / 'FEEDBACK.md', encoding='utf-8').read(); blocks = re.split(r'\n(?=## \d+ \w+ 2026, )', fb); seen = set(); out = []
+for b in blocks:
+    m = re.match(r'## (\d+ \w+ 2026, \d\d:\d\d):\d\d [+-]\d+ : (\w+)', b)
+    if not m or m.group(2).lower() not in ('prompt', 'rule', 'order'):
+        continue
+    body = '\n'.join(l[2:] for l in b.split('\n') if l.startswith('> ')); body = re.sub(r'\s*\(\d+ \w+ 2026, \d\d:\d\d:\d\d [+-]\d+\)', '', body).strip()
+    body = re.sub(r'blob:https://claude\.ai/\S+', '[image]', body)
+    h = hashlib.sha1(body[:600].encode()).hexdigest()
+    if not body or h in seen:
+        continue
+    seen.add(h); out.append('[%s] %s\n%s' % (m.group(1), m.group(2).upper(), body[:900] + (' [...]' if len(body) > 900 else '')))
+def dkey(s):
+    return datetime.strptime(s.split(']')[0][1:], '%d %B %Y, %H:%M')
+out.sort(key=dkey); half = len(out) // 2
+(A / 'matthieu_A.md').write_text('\n\n'.join(out[:half]) + '\n'); (A / 'matthieu_B.md').write_text('\n\n'.join(out[half:]) + '\n')
+# 3. digest of the main reference: every section heading and its first 700 characters
+ref = open(K / 'references/ZenRayMeshes1.md', encoding='utf-8').read(); secs = re.split(r'\n(?=## )', ref); dig = []
+for s in secs:
+    lines = s.strip().split('\n'); head = lines[0]; body = ' '.join(l.strip() for l in lines[1:] if l.strip())
+    dig.append('%s\n%s%s' % (head, body[:700], ' [...]' if len(body) > 700 else ''))
+h2 = len(dig) // 2; (A / 'reference_A.md').write_text('\n\n'.join(dig[:h2]) + '\n'); (A / 'reference_B.md').write_text('\n\n'.join(dig[h2:]) + '\n')
+v4 = open(K / 'references/ZenRayMeshesV4.md', encoding='utf-8').read(); (A / 'reference_V4.md').write_text(v4)
+# 4. scripts: one row each with what can be measured without reading them all
+grep_corpus = ''.join(open(p, encoding='utf-8', errors='ignore').read() for p in [K / 'SKILL.md'] + list((K / 'references').glob('*.md')) + list(T.glob('Projects/*/STATE.md')))
+rows = ['path\tfolder\tlines\tmodified\tuses_hou\thas_selftest\tmentions_in_docs\tfirst_comment']
+for p in sorted((K / 'scripts').rglob('*.py')):
+    s = p.read_text(encoding='utf-8', errors='ignore'); rel = str(p.relative_to(K / 'scripts'))
+    com = ' '.join(l.strip('# ').strip() for l in s.split('\n')[:8] if l.strip().startswith('#') or l.strip().startswith('"""'))[:260].replace('\t', ' ')
+    rows.append('\t'.join([rel, str(p.parent.relative_to(K / 'scripts')), str(s.count('\n')), datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d'), str(int('import hou' in s or 'hou.' in s)), str(int('selftest' in s)), str(grep_corpus.count(p.name)), com]))
+(A / 'scripts.tsv').write_text('\n'.join(rows) + '\n')
+# 5. Houdini files
+hr = ['path\tkind\tbytes\tmodified']
+for root in (K, T):
+    for p in list(root.rglob('*.hda')) + list(root.rglob('*.otl')) + list(root.rglob('*.hip')) + list(root.rglob('*.hiplc')):
+        if '/backup/' in str(p): continue
+        hr.append('%s\t%s\t%d\t%s' % (p, p.suffix[1:], p.stat().st_size, datetime.fromtimestamp(p.stat().st_mtime).strftime('%Y-%m-%d')))
+(A / 'houdini.tsv').write_text('\n'.join(hr) + '\n')
+for f in sorted(A.iterdir()):
+    print(f.name, f.stat().st_size, 'bytes', sum(1 for _ in open(f, encoding='utf-8', errors='ignore')), 'lines')
