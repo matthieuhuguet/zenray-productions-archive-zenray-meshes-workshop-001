@@ -25,18 +25,26 @@ def head(w, h, title, sub):
     s += '<text x="24" y="40" font-size="24" font-weight="700" fill="%s">%s</text>' % (P['ink'], escape(title))
     if sub: s += '<text x="24" y="66" font-size="15" fill="%s">%s</text>' % (P['ink2'], escape(sub))
     return s
-def legend(x, y, keys=None):
-    s = ''; cx = x
+def legend_layout(x, keys=None, max_x=1076):
+    """10 November 2026: legend items wrap onto a new line instead of running off the right edge; returns [(key, label, x, line)]."""
+    out = []; cx = x; line = 0
     for k, lab, _, _ in cats():
         if keys and k not in keys: continue
-        s += '<rect x="%d" y="%d" width="14" height="14" rx="3" fill="%s" stroke="#c9c8c2" stroke-width="0.6"/><text x="%d" y="%d" font-size="14" fill="%s">%s</text>' % (cx, y, fill_of(k), cx + 20, y + 12, P['ink2'], escape(lab))
-        cx += 30 + int(len(lab) * 7.3)
+        wd = 30 + int(len(lab) * 7.3)
+        if cx > x and cx + wd > max_x: cx = x; line += 1
+        out.append((k, lab, cx, line)); cx += wd
+    return out
+def legend(x, y, keys=None, max_x=1076):
+    s = ''
+    for k, lab, cx, line in legend_layout(x, keys, max_x):
+        yy = y + 22 * line
+        s += '<rect x="%d" y="%d" width="14" height="14" rx="3" fill="%s" stroke="#c9c8c2" stroke-width="0.6"/><text x="%d" y="%d" font-size="14" fill="%s">%s</text>' % (cx, yy, fill_of(k), cx + 20, yy + 12, P['ink2'], escape(lab))
     return s
 def hbar_stacked(title, sub, rows, w=1100, label_w=230, keys=None, note=None, suffix='', totals=None):
     """rows: [(label, {outcome_key: n})]. One bar per row, segments in the order of OUT, value at the tip."""
-    keys = keys or [k for k, *_ in cats()]; n = len(rows); rh = 34; top = 110; h = top + n * rh + 70 + (24 if note else 0)
+    keys = keys or [k for k, *_ in cats()]; n = len(rows); rh = 34; top = 110 + 22 * max(l for *_, l in legend_layout(24, keys, w - 24)); h = top + n * rh + 70 + (24 if note else 0)
     mx = max([sum(r[1].get(k, 0) for k in keys) for r in rows] + [1]); x0 = 24 + label_w; span = w - x0 - 80
-    s = head(w, h, title, sub) + legend(24, 80, keys)
+    s = head(w, h, title, sub) + legend(24, 80, keys, w - 24)
     for i, (lab, d) in enumerate(rows):
         y = top + i * rh; s += '<text x="%d" y="%d" font-size="15" fill="%s" text-anchor="end">%s</text>' % (x0 - 12, y + 16, P['ink'], escape(lab)); cx = x0; tot = sum(d.get(k, 0) for k in keys)
         for k in keys:
@@ -67,21 +75,29 @@ def columns_multiples(title, sub, panels, days, w=1100, panel_h=150, note=None):
     return s + '</svg>'
 def step_series(title, sub, pts, ymax, ylab, marks=(), w=1100, h=420, note=None, ref_line=None):
     """pts: [(x_label, y)] in order; marks: [(index, text)] drawn as dots with a short label above."""
-    x0, x1, y0, y1 = 70, w - 30, 100, h - 70; n = len(pts); s = head(w, h, title, sub)
+    x0, x1, y0, y1 = 70, w - 30, 100, h - 70 - 22 * ((len(marks) + 2) // 3); n = len(pts); s = head(w, h, title, sub)
     def X(i): return x0 + i * (x1 - x0) / max(n - 1, 1)
     def Y(v): return y1 - v / ymax * (y1 - y0)
     for t in range(0, int(ymax) + 1, max(int(ymax) // 5, 1)):
         s += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s"/><text x="%d" y="%.1f" font-size="12" fill="%s" text-anchor="end">%d</text>' % (x0, Y(t), x1, Y(t), P['grid'], x0 - 8, Y(t) + 4, P['muted'], t)
     if ref_line is not None:
-        s += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.5"/><text x="%d" y="%.1f" font-size="13" fill="%s" text-anchor="end">%s</text>' % (x0, Y(ref_line[0]), x1, Y(ref_line[0]), '#8a8984', x1, Y(ref_line[0]) - 6, P['ink2'], escape(ref_line[1]))
+        s += '<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="%s" stroke-width="1.5"/><text x="%d" y="%.1f" font-size="13" fill="%s" text-anchor="start">%s</text>' % (x0, Y(ref_line[0]), x1, Y(ref_line[0]), '#8a8984', x0 + 6, Y(ref_line[0]) + 17, P['ink2'], escape(ref_line[1]))
     d = 'M%.1f %.1f' % (X(0), Y(pts[0][1]))
     for i in range(1, n): d += ' H%.1f V%.1f' % (X(i), Y(pts[i][1]))
     s += '<path d="%s" fill="none" stroke="%s" stroke-width="2" stroke-linejoin="round"/>' % (d, '#3b3a37')
     for i, (lab, v) in enumerate(pts):
         s += '<circle cx="%.1f" cy="%.1f" r="6" fill="transparent"><title>%s : %s %s</title></circle>' % (X(i), Y(v), escape(lab), v, escape(ylab))
+    groups = {}                                               # 10 November 2026: marks on the same version share one label ("2, 3"), set above the reference line when the curve is near the top
+    for k, (i, txt) in enumerate(marks): groups.setdefault(i, []).append(k + 1)
+    last_x = -1e9; row = 0
+    for i, ks in sorted(groups.items()):
+        row = row + 1 if X(i) - last_x < 70 else 0; last_x = X(i)    # neighbouring groups go one row lower so their numbers never overlap
+        yy = (Y(ymax) - 10 if pts[i][1] >= ymax - 4 else Y(pts[i][1]) - 14) + 0 * row
+        if row: yy = Y(pts[i][1]) + 22
+        s += '<circle cx="%.1f" cy="%.1f" r="5" fill="%s" stroke="%s" stroke-width="2"/><text x="%.1f" y="%.1f" font-size="13" font-weight="700" fill="%s" text-anchor="%s">%s</text>' % (X(i), Y(pts[i][1]), '#0b0b0b', P['surface'], X(i), yy, P['ink'], 'end' if X(i) > x1 - 20 else 'middle', ', '.join(map(str, ks)))
+    cw = (x1 - x0) / 3
     for k, (i, txt) in enumerate(marks):
-        yy = Y(pts[i][1]) + 30 + 22 * (k % 3)                 # labels under the curve, staggered on three rows so they never collide
-        s += '<circle cx="%.1f" cy="%.1f" r="5" fill="%s" stroke="%s" stroke-width="2"/><line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="%s"/><text x="%.1f" y="%.1f" font-size="13" fill="%s" text-anchor="end">%s</text>' % (X(i), Y(pts[i][1]), '#0b0b0b', P['surface'], X(i), Y(pts[i][1]) + 8, X(i), yy - 4, P['muted'], X(i) - 4, yy, P['ink'], escape(txt))
+        s += '<text x="%.1f" y="%d" font-size="13" fill="%s"><tspan font-weight="700" fill="%s">%d</tspan>  %s (%s)</text>' % (x0 + (k % 3) * cw, y1 + 48 + 20 * (k // 3), P['ink2'], P['ink'], k + 1, escape(txt), escape(pts[i][0]))
     for i in range(0, n, max(n // 10, 1)):
         s += '<text x="%.1f" y="%d" font-size="12" fill="%s" text-anchor="middle">%s</text>' % (X(i), y1 + 20, P['muted'], escape(pts[i][0]))
     s += '<text x="%d" y="%d" font-size="13" fill="%s">%s</text>' % (x0, y0 - 14, P['ink2'], escape(ylab))
