@@ -1,0 +1,65 @@
+# 10 November 2026: places the native-node graph of the complete front-left wheel of car 2 (my hands through the MCP, not a tool inside the graph).
+# FR : pose le graphe en nœuds natifs de la roue avant gauche complète ; le graphe ne contient ni Python ni VEX.
+import hou
+obj = hou.node('/obj')
+for n in ('WHEEL_tyre', 'WHEEL_front_L', 'LAB_ring'):
+    if obj.node(n): obj.node(n).destroy()
+w = obj.createNode('geo', 'WHEEL_front_L'); c = w.createNode('null', 'CTRL_wheel')
+ptg = c.parmTemplateGroup()
+def folder(label, items):
+    f = hou.FolderParmTemplate('f_' + label.lower().split()[0], label)
+    for it in items:
+        name, lab, val = it[0], it[1], it[2]
+        if isinstance(val, int) and not isinstance(val, bool): f.addParmTemplate(hou.IntParmTemplate(name, lab, 1, default_value=(val,), min=it[3], max=it[4]))
+        elif isinstance(val, tuple): f.addParmTemplate(hou.FloatParmTemplate(name, lab, 3, default_value=val))
+        else: f.addParmTemplate(hou.FloatParmTemplate(name, lab, 1, default_value=(val,), min=it[3], max=it[4]))
+    ptg.append(f)
+folder('Tyre (pneu)', [('tyre_radius', 'Tyre radius (m)', 0.43371, 0.3, 0.5), ('bead_radius', 'Bead radius (m)', 0.37759, 0.25, 0.45), ('tyre_width', 'Tyre width (m)', 0.42, 0.2, 0.55), ('tyre_shoulder', 'Shoulder rounding (m)', 0.035, 0.0, 0.08)])
+folder('Rim (jante)', [('lip_inner', 'Lip inner radius (m)', 0.298, 0.2, 0.37), ('lip_x', 'Lip face along the axle (m)', 0.185, 0.0, 0.3), ('lip_depth', 'Lip thickness (m)', 0.02, 0.005, 0.06), ('barrel_radius', 'Barrel inner radius (m)', 0.352, 0.25, 0.4), ('rim_width', 'Rim width (m)', 0.40, 0.2, 0.55)])
+folder('Spokes (branches)', [('spokes', 'Number of spokes', 5, 3, 12), ('spin', 'Spin (deg)', 21.25, -180.0, 180.0), ('split_radius', 'Y split radius (m)', 0.128, 0.05, 0.25), ('half_angle', 'Arm half angle at the lip (deg)', 16.8, 0.0, 36.0), ('arm_width', 'Arm width (m)', 0.017, 0.005, 0.05), ('hub_x', 'Hub face along the axle (m)', 0.13, -0.1, 0.3)])
+folder('Hub (moyeu)', [('hub_radius', 'Hub radius (m)', 0.091, 0.04, 0.15), ('ring_radius', 'Hub ring radius (m)', 0.055, 0.02, 0.1), ('cap_radius', 'Centre cap radius (m)', 0.034, 0.01, 0.06), ('hub_width', 'Hub thickness (m)', 0.05, 0.01, 0.1)])
+folder('Brake (frein)', [('disc_outer', 'Disc outer radius (m)', 0.256, 0.15, 0.33), ('disc_inner', 'Disc inner radius (m)', 0.15, 0.05, 0.25), ('disc_thick', 'Disc thickness (m)', 0.034, 0.01, 0.06), ('disc_x', 'Disc along the axle (m)', 0.02, -0.2, 0.2), ('cal_angle', 'Caliper half span (deg)', 25.0, 5.0, 60.0), ('cal_in', 'Caliper inner radius (m)', 0.17, 0.1, 0.3), ('cal_out', 'Caliper outer radius (m)', 0.272, 0.15, 0.33)])
+folder('Placement', [('centre', 'Wheel centre (m)', (0.98, 0.4407, 1.2976))])
+c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_wheel/%s")' % p
+parts = []
+def ring(name, r_out, r_in, width, bevel, x, inner=1, cols=96):
+    n = w.createNode('zrm_ring', name)
+    for p, v in (('r_out', r_out), ('r_in', r_in), ('width', width), ('bevel', bevel), ('x_offset', x)):
+        n.parm(p).setExpression(v) if isinstance(v, str) else n.parm(p).set(v)
+    n.parm('inner_band').set(inner); n.parm('cols').set(cols); parts.append(n); return n
+ring('tyre', K('tyre_radius'), K('bead_radius'), K('tyre_width'), K('tyre_shoulder'), 0, inner=0)
+ring('rim_barrel', K('bead_radius') + '-0.004', K('barrel_radius'), K('rim_width'), 0.004, 0)
+ring('rim_lip', K('bead_radius') + '+0.006', K('lip_inner'), K('lip_depth'), 0.005, K('lip_x'))
+ring('brake_disc', K('disc_outer'), K('disc_inner'), K('disc_thick'), 0.003, K('disc_x'))
+ring('disc_hat', K('disc_inner'), K('ring_radius'), 0.06, 0.006, K('disc_x') + '+0.03', cols=64)
+ring('hub', K('hub_radius'), K('ring_radius'), K('hub_width'), 0.008, K('hub_x'), cols=64)
+ring('hub_ring', K('ring_radius'), K('cap_radius'), 0.03, 0.004, K('hub_x') + '+0.02', cols=64)
+ring('centre_cap', K('cap_radius'), 0.004, 0.03, 0.012, K('hub_x') + '+0.035', cols=48)
+a = w.createNode('add', 'spoke_curve'); a.parm('points').set(4)
+lipx = '(%s-%s/2)' % (K('lip_x'), K('lip_depth'))
+xs = '(%s+(%s-%s)*(%s-%s)/(%s-%s))' % (K('hub_x'), lipx, K('hub_x'), K('split_radius'), K('hub_radius'), K('lip_inner'), K('hub_radius'))
+pts = [(K('hub_x'), K('hub_radius') + '*0.85', '0'), (xs, K('split_radius'), '0'),
+       (lipx, K('lip_inner') + '*cos(' + K('half_angle') + ')', K('lip_inner') + '*sin(' + K('half_angle') + ')'),
+       (lipx, K('lip_inner') + '*cos(' + K('half_angle') + ')', '-' + K('lip_inner') + '*sin(' + K('half_angle') + ')')]
+for i, (px, py, pz) in enumerate(pts):
+    a.parm('usept%d' % i).set(1)
+    for ax, v in zip('xyz', (px, py, pz)): a.parm('pt%d%s' % (i, ax)).setExpression(v)
+a.parm('prims').set(3); a.parm('prim0').set('0 1'); a.parm('prim1').set('1 2'); a.parm('prim2').set('1 3')
+sw = w.createNode('sweep::2.0', 'spoke_body'); sw.setInput(0, a); sw.parm('surfaceshape').set('square'); sw.parm('width').setExpression(K('arm_width')); sw.parm('cols').set(2)
+cx = w.createNode('copyxform', 'five_spokes'); cx.setInput(0, sw); cx.parm('ncy').setExpression(K('spokes')); cx.parm('rx').setExpression('360/' + K('spokes'))
+sp = w.createNode('xform', 'spoke_spin'); sp.setInput(0, cx); sp.parm('rx').setExpression(K('spin')); parts.append(sp)
+cp = w.createNode('add', 'caliper_profile'); cp.parm('points').set(4)
+cpts = [(K('disc_x') + '-0.05', K('cal_in')), (K('disc_x') + '+0.05', K('cal_in')), (K('disc_x') + '+0.05', K('cal_out')), (K('disc_x') + '-0.05', K('cal_out'))]
+for i, (px, py) in enumerate(cpts):
+    cp.parm('usept%d' % i).set(1); cp.parm('pt%dx' % i).setExpression(px); cp.parm('pt%dy' % i).setExpression(py); cp.parm('pt%dz' % i).set(0)
+cp.parm('prims').set(1); cp.parm('prim0').set('0 1 2 3'); cp.parm('closed0').set(1)
+rv = w.createNode('revolve::2.0', 'caliper_body'); rv.setInput(0, cp); rv.parmTuple('origin').set((0, 0, 0)); rv.parmTuple('dir').set((1, 0, 0)); rv.parm('type').set('closedarc'); rv.parm('divs').set(16); rv.parm('cap').set(1)
+rv.parm('beginangle').setExpression('-' + K('cal_angle')); rv.parm('endangle').setExpression(K('cal_angle'))
+cf = w.createNode('fuse::2.0', 'caliper_weld'); cf.setInput(0, rv); cf.parm('tol3d').set(0.0002)
+cb = w.createNode('polybevel::3.0', 'caliper_round'); cb.setInput(0, cf); cb.parm('ignoreflatedges').set(1); cb.parm('flatangle').set(20); cb.parm('filletshape').set('round'); cb.parm('offset').set(0.008); cb.parm('divisions').set(2); parts.append(cb)
+mg = w.createNode('merge', 'wheel_parts')
+for i, p in enumerate(parts): mg.setInput(i, p)
+pl = w.createNode('xform', 'place_front_left'); pl.setInput(0, mg)
+for ax in 'xyz': pl.parm('t' + ax).setExpression('ch("../CTRL_wheel/centre%s")' % ax)
+o = w.createNode('null', 'OUT_wheel'); o.setInput(0, pl); o.setDisplayFlag(True); o.setRenderFlag(True); w.layoutChildren()
