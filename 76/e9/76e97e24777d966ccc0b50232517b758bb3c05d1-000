@@ -1,0 +1,43 @@
+# 10 November 2026 (defaults tuned 11 November 2026, A_002): places the native-node graph of the front-left wheel arch of car 2: liner, rounded lip, fender band.
+# FR : pose le graphe en nœuds natifs du passage de roue avant gauche : doublure, bord arrondi, bande d'aile.
+import hou
+obj = hou.node('/obj')
+if obj.node('ARCH_front_L'): obj.node('ARCH_front_L').destroy()
+g = obj.createNode('geo', 'ARCH_front_L'); c = g.createNode('null', 'CTRL_arch')
+ptg = c.parmTemplateGroup()
+def folder(name, label, items):
+    f = hou.FolderParmTemplate(name, label)
+    for n, lab, v, lo, hi in items: f.addParmTemplate(hou.FloatParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi))
+    ptg.append(f)
+folder('f_shape', 'Arch (passage de roue)', [('arch_radius', 'Lip edge radius (m)', 0.455, 0.43, 0.6), ('start_deg', 'Start angle, rear (deg, image)', -35.0, -90.0, 90.0), ('end_deg', 'End angle, front (deg, image)', 200.0, 90.0, 270.0), ('body_x', 'Body face from the wheel centre (m)', 0.235, 0.15, 0.4)])
+folder('f_lip', 'Lip (bord)', [('lip_radial', 'Lip radial size (m)', 0.018, 0.005, 0.05), ('lip_depth', 'Lip depth into the arch (m)', 0.06, 0.01, 0.15), ('lip_round', 'Lip rounding (m)', 0.006, 0.0, 0.02)])
+folder('f_liner', 'Liner (doublure)', [('liner_gap', 'Liner gap beyond the lip (m)', 0.02, 0.0, 0.1), ('liner_width', 'Liner width along the axle (m)', 0.46, 0.2, 0.7)])
+folder('f_band', 'Fender band (aile)', [('band_outer', 'Band outer radius (m)', 0.505, 0.5, 0.9), ('band_slope', 'Band inward slope at its outer edge (m)', 0.02, -0.05, 0.15)])
+folder('f_grey', 'Shade (gris)', [('g_body', 'Body grey', 0.62, 0.0, 1.0), ('g_liner', 'Liner grey', 0.05, 0.0, 1.0)])
+c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_arch/%s")' % p
+def arc(name, profile_pts, closed, divs=64):
+    a = g.createNode('add', name + '_profile'); a.parm('points').set(len(profile_pts))
+    for i, (px, py) in enumerate(profile_pts):
+        a.parm('usept%d' % i).set(1); a.parm('pt%dx' % i).setExpression(px); a.parm('pt%dy' % i).setExpression(py); a.parm('pt%dz' % i).set(0)
+    a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(profile_pts)))); a.parm('closed0').set(1 if closed else 0)
+    r = g.createNode('revolve::2.0', name + '_sweep'); r.setInput(0, a); r.parmTuple('origin').set((0, 0, 0)); r.parmTuple('dir').set((1, 0, 0)); r.parm('type').set('openarc'); r.parm('divs').set(divs); r.parm('cap').set(1 if closed else 0)
+    r.parm('beginangle').setExpression(K('start_deg') + '-90'); r.parm('endangle').setExpression(K('end_deg') + '-90')
+    f = g.createNode('fuse::2.0', name + '_weld'); f.setInput(0, r); f.parm('tol3d').set(0.0002)
+    return f
+R = K('arch_radius'); X = K('body_x')
+lip = arc('lip', [(X, R), (X, R + '+' + K('lip_radial')), (X + '-' + K('lip_depth'), R + '+' + K('lip_radial')), (X + '-' + K('lip_depth'), R)], True)
+lb = g.createNode('polybevel::3.0', 'lip_round'); lb.setInput(0, lip); lb.parm('ignoreflatedges').set(1); lb.parm('flatangle').set(20); lb.parm('filletshape').set('round'); lb.parm('offset').setExpression(K('lip_round')); lb.parm('divisions').set(2)
+LR = R + '+' + K('lip_radial') + '+' + K('liner_gap')
+liner = arc('liner', [(X + '-' + K('lip_depth'), LR), (X + '-' + K('liner_width'), LR)], False)
+band = arc('band', [(X, R + '+' + K('lip_radial')), (X + '-' + K('band_slope'), K('band_outer'))], False)
+cols = []
+for node, shade in ((lb, 'g_body'), (liner, 'g_liner'), (band, 'g_body')):
+    col = g.createNode('color', 'grey_' + node.name()); col.setInput(0, node)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K(shade))
+    cols.append(col)
+mg = g.createNode('merge', 'arch_parts')
+for i, n in enumerate(cols): mg.setInput(i, n)
+pl = g.createNode('xform', 'place_front_left'); pl.setInput(0, mg)
+for ax in 'xyz': pl.parm('t' + ax).setExpression('ch("/obj/WHEEL_front_L/CTRL_wheel/centre%s")' % ax)
+o = g.createNode('null', 'OUT_arch'); o.setInput(0, pl); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
