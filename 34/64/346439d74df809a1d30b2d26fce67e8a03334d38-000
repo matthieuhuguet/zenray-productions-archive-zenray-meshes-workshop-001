@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+# 10 November 2026: classification of the 705 scripts of the skill by rules written here (name, folder, first comment),
+# not by an agent: every row can be checked. Writes data/code.json and charts/07_code_par_etape.svg.
+import csv, json, re, sys
+from collections import Counter, defaultdict
+sys.path.insert(0, '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_10-November-2026/scripts')
+import chartlib as C
+A = '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_10-November-2026'; K = '/Users/zenray/.claude/skills/zenray-meshes/scripts/'
+rows = list(csv.DictReader(open(A + '/inputs/scripts.tsv'), delimiter='\t', quoting=csv.QUOTE_NONE))
+RULES = [  # (stage, regex on folder/name/comment), first match wins; order matters (10 November 2026)
+ ('topologie', r'topo|retopo|quad|remesh|planarize|qw|lines/|curvenetwork|netmesh'),
+ ('surface et lissage', r'fair|smooth|relax|crease|facet|finish/|finish|gap|contact|heightfair'),
+ ('UV et texture', r'\buv|uv_|texture|wood|bark|color|material'),
+ ('vérification', r'score|meshqa|check|bench|audit|diff|compare|blame|stats|gate|judge|missing|region|photo\.|clay|views|review|history|plot|diag|report|selftest'),
+ ('référence et calage', r'sheetsplit|sheetmask|calibrat|frame_init|viewcal|fitscale|perspective|camera|setuphoudinireference|synthsheet|sheetboard|sheetviews'),
+ ('décalque et découpe', r'trace|viewgraph|consensus|mask|sam|cut|segment|outline|blueprint|line|wireframe|feature|split|layer|wheel_|shapefit|asklayer|compboard|lookm|lookdiag|lookover|borders'),
+ ('plan et cage', r'cage|plan\.|fit\.py|iterate|blockout|archetype|design|guide|span|row|profile|mk\.py|curverig|curve|nurbs|lattice|loft'),
+ ('maillage', r'panelmesh|mesh|kit|build|lego|panel|shell|weld|hole|trim|interface|liner|inflate|subdiv|arch|nose|tail|fascia|windshield|parts|component|dracard|truck|hardsurface|micro/'),
+]
+def stage(r):
+    # the path (folder and file name) decides; the first comment only when the path says nothing (comments mention quads everywhere)
+    for t in (r['path'].lower(), r['first_comment'].lower()):
+        for st, rx in RULES:
+            if re.search(rx, t): return st
+    return 'outillage et autre'
+out = []
+for r in rows:
+    name = r['path'].split('/')[-1]; copy = bool(re.search(r'V\d{3}\.py$|_v\d+[a-z]?\.py$|v\d+bak', name))
+    out.append({'path': r['path'], 'folder': r['folder'], 'lines': int(r['lines']), 'modified': r['modified'], 'stage': stage(r), 'engine': 'houdini' if r['uses_hou'] == '1' else 'python',
+                'selftest': r['has_selftest'] == '1', 'mentions_in_docs': int(r['mentions_in_docs']), 'versioned_copy': copy, 'recent': r['modified'] >= '2026-11-09'})
+json.dump(out, open(A + '/data/code.json', 'w'), indent=1, ensure_ascii=False)
+C.CATS = [('houdini', 'Tourne dans Houdini (hou)', '#1f1f1e', None), ('python', 'Python seul (numpy, scipy, SAM)', '#b2b1ab', None), ('copie', 'Copie versionnée du même script', '#f0efea', 45)]
+t = defaultdict(Counter)
+for o in out: t[o['stage']]['copie' if o['versioned_copy'] else o['engine']] += 1
+order = ['référence et calage', 'décalque et découpe', 'plan et cage', 'maillage', 'topologie', 'surface et lissage', 'UV et texture', 'vérification', 'outillage et autre']
+rows_ = [(s, dict(t[s])) for s in order if s in t]
+open(A + '/charts/07_code_par_etape.svg', 'w').write(C.hbar_stacked('Le code écrit : où il tourne', '705 scripts Python du skill, classés par étape (règles de nom) ; « tourne dans Houdini » = le script importe hou.', rows_, note="Lecture : 8 % des scripts tournent dans Houdini ; le reste refait en Python ce que Houdini sait faire (maillage, lissage, topologie)."))
+s = {'scripts': len(out), 'lines': sum(o['lines'] for o in out), 'houdini': sum(o['engine'] == 'houdini' for o in out), 'versioned_copies': sum(o['versioned_copy'] for o in out), 'selftest': sum(o['selftest'] for o in out), 'never_in_docs': sum(o['mentions_in_docs'] == 0 for o in out), 'recent': sum(o['recent'] for o in out), 'by_stage': {k: dict(v) for k, v in t.items()}}
+json.dump(s, open(A + '/data/code_summary.json', 'w'), indent=1, ensure_ascii=False); print(json.dumps(s, ensure_ascii=False))

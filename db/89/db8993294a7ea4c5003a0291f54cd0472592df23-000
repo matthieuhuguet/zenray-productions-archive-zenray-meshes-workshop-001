@@ -32,16 +32,17 @@ if att:
     st = table('stage', [a for a in att if a.get('stage') != 'outil/infrastructure'], FOLD, 'outcome')
     order = ['référence', 'calage', 'décalque', 'découpe', 'plan/cage', 'volume', 'maillage', 'topologie', 'surface/lissage', 'détails', 'UV/texture', 'rendu/vérification']
     rows = [(s, dict(st[s])) for s in order if s in st]
-    open(A + '/charts/02_essais_par_etape.svg', 'w').write(C.hbar_stacked("Ce qui marche, étape par étape", "%d essais lus dans le journal (25 October au 10 November 2026), classés par étape de la chaîne et par issue." % sum(sum(d.values()) for _, d in rows), rows, note="Source : journal de travail, classé par deux agents ; « accepté sur la mesure seule » = un chiffre a monté sans verdict de Matthieu."))
+    open(A + '/charts/02_essais_par_etape.svg', 'w').write(C.hbar_stacked("Ce qui marche, étape par étape", "%d essais lus dans le journal (25 October au 10 November 2026), classés par étape de la chaîne et par issue." % sum(sum(d.values()) for _, d in rows), rows, note="Source : journal, classé par deux agents. Le journal ne consigne AUCUNE de tes validations : elles sont dans tes messages."))
     ob = table('object', [a for a in att if a.get('object') not in ('aucun', None)], FOLD, 'outcome')
     rows = sorted(((o, dict(c)) for o, c in ob.items()), key=lambda r: -sum(r[1].values()))[:12]
     open(A + '/charts/03_essais_par_objet.svg', 'w').write(C.hbar_stacked("Ce qui marche, objet par objet", "Les mêmes essais, regroupés par objet travaillé.", rows))
     rep['by_stage'] = {k: dict(v) for k, v in st.items()}; rep['by_object'] = {k: dict(v) for k, v in ob.items()}
     eng = Counter(a.get('engine', 'inconnu') for a in att if a.get('stage') != 'outil/infrastructure'); rep['by_engine'] = dict(eng)
 if ver:
+    C.CATS = [('valide', 'Validé', '#1f1f1e', None), ('partiel', 'Corrigé : « oui, mais »', '#b2b1ab', None), ('rejete', 'Rejeté', '#f0efea', 45)]
     vs = table('stage', ver, VFOLD, 'kind'); order = ['référence', 'calage', 'décalque', 'découpe', 'plan/cage', 'volume', 'maillage', 'topologie', 'surface/lissage', 'détails', 'UV/texture', 'rendu/vérification', 'méthode générale']
     rows = [(s, dict(vs[s])) for s in order if s in vs]
-    open(A + '/charts/05_verdicts_par_etape.svg', 'w').write(C.hbar_stacked("Tes verdicts, étape par étape", "%d verdicts de Matthieu (valide, corrige, rejette) relevés dans ses messages." % sum(sum(d.values()) for _, d in rows), rows, keys=['valide', 'partiel', 'rejete'], note="« Partiel » regroupe ici ses corrections : « oui, mais… »."))
+    open(A + '/charts/05_verdicts_par_etape.svg', 'w').write(C.hbar_stacked("Tes verdicts, étape par étape", "%d verdicts de Matthieu (valider, corriger, rejeter) relevés dans ses messages, par étape." % sum(sum(d.values()) for _, d in rows), rows, keys=['valide', 'partiel', 'rejete']))
     vo = table('object', [v for v in ver if v.get('object') not in ('aucun', None)], VFOLD, 'kind')
     rows = sorted(((o, dict(c)) for o, c in vo.items()), key=lambda r: -sum(r[1].values()))[:12]
     open(A + '/charts/06_verdicts_par_objet.svg', 'w').write(C.hbar_stacked("Tes verdicts, objet par objet", "Les mêmes verdicts, regroupés par objet.", rows, keys=['valide', 'partiel', 'rejete']))
@@ -50,3 +51,29 @@ if ver:
         rep['tone_by_date'].setdefault(v.get('date', '?'), Counter())[v.get('tone', 'neutre')] += 1
     rep['tone_by_date'] = {k: dict(c) for k, c in rep['tone_by_date'].items()}
 json.dump(rep, open(A + '/data/agents_summary.json', 'w'), indent=1, ensure_ascii=False); print(json.dumps({k: v for k, v in rep.items() if k in ('attempts', 'verdicts', 'by_engine', 'verdict_kinds')}, ensure_ascii=False))
+# 10 November 2026: verdicts per day (moved here from a one-off command so the chart can be rebuilt)
+if ver:
+    from datetime import datetime
+    C.CATS = [('valide', 'Validé', '#1f1f1e', None), ('partiel', 'Corrigé : « oui, mais »', '#b2b1ab', None), ('rejete', 'Rejeté', '#f0efea', 45)]
+    t = defaultdict(Counter); fr = Counter(); tot = Counter()
+    for v in ver:
+        try: d = datetime.strptime(v['date'], '%d %B %Y')
+        except Exception: continue
+        k = (d, d.strftime('%d %b').replace('Oct', 'oct').replace('Nov', 'nov')); tot[k] += 1; fr[k] += v.get('tone') == 'frustré'
+        if v['kind'] in VFOLD: t[k][VFOLD[v['kind']]] += 1
+    rows = [('%s  (%d %% frustré)' % (k[1], round(100 * fr[k] / tot[k])), dict(t[k])) for k in sorted(tot)]
+    n3 = sum(sum(r[1].values()) for r in rows)
+    open(A + '/charts/08_verdicts_dans_le_temps.svg', 'w').write(C.hbar_stacked('Tes verdicts, jour par jour', '%d verdicts (valider, corriger, rejeter) parmi %d lignes relevées dans tes messages ; part des messages frustrés entre parenthèses.' % (n3, len(ver)), rows, keys=['valide', 'partiel', 'rejete'], label_w=250,
+        note="Lecture : 124 rejets, 15 corrections, 27 validations ; les validations portent sur des composants isolés (roues, torse et bassin de Manny, découpe par composant)."))
+
+# 10 November 2026: the headline: what the work concluded against what Matthieu said, in shares of each total
+if att and ver:
+    C.CATS = None
+    ja = Counter(FOLD.get(a.get('outcome'), 'abandon') for a in att if a.get('stage') != 'outil/infrastructure'); nj = sum(ja.values())
+    vb = Counter(VFOLD[v['kind']] for v in ver if v['kind'] in VFOLD); nv = sum(vb.values())
+    pct = lambda c, n: {k: round(100 * c[k] / n) for k in c}
+    rows = [('Ce que le travail concluait', pct(ja, nj)), ('Ce que tu as dit', pct(vb, nv))]
+    open(A + '/charts/09_mesure_contre_oeil.svg', 'w').write(C.hbar_stacked("La mesure disait « ça avance », ton œil disait non", "Deux barres sur le même axe, en pourcentage de chaque total : en haut, %d essais du journal classés par issue ; en bas, tes %d verdicts." % (nj, nv), rows, label_w=260, suffix=' %', totals=['%d essais' % nj, '%d verdicts' % nv],
+        note="Lecture : la moitié des essais se concluaient sur un chiffre qui montait ; trois quarts de tes verdicts sont des rejets, et le journal ne garde aucune de tes 27 validations."))
+    rep['headline'] = {'journal': dict(ja), 'verdicts': dict(vb)}
+    json.dump(rep, open(A + '/data/agents_summary.json', 'w'), indent=1, ensure_ascii=False)
