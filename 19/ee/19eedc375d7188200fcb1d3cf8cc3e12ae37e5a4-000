@@ -1,0 +1,173 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 10 November 2026, 09:00 Europe/Paris: ZenRay Meshes V4 synthesis, built from the measured sources of the car project,
+# never typed by hand. It instances the V3 builder (same page, same schema helpers) with the V4 numbers.
+# FR : synthèse de ZenRay Meshes V4, chiffres relus dans le journal d'itérations et le contrôle qualité du projet ;
+# verify et selftest prouvent les deux sens (vert sur la vraie page, rouge sur une copie dont un chiffre est faussé).
+#
+# Usage: BuildSynthesisV4.py build | verify [html] | selftest
+import base64
+import io
+import json
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+from PIL import Image
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from BuildSynthesisV3 import Svg, fr, FONTS, INK, MUTED, ACCENT, RED, PAPER, W, H   # the library: one definition, two instances
+
+# ---- interface (the only place to change) -------------------------------------------------------------------------
+ART = HERE.parent
+PROJECT = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/11_CarCage')
+VERSION = 137                      # version of the car shown by the synthesis
+TITLE = 'ZenRay Meshes V4'
+BAR_PX = 760                       # length of a bar worth 1.0 in the schema
+THRESHOLD_LINES = 0.80             # gate F2
+THRESHOLD_BORDERS = 0.85           # gate F3
+VIEWS = [('front', 'avant'), ('back', 'arrière'), ('left', 'gauche'), ('right', 'droite'), ('top', 'dessus'), ('bottom', 'dessous')]
+# --------------------------------------------------------------------------------------------------------------------
+
+
+def numbers():
+    tag = 'V_%03d' % VERSION
+    recs = [json.loads(line) for line in (PROJECT / 'iterations.jsonl').read_text().splitlines() if line.strip()]
+    rec = [r for r in recs if r['version'] == tag][-1]
+    qa = json.loads((PROJECT / '04_checks' / ('%s-qa' % tag) / 'qa.json').read_text())
+    fid = qa['fidelity']; m = rec['measured']
+    passed, total = [int(x) for x in rec['gates'].split('/')]
+    plan_ok, plan_all = [int(x) for x in rec['plan'].split('/')]
+    n = {
+        'quads': '{:,}'.format(rec['quads']).replace(',', ' '),
+        'parts': str(rec['parts']),
+        'gates': '%d' % passed, 'gates_all': '%d' % total,
+        'plan': '%d' % plan_ok, 'plan_all': '%d' % plan_all,
+        'versions': str(VERSION),
+        'sil_min': fr(100 * min(m['F1.' + v] for v, _ in VIEWS), 1),
+        'lines': fr(100 * m['F2'], 0),
+        'borders': fr(100 * m['F3'], 0),
+        'borders_off': fr(100 * (1 - m['F3']), 0),
+        'within_1px': fr(100 * rec['fit']['within_1px'], 0),
+    }
+    for v, _ in VIEWS:
+        n['rec_' + v] = fr(fid[v]['line_recall_consensus'], 2)
+        n['pre_' + v] = fr(fid[v]['border_precision_consensus'], 2)
+    return n
+
+
+def schema(n):
+    s = Svg()
+    s.text(60, 92, 'ZenRay Meshes V4 : de la planche de six vues au maillage en quads', 46, INK, True, 1800)
+    s.text(60, 140, 'Chaque niveau est contrôlé contre l\'image avant le suivant ; chiffres mesurés sur la voiture le 10 November 2026', 27, MUTED, False, 1800)
+    steps = [
+        ('Six vues calées', ['une seule planche,', 'une même boîte']),
+        ('Décalque', ['6 vues sur 6', 'en lignes nettes']),
+        ('Plan en volume', ['deux vues par coin', '%s règles sur %s' % (n['plan'], n['plan_all'])]),
+        ('Maillage quads', ['%s quads' % n['quads'], '%s pièces' % n['parts']]),
+        ('%s contrôles' % n['gates_all'], ['%s passés' % n['gates'], 'contours et lignes']),
+        ('Œil de Matthieu', ['valide ou corrige', 'pas encore fait']),
+    ]
+    bw, bh, gap, x0, y0 = 268, 210, 42, 60, 200
+    for i, (t, lines) in enumerate(steps):
+        x = x0 + i * (bw + gap)
+        s.box(x, y0, bw, bh, t, lines, fill='#ffffff' if i != 2 else '#e6efe9', stroke=INK if i != 2 else ACCENT)
+        if i < len(steps) - 1:
+            s.arrow(x + bw + 4, y0 + bh // 2, x + bw + gap - 6, y0 + bh // 2)
+    # The correction loop: the checks (5th box) send back to the plan (3rd box).
+    xj = x0 + 4 * (bw + gap) + bw // 2; xp = x0 + 2 * (bw + gap) + bw // 2
+    s.raw('<path d="M %d %d C %d %d %d %d %d %d" fill="none" stroke="%s" stroke-width="4" marker-end="url(#a)"/>'
+          % (xj, y0 + bh + 6, xj, y0 + bh + 110, xp, y0 + bh + 110, xp, y0 + bh + 10, ACCENT))
+    s.text((xj + xp) // 2, y0 + bh + 140, 'Liste chiffrée des lignes manquantes : une correction du plan par ligne, %s versions' % n['versions'], 29, ACCENT, True, 1300, 'middle')
+    # Drawn lines found by the model, view by view.
+    s.text(60, 640, 'Lignes du dessin retrouvées par le modèle, vue par vue (seuil %s en moyenne)' % fr(THRESHOLD_LINES, 2), 32, INK, True, 1180)
+    for i, (v, label) in enumerate(VIEWS):
+        y = 672 + i * 58
+        val = float(n['rec_' + v].replace(',', '.'))
+        bar = int(val * BAR_PX)
+        s.text(60, y + 30, label, 27, INK, False, 150)
+        s.raw('<rect x="220" y="%d" width="%d" height="34" rx="6" fill="%s"/>' % (y + 4, bar, ACCENT if val >= THRESHOLD_LINES else RED))
+        s.text(236 + bar, y + 30, n['rec_' + v], 27, INK, False, 120)
+    s.raw('<line x1="%d" y1="668" x2="%d" y2="1024" stroke="%s" stroke-width="3" stroke-dasharray="10 8"/>' % (220 + int(THRESHOLD_LINES * BAR_PX), 220 + int(THRESHOLD_LINES * BAR_PX), INK))
+    # What still fails, and the paths tried then set aside (dashed, quieter).
+    s.box(1300, 610, 560, 160, 'Reste à faire', ['contours du modèle sur une ligne :', '%s %% pour %s %% demandés' % (n['borders'], fr(100 * THRESHOLD_BORDERS, 0))], fill='#ffffff', stroke=RED)
+    s.box(1300, 790, 560, 130, 'Ajustement automatique des coins', ['écarté : plafonne et plie des quads'], dashed=True, fill=PAPER, stroke=MUTED)
+    s.box(1300, 940, 560, 130, 'Maillage généré par IA', ['exclu de la méthode'], dashed=True, fill=PAPER, stroke=MUTED)
+    return s
+
+
+def jpeg(img, width, quality=86):
+    img = img.convert('RGB')
+    if img.width > width:
+        img = img.resize((width, round(img.height * width / img.width)), Image.LANCZOS)
+    buf = io.BytesIO(); img.save(buf, 'JPEG', quality=quality)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def build():
+    n = numbers()
+    s = schema(n)
+    over = [f for f in s.fits if f[1] > f[2]]
+    assert not over, 'text overflows its box: %s' % over
+    tag = 'V_%03d' % VERSION
+    turn = Image.open(PROJECT / '03_mesh' / tag / 'turn.png')
+    wire = Image.open(PROJECT / '03_mesh' / tag / 'turn_wire.png')
+    proof = Image.open(PROJECT / '04_checks' / ('%s-proof.png' % tag))
+    # thumbnail: the first three-quarter view of the turntable, 16:9
+    w3 = turn.width // 2; h3 = turn.height // 3
+    crop = turn.crop((0, 0, w3, h3)); th = round(w3 * 9 / 16)
+    crop = crop.crop((0, max(0, (h3 - th) // 2), w3, max(0, (h3 - th) // 2) + min(th, h3)))
+    crop.convert('RGB').resize((640, 360), Image.LANCZOS).save(ART / 'v4-thumbnail.jpg', 'JPEG', quality=85)
+    font = base64.b64encode((FONTS / 'AdobeClean-Regular.woff2').read_bytes()).decode()
+    font_m = base64.b64encode((FONTS / 'AdobeClean-Medium.woff2').read_bytes()).decode()
+    paragraphs = [
+        'ZenRay Meshes sert à reconstruire dans Houdini, sans génération par IA, la géométrie complète d\'un objet à partir d\'une simple planche de six vues, de sorte que chaque pièce sorte à la bonne taille, maillée en quads, et reste pilotée par un plan que l\'on corrige comme un dessin d\'architecte.',
+        'La quatrième version avance par niveaux, dont chacun est contrôlé contre l\'image avant que le suivant ne commence. Les six vues sont d\'abord calées sur une même boîte, puis chaque vue est décalquée en lignes vectorielles ; un plan en volume pose ensuite chaque coin à l\'aide de deux vues, ce plan est maillé en panneaux de quads dotés d\'un jeu et d\'une épaisseur, et %s contrôles de production jugent le résultat, des silhouettes jusqu\'aux lignes du dessin. Une liste chiffrée indique alors, vue par vue, quelles lignes le modèle ne retrouve pas encore, si bien que chaque correction du plan vise une ligne précise.' % n['gates_all'],
+        'Sur la voiture de démonstration, la version retenue après %s itérations compte %s quads répartis en %s pièces et passe %s contrôles sur %s : les six silhouettes tiennent à plus de %s %%, les lignes du dessin sont retrouvées à %s %%, et il reste %s %% des contours du modèle à poser sur une ligne, en partie parce que la planche se contredit d\'une vue à l\'autre. L\'œil de Matthieu n\'a encore rien validé.' % (n['versions'], n['quads'], n['parts'], n['gates'], n['gates_all'], n['sil_min'], n['lines'], n['borders_off']),
+    ]
+    html = ('<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>%s</title><style>'
+            "@font-face{font-family:'Adobe Clean';src:url(data:font/woff2;base64,%s) format('woff2');font-weight:100 450}"
+            "@font-face{font-family:'Adobe Clean';src:url(data:font/woff2;base64,%s) format('woff2');font-weight:451 900}"
+            ':root{--paper:%s;--ink:%s;--text:19px;--width:1120px}*{box-sizing:border-box}'
+            "body{margin:0;background:var(--paper);color:var(--ink);font:400 var(--text)/1.6 'Adobe Clean',sans-serif;font-synthesis:none}"
+            'main{max-width:var(--width);margin:auto;padding:72px 32px 96px}h1{font-weight:500;font-size:clamp(34px,5vw,58px);line-height:1.1;margin:0 0 32px}'
+            'p{max-width:80ch;margin:0 0 20px}figure{margin:40px 0}svg,img{display:block;width:100%%;height:auto;border-radius:10px}'
+            '@media(max-width:680px){main{padding:32px 16px}}</style><main><h1>%s</h1>%s'
+            '<figure>%s</figure>'
+            '<figure><img alt="La voiture reconstruite, six points de vue" src="data:image/jpeg;base64,%s"></figure>'
+            '<figure><img alt="Le même maillage en fil de fer : uniquement des quads" src="data:image/jpeg;base64,%s"></figure>'
+            '<figure><img alt="Les six vues : référence, décalque, modèle, contrôle" src="data:image/jpeg;base64,%s"></figure>'
+            '</main></html>') % (TITLE, font, font_m, PAPER, INK, TITLE, ''.join('<p>%s</p>' % p for p in paragraphs), s.render(),
+                                 jpeg(turn, 2240), jpeg(wire, 2240), jpeg(proof, 2240))
+    out = ART / 'index.html'
+    backup = ART / 'index-before-v4.html.bak'
+    if out.exists() and not backup.exists():
+        shutil.copy(out, backup)                    # the V3 page is kept, never overwritten without a copy
+    out.write_text(html)
+    (HERE / 'v4-chain.svg').write_text(s.render())
+    return {'index': str(out), 'bytes': len(html), 'texts_checked': len(s.fits), 'numbers': n}
+
+
+def verify(path=None):
+    html = Path(path or ART / 'index.html').read_text()
+    n = numbers()
+    shown = ['quads', 'parts', 'gates', 'gates_all', 'plan', 'versions', 'sil_min', 'lines', 'borders', 'borders_off'] + ['rec_' + v for v, _ in VIEWS]
+    missing = [k for k in shown if n[k] not in html]
+    return {'verify': 'green' if not missing else 'red', 'missing': missing}
+
+
+def selftest():
+    good = verify()
+    tmp = Path(tempfile.mkdtemp()) / 'broken.html'
+    n = numbers()
+    tmp.write_text((ART / 'index.html').read_text().replace(n['quads'], '1 234'))
+    bad = verify(tmp)
+    assert good['verify'] == 'green' and bad['verify'] == 'red', (good, bad)
+    return {'selftest': 'passed', 'true_copy': good['verify'], 'broken_copy': bad['verify'], 'broken_missing': bad['missing']}
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'build'
+    print(json.dumps({'build': build, 'verify': lambda: verify(sys.argv[2] if len(sys.argv) > 2 else None), 'selftest': selftest}[cmd](), ensure_ascii=False))
