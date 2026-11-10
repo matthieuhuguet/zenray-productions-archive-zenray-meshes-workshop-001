@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+# 10 November 2026, 15:45: first measures of a car sheet, in metres, from the tracing and the calibrated frame: wheel
+# circles of the side views (Hough), half width of the plan by station, top and bottom of the profile by station.
+import json, sys
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v4')
+import numpy as np, ViewGraph as VG
+from PIL import Image
+from skimage import feature, transform
+proj = json.load(open('project.json')); frame = json.load(open(proj['frame'])); S = VG.S; out = {'dims_m': frame['dims_m']}
+for v in ('left', 'right'):
+    m = VG.vmap(frame, v); g = np.asarray(Image.open('%s/%s_rgb.png' % (proj['views'], VG.FILES[v])).convert('L')).astype(float) / 255
+    e = feature.canny(g, sigma=1.5); radii = np.arange(28, 52)
+    acc, cx, cy, r = transform.hough_circle_peaks(transform.hough_circle(e, radii), radii, total_num_peaks=2, min_xdistance=150)
+    ws = []
+    for a, x, y, rr in zip(acc, cx, cy, r):
+        w = VG.to_world(m, np.array([float(x)]), np.array([float(y)])); ws.append({'z': round(float(w[2][0]), 3), 'y': round(float(w[1][0]), 3), 'r_m': round(float(rr / m['s']), 3), 'score': round(float(a), 2), 'px': [int(x), int(y), int(rr)]})
+    out['wheels_' + v] = sorted(ws, key=lambda q: -q['z'])
+def profile(v, axis_fixed):
+    m = VG.vmap(frame, v); sil = np.asarray(Image.open('%s/sil_%s.png' % (proj['graph'], v)).convert('L')) > 127; rows = []
+    for z in np.arange(frame['lo'][2] + 0.02, -frame['lo'][2], 0.1):
+        t = np.arange(-1.6, 1.6, 0.004); X = np.zeros((len(t), 3)); X[:, 2] = z; X[:, axis_fixed] = t
+        uv = VG.to_view(m, X) * S; iu = np.clip(uv[:, 0].astype(int), 0, sil.shape[1] - 1); iv = np.clip(uv[:, 1].astype(int), 0, sil.shape[0] - 1); val = sil[iv, iu]
+        rows.append([round(float(z), 2), round(float(t[val].min()), 3) if val.any() else None, round(float(t[val].max()), 3) if val.any() else None])
+    return rows
+out['plan_x_by_z'] = profile('top', 0); out['side_y_by_z'] = profile('left', 1)
+json.dump(out, open('01_plan/measures.json', 'w'), indent=1)
+print(json.dumps({k: out[k] for k in ('dims_m', 'wheels_left', 'wheels_right')}))
+print('z: x_min x_max |', ' '.join('%.1f:%s/%s' % (z, a, b) for z, a, b in out['plan_x_by_z'][::3]))
+print('z: y_min y_max |', ' '.join('%.1f:%s/%s' % (z, a, b) for z, a, b in out['side_y_by_z'][::3]))
