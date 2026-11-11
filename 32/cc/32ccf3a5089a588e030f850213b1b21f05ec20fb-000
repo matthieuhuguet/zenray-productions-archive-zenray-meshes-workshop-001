@@ -1,0 +1,42 @@
+# 11 November 2026: the nose band alone (/obj/NOSE), the white band carrying the logo, from the top of the mouth frame up to the hood point.
+# Its top edge reads the hood front row and its bottom edge reads the mouth top edge, so it follows both. Native nodes only.
+# FR : le bandeau de nez seul ; bord haut lu sur le capot, bord bas lu sur la bouche ; ni Python ni VEX dans le graphe.
+import hou
+obj = hou.node('/obj')
+if obj.node('NOSE'): obj.node('NOSE').destroy()
+g = obj.createNode('geo', 'NOSE'); c = g.createNode('null', 'CTRL_nose')
+ptg = c.parmTemplateGroup(); f = hou.FolderParmTemplate('f_mid', 'Middle line (ligne médiane)')
+for name, lab, v in (('mid_c', 'Centre point (x y z, m)', (0.0, 0.530, 2.357)), ('mid_m', 'Middle point (x y z, m)', (0.24, 0.548, 2.348)), ('mid_e', 'Edge point (x y z, m)', (0.50, 0.590, 2.31))):
+    f.addParmTemplate(hou.FloatParmTemplate(name, lab, 3, default_value=v))
+ptg.append(f)
+f2 = hou.FolderParmTemplate('f_shape', 'Shape (forme)')
+f2.addParmTemplate(hou.FloatParmTemplate('bottom_z', 'Bottom edge z, at the mouth frame (m)', 1, default_value=(2.35,), min=2.2, max=2.5))
+f2.addParmTemplate(hou.IntParmTemplate('levels', 'Smoothing levels', 1, default_value=(1,), min=0, max=3))
+f2.addParmTemplate(hou.FloatParmTemplate('g_body', 'Body grey', 1, default_value=(0.62,), min=0.0, max=1.0))
+ptg.append(f2); c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_nose/%s")' % p
+H = lambda p: 'ch("/obj/HOOD/CTRL_hood/%s")' % p
+M = lambda p: 'ch("/obj/MOUTH/CTRL_mouth/%s")' % p
+def curve(name, pts):
+    a = g.createNode('add', name); a.parm('points').set(len(pts))
+    for i, p in enumerate(pts):
+        a.parm('usept%d' % i).set(1)
+        for ax, v in zip('xyz', p): a.parm('pt%d%s' % (i, ax)).setExpression(v)
+    a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(pts))))
+    r = g.createNode('resample', name + '_smooth'); r.setInput(0, a); r.parm('treatpolysas').set('interp'); r.parm('dolength').set(0); r.parm('dosegs').set(1); r.parm('segs').set(32)
+    return r
+sym = lambda pts: [('-' + x if x != '0' else '0', y, z) for x, y, z in reversed(pts[1:])] + pts
+# top edge: the hood front row (point, middle, corner)
+top = curve('top_edge', sym([('0', H('front_cy'), H('front_cz')), (H('front_mx'), H('front_my'), H('front_mz')), (H('front_ex'), H('front_ey'), H('front_ez'))]))
+# bottom edge: the mouth top edge plus half the frame, same points as the mouth outline
+hw, tc, ts, fr = M('m_hw'), M('m_top_c'), M('m_top_s'), M('frame')
+T = lambda f: '%s+(%s-%s)*%s+%s/2' % (tc, ts, tc, f, fr)
+bot = curve('bottom_edge', sym([('0', tc + '+' + fr + '/2', K('bottom_z')), (hw + '*0.34', tc + '+0.004+' + fr + '/2', K('bottom_z')), (hw + '*0.68', T(0.42), K('bottom_z')), (hw + '*0.85', T(0.72), K('bottom_z'))]))
+mid = curve('middle_line', sym([('0', K('mid_cy'), K('mid_cz')), (K('mid_mx'), K('mid_my'), K('mid_mz')), (K('mid_ex'), K('mid_ey'), K('mid_ez'))]))
+mg = g.createNode('merge', 'nose_sections'); mg.setInput(0, bot); mg.setInput(1, mid); mg.setInput(2, top)
+sk = g.createNode('skin', 'nose_skin'); sk.setInput(0, mg); sk.parm('surftype').set('quads'); sk.parm('polys').set(1)
+rv = g.createNode('reverse', 'face_forward'); rv.setInput(0, sk)  # 11 November 2026: skin from bottom to top faces backward
+sd = g.createNode('subdivide', 'nose_smooth'); sd.setInput(0, rv); sd.parm('iterations').setExpression(K('levels'))
+col = g.createNode('color', 'grey_nose'); col.setInput(0, sd)
+for ax in 'rgb': col.parm('color' + ax).setExpression(K('g_body'))
+o = g.createNode('null', 'OUT_nose'); o.setInput(0, col); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
