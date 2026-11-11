@@ -1,0 +1,34 @@
+# 11 November 2026: the hood alone, as a control cage of 4 rows x 5 points (symmetric) smoothed by subdivide. Native nodes only.
+# FR : le capot seul, cage de contrôle de 4 rangées de 5 points (symétrique) lissée par subdivide ; ni Python ni VEX dans le graphe.
+import hou
+obj = hou.node('/obj')
+if obj.node('HOOD'): obj.node('HOOD').destroy()
+g = obj.createNode('geo', 'HOOD'); c = g.createNode('null', 'CTRL_hood')
+ROWS = [('rear', 'Rear row, at the windscreen', [(0.0, 0.900, 1.813), (0.34, 0.905, 1.73), (0.68, 0.918, 1.43)]),   # 11 November 2026 (H_002): rear height between the front view (0.92) and the side silhouette (0.886)
+        ('r1', 'Row 1', [(0.0, 0.811, 2.00), (0.30, 0.830, 1.93), (0.64, 0.865, 1.74)]),
+        ('r2', 'Row 2', [(0.0, 0.714, 2.20), (0.27, 0.735, 2.16), (0.56, 0.760, 2.05)]),
+        ('front', 'Front row, at the nose', [(0.0, 0.581, 2.40), (0.24, 0.600, 2.385), (0.48, 0.625, 2.33)])]
+ptg = c.parmTemplateGroup()
+for key, label, pts in ROWS:
+    f = hou.FolderParmTemplate('f_' + key, label)
+    for (name, lab), p in zip((('c', 'Centre point (x y z, m)'), ('m', 'Middle point (x y z, m)'), ('e', 'Edge point (x y z, m)')), pts):
+        f.addParmTemplate(hou.FloatParmTemplate('%s_%s' % (key, name), lab, 3, default_value=p))
+    ptg.append(f)
+f = hou.FolderParmTemplate('f_shape', 'Shape (forme)')
+f.addParmTemplate(hou.IntParmTemplate('levels', 'Smoothing levels', 1, default_value=(3,), min=0, max=5))
+f.addParmTemplate(hou.FloatParmTemplate('g_body', 'Body grey', 1, default_value=(0.62,), min=0.0, max=1.0))
+ptg.append(f); c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_hood/%s")' % p
+a = g.createNode('add', 'hood_cage'); a.parm('points').set(20)
+for r, (key, _, _) in enumerate(ROWS):
+    for col, (name, sign) in enumerate((('e', '-'), ('m', '-'), ('c', ''), ('m', ''), ('e', ''))):
+        i = r * 5 + col; a.parm('usept%d' % i).set(1)
+        a.parm('pt%dx' % i).setExpression(sign + K('%s_%sx' % (key, name)) if name != 'c' else '0')
+        a.parm('pt%dy' % i).setExpression(K('%s_%sy' % (key, name))); a.parm('pt%dz' % i).setExpression(K('%s_%sz' % (key, name)))
+quads = ['%d %d %d %d' % (r * 5 + col, r * 5 + col + 1, (r + 1) * 5 + col + 1, (r + 1) * 5 + col) for r in range(3) for col in range(4)]  # 11 November 2026: winding gives upward normals
+a.parm('prims').set(len(quads))
+for i, q in enumerate(quads): a.parm('prim%d' % i).set(q); a.parm('closed%d' % i).set(1)
+sd = g.createNode('subdivide', 'hood_smooth'); sd.setInput(0, a); sd.parm('iterations').setExpression(K('levels'))
+col = g.createNode('color', 'grey_hood'); col.setInput(0, sd)
+for ax in 'rgb': col.parm('color' + ax).setExpression(K('g_body'))
+o = g.createNode('null', 'OUT_hood'); o.setInput(0, col); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
