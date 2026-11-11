@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+# 11 November 2026: inputs of the V5 audit. Each agent reads ONE bounded bundle. The 9 and 10 November audits already cover the journal,
+# the 427 sections and the verdicts up to 10 November; this audit reads what they did not: the code of the 2D tools, the apps, the last two days.
+# FR : entrées de l'audit V5 ; un paquet borné par agent ; on ne relit que ce que les deux audits précédents n'ont pas couvert.
+import re, hashlib
+from pathlib import Path
+from datetime import datetime
+A = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_11-November-2026/inputs'); K = Path('/Users/zenray/.claude/skills/zenray-meshes'); M = Path('/Users/zenray/.claude/Memory1/Projects/zenray-meshes')
+def bundle(name, paths):
+    parts = []; n = 0
+    for p in paths:
+        p = Path(p)
+        if not p.exists(): parts.append('##### FILE MISSING: %s\n' % p); continue
+        s = p.read_text(encoding='utf-8', errors='ignore'); n += 1
+        parts.append('##### FILE: %s (%d lines, %d bytes)\n%s\n' % (p, s.count('\n') + 1, len(s.encode()), s))
+    out = A / name; out.write_text('\n'.join(parts)); t = out.read_text()
+    print('%-28s %2d files %7d bytes %6d lines' % (name, n, len(t.encode()), t.count('\n') + 1))
+S = K / 'scripts'
+# A. the 2D tools of V3 and the sheet tools at the root (blueprint, masks, SAM cut, sheet split and fit, feature lines)
+bundle('tools_v3.txt', sorted((S / 'v3').glob('*.py')) + sorted((S / 'v3').glob('*.sh')) + [S / n for n in ('SheetSplit.py', 'SheetFit.py', 'FeatureLines.py', 'LineScore.py', 'CarCuts.py')])
+# B. the 2D tools of V4 (calibration, trace, consensus, view graph) and every helper in v4/tools
+bundle('tools_v4.txt', [S / 'v4' / n for n in ('Calibrate.py', 'Trace.py', 'Consensus.py', 'ViewGraph.py')] + sorted((S / 'v4' / 'tools').glob('*.py')))
+# C. the apps: the 2D editor of ZenRay Lines (now ZenRay Meshes app), its server and launcher, its design tokens; the 3D editor only through its page and README
+L = K / 'templates' / 'zenray-lines-app'
+bundle('apps.txt', [L / n for n in ('README.md', 'index.html', 'app.js', 'style.css', 'palette.json', 'version-guard.js', '3d.html', 'style3d.css')] + [S / 'lines' / 'ZrlServe.py', S / 'lines' / 'ZrlSheetViews.py', S / 'lines' / 'app' / 'BuildLinesApp.sh', K / 'references' / 'PLAN_Lines_29-October-2026.md'])
+# D. the last days: sections 428 to 436 of the dataset, V3 and V4 method files, the pinned rules, and Matthieu's own prompts of 9 to 11 November
+ref = (K / 'references' / 'ZenRayMeshes1.md').read_text(encoding='utf-8'); i = ref.index('\n## 428.'); (A / '_sections_428_436.md').write_text(ref[i:])
+fb = (M / 'FEEDBACK.md').read_text(encoding='utf-8'); blocks = re.split(r'\n(?=## \d+ \w+ 2026, )', fb); seen = set(); out = []
+for b in blocks:
+    m = re.match(r'## (\d+ \w+ 2026, \d\d:\d\d):\d\d [+-]\d+ : (\w+)', b)
+    if not m or m.group(2).lower() not in ('prompt', 'rule', 'order') or not re.match(r'(9|10|11) November 2026', m.group(1)): continue
+    body = '\n'.join(l[2:] for l in b.split('\n') if l.startswith('> ')); body = re.sub(r'\s*\(\d+ \w+ 2026, \d\d:\d\d:\d\d [+-]\d+\)', '', body).strip()
+    body = re.sub(r'blob:https://claude\.ai/\S+', '[image]', body)
+    if 'This session is being continued from a previous conversation' in body[:300] or body.startswith('<system-reminder>'): continue   # summaries are not his words
+    h = hashlib.sha1(body[:600].encode()).hexdigest()
+    if not body or h in seen: continue
+    seen.add(h); out.append((datetime.strptime(m.group(1), '%d %B %Y, %H:%M'), '[%s] %s\n%s' % (m.group(1), m.group(2).upper(), body[:1500] + (' [...]' if len(body) > 1500 else ''))))
+out.sort(key=lambda t: t[0]); (A / '_matthieu_9_11_november.md').write_text('\n\n'.join(t[1] for t in out) + '\n'); print('prompts kept', len(out))
+bundle('recent.txt', [A / '_sections_428_436.md', K / 'references' / 'ZenRayMeshesV3.md', M / 'Rules.md', A / '_matthieu_9_11_november.md'])  # 11 November 2026: ZenRayMeshesV4.md left out, written in this very session and known

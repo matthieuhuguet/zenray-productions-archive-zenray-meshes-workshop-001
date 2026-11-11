@@ -1,0 +1,65 @@
+# Audit de l'application ZenRay Meshes (éditeur de courbes), 11 November 2026
+
+Source : inputs/apps.txt, 12 fichiers, lecture complète (2 692 lignes sur 2 692). Les numéros de ligne renvoient au paquet, sauf mention de fichier.
+
+## Ce que fait l'éditeur 2D aujourd'hui
+
+- Cinq vues orthographiques (left, right, top, front, back), touches 1 à 5 (app.js l. 218).
+- Fond : l'image de la vue, ou la planche six vues recalée par transformation affine (ZrlSheetViews.py l. 2578-2598).
+- Arcs = B-splines cubiques serrées (degré 3, n points, n-3 segments), 4 points à la création.
+- Outils : déplacer points et nœuds, ajouter un arc entre deux nœuds, supprimer, lisser (un passage de Laplacien), souder, symétrie x à -x, accrochage à la surface (désactivé par défaut), filtre par composant.
+- Absent de la 2D : tangentes de Bézier, types de tangente, insertion ou suppression de point, fusion de nœuds, aplatir, formes exactes, calque de masque, statut de validation, versions scellées.
+
+## Modèle de document
+
+- JSON, schéma 2, format « zenray-lines » : nodes {id, p}, arcs {id, a, b, closed, pair, ctrl en matrice n x 3 en mètres, mirror}, components, options facultatives.
+- Symétrie : arc.mirror donne l'id du miroir, ou son propre id au centre (tolérance 0.002 m). La matrice transforms.mirror_x est écrite, mais le code applique x devient -x.
+- Fonctions : createModel (app.js l. 482), serializeDoc (l. 462), validateDoc (l. 451).
+
+## Sauvegarde
+
+- Save to atelier : POST /save, écriture atomique, relecture SHA-256, copie horodatée de la version précédente dans data/backups.
+- Refusés : NaN, Infinity, id dupliqués, extrémité sur un nœud absent, miroir absent, écriture de lines.json (protégé).
+- app.js n'a pas d'autosave ; le README en décrit un pour la 3D, dont le code est absent.
+- Les exports 2D (JSON, SVG, PNG) passent par le navigateur, pas par work/lines/exports.
+
+## Lancement et rechargement
+
+- BuildLinesApp.sh (l. 2610-2643) construit ~/Applications/ZenRay Meshes.app, qui exécute ZenRayLines.sh (absent du paquet).
+- Le README dit port 8766, mais le port par défaut de ZrlServe.py est 8765 (l. 2264).
+- version-guard.js interroge /api/lines/version toutes les 3 s : il recharge la page si son code change et rien n'est non enregistré ; il relance le serveur si son Python change.
+
+## Jetons de design
+
+- style.css : --bg, --panel, --ink, --accent #e8590c, --radius 8px, --pad 12px ; polices en piles (GT Ultra, Literata) ; thème sombre automatique et data-theme.
+- style3d.css écrit en dur l'accent #d4733b, qui diffère de --accent, et 'GT Ultra' à trois endroits.
+- Les couleurs de dessin sont en JavaScript (CONFIG.colors, app.js l. 221-226), hors des jetons CSS.
+- palette.json : une couleur pâle par famille de composants (expressions régulières), articulations éclaircies à 0.55.
+
+## Réutilisable pour la V5
+
+1. Spline et bezierSpans (app.js l. 259-337) : B-spline serrée et cubique de Bézier exacte par segment, pour un SVG V5.
+2. project et unproject (l. 345-358) : même convention que Raster.py ; unproject avec profondeur pour remonter en 3D.
+3. decodePng16, createDepthMap, isVisible (l. 367-448) : cartes 16 bits par vue ; le sens de la profondeur est à vérifier.
+4. buildSvg, projectArc, runsOf, pathFromRuns (l. 716-783) : export SVG par segments visibles et cachés.
+5. check_document et save_edit (ZrlServe.py l. 2290-2348) : sauvegarde sûre.
+6. beginCtrlDrag, beginNodeDrag, mirrorTarget, buildNodeMirror (l. 532-639) : glissés avec symétrie.
+7. ZrlSheetViews.build (l. 2578-2598) : calage de la planche de référence.
+8. version-guard.js et la table mesh_paths avec run_netmesh (ZrlServe.py l. 2272, 2366-2405).
+
+## Manquant pour la V5
+
+- Pas de poignées de tangente de Bézier, de types de tangente, de formes exactes (cercle, arc, droite), d'aplatir, de peigne de courbure, de calque de masque.
+- Pas de statut de validation par composant, de versions scellées, de liaison entre vues, ni de tuilage pour une image haute résolution.
+- Non trouvé dans le paquet : les modules appelés par le serveur (ZrlNetMesh, ZrlCreases, ZrlProjects, etc.) et le code de l'éditeur 3D (app3d.js, view3d.js).
+
+## Pièges à corriger avant la V5
+
+- Port : 8765 dans le code, 8766 dans le README et le lanceur.
+- Chemins absolus codés en dur dans ZrlServe.py et ZrlSheetViews.py.
+- La carte de symétrie des nœuds est calculée une seule fois à l'ouverture ; elle n'est pas recalculée après Load saved ni après Undo.
+- serializeDoc écrit « undefined » si components manque : JSON invalide, refus au Save.
+- Save remplace le fichier avant de vérifier le SHA-256.
+- Les exports 2D atterrissent dans Téléchargements, pas dans work/lines/exports.
+- --host peut exposer POST /save et le redémarrage à tout le réseau, sans authentification.
+- Les arcs de moins de 4 points disparaissent du SVG sans avertissement.

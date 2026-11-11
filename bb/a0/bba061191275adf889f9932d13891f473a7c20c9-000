@@ -1,0 +1,60 @@
+# Audit de tools_v4 (ZenRay Meshes V4), 11 November 2026
+
+Couverture : 3 041 lignes lues sur 3 041, 34 fichiers. Chemins relatifs à /Users/zenray/.claude/skills/zenray-meshes/scripts/. Détail complet : agents/tools_v4.json dans le même dossier d'audit.
+
+## Les 12 briques les plus réutilisables pour la V5
+
+1. Calage : v4/Calibrate.py, fit et axis. Cadre commun en mètres, échelle sx et sy par vue, axe de symétrie des traits (±3 px, pas 1/12).
+2. Tracé au sous-pixel : v4/Trace.py, detect, refine_outline, bridge_gaps. Traits sombres, arêtes, contour sur le gradient, ponts entre bouts.
+3. Contrôle du tracé : v4/Trace.py, check_view. Rappel 0,97, précision 0,95, contour 0,80, rugosité 0,08, IoU 0,975.
+4. Cohérence entre vues : v4/Consensus.py, band et band_score. Bornes intérieure et extérieure, sans vote.
+5. Conversion pixel vers mètre : v4/ViewGraph.py, vmap, to_world, to_view. Aller-retour testé.
+6. Dessin par morceaux : v4/tools/shapefit.py, fit_line, fit_arc, fit_cubic, pieces. Droite, arc, cubique, accrochés au gradient à ±1,5 px.
+7. SAM en mètres : v4/tools/asklayer.py, sam et outline. Boîte, points positifs et négatifs, deux tirages, contour de Fourier (IoU 0,985).
+8. Masques par composant : v4/tools/samlayers.py, boucle principale. Un passage SAM par composant, statut auto_ok ou redo.
+9. Témoins et verdict : v4/tools/outline_witness.py et v4/tools/outline_verdict.py. Trois témoins, zones décidées par l'image.
+10. Découpe par fond plan : v4/tools/sheetmask.py. Écart de 20 au fond, règles d'ombre et de pneu.
+11. Découpe interne : v4/tools/splitinside.py. Watershed du gradient, fusion par frontière faible, symétrie stricte.
+12. Forme exacte avec témoin : v4/tools/wheel_layers.py, fit_circle et ask. Cercle ajusté, SAM en témoin, contrôle gauche droite en mm.
+
+## Formats de données
+
+- frame.json : dims_m, lo, views (name, rx, uy, px_per_m, bbox, sx et sy après fit).
+- graph_<vue>.json : deux schémas sous le même nom (Trace avec role, ViewGraph sans role). sil_<vue>.png entre en collision de la même façon.
+- labels_<vue>.npz : clé labels, -1 hors silhouette, 3 px par pixel de vue.
+- layers.json : clé vue/ID_nom_COTE (asklayer, samlayers), ou wheels et layers (wheel_layers).
+- nomenclature.json : components (id, name, fr, views, box, pair) et families.
+- requests.json : requests (id, name, fr, view, symmetry, box, pos, neg), en mètres.
+- band_<vue>.png : 255 intérieur, 128 entre les bornes, 0 extérieur.
+- Sorties de contrôle : trace-check.json, outline_witness.json, outline_verdict.json, wheel.json (définition plus instances).
+
+## Seuils et tolérances déjà utilisés
+
+- Trace : recall 0,97, precision 0,95, niveau de contour 0,80, niveau moyen 0,13, rugosité 0,08, IoU 0,975 ; tolérance de trait 1,5 px.
+- asklayer : stable 0,95, symétrie 0,93, bords 0,85, contour 0,985 ; gigue de points 0,03 m.
+- samlayers : score 0,80, stable 0,93, inside 0,97, bords 0,85, boîte 0,80.
+- shapefit : accrochage 1,5 px ; tolérance 0,35 px ; coin à 40 degrés ; bruit multiplié par 3.
+- outline_verdict : fond 9 et 2,2 ; objet 16 et 3 ; cible de contour prouvé 0,999 (docstring seulement).
+- sheetmask : seuil 20 ; anneau de bord 14 px ; trou comblé sous 40 px.
+- wheel_layers : SAM 0,97 ; stabilité 0,97 ; bords 0,9 ; écart gauche droite 10 mm.
+
+## Pièges notés
+
+- Trace.py et ViewGraph.py écrivent graph_<vue>.json et sil_<vue>.png sous les mêmes noms : une exécution écrase l'autre sans avertissement.
+- hash() de Python sert de graine (samlayers, missing, region) : les tirages de points ne sont pas reproductibles d'un lancement à l'autre.
+- asklayer.py : le SVG se termine par un double échappement (barre oblique inverse puis n, en littéral).
+- sheetmask.py : l'argument [views] est annoncé mais ignoré ; les masques sont réécrits sur place.
+- layerboard.py ignore son argument scale ; lookover.py code en dur le facteur 3.
+- Polices AdobeClean en chemin absolu, avec repli silencieux sur load_default.
+- Trace.py : docstring périmée (distances absentes du code) ; board exige rsvg-convert ; seuil 0,2 du contour codé en dur.
+- Tolérances en dur : 0,012 m dans resid.py ; 40 degrés, 6 px dans shapefit.py.
+- Lenteur : generic_filter avec fonction Python (outline_verdict, sheetmask) ; 400 tours de fusion en Python pur (splitinside).
+
+## Ce qui manque pour la V5
+
+- Huit modules importés ne sont pas dans le paquet : MaskJudge, SamCut, MaskAtlas, Cage, MeshViews, MeshQA, Iterate, PanelMesh.
+- Aucun SAM sur recadrage zoomé : tout passe par la vue entière à 3 px par pixel.
+- Aucune cohérence vectorielle entre vues : Consensus travaille sur des silhouettes, pas sur les tracés.
+- Aucune tangence contrôlée entre morceaux de shapefit, et aucun cas de paire gauche droite dans la chaîne 2D.
+- Aucun pilote qui enchaîne calage, SAM, forme et contrôle ; seuls quatre fichiers ont un selftest.
+- Pas de fichier de paramètres unique par objet (règle HDA) et pas d'index partagé entre les sorties par composant.

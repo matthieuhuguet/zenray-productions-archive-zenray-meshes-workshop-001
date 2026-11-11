@@ -1,0 +1,3575 @@
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/Blueprint.py (187 lines, 8407 bytes)
+#!/usr/bin/env python3
+# 9 November 2026, 17:10 Europe/Paris: ZenRay Meshes V3, read a component blueprint SVG into world curves.
+# FR : lit le plan SVG d'un composant et rend ses courbes nommées en mètres, dans le repère de l'objet.
+#
+# A blueprint is one SVG file, in millimetres, with one <g> per view. Each view group says how its 2D axes map to
+# the world through data-map, for example data-map="x:-z,y:-y" for a side view (screen x is minus world z, screen y
+# is minus world y, SVG y pointing down). Named <path id="..."> elements are the key curves of the component; an
+# optional <image> is the original reference photo placed under them. The file is text with numbers in mm, so it is
+# code: Claude edits it, Matthieu can edit it in any vector editor, and the builder reads it back.
+# Supported path commands: M L H V C S Q T Z, absolute and relative. Path coordinates are the group's LOCAL millimetres,
+# which are the world millimetres of that view: a group transform only places the view on the page and is ignored.
+# 9 November 2026: corrected, the first version subtracted the group translation and moved the hood by 2.2 m.
+import json
+import math
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+NS = {'svg': 'http://www.w3.org/2000/svg'}
+SAMPLES_PER_SEGMENT = 24
+
+
+def _tokens(d):
+    # Every SVG command letter is tokenised, so an unsupported one (A, arc) is refused instead of read as a line.
+    return re.findall(r'[A-Za-z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', d)
+
+
+def path_points(d, samples=SAMPLES_PER_SEGMENT):
+    """Sample an SVG path into a list of polylines (one per subpath), in SVG units."""
+    toks = _tokens(d)
+    i, cmd = 0, None
+    cur = (0.0, 0.0)
+    start = (0.0, 0.0)
+    last_ctrl = None
+    polys, poly = [], []
+
+    def num():
+        nonlocal i
+        v = float(toks[i]); i += 1
+        return v
+
+    def bez(p0, p1, p2, p3):
+        return [((1 - t) ** 3 * p0[0] + 3 * (1 - t) ** 2 * t * p1[0] + 3 * (1 - t) * t * t * p2[0] + t ** 3 * p3[0],
+                 (1 - t) ** 3 * p0[1] + 3 * (1 - t) ** 2 * t * p1[1] + 3 * (1 - t) * t * t * p2[1] + t ** 3 * p3[1])
+                for t in [k / samples for k in range(1, samples + 1)]]
+
+    while i < len(toks):
+        if re.match(r'[A-Za-z]', toks[i]):
+            cmd = toks[i]; i += 1
+        rel = cmd.islower()
+        c = cmd.upper()
+        ox, oy = cur if rel else (0.0, 0.0)
+        if c == 'M':
+            if poly:
+                polys.append(poly)
+            cur = (ox + num(), oy + num()); start = cur; poly = [cur]
+            cmd = 'l' if rel else 'L'
+        elif c == 'L':
+            cur = (ox + num(), oy + num()); poly.append(cur)
+        elif c == 'H':
+            cur = ((cur[0] if rel else 0.0) + num(), cur[1]); poly.append(cur)
+        elif c == 'V':
+            cur = (cur[0], (cur[1] if rel else 0.0) + num()); poly.append(cur)
+        elif c == 'C':
+            p1 = (ox + num(), oy + num()); p2 = (ox + num(), oy + num()); p3 = (ox + num(), oy + num())
+            poly += bez(cur, p1, p2, p3); last_ctrl = p2; cur = p3
+        elif c == 'S':
+            p1 = (2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]) if last_ctrl else cur
+            p2 = (ox + num(), oy + num()); p3 = (ox + num(), oy + num())
+            poly += bez(cur, p1, p2, p3); last_ctrl = p2; cur = p3
+        elif c == 'Q':
+            q = (ox + num(), oy + num()); p3 = (ox + num(), oy + num())
+            p1 = (cur[0] + 2 / 3 * (q[0] - cur[0]), cur[1] + 2 / 3 * (q[1] - cur[1]))
+            p2 = (p3[0] + 2 / 3 * (q[0] - p3[0]), p3[1] + 2 / 3 * (q[1] - p3[1]))
+            poly += bez(cur, p1, p2, p3); last_ctrl = q; cur = p3
+        elif c == 'T':
+            q = (2 * cur[0] - last_ctrl[0], 2 * cur[1] - last_ctrl[1]) if last_ctrl else cur
+            p3 = (ox + num(), oy + num())
+            p1 = (cur[0] + 2 / 3 * (q[0] - cur[0]), cur[1] + 2 / 3 * (q[1] - cur[1]))
+            p2 = (p3[0] + 2 / 3 * (q[0] - p3[0]), p3[1] + 2 / 3 * (q[1] - p3[1]))
+            poly += bez(cur, p1, p2, p3); last_ctrl = q; cur = p3
+        elif c == 'Z':
+            poly.append(start); cur = start
+        else:
+            raise ValueError('unsupported path command ' + cmd)
+        if c not in 'CSQT':
+            last_ctrl = None
+    if poly:
+        polys.append(poly)
+    return polys
+
+
+def _translate(el):
+    m = re.search(r'translate\(\s*([-\d.eE+]+)[ ,]+([-\d.eE+]+)\s*\)', el.get('transform', '') or '')
+    return (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+
+
+def _axis_map(spec):
+    # 'x:-z,y:-y' -> {'x': ('z', -1), 'y': ('y', -1)}
+    out = {}
+    for part in spec.split(','):
+        screen, world = part.split(':')
+        sign = -1.0 if world.strip().startswith('-') else 1.0
+        out[screen.strip()] = (world.strip().lstrip('+-'), sign)
+    return out
+
+
+def load(path):
+    """Return {view: {'map': ..., 'curves': {id: [[(world_a, world_b), ...], ...]}, 'axes': (a, b)}} in metres."""
+    root = ET.parse(path).getroot()
+    views = {}
+    for g in root.iter('{http://www.w3.org/2000/svg}g'):
+        if not g.get('data-map'):
+            continue
+        amap = _axis_map(g.get('data-map'))
+        (wa, sa), (wb, sb) = amap['x'], amap['y']
+        curves = {}
+        for p in g.iter('{http://www.w3.org/2000/svg}path'):
+            pid = p.get('id')
+            if not pid:
+                continue
+            polys = path_points(p.get('d'))
+            # Local mm of the group to metres on the two world axes of the view.
+            curves[pid] = [[(sa * x / 1000.0, sb * y / 1000.0) for x, y in poly] for poly in polys]
+        views[g.get('id')] = {'axes': (wa, wb), 'curves': curves, 'meta': {k: v for k, v in g.attrib.items() if k.startswith('data-')}}
+    return views
+
+
+def params(path):
+    """Generator values the photos cannot measure, written on the root <svg> as data-param-<name>="<number>".
+    9 November 2026: the blueprint is the single file of a component, curves for what is seen, params for the rest."""
+    root = ET.parse(path).getroot()
+    return {k[len('data-param-'):]: float(v) for k, v in root.attrib.items() if k.startswith('data-param-')}
+
+
+def as_function(points, key_index=0):
+    """Make a 1D interpolator value(key) from a polyline, sorted on the key axis (0 or 1)."""
+    pts = sorted(points, key=lambda p: p[key_index])
+    ks = [p[key_index] for p in pts]
+    vs = [p[1 - key_index] for p in pts]
+
+    def f(k):
+        if k <= ks[0]:
+            return vs[0]
+        if k >= ks[-1]:
+            return vs[-1]
+        lo, hi = 0, len(ks) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if ks[mid] <= k:
+                lo = mid
+            else:
+                hi = mid
+        t = (k - ks[lo]) / max(1e-12, ks[hi] - ks[lo])
+        return vs[lo] + t * (vs[hi] - vs[lo])
+    return f, (ks[0], ks[-1])
+
+
+def selftest():
+    # Green: a cubic and a line sample to the right endpoints and mapping; red: an unknown command raises.
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><g id="side" data-map="x:-z,y:-y" '
+           'transform="translate(10,20)"><path id="a" d="M 10 -500 C 10 -600 -490 -800 -990 -800"/>'
+           '<path id="b" d="m 0 0 l 100 0 v -50 z"/></g></svg>')
+    import tempfile, os
+    tmp = tempfile.NamedTemporaryFile('w', suffix='.svg', delete=False); tmp.write(svg); tmp.close()
+    v = load(tmp.name)['side']
+    a = v['curves']['a'][0]
+    # The group translation places the view on the page only: local coordinates are the world.
+    ok_end = abs(a[0][0] - (-0.01)) < 1e-9 and abs(a[0][1] - 0.5) < 1e-9 and abs(a[-1][0] - 0.99) < 1e-9 and abs(a[-1][1] - 0.8) < 1e-9
+    b = v['curves']['b'][0]
+    ok_rel = len(b) == 4 and abs(b[1][0] - (-0.1)) < 1e-9 and abs(b[2][1] - 0.05) < 1e-9
+    try:
+        path_points('M 0 0 A 1 1 0 0 1 2 2'); raised = False
+    except ValueError:
+        raised = True
+    os.unlink(tmp.name)
+    assert ok_end and ok_rel and raised, (ok_end, ok_rel, raised, a[0], a[-1], b)
+    return {'selftest': 'passed', 'cubic_endpoints': ok_end, 'relative_commands': ok_rel, 'unsupported_refused': raised}
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--selftest']:
+        print(json.dumps(selftest()))
+    else:
+        data = load(sys.argv[1])
+        print(json.dumps({k: {'axes': v['axes'], 'curves': {c: [len(p) for p in polys] for c, polys in v['curves'].items()}} for k, v in data.items()}, indent=1))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/BlueprintBoard.py (142 lines, 6326 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 18:20 Europe/Paris: ZenRay Meshes V3, judge board, models drawn in red wireframe on the real photos.
+# FR : planche de jugement, chaque modèle en fil de fer rouge sur les vraies photos calées, la courbe du plan en jaune.
+#
+# One row per view of the trace (side, front...), one column for the bare photo, then one column per model.
+# Each model is projected with the calibrated camera of the view (same pinhole model as PhotoToBlueprint.py), so a
+# wrong size or a wrong proportion shows at once against the photo. The blueprint curves (traced pixels) are drawn in
+# yellow on every tile. Only the main group of each OBJ is drawn as wireframe; its open border is drawn thicker.
+# Usage: BlueprintBoard.py <trace.json> <out.png> "<label>=<obj>" ["<label>=<obj>" ...] [--group hood_sheet]
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+BOARD = (1920, 1080)          # 1080p board, the size every synthesis schema uses
+HEADER = 70                   # px reserved for the title
+GAP = 12                      # px between tiles
+WIRE = (255, 59, 48)          # red wireframe, the board Matthieu validated
+CURVE = (255, 214, 10)        # yellow blueprint curve
+FONT = '/Users/zenray/Library/Fonts/AdobeClean-Regular.otf'
+
+
+def font(size):
+    try:
+        return ImageFont.truetype(FONT, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def camera(cams, name):
+    c = cams[name]
+    pos, tgt = np.array(c['pos'], float), np.array(c['target'], float)
+    fwd = tgt - pos; fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, [0, 1, 0]); right /= np.linalg.norm(right)
+    up = np.cross(right, fwd)
+    x0, y0, x1, y1 = c['rect']
+    f = c.get('focal_px') or cams['focal_mm'] / cams['film_back_mm'] * (x1 - x0)
+    return dict(pos=pos, fwd=fwd, right=right, up=up, f=f, cx=(x0 + x1) / 2, cy=(y0 + y1) / 2)
+
+
+def project(cam, P):
+    d = P - cam['pos']
+    dep = d @ cam['fwd']
+    return np.stack([cam['cx'] + cam['f'] * (d @ cam['right']) / dep, cam['cy'] - cam['f'] * (d @ cam['up']) / dep], 1)
+
+
+def load_obj(path, group):
+    verts, faces, cur = [], [], ''
+    for line in open(path):
+        if line.startswith('v '):
+            verts.append([float(t) for t in line.split()[1:4]])
+        elif line.startswith('g '):
+            cur = line[2:].strip()
+        elif line.startswith('f ') and (group is None or cur == group):
+            faces.append([int(t.split('/')[0]) - 1 for t in line.split()[1:]])
+    return np.array(verts), faces
+
+
+def edges(faces):
+    count = {}
+    for f in faces:
+        for a, b in zip(f, f[1:] + f[:1]):
+            k = (min(a, b), max(a, b)); count[k] = count.get(k, 0) + 1
+    return count
+
+
+def silhouette_error(cam, V, curve_px):
+    # Top envelope of the projected model against a traced silhouette curve, column by column, in photo pixels.
+    # Positive means the model sits higher than the photo. Only curves marked "silhouette": "top" are measured.
+    UV = project(cam, V)
+    errs = []
+    for u, v in curve_px:
+        m = np.abs(UV[:, 0] - u) < 1.0
+        if m.any():
+            errs.append(float(v - UV[m, 1].min()))
+    if not errs:
+        return None
+    a = np.abs(errs)
+    return {'max_px': round(float(a.max()), 1), 'mean_px': round(float(a.mean()), 1), 'signed_px': [round(e, 1) for e in errs]}
+
+
+def tile(photo, crop, size, draw_fn):
+    x0, y0, x1, y1 = crop
+    k = min(size[0] / (x1 - x0), size[1] / (y1 - y0))
+    im = photo.crop(crop).resize((int((x1 - x0) * k), int((y1 - y0) * k)), Image.LANCZOS).convert('RGBA')
+    ov = Image.new('RGBA', im.size, (0, 0, 0, 0))
+    draw_fn(ImageDraw.Draw(ov), lambda uv: ((uv[0] - x0) * k, (uv[1] - y0) * k))
+    return Image.alpha_composite(im, ov)
+
+
+def main(argv):
+    trace_path, out = argv[0], argv[1]
+    group = argv[argv.index('--group') + 1] if '--group' in argv else 'hood_sheet'
+    models = [a.split('=', 1) for a in argv[2:] if '=' in a and not a.startswith('--')]
+    trace = json.loads(Path(trace_path).read_text())
+    cams = json.loads(Path(trace['cameras']).read_text())
+    meshes = [(label, *load_obj(obj, group)) for label, obj in models]
+    whole = {label: load_obj(obj, None)[0] for label, obj in models}   # silhouettes use every group, bead included
+    report = {}
+    cols, rows = 1 + len(meshes), len(trace['views'])
+    tw = (BOARD[0] - GAP * (cols + 1)) // cols
+    th = (BOARD[1] - HEADER - GAP * (rows + 1)) // rows
+    board = Image.new('RGB', BOARD, (24, 24, 26))
+    d = ImageDraw.Draw(board)
+    d.text((GAP, 18), trace.get('title', trace['component']), font=font(34), fill=(240, 240, 240))
+    for r, view in enumerate(trace['views']):
+        cam = camera(cams, view['camera'])
+        photo = Image.open(view['photo']).convert('RGB')
+
+        def curves(dr, to):
+            for c in view['curves'].values():
+                pts = [to(p) for p in c['px']]
+                dr.line(pts, fill=CURVE + (255,), width=3) if len(pts) > 1 else None
+
+        for label, _V, _F in meshes:
+            for cname, c in view['curves'].items():
+                if c.get('silhouette') == 'top':
+                    report.setdefault(label, {})[view['id'] + '.' + cname] = silhouette_error(cam, whole[label], c['px'])
+        cells = [('Photo et plan', lambda dr, to: curves(dr, to))]
+        for label, V, F in meshes:
+            UV = project(cam, V)
+
+            def wire(dr, to, UV=UV, F=F):
+                e = edges(F)
+                for (a, b), n in e.items():
+                    dr.line([to(UV[a]), to(UV[b])], fill=WIRE + ((255,) if n == 1 else (120,)), width=3 if n == 1 else 1)
+                curves(dr, to)
+            cells.append((label, wire))
+        for c, (label, fn) in enumerate(cells):
+            im = tile(photo, view['crop'], (tw, th - 34), fn)
+            x = GAP + c * (tw + GAP); y = HEADER + GAP + r * (th + GAP)
+            board.paste(im.convert('RGB'), (x + (tw - im.size[0]) // 2, y + 34))
+            d.text((x, y + 2), '%s, %s' % (label, view.get('label', view['id'])), font=font(24), fill=(220, 220, 220))
+    board.save(out)
+    return {'board': out, 'size': BOARD, 'views': rows, 'models': [m[0] for m in models], 'silhouette_error': report}
+
+
+if __name__ == '__main__':
+    print(json.dumps(main(sys.argv[1:])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/BuildHoodFromBlueprint.py (134 lines, 6508 bytes)
+#!/usr/bin/env hython
+# 9 November 2026, 17:45 Europe/Paris: ZenRay Meshes V3 test, build the truck hood from its blueprint SVG in Houdini.
+# FR : construit le capot du camion dans Houdini à partir de son plan SVG ; les détails restent ceux de l'HDA V002.
+#
+# The blueprint gives what the photos show: the centre profile (side view), the width, the crown and the crease
+# positions (front view). The V002 generator gives the topology and the details the photos cannot measure (bead,
+# flanges, fasteners), from HoodPanel.json. The hood is written in truck coordinates, so it sits on the photos.
+# Usage: hython BuildHoodFromBlueprint.py <blueprint.svg> <out_dir> [--v002]   (--v002 builds the slider-only V002
+#        hood at the same place, for comparison)
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import hou
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent / 'components'))
+import Blueprint as B
+import HoodPanelGeometry as G
+
+CONFIG = HERE.parent / 'components' / 'HoodPanel.json'
+CROWN_RAMP = 0.3   # the crown grows from the straight front lip to its full value at this share of the length
+
+
+def flat(config):
+    return {k: v for c, d in config.items() if isinstance(d, dict) and c != 'provenance' for k, v in d.items()}
+
+
+def measure(bp):
+    side, front = bp['view-side']['curves'], bp['view-front']['curves']
+    prof = side['side_top'][0]                       # (z, y)
+    z_front = max(p[0] for p in prof); z_rear = min(p[0] for p in prof)
+    y_lip = min(p[1] for p in prof)
+    Y, _ = B.as_function(prof, 0)
+    w = front['front_width'][0]
+    x_left, x_right = min(p[0] for p in w), max(p[0] for p in w)
+    hw = (x_right - x_left) / 2.0; xc = (x_left + x_right) / 2.0
+    crown_f, _ = B.as_function(front['front_crown'][0], 0)
+    y_c = crown_f(xc); y_e = (crown_f(xc - 0.8 * hw) + crown_f(xc + 0.8 * hw)) / 2.0
+    crown = max(0.0, (y_c - y_e) / (1 - 0.64))
+    creases = [abs(sum(p[0] for p in front[k][0]) / len(front[k][0]) - xc) for k in ('crease_left', 'crease_right')]
+    return {'z_front': z_front, 'z_rear': z_rear, 'y_lip': y_lip, 'x_centre': xc, 'length': z_front - z_rear,
+            'width': 2 * hw, 'rise': max(p[1] for p in prof) - y_lip, 'crown': crown,
+            'crease_position': sum(creases) / 2 / hw}, Y
+
+
+def svg_top_height(Y, z_front, y_lip, length):
+    def top_height(x, v, hw, p):
+        y = Y(z_front - v * length) - y_lip
+        y -= p['crown'] * G.smoothstep(v / CROWN_RAMP) * (x / hw) ** 2
+        fade = G.smoothstep(v / 0.06) * (1.0 - G.smoothstep((v - 0.25) / max(0.05, p['crease_fade'] - 0.25)))
+        centre = p['crease_position'] * hw
+        width = max(p['crease_width'], 0.0001)
+        # The side view sees the raised centre panel, so the step lowers the outer parts instead of raising the centre.
+        y -= p['crease_step'] * G.smoothstep((abs(x) - centre) / width + 0.5) * fade
+        return y
+    return top_height
+
+
+def build(p, place):
+    geo = hou.Geometry()
+    G.build_surface(geo, p); G.build_rim(geo, p); G.build_fasteners(geo, p)
+    for pt in geo.points():
+        x, y, z = pt.position()
+        pt.setPosition((x + place['x_centre'], y + place['y_lip'], z + place['z_front']))
+    return geo
+
+
+def stats(geo):
+    prims = geo.prims()
+    quads = sum(1 for pr in prims if len(pr.vertices()) == 4)
+    edges = {}
+    for pr in prims:
+        vs = [v.point().number() for v in pr.vertices()]
+        for a, b in zip(vs, vs[1:] + vs[:1]):
+            k = (min(a, b), max(a, b)); edges[k] = edges.get(k, 0) + 1
+    bb = geo.boundingBox()
+    return {'prims': len(prims), 'quad_share': round(quads / max(1, len(prims)), 4), 'open_edges': sum(1 for c in edges.values() if c == 1),
+            'size_m': [round(v, 3) for v in bb.sizevec()], 'min': [round(v, 3) for v in bb.minvec()], 'max': [round(v, 3) for v in bb.maxvec()]}
+
+
+def centre_profile(geo, x_centre):
+    # Highest point per row along z near the centre plane, on the hood sheet only (bead and fasteners excluded).
+    sheet = geo.findPrimGroup('hood_sheet')
+    ids = {v.point().number() for pr in sheet.prims() for v in pr.vertices()}
+    pts = [geo.point(i).position() for i in ids if abs(geo.point(i).position()[0] - x_centre) < 0.004]
+    rows = {}
+    for x, y, z in pts:
+        k = round(z, 4); rows[k] = max(rows.get(k, -1e9), y)
+    return sorted(rows.items())
+
+
+def deviation(profile, Y, z_lo, z_hi):
+    d = [abs(y - Y(z)) for z, y in profile if z_lo <= z <= z_hi]
+    return {'max_mm': round(1000 * max(d), 1), 'mean_mm': round(1000 * sum(d) / len(d), 1), 'samples': len(d)} if d else None
+
+
+def main(svg, out, with_v002=False):
+    out = Path(out); out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    bp = B.load(svg)
+    m, Y = measure(bp)
+    p = flat(json.loads(CONFIG.read_text()))
+    svg_params = B.params(svg)
+    p.update(svg_params)   # what the photos cannot measure, set in the blueprint file itself
+    p.update({'width': m['width'], 'length': m['length'], 'rise': m['rise'], 'crown': m['crown'], 'crease_position': m['crease_position']})
+    original = G.top_height
+    G.top_height = svg_top_height(Y, m['z_front'], m['y_lip'], m['length'])
+    try:
+        geo = build(p, m)
+    finally:
+        G.top_height = original
+    elapsed = round(time.time() - t0, 3)
+    geo.saveToFile(str(out / 'hood_v3_blueprint.obj')); geo.saveToFile(str(out / 'hood_v3_blueprint.bgeo.sc'))
+    report = {'date': '9 November 2026', 'blueprint': str(svg), 'measured_from_blueprint': {k: round(v, 4) for k, v in m.items()},
+              'svg_params': svg_params, 'build_seconds': elapsed, 'v3': stats(geo),
+              'v3_profile_vs_blueprint': deviation(centre_profile(geo, m['x_centre']), Y, m['z_rear'], m['z_front'])}
+    if with_v002:
+        p2 = flat(json.loads(CONFIG.read_text()))
+        geo2 = build(p2, m)   # V002 as tuned on the ChatGPT sheet, front lip on the same point as V3
+        geo2.saveToFile(str(out / 'hood_v002_placed.obj'))
+        report['v002_params'] = {k: p2[k] for k in ('width', 'length', 'rise', 'crown', 'crease_position')}
+        report['v002'] = stats(geo2)
+        report['v002_profile_vs_blueprint'] = deviation(centre_profile(geo2, m['x_centre']), Y, max(m['z_rear'], m['z_front'] - p2['length']), m['z_front'])
+    (out / 'build-report.json').write_text(json.dumps(report, indent=1) + '\n')
+    return report
+
+
+if __name__ == '__main__':
+    print(json.dumps(main(sys.argv[1], sys.argv[2], '--v002' in sys.argv)))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/BuildHornFromBlueprint.py (204 lines, 10546 bytes)
+#!/usr/bin/env hython
+# 9 November 2026, 21:10 Europe/Paris: ZenRay Meshes V3, Dracard's horn rebuilt from the tutorial frame through a plan SVG.
+# FR : la corne de Dracard reconstruite depuis l'image du tutoriel, par un plan SVG : axe en ligne brisée, rayon en courbe.
+#
+# The horn of the video (Character Creation in Houdini, episode 4, 45:00) is a Sweep along a curve of four points with
+# sharp bends, its radius going from the base to a point, and a round collar where it meets the head. The plan holds:
+#   group "view-image" (data-map x:x,y:-y): path "horn_axis" (straight segments, tip first, base last) and the frame below;
+#   group "view-profile" (data-map x:t,y:r): path "horn_radius", radius against the share of the length (0 tip, 1 base);
+#   root data-param-*: base_tilt_deg (last segment leaving the picture plane, toward the camera), collar_major,
+#   collar_tube, collar_offset (along the axis, negative = toward the head), around, per_segment, collar_around.
+# The sweep is written here (parallel transport frames, mitred bends capped like Sweep's Max Stretch), so the result is
+# the same with or without Houdini; under hython it is also saved as .bgeo.sc and as a .hip with a File SOP.
+# Usage: hython|python BuildHornFromBlueprint.py <horn.blueprint.svg> <out_dir>
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import Blueprint as B
+
+DEFAULTS = {'collar_axis_tilt_deg': 25.0, 'base_tilt_deg': 35.0, 'collar_major': 0.045, 'collar_tube': 0.012, 'collar_offset': -0.01,
+            'around': 24, 'per_segment': 16, 'collar_around': 32, 'collar_tube_segments': 12, 'max_stretch': 3.0}
+
+
+def add(a, b): return [a[i] + b[i] for i in range(3)]
+def sub(a, b): return [a[i] - b[i] for i in range(3)]
+def mul(a, s): return [a[i] * s for i in range(3)]
+def dot(a, b): return sum(a[i] * b[i] for i in range(3))
+def cross(a, b): return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+def norm(a):
+    n = math.sqrt(dot(a, a)); return [v / n for v in a] if n > 1e-12 else a
+
+
+def axis_points(bp, p):
+    # Axis in the picture plane (z = 0), base last; the last segment leaves the plane by base_tilt_deg toward the camera.
+    pts = [[x, y, 0.0] for x, y in bp['view-image']['curves']['horn_axis'][0]]
+    a, b = pts[-2], pts[-1]
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    b[2] = length * math.tan(math.radians(p['base_tilt_deg']))
+    return pts
+
+
+def sweep(axis, radius_of, p):
+    """Tube along a polyline with sharp bends. Returns points and quads; the tip ring closes on one point."""
+    n = int(p['around'])
+    samples = []                                         # (position, tangent, mitre scale, mitre direction, t)
+    # The radius graph is read along the axis as drawn on the picture (2D length), like the trace that made it.
+    seg_len = [math.hypot(axis[i + 1][0] - axis[i][0], axis[i + 1][1] - axis[i][1]) for i in range(len(axis) - 1)]
+    total = sum(seg_len); run = 0.0
+    for i in range(len(axis) - 1):
+        d = norm(sub(axis[i + 1], axis[i]))
+        steps = int(p['per_segment'])
+        for k in range(steps + (1 if i == len(axis) - 2 else 0)):
+            f = k / steps
+            pos = add(axis[i], mul(sub(axis[i + 1], axis[i]), f))
+            t = (run + f * seg_len[i]) / total
+            tangent, scale, bend = d, 1.0, None
+            if k == 0 and i > 0:                         # a bend: the section lies in the bisecting plane (mitre)
+                prev = norm(sub(axis[i], axis[i - 1]))
+                tangent = norm(add(prev, d))
+                c = max(1e-3, dot(tangent, d))
+                scale = min(1.0 / c, p['max_stretch'])
+                bend = norm(sub(d, prev))
+            samples.append((pos, tangent, scale, bend, t))
+        run += seg_len[i]
+    # Parallel transport of a normal along the samples.
+    t0 = samples[0][1]
+    ref = [0, 0, 1] if abs(t0[2]) < 0.9 else [1, 0, 0]
+    normal = norm(cross(cross(t0, ref), t0))
+    pts, rings = [], []
+    prev_t = t0
+    for pos, tan, scale, bend, t in samples:
+        axis_r = cross(prev_t, tan)
+        if math.sqrt(dot(axis_r, axis_r)) > 1e-9:
+            ang = math.acos(max(-1.0, min(1.0, dot(prev_t, tan)))); k = norm(axis_r)
+            normal = add(add(mul(normal, math.cos(ang)), mul(cross(k, normal), math.sin(ang))), mul(k, dot(k, normal) * (1 - math.cos(ang))))
+        normal = norm(sub(normal, mul(tan, dot(normal, tan))))
+        binormal = cross(tan, normal)
+        prev_t = tan
+        r = radius_of(t)
+        ring = []
+        for j in range(n):
+            a = 2 * math.pi * j / n
+            off = add(mul(normal, math.cos(a) * r), mul(binormal, math.sin(a) * r))
+            if bend is not None:                         # stretch the section along the bend direction only
+                along = dot(off, bend); off = add(off, mul(bend, along * (scale - 1.0)))
+            ring.append(len(pts)); pts.append(add(pos, off))
+        rings.append(ring)
+    polys = []
+    for a, b in zip(rings, rings[1:]):
+        for j in range(n):
+            polys.append([a[j], a[(j + 1) % n], b[(j + 1) % n], b[j]])
+    tip = rings[0]                                       # tip first in the plan: its ring has radius 0, fan it to one point
+    centre = len(pts); pts.append(samples[0][0])
+    polys += [[centre, tip[(j + 1) % n], tip[j]] for j in range(n)]
+    return pts, polys
+
+
+def torus(centre, axis_dir, major, tube, n_major, n_tube, start):
+    a = norm(axis_dir)
+    u = norm(cross(a, [0, 0, 1] if abs(a[2]) < 0.9 else [1, 0, 0])); w = cross(a, u)
+    pts, polys = [], []
+    for i in range(n_major):
+        th = 2 * math.pi * i / n_major
+        radial = add(mul(u, math.cos(th)), mul(w, math.sin(th)))
+        c = add(centre, mul(radial, major))
+        for j in range(n_tube):
+            ph = 2 * math.pi * j / n_tube
+            pts.append(add(c, add(mul(radial, tube * math.cos(ph)), mul(a, tube * math.sin(ph)))))
+    for i in range(n_major):
+        for j in range(n_tube):
+            q = lambda ii, jj: start + (ii % n_major) * n_tube + (jj % n_tube)
+            polys.append([q(i, j), q(i, j + 1), q(i + 1, j + 1), q(i + 1, j)])
+    return pts, polys
+
+
+def fit_circle(points):
+    # Algebraic least squares circle (Kasa): x^2 + y^2 + D x + E y + F = 0.
+    n = len(points); sx = sy = sxx = syy = sxy = sxz = syz = sz = 0.0
+    for x, y in points:
+        z = x * x + y * y
+        sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sxz += x * z; syz += y * z; sz += z
+    A = [[sxx, sxy, sx], [sxy, syy, sy], [sx, sy, n]]; b = [-sxz, -syz, -sz]
+    det = lambda m: m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    d0 = det(A); sol = []
+    for c in range(3):
+        m = [row[:] for row in A]
+        for r in range(3):
+            m[r][c] = b[r]
+        sol.append(det(m) / d0)
+    D, E, F = sol
+    cx, cy = -D / 2, -E / 2
+    return cx, cy, math.sqrt(max(0.0, cx * cx + cy * cy - F))
+
+
+def build(svg):
+    bp = B.load(svg)
+    p = dict(DEFAULTS); p.update(B.params(svg))
+    axis = axis_points(bp, p)
+    prof = bp['view-profile']['curves']['horn_radius'][0]
+    span = max(q[0] for q in prof)                       # the graph is drawn at any width: its x runs 0 (tip) to span (base)
+    radius_of, _ = B.as_function([(q[0] / span, q[1]) for q in prof], 0)
+    pts, polys = sweep(axis, radius_of, p)
+    base_dir = norm(sub(axis[-1], axis[-2]))
+    outer = bp['view-image']['curves'].get('collar_outer')
+    if outer:
+        # The collar lies on the head, not across the horn: its outline in the picture gives its centre and size
+        # (least squares circle), its axis faces the camera, tilted by collar_axis_tilt_deg toward the horn base.
+        cx, cy, ro = fit_circle(outer[0])
+        centre = [cx, cy, axis[-1][2]]
+        major = ro - p['collar_tube']
+        flat = norm([base_dir[0], base_dir[1], 0.0])
+        a = math.radians(p.get('collar_axis_tilt_deg', 25.0))
+        ring_axis = norm(add(mul([0, 0, 1], math.cos(a)), mul(flat, -math.sin(a))))
+    else:
+        centre, major, ring_axis = add(axis[-1], mul(base_dir, p['collar_offset'])), p['collar_major'], base_dir
+    tp, tq = torus(centre, ring_axis, major, p['collar_tube'], int(p['collar_around']), int(p['collar_tube_segments']), len(pts))
+    groups = {'horn': (0, len(polys))}
+    polys += tq; pts += tp
+    groups['collar'] = (groups['horn'][1], len(polys))
+    return pts, polys, groups, p, axis
+
+
+def write_obj(path, pts, polys, groups):
+    with open(path, 'w') as f:
+        f.write('# 9 November 2026, ZenRay Meshes V3 horn\n')
+        for v in pts:
+            f.write('v %.6f %.6f %.6f\n' % tuple(v))
+        for name, (a, b) in groups.items():
+            f.write('g %s\n' % name)
+            for poly in polys[a:b]:
+                f.write('f ' + ' '.join(str(i + 1) for i in poly) + '\n')
+
+
+def main(svg, out):
+    out = Path(out); out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    pts, polys, groups, p, axis = build(svg)
+    write_obj(out / 'horn_v3.obj', pts, polys, groups)
+    report = {'date': '9 November 2026', 'blueprint': str(svg), 'params': p, 'points': len(pts), 'polygons': len(polys),
+              'quads': sum(1 for q in polys if len(q) == 4), 'axis_units': [[round(c, 4) for c in v] for v in axis],
+              'length_units': round(sum(math.dist(axis[i], axis[i + 1]) for i in range(len(axis) - 1)), 4)}
+    try:
+        import hou                                       # under hython: Houdini geometry and a scene to orbit
+        geo = hou.Geometry(); geo.loadFromFile(str(out / 'horn_v3.obj'))
+        geo.saveToFile(str(out / 'horn_v3.bgeo.sc'))
+        node = hou.node('/obj').createNode('geo', 'horn_v3')
+        f = node.createNode('file', 'blueprint_horn'); f.parm('file').set(str(out / 'horn_v3.bgeo.sc')); f.setDisplayFlag(True)
+        hou.hipFile.save(str(out / 'horn_v3.hip'))
+        report['houdini'] = {'bgeo': str(out / 'horn_v3.bgeo.sc'), 'hip': str(out / 'horn_v3.hip'), 'prims': len(geo.prims())}
+    except ImportError:
+        report['houdini'] = None
+    report['build_seconds'] = round(time.time() - t0, 3)
+    (out / 'build-report.json').write_text(json.dumps(report, indent=1) + '\n')
+    return report
+
+
+if __name__ == '__main__':
+    r = main(sys.argv[1], sys.argv[2])
+    print(json.dumps({k: r[k] for k in ('points', 'polygons', 'quads', 'length_units', 'build_seconds', 'houdini')}))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/BuildPanelFromBlueprint.py (354 lines, 17473 bytes)
+#!/usr/bin/env hython
+# 9 November 2026, 23:55 Europe/Paris: ZenRay Meshes V3, a body panel from its plan SVG (v2: any outline view, depth by
+# "sum" of curves or "loft" between two edge curves). One four-sided Coons patch of quads, closed shell.
+# FR : un panneau de carrosserie depuis son plan SVG ; contour dans n'importe quelle vue ; profondeur par somme de courbes
+#      (profil + galbe) ou par lissage entre deux bords lus dans une autre vue ; un patch de Coons en quads, coque fermée.
+#
+# Outline: the closed polygon of the mask, its four corners (near points merged, the four sharpest turns kept), its four
+# sides resampled along their length; the Coons patch keeps curved sides. Depth, read from the root data-build recipe:
+#   {"mode": "sum", "base": [ids], "relative": [ids]}   depth = sum of base curves + relative curves minus their value at
+#                                                       the middle of the outline (a crown added to a profile);
+#   {"mode": "loft", "edges": {"min": id, "max": id}}   depth = blend of two edge curves across the outline (the curve at
+#                                                       the outline's smallest across value, and the one at the largest).
+# Each depth curve lives in a view that shares one outline axis (its key) and sees the depth axis (its value).
+# Usage: hython|python BuildPanelFromBlueprint.py <panel.blueprint.svg> <out_dir>
+import json
+import math
+import sys
+import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import Blueprint as B
+
+DEFAULTS = {'thickness': 0.03, 'lean_deg': 0.0, 'cols': 16, 'rows': 8, 'merge_m': 0.04}
+
+
+def corners_of(pts, merge):
+    out = []
+    for p in pts:
+        if out and math.dist(out[-1][1], p) < merge:
+            continue
+        out.append((len(out), p))
+    pts = [p for _, p in out]
+    if math.dist(pts[0], pts[-1]) < merge:
+        pts = pts[:-1]
+
+    def turn(i):
+        a, b, c = pts[i - 1], pts[i], pts[(i + 1) % len(pts)]
+        u = (b[0] - a[0], b[1] - a[1]); v = (c[0] - b[0], c[1] - b[1])
+        return abs(math.atan2(u[0] * v[1] - u[1] * v[0], u[0] * v[0] + u[1] * v[1]))
+    keep = sorted(sorted(range(len(pts)), key=turn)[-4:])
+    return pts, keep
+
+
+def resample(poly, n):
+    L = [0.0]
+    for a, b in zip(poly, poly[1:]):
+        L.append(L[-1] + math.dist(a, b))
+    out = []
+    for k in range(n + 1):
+        t = L[-1] * k / n; i = max(0, min(len(poly) - 2, next((j for j in range(len(L) - 1) if L[j + 1] >= t), len(L) - 2)))
+        f = (t - L[i]) / max(1e-12, L[i + 1] - L[i])
+        out.append((poly[i][0] + f * (poly[i + 1][0] - poly[i][0]), poly[i][1] + f * (poly[i + 1][1] - poly[i][1])))
+    return out
+
+
+def sides(pts, keep):
+    n = len(pts); s = []
+    for k in range(4):
+        i, j = keep[k], keep[(k + 1) % 4]
+        seq = [pts[i]]; m = i
+        while m != j:
+            m = (m + 1) % n; seq.append(pts[m])
+        s.append(seq)
+    return s
+
+
+def span_at(pts, key_index, key):
+    # Across-axis values where the line key = const crosses the outline: its smallest and largest.
+    vals = []
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        ka, kb = a[key_index], b[key_index]
+        if (ka - key) * (kb - key) <= 0 and ka != kb:
+            f = (key - ka) / (kb - ka); vals.append(a[1 - key_index] + f * (b[1 - key_index] - a[1 - key_index]))
+    return (min(vals), max(vals)) if vals else (None, None)
+
+
+def build(svg):
+    root = ET.parse(svg).getroot()
+    recipe = json.loads(root.get('data-build') or '{}')
+    bp = B.load(svg)
+    p = dict(DEFAULTS); p.update(B.params(svg))
+    curves = {cid: (vname, v['axes'], polys[0]) for vname, v in bp.items() for cid, polys in v['curves'].items()}
+    _, (ha, va), outline = curves[recipe['outline']]
+    depth_axis = next(a for a in 'xyz' if a not in (ha, va))
+    pts, keep = corners_of(outline, p['merge_m'])
+    S = sides(pts, keep)
+    if sum(math.dist(*x) for x in zip(S[0], S[0][1:])) < sum(math.dist(*x) for x in zip(S[1], S[1][1:])):
+        keep = keep[1:] + keep[:1]; S = sides(pts, keep)
+    cols, rows = int(p['cols']), int(p['rows'])
+    B0 = resample(S[0], cols); B1 = resample(S[2], cols)[::-1]; L1 = resample(S[1], rows); L0 = resample(S[3], rows)[::-1]
+    c00, c10, c11, c01 = B0[0], B0[-1], B1[-1], B1[0]
+
+    def fn(cid):
+        _, axes, poly = curves[cid]
+        key = ha if ha in axes else va
+        assert depth_axis in axes, '%s does not carry the depth axis %s' % (cid, depth_axis)
+        f, _ = B.as_function(poly, axes.index(key))
+        return key, f
+
+    if recipe.get('mode') == 'coons':
+        return build_coons(recipe, curves, (ha, va), depth_axis, pts, keep, p)
+    ix = {ha: 0, va: 1}
+    centre = {ha: (min(q[0] for q in pts) + max(q[0] for q in pts)) / 2, va: (min(q[1] for q in pts) + max(q[1] for q in pts)) / 2}
+    if recipe.get('mode', 'sum') == 'sum':
+        base = [fn(c) for c in recipe.get('base', [])]; rel = [fn(c) for c in recipe.get('relative', [])]
+
+        def depth(h, v):
+            q = {ha: h, va: v}
+            return sum(f(q[k]) for k, f in base) + sum(f(q[k]) - f(centre[k]) for k, f in rel)
+    else:
+        kmin, fmin = fn(recipe['edges']['min']); kmax, fmax = fn(recipe['edges']['max'])
+        assert kmin == kmax
+        across = va if kmin == ha else ha
+
+        def depth(h, v):
+            q = {ha: h, va: v}
+            lo, hi = span_at(pts, ix[kmin], q[kmin])
+            t = 0.5 if lo is None or hi - lo < 1e-9 else min(1.0, max(0.0, (q[across] - lo) / (hi - lo)))
+            return (1 - t) * fmin(q[kmin]) + t * fmax(q[kmin])
+
+    idx = {a: i for i, a in enumerate('xyz')}
+    surf = []
+    for j in range(rows + 1):
+        t = j / rows
+        for i in range(cols + 1):
+            s = i / cols
+            P = [(1 - t) * B0[i][k] + t * B1[i][k] + (1 - s) * L0[j][k] + s * L1[j][k]
+                 - ((1 - s) * (1 - t) * c00[k] + s * (1 - t) * c10[k] + (1 - s) * t * c01[k] + s * t * c11[k]) for k in range(2)]
+            surf.append((P[0], P[1], depth(P[0], P[1])))
+    mean_d = sum(q[2] for q in surf) / len(surf)
+    inward = -1.0 if mean_d > p['centre_' + depth_axis] else 1.0
+
+    def world(h, v, d):
+        w = [0.0, 0.0, 0.0]; w[idx[ha]] = h; w[idx[va]] = v; w[idx[depth_axis]] = d
+        return w
+    outer = [world(h, v, d) for h, v, d in surf]; inner = [world(h, v, d + inward * p['thickness']) for h, v, d in surf]
+    n = (cols + 1) * (rows + 1)
+    q = lambda i, j, k=0: k * n + j * (cols + 1) + i
+    polys, groups = [], {}
+    for name, k, flip in (('panel_outer', 0, False), ('panel_inner', 1, True)):
+        a0 = len(polys)
+        for j in range(rows):
+            for i in range(cols):
+                f = [q(i, j, k), q(i + 1, j, k), q(i + 1, j + 1, k), q(i, j + 1, k)]
+                polys.append(f[::-1] if flip else f)
+        groups[name] = (a0, len(polys))
+    a0 = len(polys)
+    ring = [(i, 0) for i in range(cols)] + [(cols, j) for j in range(rows)] + [(i, rows) for i in range(cols, 0, -1)] + [(0, j) for j in range(rows, 0, -1)]
+    for k in range(len(ring)):
+        (i0, j0), (i1, j1) = ring[k], ring[(k + 1) % len(ring)]
+        polys.append([q(i0, j0), q(i1, j1), q(i1, j1, 1), q(i0, j0, 1)])
+    groups['panel_edge'] = (a0, len(polys))
+    # Outward winding: the first outer quad's normal must point away from the object's centre along the depth axis.
+    P0, P1, P3 = outer[q(0, 0)], outer[q(1, 0)], outer[q(0, 1)]
+    nrm = [(P1[1] - P0[1]) * (P3[2] - P0[2]) - (P1[2] - P0[2]) * (P3[1] - P0[1]), (P1[2] - P0[2]) * (P3[0] - P0[0]) - (P1[0] - P0[0]) * (P3[2] - P0[2]), (P1[0] - P0[0]) * (P3[1] - P0[1]) - (P1[1] - P0[1]) * (P3[0] - P0[0])]
+    if nrm[idx[depth_axis]] * -inward < 0:
+        polys = [f[::-1] for f in polys]
+    info = {'outline_axes': [ha, va], 'depth_axis': depth_axis, 'mode': recipe.get('mode', 'sum'),
+            'corners': [[round(c, 4) for c in pts[k]] for k in keep],
+            'depth_range': [round(min(x[2] for x in surf), 4), round(max(x[2] for x in surf), 4)]}
+    return outer + inner, polys, groups, p, info
+
+
+def name_sides(S, axes):
+    # A side mostly along the second axis sits at an extreme of the first one, and the reverse: "zmin", "xmax", ...
+    out = {}
+    for k, side in enumerate(S):
+        d0, d1 = side[-1][0] - side[0][0], side[-1][1] - side[0][1]
+        if abs(d1) > abs(d0):
+            out[k] = (axes[0], sum(q[0] for q in side) / len(side))
+        else:
+            out[k] = (axes[1], sum(q[1] for q in side) / len(side))
+    names = {}
+    for ax in axes:
+        ks = [k for k in out if out[k][0] == ax]
+        if len(ks) == 2:
+            lo, hi = sorted(ks, key=lambda k: out[k][1]); names[lo] = ax + 'min'; names[hi] = ax + 'max'
+    return names
+
+
+def side_depth_by_key(side2, key_i):
+    # The secondary side as a function key -> depth (it is monotone in its shared key when the key varies enough).
+    f, _ = B.as_function(side2, key_i)
+    return f
+
+
+def build_coons(recipe, curves, axes, depth_axis, pts, keep, p):
+    """Two views of each edge give it in 3D; a Coons patch spans the four 3D edges (9 November 2026)."""
+    ha, va = axes
+    S = sides(pts, keep)
+    names = name_sides(S, axes)
+    second = {}
+    for cid, (vname, saxes, poly) in curves.items():
+        if cid == recipe['outline'] or depth_axis not in saxes:
+            continue
+        sp, sk = corners_of(poly, p['merge_m'])
+        SS = sides(sp, sk)
+        second[cid] = (saxes, {nm: SS[k] for k, nm in name_sides(SS, saxes).items()})
+    depth_of_side = {}
+    pending = []
+    for k, side in enumerate(S):
+        src = recipe['sides'][names[k]]
+        if 'curve' in src:
+            # 9 November 2026: an edge read column by column in another view (robust for thin slivers of a part).
+            _, caxes, cpoly = curves[src['curve']]
+            key = ha if ha in caxes else va
+            g, _ = B.as_function(cpoly, caxes.index(key))
+            depth_of_side[k] = [g(q[(ha, va).index(key)]) for q in side]
+            continue
+        saxes, ssides = second[src['outline']]
+        key = ha if ha in saxes else va
+        kin = (ha, va).index(key)
+        sside = ssides[src['side']]
+        ksi = saxes.index(key); dsi = saxes.index(depth_axis)
+        span = abs(side[-1][kin] - side[0][kin])
+        if span > recipe.get('key_span_m', 0.05):
+            g = side_depth_by_key([(q[ksi], q[dsi]) for q in sside], 0)
+            depth_of_side[k] = [g(q[kin]) for q in side]
+        else:
+            pending.append((k, [q[dsi] for q in sside]))
+    for k, dv in pending:
+        # Orientation unknown from this view alone: pick the one that meets the neighbours' depths at the corners.
+        prev, nxt = depth_of_side.get((k - 1) % 4), depth_of_side.get((k + 1) % 4)
+        cand = [dv, dv[::-1]]
+        def cost(c):
+            e = 0.0
+            if prev: e += abs(c[0] - prev[-1])
+            if nxt: e += abs(c[-1] - nxt[0])
+            return e
+        dv = min(cand, key=cost)
+        L = [0.0]
+        for a, b in zip(S[k], S[k][1:]):
+            L.append(L[-1] + math.dist(a, b))
+        Ld = len(dv) - 1
+        depth_of_side[k] = [dv[min(Ld, int(round(L[i] / max(L[-1], 1e-12) * Ld)))] for i in range(len(S[k]))]
+    # Corners: the two sides meeting there may disagree by a pixel; meet halfway and spread the difference.
+    for k in range(4):
+        a, b = depth_of_side[k], depth_of_side[(k + 1) % 4]
+        m = (a[-1] + b[0]) / 2; da, db = m - a[-1], m - b[0]
+        n1, n2 = len(a) - 1, len(b) - 1
+        depth_of_side[k] = [a[i] + da * i / max(n1, 1) for i in range(len(a))]
+        depth_of_side[(k + 1) % 4] = [b[i] + db * (1 - i / max(n2, 1)) for i in range(len(b))]
+    # 9 November 2026: optional interior shape from the crest lines (profile + crown, as in "sum"); the edges stay exact
+    # because the Coons patch then carries only the difference between the measured edges and that interior.
+    inner_f = None
+    if recipe.get('interior'):
+        it = recipe['interior']
+        def fn2(cid):
+            _, caxes, cpoly = curves[cid]
+            key = ha if ha in caxes else va
+            g, _ = B.as_function(cpoly, caxes.index(key))
+            return (ha, va).index(key), g
+        base = [fn2(c) for c in it.get('base', [])]; rel = [fn2(c) for c in it.get('relative', [])]
+        mid = [(min(q[0] for q in pts) + max(q[0] for q in pts)) / 2, (min(q[1] for q in pts) + max(q[1] for q in pts)) / 2]
+        inner_f = lambda h, v: sum(g((h, v)[i]) for i, g in base) + sum(g((h, v)[i]) - g(mid[i]) for i, g in rel)
+        depth_of_side = {k: [d - inner_f(q[0], q[1]) for q, d in zip(S[k], depth_of_side[k])] for k in range(4)}
+    S3 = [[(q[0], q[1], d) for q, d in zip(S[k], depth_of_side[k])] for k in range(4)]
+    def resample3(poly, n):
+        L = [0.0]
+        for a, b in zip(poly, poly[1:]):
+            L.append(L[-1] + math.dist(a, b))
+        out = []
+        for j in range(n + 1):
+            t = L[-1] * j / n; i = max(0, min(len(poly) - 2, next((r for r in range(len(L) - 1) if L[r + 1] >= t), len(L) - 2)))
+            f = (t - L[i]) / max(1e-12, L[i + 1] - L[i])
+            out.append(tuple(poly[i][c] + f * (poly[i + 1][c] - poly[i][c]) for c in range(3)))
+        return out
+    l0 = sum(math.dist(a, b) for a, b in zip(S3[0], S3[0][1:])); l1 = sum(math.dist(a, b) for a, b in zip(S3[1], S3[1][1:]))
+    if l0 < l1:
+        S3 = S3[1:] + S3[:1]
+    cols, rows = int(p['cols']), int(p['rows'])
+    B0 = resample3(S3[0], cols); B1 = resample3(S3[2], cols)[::-1]; L1 = resample3(S3[1], rows); L0 = resample3(S3[3], rows)[::-1]
+    c00, c10, c11, c01 = B0[0], B0[-1], B1[-1], B1[0]
+    surf = []
+    for j in range(rows + 1):
+        t = j / rows
+        for i in range(cols + 1):
+            s = i / cols
+            surf.append(tuple((1 - t) * B0[i][c] + t * B1[i][c] + (1 - s) * L0[j][c] + s * L1[j][c]
+                              - ((1 - s) * (1 - t) * c00[c] + s * (1 - t) * c10[c] + (1 - s) * t * c01[c] + s * t * c11[c]) for c in range(3)))
+    if inner_f:
+        surf = [(h, v, d + inner_f(h, v)) for h, v, d in surf]
+    return shell(surf, (ha, va), depth_axis, cols, rows, p, {'mode': 'coons', 'interior': bool(inner_f), 'sides': {names[k]: recipe['sides'][names[k]] for k in range(4)}})
+
+
+def shell(surf, axes, depth_axis, cols, rows, p, extra):
+    ha, va = axes
+    idx = {a: i for i, a in enumerate('xyz')}
+    mean_d = sum(q[2] for q in surf) / len(surf)
+    inward = -1.0 if mean_d > p['centre_' + depth_axis] else 1.0
+    def world(h, v, d):
+        w = [0.0, 0.0, 0.0]; w[idx[ha]] = h; w[idx[va]] = v; w[idx[depth_axis]] = d
+        return w
+    outer = [world(*q) for q in surf]; inner = [world(q[0], q[1], q[2] + inward * p['thickness']) for q in surf]
+    n = (cols + 1) * (rows + 1)
+    q = lambda i, j, k=0: k * n + j * (cols + 1) + i
+    polys, groups = [], {}
+    for name, k, flip in (('panel_outer', 0, False), ('panel_inner', 1, True)):
+        a0 = len(polys)
+        for j in range(rows):
+            for i in range(cols):
+                f = [q(i, j, k), q(i + 1, j, k), q(i + 1, j + 1, k), q(i, j + 1, k)]
+                polys.append(f[::-1] if flip else f)
+        groups[name] = (a0, len(polys))
+    a0 = len(polys)
+    ring = [(i, 0) for i in range(cols)] + [(cols, j) for j in range(rows)] + [(i, rows) for i in range(cols, 0, -1)] + [(0, j) for j in range(rows, 0, -1)]
+    for k in range(len(ring)):
+        (i0, j0), (i1, j1) = ring[k], ring[(k + 1) % len(ring)]
+        polys.append([q(i0, j0), q(i1, j1), q(i1, j1, 1), q(i0, j0, 1)])
+    groups['panel_edge'] = (a0, len(polys))
+    info = dict(extra); info.update({'outline_axes': [ha, va], 'depth_axis': depth_axis,
+                'depth_range': [round(min(x[2] for x in surf), 4), round(max(x[2] for x in surf), 4)]})
+    return outer + inner, polys, groups, p, info
+
+
+def write_obj(path, pts, polys, groups):
+    with open(path, 'w') as f:
+        f.write('# 9 November 2026, ZenRay Meshes V3 panel\n')
+        for v in pts:
+            f.write('v %.6f %.6f %.6f\n' % tuple(v))
+        for name, (a, b) in groups.items():
+            f.write('g %s\n' % name)
+            for poly in polys[a:b]:
+                f.write('f ' + ' '.join(str(i + 1) for i in poly) + '\n')
+
+
+def main(svg, out):
+    out = Path(out); out.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    pts, polys, groups, p, info = build(svg)
+    write_obj(out / 'panel_v3.obj', pts, polys, groups)
+    report = {'date': '9 November 2026', 'blueprint': str(svg), 'params': p, 'info': info, 'points': len(pts), 'polygons': len(polys),
+              'quads': sum(1 for x in polys if len(x) == 4)}
+    try:
+        import hou
+        geo = hou.Geometry(); geo.loadFromFile(str(out / 'panel_v3.obj')); geo.saveToFile(str(out / 'panel_v3.bgeo.sc'))
+        node = hou.node('/obj').createNode('geo', 'panel_v3')
+        f = node.createNode('file', 'blueprint_panel'); f.parm('file').set(str(out / 'panel_v3.bgeo.sc')); f.setDisplayFlag(True)
+        hou.hipFile.save(str(out / 'panel_v3.hip'))
+        report['houdini'] = {'hip': str(out / 'panel_v3.hip'), 'prims': len(geo.prims())}
+    except ImportError:
+        report['houdini'] = None
+    report['build_seconds'] = round(time.time() - t0, 3)
+    (out / 'build-report.json').write_text(json.dumps(report, indent=1) + '\n')
+    return report
+
+
+if __name__ == '__main__':
+    r = main(sys.argv[1], sys.argv[2])
+    print(json.dumps({k: r[k] for k in ('info', 'points', 'polygons', 'quads', 'build_seconds', 'houdini')}))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/CameraHeight.py (70 lines, 3435 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 20:40 Europe/Paris: ZenRay Meshes V3, make a second photo camera agree in height with the first.
+# FR : accorde la hauteur d'une deuxième caméra photo avec la première, sur un seul nombre, en gardant un contrôle libre.
+#
+# The side camera fixes every height of the component. Another camera (front, three quarters) may sit a few centimetres
+# too high or too low, which shifts the whole model up or down on its photo. This tool moves that camera (position and
+# target together) by dy so the model's top silhouette meets one traced curve, then reports a second traced curve that
+# was NOT used, as the independent check. It writes a new camera entry "<name>_v3", the original stays untouched.
+# Usage: CameraHeight.py <cameras.json> <name> <model.obj> <photo-curve.json> --fit <curve> --check <curve> [--pitch]
+#   photo-curve.json: {"<curve>": {"px": [[u, v], ...], "kind": "top" | "line"}}   (line = the model's lowest edge row)
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from BlueprintBoard import camera, project, load_obj
+
+
+def errors(cam, V, curve):
+    UV = project(cam, V)
+    out = []
+    for u, v in curve['px']:
+        m = np.abs(UV[:, 0] - u) < 1.0
+        if m.any():
+            edge = UV[m, 1].min() if curve.get('kind', 'top') == 'top' else UV[m, 1].max()
+            out.append(v - edge)
+    return np.array(out)
+
+
+def main(a):
+    cams_path, name, obj, curves_path = a[0], a[1], a[2], a[3]
+    fit, check = a[a.index('--fit') + 1], a[a.index('--check') + 1]
+    cams = json.loads(Path(cams_path).read_text())
+    curves = json.loads(Path(curves_path).read_text())
+    V = load_obj(obj, None)[0]
+
+    pitch = '--pitch' in a                   # move the target only: a tilt, the likelier error of a hand-set camera
+
+    def cam_at(dy):
+        c = json.loads(json.dumps(cams)); c[name]['target'][1] += dy
+        if not pitch:
+            c[name]['pos'][1] += dy
+        return camera(c, name)
+
+    lo, hi = (-1.5, 1.5) if pitch else (-0.5, 0.5)
+    for _ in range(60):                      # golden section on |mean signed error| of the fit curve
+        m1, m2 = lo + (hi - lo) * 0.382, lo + (hi - lo) * 0.618
+        if abs(errors(cam_at(m1), V, curves[fit]).mean()) < abs(errors(cam_at(m2), V, curves[fit]).mean()):
+            hi = m2
+        else:
+            lo = m1
+    dy = (lo + hi) / 2
+    before = {k: round(float(np.abs(errors(cam_at(0.0), V, curves[k])).mean()), 1) for k in (fit, check)}
+    after = {k: round(float(np.abs(errors(cam_at(dy), V, curves[k])).mean()), 1) for k in (fit, check)}
+    entry = json.loads(json.dumps(cams[name])); entry['target'][1] += dy
+    if not pitch:
+        entry['pos'][1] += dy
+    dist = float(np.linalg.norm(np.array(entry['target']) - np.array(entry['pos'])))
+    what = 'tilted by %+.2f degrees' % np.degrees(np.arctan2(dy, dist)) if pitch else 'moved by %+.3f m in height' % dy
+    entry['_note'] = '9 November 2026: %s %s so the hood top measured from the side meets this photo; check curve %s left out of the fit.' % (name, what, check)
+    cams[name + '_v3'] = entry
+    Path(cams_path).write_text(json.dumps(cams, indent=1) + '\n')
+    return {'camera': name + '_v3', 'change': what, 'mean_px_before': before, 'mean_px_after': after}
+
+
+if __name__ == '__main__':
+    print(json.dumps(main(sys.argv[1:])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/CutTournament.py (270 lines, 13384 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 23:59 Europe/Paris: ZenRay Meshes V3, tournament of four methods to perfect a cut (part masks of a
+# 6-view sheet) from the current ID map and the reference, all judged by MaskJudge.py. Phase 1 of each method.
+# FR : tournoi de quatre méthodes pour perfectionner une découpe à partir de l'ID map actuelle et de la référence.
+#   M1 lines   : cells closed by the reference's drawn lines (trapped ball, then watershed on the lines), each cell takes the
+#                majority part of the current map; a cell fully closed by lines inside a part splits off as a new part.
+#   M2 prims   : the current borders, each refitted as the simplest primitive (straight line, circular arc), else smoothed.
+#   M3 sym     : left and right profiles made mirror-equal part by part, keeping the side whose border sits better on the
+#                drawn lines; front, back, top and bottom made symmetric about x = 0 the same way.
+#   M4 shapes  : every part replaced by its best procedural shape (circle, ellipse, polygon of 3 to 8 corners) chosen by
+#                overlap minus a cost per parameter; parts painted large to small, gaps filled by the nearest part.
+# Usage: CutTournament.py <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [methods m1,m2,m3,m4]
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
+from skimage import filters, measure, morphology, segmentation
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import MaskAtlas as MA
+import MaskJudge as MJ
+
+VIEWS = MJ.VIEWS
+FILES = MJ.FILES
+S = MJ.SCALE
+P = {'snap_px': 6, 'ball_px': 4, 'line_disk': 6, 'split_min_px': 900, 'split_line_share': 0.8,
+     'line_tol_px': 1.2, 'arc_tol_px': 1.5, 'shape_param_cost': 0.004, 'shape_max_corners': 8}
+
+
+def load(views_dir, view, shape):
+    H, W = shape
+    g = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_rgb.png')).convert('L').resize((W, H), Image.BICUBIC)).astype(float)
+    sil = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_mask.png')).convert('L').resize((W, H), Image.NEAREST)) > 127
+    return g, sil
+
+
+def fill_gaps(out, sil):
+    hole = sil & (out < 0)
+    if hole.any() and (out >= 0).any():
+        idx = ndi.distance_transform_edt(out < 0, return_distances=False, return_indices=True)
+        out = out.copy(); out[hole] = out[idx[0][hole], idx[1][hole]]
+    out[~sil] = -1
+    return out
+
+
+def m1_lines(L, g, sil):
+    th = morphology.black_tophat(g, morphology.disk(P['line_disk']))
+    line = (th > filters.threshold_otsu(th[sil])) & sil
+    core = morphology.binary_erosion(sil & ~line, morphology.disk(P['ball_px']))
+    markers, n = ndi.label(core)
+    cells = segmentation.watershed(th, markers, mask=sil)
+    k = int(L.max()) + 2
+    joint = np.bincount((cells.ravel() * k + (L.ravel() + 1)), minlength=(n + 1) * k).reshape(n + 1, k)
+    joint[:, 0] = 0
+    major = joint.argmax(1) - 1
+    out = np.where(cells > 0, major[cells], -1)
+    # Split: a cell closed by drawn lines on most of its border, sharing its part with other cells, becomes a new part.
+    new_id = 1000; splits = 0
+    count = {}
+    for c in range(1, n + 1):
+        count.setdefault(int(major[c]), []).append(c)
+    sizes = np.bincount(cells.ravel(), minlength=n + 1)
+    linegrow = ndi.binary_dilation(line, iterations=2)
+    objs = ndi.find_objects(cells)
+    for lab, cs in count.items():
+        if lab < 0 or len(cs) < 2:
+            continue
+        big = max(cs, key=lambda c: sizes[c])
+        for c in cs:
+            if c == big or sizes[c] < P['split_min_px'] or objs[c - 1] is None:
+                continue
+            sl = objs[c - 1]; m = cells[sl] == c
+            ring = ndi.binary_dilation(m, iterations=2) & ~m & sil[sl]
+            if ring.any() and linegrow[sl][ring].mean() >= P['split_line_share']:
+                out[cells == c] = new_id; new_id += 1; splits += 1
+    return fill_gaps(out, sil), {'cells': int(n), 'new_parts': splits}
+
+
+def m1b_snap_split(L, g, sil):
+    """Phase 2 of M1 (9 November 2026): keep every current border, let it slide onto the drawn line within a band of
+    snap_px, and add a cut only where a drawn line closes a cell inside a part. Never merges two parts."""
+    lines_out, info = m1_lines(L, g, sil)
+    band = ndi.binary_dilation(ndi.minimum_filter(L, 3) != ndi.maximum_filter(L, 3), iterations=P['snap_px'])
+    out = L.copy()
+    # Inside the band, a pixel takes the line-cell label if that label already owns pixels within the band nearby.
+    local = ndi.maximum_filter(np.where(band, L, -1), size=2 * P['snap_px'] + 1)
+    local2 = ndi.minimum_filter(np.where(band, L, 10 ** 6), size=2 * P['snap_px'] + 1)
+    ok = band & (lines_out >= 0) & (lines_out < 1000) & ((lines_out == local) | (lines_out == local2))
+    out[ok] = lines_out[ok]
+    split = lines_out >= 1000
+    out[split] = lines_out[split]
+    return fill_gaps(out, sil), {'new_parts': info['new_parts'], 'snapped_px': int((ok & (out != L)).sum())}
+
+
+def m2_prims(L, g, sil):
+    chains, Wc = MA.chains_of(L)
+    out_rings = {}
+
+    def fit(yx):
+        a, b = yx[0], yx[-1]; seg = b - a; n = np.hypot(*seg)
+        if len(yx) > 2 and n > 1e-9:
+            d = np.abs(seg[0] * (yx[:, 1] - a[1]) - seg[1] * (yx[:, 0] - a[0])) / n
+            if d.max() <= P['line_tol_px']:
+                return np.vstack([a, b])
+        if len(yx) >= 8 and not np.allclose(a, b):
+            cm = measure.CircleModel()
+            if cm.estimate(yx[:, ::-1]):
+                xc, yc, r = cm.params
+                res = np.abs(np.hypot(yx[:, 1] - xc, yx[:, 0] - yc) - r)
+                if res.max() <= P['arc_tol_px'] and r < 1e5:
+                    t0, t1 = np.arctan2(a[0] - yc, a[1] - xc), np.arctan2(b[0] - yc, b[1] - xc)
+                    tm = np.arctan2(yx[len(yx) // 2, 0] - yc, yx[len(yx) // 2, 1] - xc)
+                    # go from t0 to t1 through tm
+                    def unwrap(x, ref):
+                        while x - ref > np.pi: x -= 2 * np.pi
+                        while x - ref < -np.pi: x += 2 * np.pi
+                        return x
+                    tm = unwrap(tm, t0); t1 = unwrap(t1, tm)
+                    ts = np.linspace(t0, t1, max(8, len(yx) // 6))
+                    arc = np.stack([yc + r * np.sin(ts), xc + r * np.cos(ts)], 1); arc[0], arc[-1] = a, b
+                    return arc
+        return MA.clean_chain(yx, 1.0)
+    simple = []
+    for c, la, ra in chains:
+        yx = np.array([divmod(n, Wc) for n in c], float)
+        simple.append((c[0], c[-1], fit(yx), la, ra))
+    rings = {}
+    for a, b, s, la, ra in simple:
+        rings.setdefault(la, []).append((a, b, s)); rings.setdefault(ra, []).append((b, a, s[::-1]))
+    H, W = L.shape
+    img = Image.new('I', (W, H), -1); d = ImageDraw.Draw(img)
+    order = sorted([l for l in rings if l >= 0], key=lambda l: -(L == l).sum())
+    for lab in order:
+        by = {}
+        for seg in rings[lab]:
+            by.setdefault(seg[0], []).append(seg)
+        while any(by.values()):
+            st = next(k for k, v in by.items() if v)
+            a, b, s = by[st].pop(); loop = [s]
+            while b != st and by.get(b):
+                a, b, s = by[b].pop(); loop.append(s[1:])
+            lp = np.vstack(loop)
+            if len(lp) >= 3:
+                d.polygon([(x - 1, y - 1) for y, x in lp], fill=int(lab))
+    out = np.array(img, dtype=np.int32)
+    return fill_gaps(out, sil), {'borders': len(simple)}
+
+
+def m3_sym(Ls, frame, partner, views_dir):
+    out = {v: Ls[v].copy() for v in VIEWS}
+    precs = {}
+    for v in VIEWS:
+        edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]
+        precs[v] = ndi.distance_transform_edt(~np.kron(edges, np.ones((S, S), bool))[:Ls[v].shape[0], :Ls[v].shape[1]])
+
+    def border_quality(L, lab, v):
+        m = L == lab
+        if m.sum() < 50:
+            return 0.0
+        b = m & ~ndi.binary_erosion(m)
+        return float((precs[v][b] <= MJ.TOL * S).mean())
+    stats = {}
+    # Left and right profiles: one consensus, mirrored to both.
+    Lr_on_l = MJ.remap(Ls['right'], frame, 'right', 'left', Ls['left'].shape, False)
+    Lr_on_l = np.where(Lr_on_l >= 0, np.vectorize(lambda x: partner.get(int(x), int(x)))(Lr_on_l), -1)
+    cons = np.full(Ls['left'].shape, -1, np.int32)
+    labs = sorted(set(np.unique(Ls['left'][Ls['left'] >= 0])) | set(np.unique(Lr_on_l[Lr_on_l >= 0])), key=lambda l: -((Ls['left'] == l).sum() + (Lr_on_l == l).sum()))
+    pick_r = 0
+    for lab in labs:
+        ql = border_quality(Ls['left'], lab, 'left')
+        Lr = Ls['right']; qr = border_quality(Lr, partner.get(int(lab), int(lab)), 'right')
+        src = Lr_on_l if qr > ql else Ls['left']; pick_r += qr > ql
+        cons[src == lab] = lab
+    sil_l = load(views_dir, 'left', Ls['left'].shape)[1]
+    cons = fill_gaps(cons, sil_l)
+    out['left'] = cons
+    back = MJ.remap(cons, frame, 'left', 'right', Ls['right'].shape, False)
+    back = np.where(back >= 0, np.vectorize(lambda x: partner.get(int(x), int(x)))(back), -1)
+    out['right'] = fill_gaps(back, load(views_dir, 'right', Ls['right'].shape)[1])
+    stats['left_right_from_right'] = int(pick_r)
+    # Self-symmetric views: each part keeps the better half, mirrored.
+    for v in ('front', 'back', 'top', 'bottom'):
+        L = Ls[v]; mir = MJ.remap(L, frame, v, v, L.shape, True)
+        conv = mir.copy()
+        for lab in np.unique(mir[mir >= 0]):
+            m = mir == lab; tw = partner.get(int(lab), int(lab))
+            if (L[m] == tw).sum() > (L[m] == lab).sum():
+                conv[m] = tw
+        q_orig = np.mean([border_quality(L, l, v) for l in np.unique(L[L >= 0])])
+        res = np.where((L >= 0) & (conv >= 0), np.where(L == conv, L, -1), np.maximum(L, conv))
+        out[v] = fill_gaps(res, load(views_dir, v, L.shape)[1])
+        stats[v] = round(float(q_orig), 3)
+    return out, stats
+
+
+def m4_shapes(L, g, sil):
+    H, W = L.shape
+    img = Image.new('I', (W, H), -1); d = ImageDraw.Draw(img)
+    labs = [int(l) for l in np.unique(L[L >= 0])]
+    labs.sort(key=lambda l: -(L == l).sum())
+    kinds = {}
+    for lab in labs:
+        m = L == lab
+        if m.sum() < 30:
+            continue
+        ys, xs = np.nonzero(m); y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+        sub = np.pad(m[y0:y1, x0:x1], 2)
+        cont = max(measure.find_contours(sub.astype(float), 0.5), key=len)
+        cont = cont - 2 + [y0, x0]
+        cands = []
+        for tol in (1.0, 2.0, 3.0, 5.0, 8.0, 12.0):
+            poly = measure.approximate_polygon(cont, tol)
+            if len(poly) - 1 <= P['shape_max_corners']:
+                cands.append(('polygon%d' % (len(poly) - 1), [(x, y) for y, x in poly], 2 * (len(poly) - 1))); break
+        em = measure.EllipseModel()
+        try:
+            ok = em.estimate(cont[:, ::-1]) and all(np.isfinite(em.params))
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            ok = False                                     # degenerate contour (a sliver): no ellipse candidate
+        if ok:
+            xc, yc, a, b, th = em.params
+            t = np.linspace(0, 2 * np.pi, 96)
+            ex = xc + a * np.cos(t) * np.cos(th) - b * np.sin(t) * np.sin(th); ey = yc + a * np.cos(t) * np.sin(th) + b * np.sin(t) * np.cos(th)
+            cands.append(('ellipse', list(zip(ex, ey)), 5))
+        best, bs = None, -1e9
+        for name, pts, k in cands:
+            t = Image.new('1', (x1 - x0 + 40, y1 - y0 + 40), 0)
+            ImageDraw.Draw(t).polygon([(x - x0 + 20, y - y0 + 20) for x, y in pts], fill=1)
+            r = np.array(t, bool)
+            mm = np.zeros_like(r); mm[20:20 + y1 - y0, 20:20 + x1 - x0] = m[y0:y1, x0:x1]
+            iou = (r & mm).sum() / max((r | mm).sum(), 1)
+            sc = iou - P['shape_param_cost'] * k
+            if sc > bs:
+                bs, best = sc, (name, pts)
+        if best:
+            d.polygon(best[1], fill=lab); kinds[best[0][:7]] = kinds.get(best[0][:7], 0) + 1
+    out = np.array(img, dtype=np.int32)
+    return fill_gaps(out, sil), kinds
+
+
+def main(a):
+    labels_dir, views_dir, frame_path, micro_path, out = a[:5]
+    methods = a[5].split(',') if len(a) > 5 else ['m1', 'm2', 'm3', 'm4']
+    frame = json.loads(Path(frame_path).read_text()); partner, names = MJ.partners(micro_path)
+    Ls = {v: np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels'] for v in VIEWS}
+    res = {}
+    for meth in methods:
+        d = Path(out) / meth; d.mkdir(parents=True, exist_ok=True); info = {}
+        if meth == 'm3':
+            outs, info = m3_sym(Ls, frame, partner, views_dir)
+        else:
+            outs = {}
+            for v in VIEWS:
+                g, sil = load(views_dir, v, Ls[v].shape)
+                outs[v], info[v] = {'m1': m1_lines, 'm1b': m1b_snap_split, 'm2': m2_prims, 'm4': m4_shapes}[meth](Ls[v], g, sil)
+        for v in VIEWS:
+            np.savez_compressed(d / ('labels_%s.npz' % v), labels=outs[v].astype(np.int32))
+        j = MJ.judge(d, views_dir, frame_path, micro_path, d / 'judge', name=meth)
+        res[meth] = {'summary': j['summary'], 'info': info}
+        print(meth, json.dumps(j['summary']), flush=True)
+    (Path(out) / 'tournament.json').write_text(json.dumps(res, indent=1, ensure_ascii=False, default=str) + '\n')
+    return res
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/ImageToBlueprint.py (54 lines, 3243 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 21:20 Europe/Paris: ZenRay Meshes V3, plan SVG from a picture WITHOUT a calibrated camera.
+# FR : plan SVG depuis une image sans caméra calée (capture d'un tutoriel) : le plan de l'image fait office de plan du monde.
+#
+# For a video frame, the picture plane is taken as the world plane: world x = (u - u0) * s, world y = -(v - v0) * s,
+# s in units per pixel, chosen from one length read on screen. Curves keep their straight segments when "straight" is
+# true (a polyline with sharp bends stays one), otherwise they become smooth cubics. Graphs (a radius along the length)
+# go to their own group with data-map x:t,y:-r. Parameters the picture cannot give go on the root as data-param-*.
+# Usage: ImageToBlueprint.py <trace.json> <out.svg>
+import base64
+import io
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from PhotoToBlueprint import catmull_rom_path
+
+
+def build(trace_path, out_path):
+    t = json.loads(Path(trace_path).read_text())
+    u0, v0 = t['origin_px']; s = t['units_per_px']
+    mm = lambda u, v: ((u - u0) * s * 1000.0, (v - v0) * s * 1000.0)
+    x0, y0, x1, y1 = t['crop']
+    crop = Image.open(t['photo']).convert('RGB').crop((x0, y0, x1, y1))
+    buf = io.BytesIO(); crop.save(buf, 'JPEG', quality=90)
+    ax, ay = mm(x0, y0); bx, by = mm(x1, y1)
+    stroke = (bx - ax) / 300.0
+    paths = []
+    for name, c in t['curves'].items():
+        pts = [mm(u, v) for u, v in c['px']]
+        d = ('M %.2f %.2f ' % pts[0] + ' '.join('L %.2f %.2f' % q for q in pts[1:])) if c.get('straight') else catmull_rom_path(pts)
+        paths.append('<path id="%s" d="%s" fill="none" stroke="%s" stroke-width="%.2f"/>' % (name, d, c.get('color', '#ff3b30'), stroke))
+    img = '<image x="%.2f" y="%.2f" width="%.2f" height="%.2f" opacity="0.85" href="data:image/jpeg;base64,%s"/>' % (ax, ay, bx - ax, by - ay, base64.b64encode(buf.getvalue()).decode())
+    groups = ['<g id="view-image" data-map="x:x,y:-y" data-camera="image" data-origin-px="%s,%s" data-units-per-px="%s">%s%s</g>' % (u0, v0, s, img, ''.join(paths))]
+    gy = by + (by - ay) * 0.15
+    for name, g in t.get('graphs', {}).items():
+        pts = [(tt * (bx - ax), -r * (s if g.get('r_in_px') else 1.0) * 1000.0) for tt, r in g['points']]
+        d = 'M %.2f %.2f ' % pts[0] + ' '.join('L %.2f %.2f' % q for q in pts[1:])
+        groups.append('<g id="view-profile" data-map="x:t,y:-r" data-note="%s" transform="translate(%.2f,%.2f)"><path id="%s" d="%s" fill="none" stroke="#ffd60a" stroke-width="%.2f"/></g>'
+                      % (g.get('note', ''), ax, gy, name, d, stroke))
+    params = ''.join(' data-param-%s="%s"' % (k, v) for k, v in t.get('params', {}).items())
+    h = (by - ay) * 1.6
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg"%s viewBox="%.2f %.2f %.2f %.2f" width="900" data-units="mm" data-component="%s"><!-- %s -->%s</svg>'
+           % (params, ax, ay, bx - ax, h, t['component'], t.get('doc', ''), ''.join(groups)))
+    Path(out_path).write_text(svg)
+    return {'blueprint': str(out_path), 'bytes': len(svg)}
+
+
+if __name__ == '__main__':
+    print(json.dumps(build(sys.argv[1], sys.argv[2])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/MaskAtlas.py (300 lines, 15594 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 23:59 Europe/Paris: ZenRay Meshes V3, all the masks of a 6-view sheet at once: an ID map per view
+# (one colour per part), a clean SVG per view (shared borders drawn once, so no gap and no overlap), a check of the SVG
+# against the masks, and a coverage report against the object's silhouette.
+# FR : tous les masques d'une planche 6 vues d'un coup : une ID map par vue (une couleur par pièce), un SVG propre par vue
+#      (chaque frontière tracée une seule fois et partagée par ses deux pièces), le contrôle du SVG contre les masques.
+#
+# Input: the fitted labels of the cut (labels_<view>.npz, one value per part "atom", -1 for none), micro.json (atom id ->
+# part), catalog.json (part -> French name), frame.json (pixel -> world metres), views/<n>_rgb.png and _mask.png.
+# Method: the label image is read as a planar map. Every pixel edge between two different labels is a border edge; the
+# edges chain from junction to junction (corners where three labels meet); each chain is simplified ONCE (Douglas-Peucker,
+# ends fixed) and every part's outline is assembled from the chains around it. SVG coordinates are world millimetres.
+# Usage: MaskAtlas.py <project_dir> <views_dir> <frame.json> <out_dir> [--tol 0.7]
+import colorsys
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+
+VIEWS = ['front', 'back', 'left', 'right', 'top', 'bottom']
+FILES = {'front': '00_front', 'back': '01_back', 'left': '02_left', 'right': '03_right', 'top': '04_top', 'bottom': '05_bottom'}
+FONT = '/Users/zenray/Library/Fonts/AdobeClean-Regular.otf'
+SCALE = 3                      # label pixels per view pixel (params.json "scale")
+SIDE = {'L': ' gauche', 'R': ' droite', 'M': ''}
+
+
+PALETTE = 'grey'               # 9 November 2026, Matthieu: random grey per part like Substance Designer's Flood Fill to
+                               # Random Grayscale (tile random), black background; 'colour' keeps the old hue palette.
+GREY_RANGE = (38, 242)         # grey levels used by the parts, black stays the background
+
+
+def grey_of(i):
+    lo, hi = GREY_RANGE
+    return int(round(lo + ((i * 0.618033988749895 + 0.31) % 1.0) * (hi - lo)))
+
+
+def colour(i):
+    if PALETTE == 'grey':
+        g = 0 if i < 0 else grey_of(i)
+        return (g, g, g)
+    if i < 0:
+        return (24, 24, 26)
+    h = (i * 0.618033988749895) % 1.0
+    s = (0.55, 0.78, 0.92)[i % 3]
+    v = (0.97, 0.82, 0.66)[(i // 3) % 3]
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def chains_of(L):
+    """Border chains of a label image, as lists of corner ids, with the label on their left and on their right."""
+    P = np.pad(L, 1, constant_values=-1)
+    H2, W2 = P.shape; Wc = W2 + 1
+    iv, jv = np.nonzero(P[:, 1:] != P[:, :-1])
+    ih, jh = np.nonzero(P[1:, :] != P[:-1, :])
+    A = np.concatenate([iv * Wc + (jv + 1), (ih + 1) * Wc + jh]).tolist()
+    B = np.concatenate([(iv + 1) * Wc + (jv + 1), (ih + 1) * Wc + (jh + 1)]).tolist()
+    adj = defaultdict(list)
+    for a, b in zip(A, B):
+        adj[a].append(b); adj[b].append(a)
+    junction = {n for n, l in adj.items() if len(l) != 2}
+    seen = set(); chains = []
+    key = lambda a, b: (a, b) if a < b else (b, a)
+
+    def walk(start, nxt):
+        path = [start, nxt]; seen.add(key(start, nxt)); prev, cur = start, nxt
+        while cur not in junction and cur != start:
+            n1, n2 = adj[cur]
+            nx = n2 if n1 == prev else n1
+            seen.add(key(cur, nx)); path.append(nx); prev, cur = cur, nx
+        return path
+    for j in list(junction):
+        for n in adj[j]:
+            if key(j, n) not in seen:
+                chains.append(walk(j, n))
+    for n in list(adj):
+        for m in adj[n]:
+            if key(n, m) not in seen:
+                chains.append(walk(n, m))
+
+    def side_labels(p, q):
+        py, px = divmod(p, Wc); qy, qx = divmod(q, Wc)
+        dy, dx = qy - py, qx - px
+        my, mx = (py + qy) / 2.0, (px + qx) / 2.0
+        left = P[int(np.floor(my + dx * 0.5)), int(np.floor(mx - dy * 0.5))]
+        right = P[int(np.floor(my - dx * 0.5)), int(np.floor(mx + dy * 0.5))]
+        return int(left), int(right)
+    out = [(c, *side_labels(c[0], c[1])) for c in chains]
+    return out, Wc
+
+
+def simplify(pts, tol):
+    """Douglas-Peucker with both ends kept (a closed chain keeps its start and its farthest point)."""
+    pts = np.asarray(pts, float)
+    if len(pts) < 3:
+        return pts
+    if np.allclose(pts[0], pts[-1]):
+        far = int(np.argmax(((pts - pts[0]) ** 2).sum(1)))
+        a = simplify(pts[:far + 1], tol); b = simplify(pts[far:], tol)
+        return np.vstack([a[:-1], b])
+    keep = np.zeros(len(pts), bool); keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        a, b = pts[i], pts[j]; seg = b - a; n = np.hypot(*seg)
+        sub = pts[i + 1:j]
+        d = np.abs(seg[0] * (sub[:, 1] - a[1]) - seg[1] * (sub[:, 0] - a[0])) / n if n > 1e-12 else np.hypot(*(sub - a).T)
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            m = i + 1 + k; keep[m] = True; stack += [(i, m), (m, j)]
+    return pts[keep]
+
+
+def clean_chain(pts, tol, k=8, corner_deg=35.0, window=9):
+    """9 November 2026: pixel staircase to clean lines. Split at real corners (turn above corner_deg over k pixels),
+    smooth each piece by a moving average with its ends fixed, then Douglas-Peucker. Ends never move, so a border
+    shared by two parts stays identical for both."""
+    pts = np.asarray(pts, float); n = len(pts)
+    if n < 2 * k + 2:
+        return simplify(pts, tol)
+    ang = np.zeros(n)
+    for i in range(k, n - k):
+        v1, v2 = pts[i] - pts[i - k], pts[i + k] - pts[i]
+        c = np.dot(v1, v2) / max(np.linalg.norm(v1) * np.linalg.norm(v2), 1e-9)
+        ang[i] = np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))
+    cuts = [0]
+    for i in range(k, n - k):
+        if ang[i] > corner_deg and ang[i] == ang[max(0, i - k):i + k + 1].max() and i - cuts[-1] > k:
+            cuts.append(i)
+    cuts.append(n - 1)
+    out = []
+    for a, b in zip(cuts, cuts[1:]):
+        piece = pts[a:b + 1].copy()
+        if len(piece) > window:
+            h = window // 2; sm = piece.copy()
+            for i in range(1, len(piece) - 1):
+                lo, hi = max(0, i - h), min(len(piece), i + h + 1)
+                sm[i] = piece[lo:hi].mean(0)
+            piece = sm
+        q = simplify(piece, tol)
+        out.append(q if not out else q[1:])
+    return np.vstack(out)
+
+
+def view_map(frame, name):
+    v = next(x for x in frame['views'] if x['name'] == name)
+    lo = np.array(frame['lo']); hi = lo + np.array(frame['dims_m'])
+    rx, uy = np.array(v['rx'], float), np.array(v['uy'], float)
+    lo_r = sum(min(lo[i] * rx[i], hi[i] * rx[i]) for i in range(3)); lo_u = sum(min(lo[i] * uy[i], hi[i] * uy[i]) for i in range(3))
+    x0, y1, s = v['bbox'][0], v['bbox'][3], v['px_per_m']
+    ax = lambda vec: ('-' if vec[int(np.argmax(np.abs(vec)))] < 0 else '') + 'xyz'[int(np.argmax(np.abs(vec)))]
+    flip = lambda a: a[1:] if a.startswith('-') else '-' + a
+    return {'mm': lambda u, vv: (((u - x0) / s + lo_r) * 1000.0, -((y1 - vv) / s + lo_u) * 1000.0), 's': s,
+            'data_map': 'x:%s,y:%s' % (ax(rx), flip(ax(uy)))}
+
+
+def names_of(project):
+    M = Path(project) / '02_masks'
+    atoms = json.loads((M / 'micro.json').read_text())['atoms']
+    fam = json.loads((M / 'catalog.json').read_text())['families']
+    out = {}
+    for a in atoms:
+        side = a['part'].rsplit('_', 1)[-1]
+        out[a['id']] = (a['part'], fam.get(a['family'], {}).get('fr', a['family']) + SIDE.get(side, ''))
+    return out
+
+
+def run_view(project, views_dir, frame, view, out, tol, names):
+    L = np.load(Path(project) / '02_masks' / ('labels_%s.npz' % view))['labels']
+    H, W = L.shape
+    chains, Wc = chains_of(L)
+    m = view_map(frame, view)
+    # Corner (padded label grid) -> view pixel -> world mm.
+    to_mm = lambda cy, cx: m['mm']((cx - 1) / SCALE, (cy - 1) / SCALE)
+    simple = []
+    for c, la, ra in chains:
+        yx = np.array([divmod(n, Wc) for n in c], float)
+        s = clean_chain(yx, tol)
+        simple.append((c[0], c[-1], s, la, ra))
+    rings = defaultdict(list)                                  # label -> list of (start, end, points)
+    for a, b, s, la, ra in simple:
+        rings[la].append((a, b, s)); rings[ra].append((b, a, s[::-1]))
+    paths = {}
+    for lab, segs in rings.items():
+        if lab < 0:
+            continue
+        by_start = defaultdict(list)
+        for seg in segs:
+            by_start[seg[0]].append(seg)
+        loops = []
+        while any(by_start.values()):
+            st = next(k for k, v in by_start.items() if v)
+            a, b, s = by_start[st].pop(); loop = [s]
+            while b != st and by_start.get(b):
+                a, b, s = by_start[b].pop(); loop.append(s[1:])
+            loops.append(np.vstack(loop))
+        d = ' '.join('M ' + ' L '.join('%.2f %.2f' % to_mm(y, x) for y, x in lp[:-1]) + ' Z' for lp in loops)
+        paths[lab] = d
+    # Image extent in mm, so the SVG rasterises on the label grid.
+    ax0, ay0 = to_mm(1, 1); ax1, ay1 = to_mm(H + 1, W + 1)
+    vx, vy, vw, vh = min(ax0, ax1), min(ay0, ay1), abs(ax1 - ax0), abs(ay1 - ay0)
+    body = []
+    for lab in sorted(paths):
+        part, name = names.get(lab, ('?', '?'))
+        body.append('<path id="atom-%d" data-part="%s" data-name="%s" fill="rgb%s" fill-rule="evenodd" d="%s"/>' % (lab, part, name, str(colour(lab)).replace(' ', ''), paths[lab]))
+    edges = ''.join('<path d="M %s" data-left="%d" data-right="%d"/>' % (' L '.join('%.2f %.2f' % to_mm(y, x) for y, x in s), la, ra) for _, _, s, la, ra in simple)
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.3f %.3f %.3f %.3f" width="%d" height="%d" data-units="mm" data-view="%s" data-map="%s" shape-rendering="crispEdges">'
+           '<g id="parts">%s</g><g id="borders" fill="none" stroke="#ff3b30" stroke-width="%.2f">%s</g></svg>'
+           % (vx, vy, vw, vh, W, H, view, m['data_map'], ''.join(body), 1000.0 / m['s'] / SCALE * 0.6, edges))
+    svg_path = Path(out) / ('car-masks-%s.svg' % view); svg_path.write_text(svg)
+    # Check: the SVG parts alone, rasterised on the label grid, against the labels (away from a 1 px band at borders).
+    tmp = Path(out) / ('.check-%s.svg' % view)
+    tmp.write_text(svg.replace('<g id="borders"', '<g id="borders" display="none"'))
+    png = Path(out) / ('.check-%s.png' % view)
+    subprocess.run(['rsvg-convert', '-w', str(W), '-h', str(H), '-b', 'rgb(%d,%d,%d)' % colour(-1), str(tmp), '-o', str(png)], check=True)
+    R = np.asarray(Image.open(png).convert('RGB')).astype(int)
+    lut = {colour(l): l for l in list(paths) + [-1]}
+    flat = R.reshape(-1, 3)
+    dec = np.array([lut.get(tuple(px), -2) for px in map(tuple, flat)]).reshape(H, W)
+    interior = (ndi.minimum_filter(L, 3) == ndi.maximum_filter(L, 3))
+    agree = float((dec[interior] == L[interior]).mean())
+    tmp.unlink(); png.unlink()
+    # Coverage against the object's silhouette (view mask upscaled to the label grid).
+    sil = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_mask.png')).convert('L').resize((W, H), Image.NEAREST)) > 127
+    report = {'view': view, 'parts': len(paths), 'borders': len(simple), 'svg_vs_masks_interior': round(agree, 5),
+              'silhouette_px': int(sil.sum()), 'unlabelled_inside_px': int((sil & (L < 0)).sum()),
+              'labelled_outside_px': int((~sil & (L >= 0)).sum()), 'svg': str(svg_path)}
+    return L, report
+
+
+def render(L, views_dir, view, names, out):
+    H, W = L.shape
+    rgb = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_rgb.png')).convert('RGB').resize((W, H), Image.LANCZOS)).astype(float)
+    labs = [int(x) for x in np.unique(L[L >= 0])]
+    assert len({colour(l) for l in labs}) == len(labs), 'two parts share a grey level in view %s' % view
+    pal = np.zeros((int(L.max()) + 2, 3)); pal[0] = colour(-1)
+    for lab in range(int(L.max()) + 1):
+        pal[lab + 1] = colour(lab)
+    col = pal[L + 1]
+    lab_px = L >= 0
+    over = rgb.copy(); over[lab_px] = rgb[lab_px] * 0.25 + col[lab_px] * 0.75
+    border = (ndi.minimum_filter(L, 3) != ndi.maximum_filter(L, 3))
+    over[border] = (255, 59, 48)                         # thin red borders on the overlay only, to judge the fit
+    idmap = col.copy()                                   # the pure ID map: uniform grey per part, black background
+    Image.fromarray(idmap.astype(np.uint8)).save(Path(out) / ('car-masks-%s-grey.png' % view))
+    im_o = Image.fromarray(over.astype(np.uint8)); im_i = Image.fromarray(idmap.astype(np.uint8))
+    f = ImageFont.truetype(FONT, 26)
+    for im in (im_o, im_i):
+        d = ImageDraw.Draw(im)
+        for lab in np.unique(L[L >= 0]):
+            mask = L == lab
+            if mask.sum() < 400:
+                continue
+            ys, xs = np.nonzero(mask); y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+            dt = ndi.distance_transform_edt(mask[y0:y1, x0:x1]); cy, cx = np.unravel_index(np.argmax(dt), dt.shape)
+            t = str(lab); w = d.textlength(t, font=f)
+            d.rectangle([x0 + cx - w / 2 - 4, y0 + cy - 15, x0 + cx + w / 2 + 4, y0 + cy + 15], fill=(255, 255, 255))
+            d.text((x0 + cx - w / 2, y0 + cy - 14), t, font=f, fill=(10, 10, 10))
+    im_o.save(Path(out) / ('car-masks-%s-overlay.png' % view)); im_i.save(Path(out) / ('car-masks-%s-grey-numbered.png' % view))
+
+
+def legend(names, used, out):
+    rows = sorted(used)
+    f = ImageFont.truetype(FONT, 24); cols = 3; per = (len(rows) + cols - 1) // cols
+    im = Image.new('RGB', (1920, max(1080, 90 + per * 34)), (24, 24, 26)); d = ImageDraw.Draw(im)
+    d.text((20, 20), 'Légende des masques de la voiture : numéro, couleur, pièce (côté)', font=ImageFont.truetype(FONT, 32), fill=(240, 240, 240))
+    for k, lab in enumerate(rows):
+        x = 20 + (k // per) * 630; y = 80 + (k % per) * 34
+        d.rectangle([x, y + 4, x + 26, y + 28], fill=colour(lab))
+        d.text((x + 38, y), '%d  %s' % (lab, names.get(lab, ('?', '?'))[1]), font=f, fill=(230, 230, 230))
+    im.save(Path(out) / 'car-masks-legend.png')
+
+
+def main(a):
+    project, views_dir, frame_path, out = a[0], a[1], a[2], a[3]
+    tol = float(a[a.index('--tol') + 1]) if '--tol' in a else 1.0
+    Path(out).mkdir(parents=True, exist_ok=True)
+    frame = json.loads(Path(frame_path).read_text()); names = names_of(project)
+    reports, used = [], set()
+    for v in VIEWS:
+        L, r = run_view(project, views_dir, frame, v, out, tol, names)
+        render(L, views_dir, v, names, out); reports.append(r); used |= set(int(x) for x in np.unique(L[L >= 0]))
+    legend(names, used, out)
+    summary = {'date': '9 November 2026', 'atoms_in_catalogue': len(names), 'atoms_drawn': len(used),
+               'atoms_never_drawn': sorted(set(names) - used), 'views': reports}
+    (Path(out) / 'car-masks-report.json').write_text(json.dumps(summary, indent=1, ensure_ascii=False) + '\n')
+    return summary
+
+
+if __name__ == '__main__':
+    s = main(sys.argv[1:])
+    print(json.dumps({'atoms_drawn': s['atoms_drawn'], 'never': len(s['atoms_never_drawn']), 'views': [{k: r[k] for k in ('view', 'parts', 'borders', 'svg_vs_masks_interior', 'unlabelled_inside_px', 'labelled_outside_px', 'silhouette_px')} for r in s['views']]}, ensure_ascii=False, indent=0))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/MaskIoU.py (25 lines, 1395 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 21:35 Europe/Paris: ZenRay Meshes V3, overlap between the model and the reference where the
+# reference outline is clean (object against a plain background), so the number only judges what the picture shows.
+# FR : recouvrement modèle et référence, seulement là où le contour de la référence est net (objet sur fond uni).
+# Usage: MaskIoU.py <views.json> <view index> x0 y0 x1 y1 --bright 135
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ModelViews import load_obj, make_camera, render
+
+a = sys.argv[1:]
+spec = json.loads(Path(a[0]).read_text()); view = spec['views'][int(a[1])]
+x0, y0, x1, y1 = map(int, a[2:6]); bright = float(a[a.index('--bright') + 1]) if '--bright' in a else 135
+ref = np.asarray(Image.open(view['photo']).convert('L')).astype(float)[y0:y1, x0:x1] > bright
+V, F = load_obj(spec['obj'])
+alpha = np.asarray(render(V, F, make_camera(view['camera']), [x0, y0, x1, y1], 1).getchannel('A')) > 127
+inter, union = (ref & alpha).sum(), (ref | alpha).sum()
+print(json.dumps({'iou': round(float(inter / max(1, union)), 4), 'reference_px': int(ref.sum()), 'model_px': int(alpha.sum()),
+                  'model_outside_px': int((alpha & ~ref).sum()), 'reference_missed_px': int((ref & ~alpha).sum())}))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/MaskJudge.py (191 lines, 11247 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 23:59 Europe/Paris: ZenRay Meshes V3, the judge of a cut (part masks of a 6-view sheet), the same for
+# every method of the tournament. Two measures, both from the reference only:
+#   1. drawn lines: the sheet draws every panel edge as a thin dark line. Recall = share of drawn line pixels that a mask
+#      border follows (low = missing cuts, the last band of a window); precision = share of mask borders that sit on a
+#      drawn line (low = borders invented or wobbling). The object's silhouette is excluded from both.
+#   2. symmetry: the car is mirror-symmetric, so the left profile mirrored must equal the right profile part for part
+#      (door L against door R), and the front, back, top and bottom views must equal themselves mirrored about x = 0.
+#      IoU per part pair (low = the blinker that differs between the two profiles).
+# FR : le juge d'une découpe, le même pour toutes les méthodes du tournoi : traits dessinés (rappel, précision) et symétrie
+#      (profil gauche contre profil droit, chaque vue contre elle-même en miroir), tirés de la seule référence.
+# Usage: MaskJudge.py judge <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [--name tag]
+#        MaskJudge.py selftest <labels_dir> <views_dir> <frame.json> <micro.json>
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+from skimage import filters, morphology
+
+VIEWS = ['front', 'back', 'left', 'right', 'top', 'bottom']
+FILES = {'front': '00_front', 'back': '01_back', 'left': '02_left', 'right': '03_right', 'top': '04_top', 'bottom': '05_bottom'}
+SCALE = 3                # label pixels per view pixel
+TOL = 1.5                # view pixels: a border within this distance of a drawn line follows it
+LINE_RADIUS = 2          # black top-hat radius (view px) that isolates thin dark lines
+SIL_BAND = 3             # view px of the silhouette left out of the line measures
+EDGE_SIGMA = 1.0         # Canny sigma (view px) for the shading edges that also support a border
+PAIRS = [('left', 'right'), ('front', 'front'), ('back', 'back'), ('top', 'top'), ('bottom', 'bottom')]
+
+
+def axis_of(vec):
+    i = int(np.argmax(np.abs(vec))); return i, (1.0 if vec[i] > 0 else -1.0)
+
+
+def vmap(frame, name):
+    v = next(x for x in frame['views'] if x['name'] == name)
+    lo = np.array(frame['lo']); hi = lo + np.array(frame['dims_m'])
+    rx, uy = np.array(v['rx'], float), np.array(v['uy'], float)
+    lo_r = sum(min(lo[i] * rx[i], hi[i] * rx[i]) for i in range(3)); lo_u = sum(min(lo[i] * uy[i], hi[i] * uy[i]) for i in range(3))
+    return {'rx': rx, 'uy': uy, 'x0': v['bbox'][0], 'y1': v['bbox'][3], 's': v['px_per_m'], 'lo_r': lo_r, 'lo_u': lo_u}
+
+
+def remap(src, frame, vsrc, vdst, shape, mirror_x):
+    """Label image of view vsrc resampled on the grid of view vdst (label scale), optionally mirrored about x = 0."""
+    ms, md = vmap(frame, vsrc), vmap(frame, vdst)
+    H, W = shape
+    V, U = np.mgrid[0:H, 0:W].astype(float)
+    a = (U / SCALE - md['x0']) / md['s'] + md['lo_r']; b = (md['y1'] - V / SCALE) / md['s'] + md['lo_u']
+    P = np.zeros((3, H, W))
+    i, sg = axis_of(md['rx']); P[i] = a * sg
+    j, sg = axis_of(md['uy']); P[j] = b * sg
+    if mirror_x:
+        P[0] = -P[0]
+    i, sg = axis_of(ms['rx']); a2 = P[i] * sg
+    j, sg = axis_of(ms['uy']); b2 = P[j] * sg
+    us = (ms['x0'] + (a2 - ms['lo_r']) * ms['s']) * SCALE; vs = (ms['y1'] - (b2 - ms['lo_u']) * ms['s']) * SCALE
+    ui, vi = np.round(us).astype(int), np.round(vs).astype(int)
+    ok = (ui >= 0) & (ui < src.shape[1]) & (vi >= 0) & (vi < src.shape[0])
+    out = np.full(shape, -1, np.int32); out[ok] = src[vi[ok], ui[ok]]
+    return out
+
+
+def partners(micro_path):
+    atoms = json.loads(Path(micro_path).read_text())['atoms']
+    by = {a['part']: a['id'] for a in atoms}
+    out = {}
+    for a in atoms:
+        fam, side = a['part'].rsplit('_', 1)
+        other = {'L': 'R', 'R': 'L'}.get(side, side)
+        out[a['id']] = by.get(fam + '_' + other, a['id'])
+    return out, {a['id']: a['part'] for a in atoms}
+
+
+def drawn_lines(views_dir, view, with_edges=False):
+    g = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_rgb.png')).convert('L')).astype(float)
+    sil = np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_mask.png')).convert('L')) > 127
+    th = morphology.black_tophat(g, morphology.disk(LINE_RADIUS))
+    inner = ndi.binary_erosion(sil, iterations=SIL_BAND)
+    t = filters.threshold_otsu(th[inner]) if inner.any() else 0
+    line = morphology.skeletonize((th > t) & inner)
+    if with_edges:
+        # 9 November 2026: facet edges show as shading steps, not as dark lines; a border on them is supported too.
+        from skimage import feature
+        line = morphology.skeletonize(line | (feature.canny(g / 255.0, sigma=EDGE_SIGMA) & inner))
+    return line, sil, inner
+
+
+def borders_view(L):
+    """Interior borders (between two parts, not with the background) at view resolution."""
+    b = (ndi.minimum_filter(L, 3) != ndi.maximum_filter(L, 3)) & (ndi.minimum_filter(L, 3) >= 0)
+    H, W = L.shape[0] // SCALE, L.shape[1] // SCALE
+    return b[:H * SCALE, :W * SCALE].reshape(H, SCALE, W, SCALE).any(axis=(1, 3))
+
+
+def line_scores(L, views_dir, view):
+    line, sil, inner = drawn_lines(views_dir, view)
+    edges = drawn_lines(views_dir, view, with_edges=True)[0]
+    bd = borders_view(L)
+    h, w = min(line.shape[0], bd.shape[0]), min(line.shape[1], bd.shape[1])
+    line, edges, bd, inner = line[:h, :w], edges[:h, :w], bd[:h, :w] & inner[:h, :w], inner[:h, :w]
+    d_to_border = ndi.distance_transform_edt(~bd); d_to_line = ndi.distance_transform_edt(~edges)
+    missed = line & (d_to_border > TOL); unsupported = bd & (d_to_line > TOL)
+    recall = 1 - missed.sum() / max(line.sum(), 1); precision = 1 - unsupported.sum() / max(bd.sum(), 1)
+    return {'line_recall': round(float(recall), 4), 'border_precision': round(float(precision), 4),
+            'line_px': int(line.sum()), 'border_px': int(bd.sum())}, missed, unsupported
+
+
+def sym_scores(Ls, frame, partner, names, a, b):
+    La, Lb = Ls[a], Ls[b]
+    mapped = remap(Lb, frame, b, a, La.shape, mirror_x=(a == b))
+    if a == b:
+        # 9 November 2026: a part drawn across the axis keeps one atom id on both halves; each label takes the name, its
+        # own or its twin's, that overlaps the original best (the L/R suffix is an index, not a side, for such parts).
+        conv = mapped.copy()
+        for lab in np.unique(mapped[mapped >= 0]):
+            m = mapped == lab; tw = partner.get(int(lab), int(lab))
+            if (La[m] == tw).sum() > (La[m] == lab).sum():
+                conv[m] = tw
+    else:
+        conv = np.where(mapped >= 0, np.vectorize(lambda x: partner.get(int(x), int(x)))(mapped), -1) if mapped.max() >= 0 else mapped
+    sil = (La >= 0) | (conv >= 0)
+    ious, total_i, total_u = [], 0, 0
+    for lab in np.unique(np.concatenate([La[La >= 0], conv[conv >= 0]])):
+        x, y = La == lab, conv == lab
+        i, u = int((x & y).sum()), int((x | y).sum())
+        total_i += i; total_u += u
+        if u > 900:
+            ious.append((round(i / u, 3), int(lab), names.get(int(lab), '?'), u))
+    ious.sort()
+    disagree = sil & (La != conv)
+    return {'pair': '%s/%s' % (a, b), 'iou_weighted': round(total_i / max(total_u, 1), 4), 'worst': ious[:6]}, disagree
+
+
+def judge(labels_dir, views_dir, frame_path, micro_path, out, name='cut'):
+    frame = json.loads(Path(frame_path).read_text()); partner, names = partners(micro_path)
+    Ls = {v: np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels'] for v in VIEWS}
+    out = Path(out); out.mkdir(parents=True, exist_ok=True)
+    rep = {'name': name, 'lines': {}, 'symmetry': []}
+    for v in VIEWS:
+        sc, missed, unsup = line_scores(Ls[v], views_dir, v); rep['lines'][v] = sc
+        rgb = np.asarray(Image.open(Path(views_dir) / (FILES[v] + '_rgb.png')).convert('RGB')).copy()
+        h, w = missed.shape
+        rgb = rgb[:h, :w]
+        rgb[ndi.binary_dilation(missed)] = (255, 40, 40); rgb[ndi.binary_dilation(unsup)] = (40, 140, 255)
+        Image.fromarray(rgb).resize((w * 2, h * 2), Image.NEAREST).save(out / ('%s-lines-%s.png' % (name, v)))
+    for a, b in PAIRS:
+        sc, dis = sym_scores(Ls, frame, partner, names, a, b); rep['symmetry'].append(sc)
+        img = np.zeros(dis.shape + (3,), np.uint8); img[Ls[a] >= 0] = (60, 60, 60); img[dis] = (255, 200, 0)
+        Image.fromarray(img).save(out / ('%s-sym-%s.png' % (name, sc['pair'].replace('/', '-'))))
+    L_ = [rep['lines'][v] for v in VIEWS]
+    rep['summary'] = {'line_recall_mean': round(float(np.mean([x['line_recall'] for x in L_])), 4),
+                      'border_precision_mean': round(float(np.mean([x['border_precision'] for x in L_])), 4),
+                      'symmetry_iou_mean': round(float(np.mean([x['iou_weighted'] for x in rep['symmetry']])), 4)}
+    (out / ('%s-judge.json' % name)).write_text(json.dumps(rep, indent=1, ensure_ascii=False) + '\n')
+    return rep
+
+
+def selftest(labels_dir, views_dir, frame_path, micro_path):
+    frame = json.loads(Path(frame_path).read_text()); partner, names = partners(micro_path)
+    Ls = {v: np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels'] for v in VIEWS}
+    # Symmetry, green: a view against its own double mirror is itself; red: the right profile shifted by 30 label px.
+    L0 = Ls['front']
+    twice = remap(remap(L0, frame, 'front', 'front', L0.shape, True), frame, 'front', 'front', L0.shape, True)
+    valid = (L0 >= 0) | (twice >= 0)
+    s_green = round(float((L0 == twice)[valid].mean()), 4)
+    red = dict(Ls); red['right'] = np.roll(Ls['right'], 30, axis=1)
+    s_ref = sym_scores(Ls, frame, partner, names, 'left', 'right')[0]['iou_weighted']
+    s_red = sym_scores(red, frame, partner, names, 'left', 'right')[0]['iou_weighted']
+    # Lines, green: cells cut exactly by the drawn lines; red: the same cells shifted by 6 view px.
+    line, sil, inner = drawn_lines(views_dir, 'left')
+    cells, _ = ndi.label(sil & ~ndi.binary_dilation(line))
+    cells = ndi.grey_dilation(cells, size=3) * sil
+    Lg = np.kron(np.where(sil, cells, -1), np.ones((SCALE, SCALE), int)).astype(np.int32)
+    g = line_scores(Lg, views_dir, 'left')[0]
+    r = line_scores(np.roll(Lg, 6 * SCALE, axis=1), views_dir, 'left')[0]
+    ok = s_green > 0.999 and s_red < s_ref - 0.02 and g['line_recall'] > 0.9 and g['border_precision'] > 0.9 and r['border_precision'] < g['border_precision'] - 0.2 and r['line_recall'] < g['line_recall'] - 0.2
+    return {'selftest': 'passed' if ok else 'FAILED', 'sym_identity': s_green, 'sym_left_right': s_ref, 'sym_shifted': s_red,
+            'lines_exact_cells': g, 'lines_shifted_cells': r}
+
+
+if __name__ == '__main__':
+    a = sys.argv[1:]
+    if a[0] == 'selftest':
+        print(json.dumps(selftest(*a[1:5]), ensure_ascii=False))
+    else:
+        nm = a[a.index('--name') + 1] if '--name' in a else 'cut'
+        r = judge(*a[1:6], name=nm)
+        print(json.dumps({'summary': r['summary'], 'lines': r['lines'], 'symmetry': [{k: s[k] for k in ('pair', 'iou_weighted')} | {'worst': s['worst'][:3]} for s in r['symmetry']]}, ensure_ascii=False, indent=0))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/MaskToBlueprint.py (166 lines, 10169 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 23:40 Europe/Paris: ZenRay Meshes V3, clean masks of an orthographic sheet to a plan SVG in mm (v2:
+# any outline view, any number of depth curves from other views, from a mask label or from the object's silhouette).
+# FR : masques propres d'une planche orthographique vers un plan SVG en millimètres ; contour dans n'importe quelle vue,
+#      courbes de profondeur lues dans les autres vues, sur une étiquette de masque ou sur la silhouette de l'objet.
+#
+# The loop (Matthieu, 9 November 2026): grey sheet + sheet of cut lines (an ID map, like Substance Designer) -> indexed
+# cut -> clean masks (labels_<view>.npz) -> this tool -> plan SVG -> BuildPanelFromBlueprint.py in Houdini -> retopology.
+# A sheet view is orthographic: pixel (u, v) = (x0 + s (P.rx - min rx), y1 - s (P.uy - min uy)), x0, y1, s, rx, uy from
+# frame.json, so a mask outline is a curve in world metres, with no camera guess and no perspective.
+# Depth curves: a depth view shares one world axis with the outline (the key) and sees the outline's missing axis (the
+# depth) on its other screen axis. Edge "top"/"bottom" samples columns and keeps the highest/lowest pixel of the region,
+# "left"/"right" samples rows. With fit "quadratic" the curve is ONE parabola written as one SVG Q (one line, one arc).
+# Usage: MaskToBlueprint.py <spec.json> <out.svg>
+#   spec: {"component", "frame", "views_dir", "labels_dir", "label_scale": 3,
+#          "outline": {"view", "label", "tol_px", "id"},
+#          "depth": [{"id", "view", "source": "label"|"silhouette", "label", "edge", "fit", "step_px"}],
+#          "build": {...recipe for the builder...}, "params": {...}}
+import base64
+import io
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from skimage import measure
+
+VIEW_FILES = {'front': '00_front', 'back': '01_back', 'left': '02_left', 'right': '03_right', 'top': '04_top', 'bottom': '05_bottom'}
+AXES = 'xyz'
+
+
+def view_map(frame, name):
+    v = next(x for x in frame['views'] if x['name'] == name)
+    lo = np.array(frame['lo']); hi = lo + np.array(frame['dims_m'])
+    rx, uy = np.array(v['rx'], float), np.array(v['uy'], float)
+    lo_r = sum(min(lo[i] * rx[i], hi[i] * rx[i]) for i in range(3))
+    lo_u = sum(min(lo[i] * uy[i], hi[i] * uy[i]) for i in range(3))
+    x0, y1, s = v['bbox'][0], v['bbox'][3], v['px_per_m']
+    return {'name': name, 's': s, 'rx': rx, 'uy': uy, 'x0': x0, 'y1': y1, 'lo_r': lo_r, 'lo_u': lo_u,
+            'to_ab': lambda u, vv: ((u - x0) / s + lo_r, (y1 - vv) / s + lo_u),
+            'u_of_a': lambda a: x0 + (a - lo_r) * s, 'v_of_b': lambda b: y1 - (b - lo_u) * s}
+
+
+def axis_of(vec):
+    i = int(np.argmax(np.abs(vec))); return AXES[i], (1.0 if vec[i] > 0 else -1.0)
+
+
+def data_map(m):
+    (ra, rs), (ua, us) = axis_of(m['rx']), axis_of(m['uy'])
+    return 'x:%s%s,y:%s%s' % ('' if rs > 0 else '-', ra, '-' if us > 0 else '', ua)   # SVG y = -(P.uy)
+
+
+def underlay(views_dir, m):
+    im = Image.open(Path(views_dir) / (VIEW_FILES[m['name']] + '_rgb.png')).convert('RGB')
+    buf = io.BytesIO(); im.save(buf, 'JPEG', quality=88)
+    a0, b0 = m['to_ab'](0, 0)
+    return '<image x="%.2f" y="%.2f" width="%.2f" height="%.2f" opacity="0.8" href="data:image/jpeg;base64,%s"/>' % (
+        a0 * 1000, -b0 * 1000, im.size[0] / m['s'] * 1000, im.size[1] / m['s'] * 1000, base64.b64encode(buf.getvalue()).decode())
+
+
+def region(spec, view, source, label):
+    k = spec.get('label_scale', 3)
+    if source == 'label':
+        L = np.load(Path(spec['labels_dir']) / ('labels_%s.npz' % view))['labels']
+        return L == label, k
+    return np.asarray(Image.open(Path(spec['views_dir']) / (VIEW_FILES[view] + '_mask.png')).convert('L')) > 127, 1
+
+
+def outline(spec, frame, o=None):
+    o = o or spec['outline']; m = view_map(frame, o['view'])
+    mask, k = region(spec, o['view'], 'label', o['label'])
+    c = max(measure.find_contours(np.pad(mask.astype(float), 1), 0.5), key=len) - 1
+    poly = measure.approximate_polygon(c, tolerance=o.get('tol_px', 1.5) * k)
+    return m, [m['to_ab'](col / k, row / k) for row, col in poly[:-1]], int(mask.sum())
+
+
+def depth_curve(spec, frame, d, mo, pts):
+    m = view_map(frame, d['view'])
+    mask, k = region(spec, d['view'], d.get('source', 'label'), d.get('label'))
+    o_axes = {axis_of(mo['rx'])[0]: 0, axis_of(mo['uy'])[0]: 1}           # outline world axes -> index in (a, b)
+    r_axis, u_axis = axis_of(m['rx'])[0], axis_of(m['uy'])[0]
+    by_cols = d['edge'] in ('top', 'bottom')
+    key_axis = r_axis if by_cols else u_axis
+    assert key_axis in o_axes, 'view %s does not share the key axis with the outline' % d['view']
+    key_vals = [p[o_axes[key_axis]] * (axis_of(mo['rx'])[1] if o_axes[key_axis] == 0 else axis_of(mo['uy'])[1]) for p in pts]
+    # key_vals are world values of the shared axis; convert to this view's screen coordinate.
+    sign = axis_of(m['rx'])[1] if by_cols else axis_of(m['uy'])[1]
+    lo_w, hi_w = min(key_vals), max(key_vals)
+    screen = (lambda w: m['u_of_a'](sign * w)) if by_cols else (lambda w: m['v_of_b'](sign * w))
+    s0, s1 = sorted((screen(lo_w), screen(hi_w)))
+    out = []
+    for t in np.arange(np.ceil(s0) + 1, np.floor(s1) - 1 + 1e-9, d.get('step_px', 1.0)):
+        line = mask[:, int(round(t * k))] if by_cols else mask[int(round(t * k)), :]
+        idx = np.nonzero(line)[0]
+        if not len(idx):
+            continue
+        e = (idx.min() if d['edge'] in ('top', 'left') else idx.max() + 1) / k
+        out.append(m['to_ab'](t + 0.5, e) if by_cols else m['to_ab'](e, t + 0.5))
+    fit = None
+    if d.get('fit') == 'auto' and len(out) > 4:
+        # 9 November 2026: one parabola when it holds within 1.5 px, else a smoothed polyline (facets keep their corners).
+        ki, vi = (0, 1) if by_cols else (1, 0)
+        A = np.array([q[ki] for q in out]); Bv = np.array([q[vi] for q in out])
+        res = np.abs(Bv - np.polyval(np.polyfit(A, Bv, 2), A)) * m['s']
+        if res.max() <= d.get('auto_tol_px', 1.5):
+            d = dict(d, fit='quadratic')
+        else:
+            w = 7; Bs = np.convolve(np.pad(Bv, w // 2, mode='edge'), np.ones(w) / w, mode='valid')
+            pts2 = np.stack([A, Bs], 1)
+            keep = measure.approximate_polygon(pts2, tolerance=0.5 / m['s'])
+            out = [(a, b) if by_cols else (b, a) for a, b in keep]
+            fit = {'kind': 'polyline', 'parabola_max_px': round(float(res.max()), 2), 'points': len(out)}
+    if d.get('fit') == 'quadratic' and len(out) > 4:
+        ki, vi = (0, 1) if by_cols else (1, 0)
+        A = np.array([q[ki] for q in out]); Bv = np.array([q[vi] for q in out])
+        c2, c1, c0 = np.polyfit(A, Bv, 2)
+        f = lambda a: c0 + c1 * a + c2 * a * a; df = lambda a: c1 + 2 * c2 * a
+        a0, a1 = A.min(), A.max(); am = (a0 + a1) / 2; cv = f(a0) + df(a0) * (am - a0)
+        P = (lambda a, b: (a, b)) if by_cols else (lambda a, b: (b, a))
+        p0, pc, p1 = P(a0, f(a0)), P(am, cv), P(a1, f(a1))
+        path = 'M %.3f %.3f Q %.3f %.3f %.3f %.3f' % (p0[0] * 1000, -p0[1] * 1000, pc[0] * 1000, -pc[1] * 1000, p1[0] * 1000, -p1[1] * 1000)
+        res = np.abs(Bv - f(A)) * m['s']
+        fit = {'max_px': round(float(res.max()), 2), 'mean_px': round(float(res.mean()), 2), 'samples': len(out)}
+    else:
+        path = 'M ' + ' L '.join('%.2f %.2f' % (a * 1000, -b * 1000) for a, b in out)
+    return m, path, fit
+
+
+def build(spec_path, out_path):
+    spec = json.loads(Path(spec_path).read_text())
+    frame = json.loads(Path(spec['frame']).read_text())
+    mo, pts, area = outline(spec, frame)
+    o = spec['outline']
+    groups = {mo['name']: [underlay(spec['views_dir'], mo), '<path id="%s" d="M %s Z" fill="none" stroke="#ff3b30" stroke-width="6"/>'
+                           % (o.get('id', 'outline'), ' L '.join('%.2f %.2f' % (a * 1000, -b * 1000) for a, b in pts))]}
+    maps = {mo['name']: mo}
+    report = {'outline_view': o['view'], 'outline_points': len(pts), 'mask_px_label_scale': area, 'depth': {}}
+    # 9 November 2026: secondary outlines, the same part seen in another view; the builder pairs their sides with the
+    # outline's sides to lift every edge into 3D (two orthographic views of one edge give its three coordinates).
+    for so in spec.get('outlines', []):
+        ms, spts, sarea = outline(spec, frame, so)
+        maps.setdefault(ms['name'], ms)
+        groups.setdefault(ms['name'], [underlay(spec['views_dir'], ms)]).append('<path id="%s" d="M %s Z" fill="none" stroke="#0a84ff" stroke-width="6"/>'
+                                                                              % (so['id'], ' L '.join('%.2f %.2f' % (a * 1000, -b * 1000) for a, b in spts)))
+        report.setdefault('outlines', {})[so['id']] = {'view': so['view'], 'points': len(spts), 'mask_px_label_scale': sarea}
+    for d in spec.get('depth', []):
+        m, path, fit = depth_curve(spec, frame, d, mo, pts)
+        maps.setdefault(m['name'], m)
+        groups.setdefault(m['name'], [underlay(spec['views_dir'], m)]).append('<path id="%s" d="%s" fill="none" stroke="#30d158" stroke-width="6"/>' % (d['id'], path))
+        report['depth'][d['id']] = fit or 'polyline'
+    lo = np.array(frame['lo']); hi = lo + np.array(frame['dims_m'])
+    params = dict(spec.get('params', {}))
+    params.update({'centre_x': (lo[0] + hi[0]) / 2, 'centre_y': (lo[1] + hi[1]) / 2, 'centre_z': (lo[2] + hi[2]) / 2})
+    attrs = ''.join(' data-param-%s="%s"' % (k, v) for k, v in params.items())
+    build_json = json.dumps(spec.get('build', {})).replace('"', '&quot;')
+    body = ''.join('<g id="view-%s" data-map="%s" data-px-per-m="%.4f" transform="translate(0,%d)">%s</g>' % (n, data_map(maps[n]), maps[n]['s'], 3500 * i, ''.join(g))
+                   for i, (n, g) in enumerate(groups.items()))
+    Path(out_path).write_text('<svg xmlns="http://www.w3.org/2000/svg"%s data-build="%s" viewBox="-3000 -2500 6000 %d" width="900" data-units="mm" data-component="%s">%s</svg>'
+                              % (attrs, build_json, 3500 * len(groups) + 1500, spec['component'], body))
+    return report
+
+
+if __name__ == '__main__':
+    print(json.dumps(build(sys.argv[1], sys.argv[2])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/ModelViews.py (193 lines, 9625 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 20:10 Europe/Paris: ZenRay Meshes V3, show a component the way Matthieu judges it:
+# reference image, the model seen through the same camera, the overlay; then the model alone from four sides.
+# FR : montre un composant comme Matthieu le juge : image de référence, modèle vu par la même caméra, superposition,
+#      puis le modèle seul sous quatre angles. Rendu logiciel (numpy, tampon de profondeur), sans Houdini ouvert.
+#
+# Input: a views JSON:
+#   {"title": "...", "obj": "<model.obj>", "views": [
+#      {"label": "vue de côté", "photo": "<png>", "crop": [x0,y0,x1,y1],
+#       "camera": {"cameras": "<cameras.json>", "name": "side"}               (calibrated pinhole of BlueprintBoard)
+#              or {"ortho": true, "cx": u0, "cy": v0, "scale": px_per_unit,  (image plane: world x right, y up)
+#                  "right": [1,0,0], "up": [0,1,0], "fwd": [0,0,-1], "pos": [0,0,10]}}, ...]}
+# Usage: ModelViews.py <views.json> <out_compare.png> <out_turntable.png>
+import json
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from BlueprintBoard import camera as photo_camera
+
+BOARD = (1920, 1080)
+HEADER, GAP, LABEL = 70, 12, 34
+GREY = np.array([0.80, 0.80, 0.78])          # clay colour of the model
+BG = (24, 24, 26)
+WIRE_ALPHA = 46                              # faint quad wireframe on the clay, to read the topology
+OVERLAY_ALPHA = 0.55                         # model opacity over the photo
+SUPERSAMPLE = 2
+FONT = '/Users/zenray/Library/Fonts/AdobeClean-Regular.otf'
+
+
+def font(size):
+    return ImageFont.truetype(FONT, size)
+
+
+def load_obj(path):
+    V, F = [], []
+    for line in open(path):
+        if line.startswith('v '):
+            V.append([float(t) for t in line.split()[1:4]])
+        elif line.startswith('f '):
+            F.append([int(t.split('/')[0]) - 1 for t in line.split()[1:]])
+    return np.array(V), F
+
+
+def project(cam, P):
+    d = P - cam['pos']
+    if cam.get('ortho'):
+        s = cam['scale']
+        return np.stack([cam['cx'] + s * (d @ cam['right']), cam['cy'] - s * (d @ cam['up'])], 1), d @ cam['fwd']
+    dep = d @ cam['fwd']
+    return np.stack([cam['cx'] + cam['f'] * (d @ cam['right']) / dep, cam['cy'] - cam['f'] * (d @ cam['up']) / dep], 1), dep
+
+
+def make_camera(spec):
+    if spec.get('ortho'):
+        return {k: (np.array(v, float) if isinstance(v, list) else v) for k, v in spec.items()}
+    return photo_camera(json.loads(Path(spec['cameras']).read_text()), spec['name'])
+
+
+def vertex_normals(V, tris):
+    a, b, c = V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]
+    n = np.cross(b - a, c - a)
+    N = np.zeros_like(V)
+    for k in range(3):
+        np.add.at(N, tris[:, k], n)
+    return N / np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+
+
+def render(V, F, cam, crop, k):
+    """Clay render of the model through cam, in the pixel frame of crop scaled by k. Returns RGBA uint8."""
+    x0, y0, x1, y1 = crop
+    W, H = int((x1 - x0) * k * SUPERSAMPLE), int((y1 - y0) * k * SUPERSAMPLE)
+    tris = np.array([[f[0], f[i], f[i + 1]] for f in F for i in range(1, len(f) - 1)])
+    UV, dep = project(cam, V)
+    S = (UV - [x0, y0]) * k * SUPERSAMPLE
+    N = vertex_normals(V, tris)
+    light = -cam['fwd'] * 0.75 + cam['up'] * 0.55 - cam['right'] * 0.35
+    light /= np.linalg.norm(light)
+    shade = 0.28 + 0.72 * np.abs(N @ light)                   # two-sided, the clay never goes black
+    z = np.full((H, W), np.inf); col = np.zeros((H, W)); a = np.zeros((H, W), bool)
+    for t in tris:
+        p = S[t]
+        lo = np.floor(p.min(0)).astype(int); hi = np.ceil(p.max(0)).astype(int)
+        lo = np.maximum(lo, 0); hi = np.minimum(hi, [W - 1, H - 1])
+        if lo[0] > hi[0] or lo[1] > hi[1]:
+            continue
+        xs, ys = np.meshgrid(np.arange(lo[0], hi[0] + 1) + 0.5, np.arange(lo[1], hi[1] + 1) + 0.5)
+        (ax, ay), (bx, by), (cx, cy) = p
+        den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(den) < 1e-12:
+            continue
+        w0 = ((by - cy) * (xs - cx) + (cx - bx) * (ys - cy)) / den
+        w1 = ((cy - ay) * (xs - cx) + (ax - cx) * (ys - cy)) / den
+        w2 = 1 - w0 - w1
+        m = (w0 >= -1e-6) & (w1 >= -1e-6) & (w2 >= -1e-6)
+        if not m.any():
+            continue
+        zz = w0 * dep[t[0]] + w1 * dep[t[1]] + w2 * dep[t[2]]
+        sub = z[lo[1]:hi[1] + 1, lo[0]:hi[0] + 1]
+        win = m & (zz < sub) & (zz > 0)
+        sub[win] = zz[win]
+        cs = col[lo[1]:hi[1] + 1, lo[0]:hi[0] + 1]
+        cs[win] = (w0 * shade[t[0]] + w1 * shade[t[1]] + w2 * shade[t[2]])[win]
+        a[lo[1]:hi[1] + 1, lo[0]:hi[0] + 1] |= win
+    rgb = (np.clip(col[..., None] * GREY, 0, 1) * 255).astype(np.uint8)
+    img = Image.fromarray(np.dstack([rgb, (a * 255).astype(np.uint8)]), 'RGBA')
+    img = img.resize((W // SUPERSAMPLE, H // SUPERSAMPLE), Image.LANCZOS)
+    # Faint wireframe of the original polygons, drawn after the downsample so it stays one pixel thin.
+    wire = Image.new('RGBA', img.size, (0, 0, 0, 0)); d = ImageDraw.Draw(wire)
+    P = S / SUPERSAMPLE
+    edges = set()
+    for f in F:
+        for i in range(len(f)):
+            e = (min(f[i], f[(i + 1) % len(f)]), max(f[i], f[(i + 1) % len(f)]))
+            edges.add(e)
+    zfull = z[::SUPERSAMPLE, ::SUPERSAMPLE]
+    for e0, e1 in edges:
+        mid = (P[e0] + P[e1]) / 2; mz = (dep[e0] + dep[e1]) / 2
+        xi, yi = int(mid[0]), int(mid[1])
+        if 0 <= xi < zfull.shape[1] and 0 <= yi < zfull.shape[0] and mz <= zfull[yi, xi] * 1.002:
+            d.line([tuple(P[e0]), tuple(P[e1])], fill=(20, 20, 20, WIRE_ALPHA), width=1)
+    return Image.alpha_composite(img, wire)
+
+
+def orbit_camera(V, direction, up, ortho, size):
+    c = (V.min(0) + V.max(0)) / 2; r = np.linalg.norm(V.max(0) - V.min(0)) / 2
+    fwd = -np.array(direction, float); fwd /= np.linalg.norm(fwd)
+    right = np.cross(fwd, up); right /= np.linalg.norm(right); upv = np.cross(right, fwd)
+    if ortho:
+        # 9 November 2026: frame each view on the object's own extent in that view, so a long flat part fills its tile.
+        a, b = (V - c) @ right, (V - c) @ upv
+        scale = 0.88 * min(size[0] / max(np.ptp(a), 1e-9), size[1] / max(np.ptp(b), 1e-9))
+        return {'ortho': True, 'pos': c - fwd * r * 4, 'fwd': fwd, 'right': right, 'up': upv,
+                'cx': size[0] / 2 - scale * (a.max() + a.min()) / 2, 'cy': size[1] / 2 + scale * (b.max() + b.min()) / 2, 'scale': scale}
+    dist = r * 3.2
+    return {'pos': c - fwd * dist, 'fwd': fwd, 'right': right, 'up': upv, 'f': 0.5 * min(size) * dist / (r * 1.15), 'cx': size[0] / 2, 'cy': size[1] / 2}
+
+
+def compare(spec, out):
+    V, F = load_obj(spec['obj'])
+    rows = len(spec['views'])
+    tw = (BOARD[0] - GAP * 4) // 3
+    th = (BOARD[1] - HEADER - GAP * (rows + 1)) // rows
+    board = Image.new('RGB', BOARD, BG); d = ImageDraw.Draw(board)
+    d.text((GAP, 18), spec['title'], font=font(34), fill=(240, 240, 240))
+    for r, view in enumerate(spec['views']):
+        cam = make_camera(view['camera'])
+        x0, y0, x1, y1 = view['crop']
+        k = min(tw / (x1 - x0), (th - LABEL) / (y1 - y0))
+        photo = Image.open(view['photo']).convert('RGB').crop((x0, y0, x1, y1)).resize((int((x1 - x0) * k), int((y1 - y0) * k)), Image.LANCZOS)
+        model = render(V, F, cam, view['crop'], k)
+        clay = Image.new('RGBA', photo.size, BG + (255,)); clay.alpha_composite(model.resize(photo.size))
+        over = photo.convert('RGBA'); m = model.resize(photo.size)
+        m.putalpha(m.getchannel('A').point(lambda v: int(v * OVERLAY_ALPHA)))
+        over.alpha_composite(m)
+        y = HEADER + GAP + r * (th + GAP)
+        for c, (name, im) in enumerate((('Référence', photo), ('Modèle, même caméra', clay), ('Superposition', over))):
+            x = GAP + c * (tw + GAP)
+            board.paste(im.convert('RGB'), (x + (tw - im.size[0]) // 2, y + LABEL))
+            d.text((x, y + 2), '%s, %s' % (name, view['label']), font=font(24), fill=(220, 220, 220))
+    board.save(out)
+
+
+def turntable(spec, out):
+    V, F = load_obj(spec['obj'])
+    cells = [('Trois quarts', (1, 0.7, 1.2), True), ('Côté', (1, 0, 0), True), ('Face', (0, 0, 1), True), ('Dessus', (0, 1, 0.0001), True)]
+    if spec.get('turntable_dirs'):
+        cells = [(c['label'], tuple(c['dir']), c.get('ortho', True)) for c in spec['turntable_dirs']]
+    tw, th = (BOARD[0] - GAP * 3) // 2, (BOARD[1] - HEADER - GAP * 3) // 2
+    board = Image.new('RGB', BOARD, BG); d = ImageDraw.Draw(board)
+    d.text((GAP, 18), spec['title'] + ', le modèle seul', font=font(34), fill=(240, 240, 240))
+    up = spec.get('up', [0, 1, 0])
+    for i, (label, direction, ortho) in enumerate(cells):
+        cam = orbit_camera(V, direction, up if abs(np.dot(np.array(direction) / np.linalg.norm(direction), up)) < 0.99 else [0, 0, -1], ortho, (tw, th - LABEL))
+        im = render(V, F, cam, [0, 0, tw, th - LABEL], 1)
+        x = GAP + (i % 2) * (tw + GAP); y = HEADER + GAP + (i // 2) * (th + GAP)
+        board.paste((0x2c, 0x2c, 0x30), (x, y + LABEL, x + tw, y + th))
+        board.paste(im, (x, y + LABEL), im)
+        d.text((x, y + 2), label, font=font(24), fill=(220, 220, 220))
+    board.save(out)
+
+
+if __name__ == '__main__':
+    spec = json.loads(Path(sys.argv[1]).read_text())
+    WIRE_ALPHA = spec.get('wire_alpha', WIRE_ALPHA)   # 9 November 2026: stronger wire to judge topology
+    compare(spec, sys.argv[2])
+    turntable(spec, sys.argv[3])
+    print(json.dumps({'compare': sys.argv[2], 'turntable': sys.argv[3]}))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/PerspectiveFix.py (76 lines, 3623 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 18:45 Europe/Paris: ZenRay Meshes V3, put a traced silhouette back on the plane that really makes it.
+# FR : remet une silhouette relevée sur une photo dans le plan qui la produit vraiment (perspective), pas dans le plan central.
+#
+# PhotoToBlueprint reads every traced pixel at one depth (the centre plane). In a perspective photo the silhouette is
+# made by whatever part of the object reaches highest in that column: the centre line where the crown dominates, the
+# edge nearest to the camera where it does not (near the lip of the hood, 0.87 m closer). Read at the wrong depth, the
+# curve is off by up to 21 px. This tool takes the built model, finds for every traced pixel the model point that makes
+# the silhouette, re-reads the pixel at that point's depth, and moves the blueprint curve by the same amount, keeping
+# the offset between that point and the curve. Three rounds of build then fix converge; the board measures each.
+# Usage: PerspectiveFix.py <trace.json> <view_id> <curve_id> <blueprint.svg> <model.obj> <out.svg>
+import json
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import Blueprint as B
+from BlueprintBoard import camera, project, load_obj
+from PhotoToBlueprint import catmull_rom_path, parse_map, to_screen
+
+COLUMN = 1.0   # px half-width of the column searched for the silhouette point
+
+
+def unproject(cam, u, v, depth):
+    s = depth / cam['f']
+    return cam['pos'] + depth * cam['fwd'] + (u - cam['cx']) * s * cam['right'] + (cam['cy'] - v) * s * cam['up']
+
+
+def fix(trace_path, view_id, curve_id, svg_path, obj_path, out_path):
+    trace = json.loads(Path(trace_path).read_text())
+    view = next(v for v in trace['views'] if v['id'] == view_id)
+    cams = json.loads(Path(trace['cameras']).read_text())
+    cam = camera(cams, view['camera'])
+    dmap = parse_map(view['map'])
+    (wa, _), (wb, _) = dmap['x'], dmap['y']
+    ia, ib = 'xyz'.index(wa), 'xyz'.index(wb)
+    curve = B.load(svg_path)[view_id]['curves'][curve_id][0]          # (a, b) world metres, a = key axis
+    key = B.as_function(curve, 0)[0]
+    V = load_obj(obj_path, None)[0]
+    UV = project(cam, V)
+    moved, kept = [], 0
+    new = []
+    for u, v in view['curves'][curve_id]['px']:
+        m = np.abs(UV[:, 0] - u) < COLUMN
+        if not m.any():
+            kept += 1
+            continue
+        i = np.flatnonzero(m)[np.argmin(UV[m, 1])]
+        P = V[i]
+        depth = float((P - cam['pos']) @ cam['fwd'])
+        Q = unproject(cam, u, v, depth)
+        offset = key(P[ia]) - P[ib]                                    # curve height above the silhouette point
+        new.append((Q[ia], Q[ib] + offset))
+        moved.append(round(float(np.hypot(Q[ia] - P[ia], Q[ib] - P[ib])) * 1000, 1))
+    new.sort(key=lambda p: p[0])
+    # World (a, b) back to the group's local millimetres: the inverse of Blueprint.load (signs from data-map).
+    pts = []
+    for a, b in new:
+        w = [0.0, 0.0, 0.0]; w[ia] = a; w[ib] = b
+        pts.append(to_screen(w, dmap))
+    pts.sort(key=lambda p: p[0])
+    d = catmull_rom_path(pts)
+    s = Path(svg_path).read_text()
+    pat = re.compile(r'(<path id="%s" d=")[^"]*(")' % re.escape(curve_id))
+    assert pat.search(s), 'curve %s not found in %s' % (curve_id, svg_path)
+    Path(out_path).write_text(pat.sub(lambda mm: mm.group(1) + d + mm.group(2), s, count=1))
+    return {'out': str(out_path), 'points_moved_mm': moved, 'points_kept': kept}
+
+
+if __name__ == '__main__':
+    print(json.dumps(fix(*sys.argv[1:7])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/PhotoToBlueprint.py (109 lines, 5748 bytes)
+#!/usr/bin/env python3
+# 9 November 2026, 17:25 Europe/Paris: ZenRay Meshes V3, turn points traced on calibrated photos into a blueprint SVG.
+# FR : transforme des points relevés sur des photos calées en plan SVG en millimètres, photo d'origine en dessous.
+#
+# Input: a trace JSON (one per component) listing views. Each view gives the photo, its crop, the camera (from a
+# cameras.json: pos, target, rect, focal), the depth plane where the curves lie, the data-map of the view and the
+# traced curves in photo pixels. Each curve becomes a smooth cubic path (Catmull-Rom through the points, written as
+# C segments), so it stays "one line, one arc" and editable point by point. The photo crop is embedded under the
+# curves, placed in the same millimetre frame, so a misplaced point is visible at once.
+# Usage: PhotoToBlueprint.py <trace.json> <out.svg>
+import base64
+import io
+import json
+import math
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+
+def camera(cams, name):
+    c = cams[name]
+    pos, tgt = c['pos'], c['target']
+    fwd = [t - p for t, p in zip(tgt, pos)]; n = math.sqrt(sum(v * v for v in fwd)); fwd = [v / n for v in fwd]
+    up0 = [0.0, 1.0, 0.0]
+    right = [fwd[1] * up0[2] - fwd[2] * up0[1], fwd[2] * up0[0] - fwd[0] * up0[2], fwd[0] * up0[1] - fwd[1] * up0[0]]
+    n = math.sqrt(sum(v * v for v in right)); right = [v / n for v in right]
+    up = [right[1] * fwd[2] - right[2] * fwd[1], right[2] * fwd[0] - right[0] * fwd[2], right[0] * fwd[1] - right[1] * fwd[0]]
+    x0, y0, x1, y1 = c['rect']
+    f = c.get('focal_px') or cams['focal_mm'] / cams['film_back_mm'] * (x1 - x0)
+    return {'pos': pos, 'fwd': fwd, 'right': right, 'up': up, 'f': f, 'cx': (x0 + x1) / 2, 'cy': (y0 + y1) / 2}
+
+
+def pixel_to_world(cam, u, v, depth):
+    # Ray through the pixel, cut at the given depth along the camera axis. World point in metres.
+    s = depth / cam['f']
+    a, b = (u - cam['cx']) * s, (cam['cy'] - v) * s
+    return [cam['pos'][k] + depth * cam['fwd'][k] + a * cam['right'][k] + b * cam['up'][k] for k in range(3)]
+
+
+AXIS = {'x': 0, 'y': 1, 'z': 2}
+
+
+def to_screen(world, dmap):
+    # dmap like {'x': ('z', -1), 'y': ('y', -1)}: screen mm from world metres.
+    (wa, sa), (wb, sb) = dmap['x'], dmap['y']
+    return (sa * world[AXIS[wa]] * 1000.0, sb * world[AXIS[wb]] * 1000.0)
+
+
+def parse_map(spec):
+    out = {}
+    for part in spec.split(','):
+        screen, world = part.split(':')
+        out[screen.strip()] = (world.strip().lstrip('+-'), -1.0 if world.strip().startswith('-') else 1.0)
+    return out
+
+
+def catmull_rom_path(pts):
+    # Smooth cubic through every point (uniform Catmull-Rom, tension 0.5), written as SVG C segments.
+    d = 'M %.1f %.1f' % pts[0]
+    for i in range(len(pts) - 1):
+        p0 = pts[i - 1] if i > 0 else pts[i]
+        p1, p2 = pts[i], pts[i + 1]
+        p3 = pts[i + 2] if i + 2 < len(pts) else pts[i + 1]
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+        d += ' C %.1f %.1f %.1f %.1f %.1f %.1f' % (c1 + c2 + p2)
+    return d
+
+
+def build(trace_path, out_path):
+    trace = json.loads(Path(trace_path).read_text())
+    cams = json.loads(Path(trace['cameras']).read_text())
+    groups, boxes = [], []
+    offset = 0.0
+    for view in trace['views']:
+        cam = camera(cams, view['camera'])
+        dmap = parse_map(view['map'])
+        photo = Image.open(view['photo']).convert('RGB')
+        x0, y0, x1, y1 = view['crop']
+        crop = photo.crop((x0, y0, x1, y1))
+        buf = io.BytesIO(); crop.save(buf, 'JPEG', quality=90)
+        # Crop corners to screen millimetres at the view's depth plane (photo plane is flat at that depth).
+        a = to_screen(pixel_to_world(cam, x0, y0, view['depth']), dmap)
+        b = to_screen(pixel_to_world(cam, x1, y1, view['depth']), dmap)
+        ix, iy = min(a[0], b[0]), min(a[1], b[1]); iw, ih = abs(b[0] - a[0]), abs(b[1] - a[1])
+        flip_x = (b[0] - a[0]) < 0
+        img = ('<image x="%.1f" y="%.1f" width="%.1f" height="%.1f" preserveAspectRatio="none" opacity="0.85"%s href="data:image/jpeg;base64,%s"/>'
+               % (ix, iy, iw, ih, (' transform="translate(%.1f 0) scale(-1 1)"' % (2 * ix + iw)) if flip_x else '', base64.b64encode(buf.getvalue()).decode()))
+        paths = []
+        for name, curve in view['curves'].items():
+            pts = [to_screen(pixel_to_world(cam, u, v, curve.get('depth', view['depth'])), dmap) for u, v in curve['px']]
+            paths.append('<path id="%s" d="%s" fill="none" stroke="%s" stroke-width="%.1f"/>' % (name, catmull_rom_path(pts), curve.get('color', '#ff3b30'), trace.get('stroke_mm', 6)))
+        tx = offset - ix
+        groups.append('<g id="%s" data-map="%s" data-camera="%s" data-depth="%.3f" data-note="%s" transform="translate(%.1f,0)">%s%s</g>'
+                      % (view['id'], view['map'], view['camera'], view['depth'], view.get('note', ''), tx, img, ''.join(paths)))
+        boxes.append((offset, iy, offset + iw, iy + ih))
+        offset += iw + 200.0
+    minx = min(b[0] for b in boxes) - 100; miny = min(b[1] for b in boxes) - 100
+    maxx = max(b[2] for b in boxes) + 100; maxy = max(b[3] for b in boxes) + 100
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="%.1f %.1f %.1f %.1f" width="%.0f" data-units="mm" data-component="%s">'
+           '<!-- %s -->%s</svg>' % (minx, miny, maxx - minx, maxy - miny, min(1800, (maxx - minx) / 3), trace['component'], trace.get('doc', ''), ''.join(groups)))
+    Path(out_path).write_text(svg)
+    return {'blueprint': str(out_path), 'views': [v['id'] for v in trace['views']], 'bytes': len(svg)}
+
+
+if __name__ == '__main__':
+    print(json.dumps(build(sys.argv[1], sys.argv[2])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/SamCut.py (539 lines, 25843 bytes)
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 9 November 2026, 21:35 Europe/Paris: ZenRay Meshes V3, ZenRay Cut: refine every part mask of a 6-view sheet with
+# SAM 2.1 (Meta, Apache 2.0, hiera large), prompted by the current ID map, then find missing cuts with SAM's automatic
+# masks, kept only when the cut sits on the reference's drawn lines and exists on the mirrored side too.
+# FR : affine chaque masque de pièce par SAM 2.1, guidé par l'ID map actuelle (boîte, points dedans, points chez les
+# voisins), puis cherche les découpes manquantes par les masques automatiques de SAM, gardées seulement si la coupe suit
+# les traits de la référence et existe aussi du côté miroir.
+# Usage:
+#   SamCut.py smoke  <labels_dir> <views_dir> <view> <label> <out.png>
+#   SamCut.py refine <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [s1|s2|s3|s23] [views]
+#   SamCut.py clean  <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [snap,sym]
+#   SamCut.py split  <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [crop_layers 0|1]
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import MaskJudge as MJ
+
+VIEWS = MJ.VIEWS
+FILES = MJ.FILES
+S = MJ.SCALE
+# 9 November 2026: every tunable value of the tool, one place.
+P = {
+    'checkpoint': '/Users/zenray/.claude/tmp/tmp-zenray-meshes/models/sam2.1/sam2.1_hiera_large.pt',
+    'config': 'configs/sam2.1/sam2.1_hiera_l.yaml',
+    'crop_margin': 0.35,     # crop = part box grown by this share of its size on each side
+    'crop_min_px': 96,       # label px, smallest crop side
+    'min_part_px': 40,       # label px, parts smaller than this keep their current mask
+    'pos_points': 3,         # interior points given to SAM
+    'neg_max': 8,            # neighbour points given as negatives
+    'accept_iou': 0.6,       # a SAM mask replaces the current one only when they overlap this much
+    'speck_px': 400,         # label px, stray islands smaller than this go to their neighbour (9 November 2026: 30 left confetti)
+    'guard_share': 0.5,      # a cleanup stage may take at most this share of a part away
+    'snap_px': 2,            # view px, recalage: how far an inner border may slide onto a drawn line
+    'auto_points': 48,       # automatic masks: grid points per side
+    'auto_iou': 0.8,         # automatic masks: predicted IoU floor
+    'auto_stab': 0.9,        # automatic masks: stability floor
+    'auto_crop_layers': 0,   # automatic masks: 1 adds 2 x 2 zoomed tiles per view (thin bands), 0 the whole view only
+    'split_inside': 0.9,     # a split candidate lies this much inside one part
+    'split_frac': (0.05, 0.95),  # and covers this share of it (9 November 2026: 0.08 to 0.85 missed thin bands, the glass alone was 85 % of the rear window part)
+    'split_min_px': 600,     # label px, both halves of a split at least this large
+    'split_on_lines': 0.6,   # share of the new cut within MJ.TOL view px of a drawn or edge line
+    'split_mirror_iou': 0.5, # the mirrored candidate must match this well on the opposite side
+}
+# 9 November 2026: how SAM is used, one switch per principle (S1 plain, S2 zoom + mirror, S3 nested and per piece).
+MODE = {'margin': None, 'mirror': False, 'nested': False, 'per_piece': False}
+_PRED = None
+
+
+def device():
+    return torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+
+
+def predictor():
+    global _PRED
+    if _PRED is None:
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        model = build_sam2(P['config'], P['checkpoint'], device=device())
+        _PRED = SAM2ImagePredictor(model)
+    return _PRED
+
+
+def view_rgb(views_dir, view, shape):
+    H, W = shape
+    return np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_rgb.png')).convert('RGB').resize((W, H), Image.BICUBIC))
+
+
+def view_sil(views_dir, view, shape):
+    H, W = shape
+    return np.asarray(Image.open(Path(views_dir) / (FILES[view] + '_mask.png')).convert('L').resize((W, H), Image.NEAREST)) > 127
+
+
+def peaks(mask, n, sep):
+    # n interior points far from the border and from each other (distance-transform maxima).
+    d = ndi.distance_transform_edt(mask)
+    pts = []
+    for _ in range(n):
+        if d.max() <= 0:
+            break
+        y, x = np.unravel_index(int(d.argmax()), d.shape)
+        pts.append((x, y))
+        yy, xx = np.ogrid[:d.shape[0], :d.shape[1]]
+        d[(yy - y) ** 2 + (xx - x) ** 2 <= max(sep, d[y, x]) ** 2] = 0
+    return pts
+
+
+def prompt_part(L, lab, m=None):
+    # Box, positives and negatives for one part (or the given mask), in crop coordinates, plus the crop window.
+    H, W = L.shape
+    m = (L == lab) if m is None else m
+    ys, xs = np.nonzero(m)
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    cm = MODE['margin'] if MODE['margin'] is not None else P['crop_margin']
+    gy = max(int((y1 - y0) * cm), (P['crop_min_px'] - (y1 - y0)) // 2, 8)
+    gx = max(int((x1 - x0) * cm), (P['crop_min_px'] - (x1 - x0)) // 2, 8)
+    cy0, cy1, cx0, cx1 = max(0, y0 - gy), min(H, y1 + gy), max(0, x0 - gx), min(W, x1 + gx)
+    mc = m[cy0:cy1, cx0:cx1]
+    pos = peaks(mc, P['pos_points'], max(4, int(0.15 * max(mc.shape))))
+    ring = ndi.binary_dilation(mc, iterations=6) & ~mc
+    Lc = L[cy0:cy1, cx0:cx1]
+    neigh = [int(l) for l in np.unique(Lc[ring]) if l >= 0]
+    neigh.sort(key=lambda l: -int((Lc[ring] == l).sum()))
+    neg = []
+    for l in neigh[:P['neg_max']]:
+        neg += peaks((Lc == l) & ~mc, 1, 4)
+    sil_out = peaks(Lc < 0, 1, 4)
+    neg += sil_out
+    box = np.array([x0 - cx0, y0 - cy0, x1 - cx0, y1 - cy0], float)
+    return (cy0, cy1, cx0, cx1), mc, pos, neg, box
+
+
+def _predict(img, pts, lbl, box, mc):
+    pr = predictor()
+    pr.set_image(img)
+    with torch.inference_mode():
+        masks, scores, _ = pr.predict(point_coords=pts, point_labels=lbl, box=box, multimask_output=True, return_logits=True)
+    ious = [((mk > 0) & mc).sum() / max(1, ((mk > 0) | mc).sum()) for mk in masks]
+    k = int(np.argmax(ious))
+    return masks[k].astype(np.float32), float(scores[k])
+
+
+def sam_part(rgb, L, lab, m=None):
+    (cy0, cy1, cx0, cx1), mc, pos, neg, box = prompt_part(L, lab, m)
+    crop = rgb[cy0:cy1, cx0:cx1]
+    pts = np.array(pos + neg, float)
+    lbl = np.array([1] * len(pos) + [0] * len(neg))
+    lg, sc = _predict(crop, pts, lbl, box, mc)
+    if MODE['mirror']:
+        # S2: the same prompt on the mirrored crop, mirrored back and averaged (test-time augmentation).
+        w = crop.shape[1]
+        pts_m = pts.copy(); pts_m[:, 0] = w - 1 - pts_m[:, 0]
+        box_m = np.array([w - box[2], box[1], w - box[0], box[3]], float)
+        lg_m, sc_m = _predict(np.ascontiguousarray(crop[:, ::-1]), pts_m, lbl, box_m, mc[:, ::-1])
+        lg = 0.5 * (lg + lg_m[:, ::-1]); sc = 0.5 * (sc + sc_m)
+    iou = float(((lg > 0) & mc).sum() / max(1, ((lg > 0) | mc).sum()))
+    return (cy0, cy1, cx0, cx1), lg, iou, sc, pos, neg
+
+
+def despeck(out, sil):
+    res = out.copy()
+    for lab in np.unique(out[out >= 0]):
+        cc, n = ndi.label(out == lab)
+        if n > 1:
+            sizes = ndi.sum(np.ones_like(cc), cc, range(1, n + 1))
+            keep = int(np.argmax(sizes)) + 1
+            for i, s in enumerate(sizes, 1):
+                if i != keep and s < P['speck_px']:
+                    res[cc == i] = -2
+    hole = sil & (res < 0)
+    if hole.any():
+        idx = ndi.distance_transform_edt(res < 0, return_distances=False, return_indices=True)
+        res[hole] = res[idx[0][hole], idx[1][hole]]
+    res[~sil] = -1
+    return res
+
+
+def enclosed_by(L, lab):
+    # Parts lying (90 % or more) inside the holes of this part: the rim inside a tyre, the hub inside the spokes.
+    m = L == lab
+    holes = ndi.binary_fill_holes(m) & ~m
+    if holes.sum() < P['min_part_px']:
+        return []
+    out = []
+    for l in np.unique(L[holes]):
+        if l >= 0 and l != lab and (holes & (L == l)).sum() >= 0.9 * (L == l).sum():
+            out.append(int(l))
+    return out
+
+
+def refine_view(L, rgb, sil):
+    best = np.zeros(L.shape, np.float32)
+    lab_of = np.full(L.shape, -1, np.int32)
+    stats = {}
+    labs = sorted([int(l) for l in np.unique(L[L >= 0])], key=lambda l: -int((L == l).sum()))
+    nested = {l: enclosed_by(L, l) for l in labs} if MODE['nested'] else {l: [] for l in labs}
+    # Nested parts go last, so their inner parts are settled first (S3).
+    order = [l for l in labs if not nested[l]] + [l for l in labs if nested[l]]
+    for lab in order:
+        m = L == lab
+        if m.sum() < P['min_part_px']:
+            stats[lab] = {'skip': 'small'}
+            continue
+        if nested[lab]:
+            # S3: segment the whole assembly (part plus what it encloses), then keep it minus the settled inner parts.
+            whole = ndi.binary_fill_holes(m)
+            win_c, lg, iou, sc, _, _ = sam_part(rgb, L, lab, whole)
+            cy0, cy1, cx0, cx1 = win_c
+            inner = np.isin(lab_of[cy0:cy1, cx0:cx1], nested[lab]) | np.isin(L[cy0:cy1, cx0:cx1], nested[lab])
+            stats[lab] = {'iou': round(iou, 4), 'score': round(sc, 4), 'nested': nested[lab]}
+            if iou < P['accept_iou']:
+                stats[lab]['skip'] = 'low_iou'
+                continue
+            take = (lg > 0) & ~inner
+            o = lab_of[cy0:cy1, cx0:cx1]; b = best[cy0:cy1, cx0:cx1]
+            o[take & (o < 0)] = lab; b[take] = np.maximum(b[take], lg[take])
+            continue
+        pieces = [m]
+        if MODE['per_piece']:
+            cc, n = ndi.label(m)
+            if n > 1:
+                pieces = [cc == i for i in range(1, n + 1) if (cc == i).sum() >= P['min_part_px']]
+        st = []
+        for pm in pieces:
+            (cy0, cy1, cx0, cx1), lg, iou, sc, _, _ = sam_part(rgb, L, lab, pm)
+            st.append(round(iou, 4))
+            if iou < P['accept_iou']:
+                continue
+            b = best[cy0:cy1, cx0:cx1]; o = lab_of[cy0:cy1, cx0:cx1]
+            win = lg > b
+            b[win] = lg[win]; o[win] = lab
+        stats[lab] = {'iou': min(st) if st else None, 'pieces': len(pieces)}
+        if not st or max(st) < P['accept_iou']:
+            stats[lab]['skip'] = 'low_iou'
+    out = np.where(lab_of >= 0, lab_of, L)
+    # 9 November 2026: a part SAM refused (or too small) keeps its current pixels; before, its neighbours swallowed it
+    # (the rib of the underside arrow went from 10 127 to 1 837 px). FR : une pièce refusée garde ses pixels.
+    locked = [l for l, x in stats.items() if 'skip' in x]
+    lk = np.isin(L, locked)
+    out[lk] = L[lk]
+    out[~sil] = -1
+    return despeck(out, sil), stats
+
+
+def outline(draw, m, colour, off=(0, 0)):
+    b = m & ~ndi.binary_erosion(m)
+    ys, xs = np.nonzero(b)
+    for y, x in zip(ys, xs):
+        draw.point((x + off[0], y + off[1]), fill=colour)
+
+
+def smoke(a):
+    labels_dir, views_dir, view, lab, out = a[0], a[1], a[2], int(a[3]), a[4]
+    L = np.load(Path(labels_dir) / ('labels_%s.npz' % view))['labels']
+    rgb = view_rgb(views_dir, view, L.shape)
+    t = time.time(); predictor(); t_load = time.time() - t
+    t = time.time(); (cy0, cy1, cx0, cx1), lg, iou, sc, pos, neg = sam_part(rgb, L, lab); t_run = time.time() - t
+    crop = rgb[cy0:cy1, cx0:cx1]; mc = L[cy0:cy1, cx0:cx1] == lab; ms = lg > 0
+    k = max(1, 600 // max(crop.shape[:2]))
+    panels = []
+    for title, m in (('carte actuelle', mc), ('SAM 2.1 large', ms)):
+        im = Image.fromarray(crop).convert('L').convert('RGB')
+        d = ImageDraw.Draw(im); outline(d, m, (230, 40, 40))
+        if title.startswith('SAM'):
+            for (x, y) in pos:
+                d.ellipse((x - 3, y - 3, x + 3, y + 3), outline=(40, 200, 60), width=2)
+            for (x, y) in neg:
+                d.ellipse((x - 3, y - 3, x + 3, y + 3), outline=(40, 90, 230), width=2)
+        im = im.resize((im.width * k, im.height * k), Image.NEAREST)
+        ImageDraw.Draw(im).text((8, 8), title, fill=(255, 255, 0))
+        panels.append(im)
+    board = Image.new('RGB', (sum(p.width for p in panels) + 10, panels[0].height), (30, 30, 30))
+    board.paste(panels[0], (0, 0)); board.paste(panels[1], (panels[0].width + 10, 0)); board.save(out)
+    info = {'view': view, 'label': lab, 'iou_with_current': round(iou, 4), 'sam_score': round(sc, 4),
+            'load_s': round(t_load, 2), 'run_s': round(t_run, 2), 'device': str(device()), 'crop': [int(cy1 - cy0), int(cx1 - cx0)]}
+    print(json.dumps(info))
+    return info
+
+
+def refine(a):
+    labels_dir, views_dir, frame_path, micro_path, out = a[:5]
+    mode = a[5] if len(a) > 5 else 's1'
+    views = a[6].split(',') if len(a) > 6 else VIEWS
+    if '2' in mode[1:]:
+        MODE.update(margin=0.15, mirror=True)
+    if '3' in mode[1:]:
+        MODE.update(nested=True, per_piece=True)
+    d = Path(out); d.mkdir(parents=True, exist_ok=True)
+    allstats = {'mode': dict(MODE)}
+    for v in VIEWS:
+        L = np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels']
+        if v in views:
+            t = time.time()
+            # 9 November 2026: the outer silhouette never moves, only inner borders do (the nearest-upscaled view mask
+            # gave a jagged outline); FR : la silhouette reste celle de la carte actuelle.
+            R, st = refine_view(L, view_rgb(views_dir, v, L.shape), L >= 0)
+            allstats[v] = {'seconds': round(time.time() - t, 1), 'parts': st}
+            print(v, allstats[v]['seconds'], 's', flush=True)
+        else:
+            R = L
+        np.savez_compressed(d / ('labels_%s.npz' % v), labels=R.astype(np.int32))
+    (d / 'samcut.json').write_text(json.dumps({'params': P, 'views': allstats}, indent=1, default=str) + '\n')
+    j = MJ.judge(d, views_dir, frame_path, micro_path, d / 'judge', name='samcut')
+    print('judge', json.dumps(j['summary']), flush=True)
+    return j
+
+
+def auto_masks(rgb):
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+    gen = SAM2AutomaticMaskGenerator(predictor().model, points_per_side=P['auto_points'], pred_iou_thresh=P['auto_iou'],
+                                     stability_score_thresh=P['auto_stab'], crop_n_layers=P['auto_crop_layers'],
+                                     output_mode='binary_mask')
+    with torch.inference_mode():
+        return [m['segmentation'] for m in gen.generate(rgb)]
+
+
+def line_dist(views_dir, v, shape):
+    edges = MJ.drawn_lines(views_dir, v, with_edges=True)[0]
+    big = np.kron(edges, np.ones((S, S), bool))[:shape[0], :shape[1]]
+    return ndi.distance_transform_edt(~big)
+
+
+def cut_on_lines(part, A, dist):
+    # Share of the new cut (pixels of A touching the rest of the part) that lies on a drawn or edge line.
+    B = part & ~A
+    cut = A & ndi.binary_dilation(B)
+    if cut.sum() < 10:
+        return 0.0
+    return float((dist[cut] <= MJ.TOL * S).mean())
+
+
+def candidates(L, masks, dist):
+    out = []
+    for m in masks:
+        labs, cnt = np.unique(L[m], return_counts=True)
+        ok = labs >= 0
+        if not ok.any():
+            continue
+        p = int(labs[ok][np.argmax(cnt[ok])])
+        part = L == p
+        A = part & m
+        inside = A.sum() / max(1, m.sum()); frac = A.sum() / max(1, part.sum())
+        if inside < P['split_inside'] or not (P['split_frac'][0] <= frac <= P['split_frac'][1]):
+            continue
+        if A.sum() < P['split_min_px'] or (part & ~A).sum() < P['split_min_px']:
+            continue
+        q = cut_on_lines(part, A, dist)
+        if q >= P['split_on_lines']:
+            out.append({'part': p, 'A': A, 'on_lines': q})
+    out.sort(key=lambda c: -c['on_lines'])
+    kept = []
+    for c in out:
+        if all((c['A'] & k['A']).sum() / max(1, (c['A'] | k['A']).sum()) < 0.7 for k in kept):
+            kept.append(c)
+    return kept
+
+
+def split(a):
+    # Run after refine: missing cuts found by SAM's automatic masks, applied only when the mirrored side agrees.
+    labels_dir, views_dir, frame_path, micro_path, out = a[:5]
+    if len(a) > 5:
+        P['auto_crop_layers'] = int(a[5])
+    frame = json.loads(Path(frame_path).read_text()); partner, _ = MJ.partners(micro_path)
+    Ls = {v: np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels'] for v in VIEWS}
+    dists = {v: line_dist(views_dir, v, Ls[v].shape) for v in VIEWS}
+    cands = {}
+    for v in VIEWS:
+        t = time.time()
+        cands[v] = candidates(Ls[v], auto_masks(view_rgb(views_dir, v, Ls[v].shape)), dists[v])
+        print(v, len(cands[v]), 'candidates', round(time.time() - t, 1), 's', flush=True)
+    new_id = max(1000, max(int(Ls[v].max()) for v in VIEWS) + 1)   # continues after earlier splits
+    res = {v: Ls[v].copy() for v in VIEWS}
+    log = []
+    used = {v: [] for v in VIEWS}
+
+    def free(v, A):
+        return all((A & u).sum() < 0.3 * A.sum() for u in used[v])
+    for v in VIEWS:
+        for c in cands[v]:
+            A, p = c['A'], c['part']
+            if not free(v, A):
+                continue
+            if v in ('left', 'right'):
+                w = 'right' if v == 'left' else 'left'
+                Am = MJ.remap(np.where(A, 1, -1).astype(np.int32), frame, v, w, Ls[w].shape, False) > 0
+                pm = partner.get(p, p); part_m = Ls[w] == pm; Am &= part_m
+                if Am.sum() < P['split_min_px'] or (part_m & ~Am).sum() < P['split_min_px']:
+                    continue
+                qm = cut_on_lines(part_m, Am, dists[w])
+                if qm < P['split_on_lines'] or not free(w, Am):
+                    continue
+                res[v][A] = new_id; res[w][Am] = new_id
+                used[v].append(A); used[w].append(Am)
+                log.append({'id': new_id, 'views': [v, w], 'part': p, 'on_lines': [round(c['on_lines'], 3), round(qm, 3)], 'px': [int(A.sum()), int(Am.sum())]})
+            else:
+                Am = MJ.remap(np.where(A, 1, -1).astype(np.int32), frame, v, v, Ls[v].shape, True) > 0
+                iou = (A & Am).sum() / max(1, (A | Am).sum())
+                if iou >= P['split_mirror_iou']:
+                    res[v][A] = new_id; used[v].append(A)
+                    log.append({'id': new_id, 'views': [v], 'part': p, 'centred_iou': round(float(iou), 3), 'on_lines': round(c['on_lines'], 3), 'px': int(A.sum())})
+                else:
+                    labs, cnt = np.unique(Ls[v][Am], return_counts=True); ok = labs >= 0
+                    if not ok.any():
+                        continue
+                    pm = int(labs[ok][np.argmax(cnt[ok])]); part_m = Ls[v] == pm; Am &= part_m
+                    if Am.sum() < P['split_min_px'] or (part_m & ~Am).sum() < P['split_min_px'] or not free(v, Am):
+                        continue
+                    qm = cut_on_lines(part_m, Am, dists[v])
+                    if qm < P['split_on_lines']:
+                        continue
+                    res[v][A] = new_id; res[v][Am] = new_id; used[v] += [A, Am]
+                    log.append({'id': new_id, 'views': [v], 'part': p, 'mirror_part': pm, 'on_lines': [round(c['on_lines'], 3), round(qm, 3)], 'px': [int(A.sum()), int(Am.sum())]})
+            new_id += 1
+    d = Path(out); d.mkdir(parents=True, exist_ok=True)
+    for v in VIEWS:
+        np.savez_compressed(d / ('labels_%s.npz' % v), labels=res[v].astype(np.int32))
+    (d / 'splits.json').write_text(json.dumps({'params': P, 'splits': log, 'candidates': {v: len(cands[v]) for v in VIEWS}}, indent=1, default=str) + '\n')
+    print(len(log), 'splits applied', flush=True)
+    j = MJ.judge(d, views_dir, frame_path, micro_path, d / 'judge', name='samcut_split')
+    print('judge', json.dumps(j['summary']), flush=True)
+    return j
+
+
+def keep_silhouette(R, sil):
+    # The outer silhouette never moves: outside goes to -1, holes inside take the nearest part.
+    R = R.copy(); R[~sil] = -1
+    hole = sil & (R < 0)
+    if hole.any() and (R >= 0).any():
+        idx = ndi.distance_transform_edt(R < 0, return_distances=False, return_indices=True)
+        R[hole] = R[idx[0][hole], idx[1][hole]]
+    return R
+
+
+def tophat(views_dir, v, shape):
+    from skimage import morphology
+    g = np.asarray(Image.open(Path(views_dir) / (FILES[v] + '_rgb.png')).convert('L').resize(shape[::-1], Image.BICUBIC)).astype(float)
+    return morphology.black_tophat(g, morphology.disk(MJ.LINE_RADIUS * S))
+
+
+def joint_tophat(views_dir, frame, v, shape, shapes):
+    # Line strength of this view plus the mirrored side's (left with right, a self-symmetric view with its own mirror).
+    w = {'left': 'right', 'right': 'left'}.get(v, v)
+    th = tophat(views_dir, v, shape)
+    tw = tophat(views_dir, w, shapes[w])
+    q = MJ.remap(np.round(tw * 100).astype(np.int32), frame, w, v, shape, w == v)
+    return th + np.where(q >= 0, q / 100.0, 0.0)
+
+
+def snap(L, views_dir, v, th=None):
+    # S4 recalage: inner borders slide onto the reference's dark lines within snap_px view px (watershed on the line
+    # strength, seeded by each part shrunk by that radius); the silhouette stays.
+    from skimage import morphology, segmentation
+    sil = L >= 0
+    if th is None:
+        th = tophat(views_dir, v, L.shape)
+    r = P['snap_px'] * S
+    same = (ndi.minimum_filter(L, size=2 * r + 1) == ndi.maximum_filter(L, size=2 * r + 1))
+    markers = np.where(same & sil, L + 1, 0)
+    for lab in np.unique(L[sil]):            # a part thinner than the radius keeps its own core as a seed
+        if not (markers == lab + 1).any():
+            m = L == lab
+            markers[m & (ndi.distance_transform_edt(m) >= ndi.distance_transform_edt(m).max() * 0.5)] = lab + 1
+    out = segmentation.watershed(th, markers, mask=sil) - 1
+    return keep_silhouette(out, sil)
+
+
+def guard(before, after):
+    # 9 November 2026: a cleanup stage may not take more than guard_share of a part away; such a part gets its pixels
+    # back (the symmetry stage erased the right floor of the underside, 49 707 px to 0). FR : garde-fou de surface.
+    out = after.copy()
+    for lab in np.unique(before[before >= 0]):
+        n0 = (before == lab).sum()
+        if (after == lab).sum() < (1 - P['guard_share']) * n0:
+            out[before == lab] = lab
+    return out
+
+
+def clean(a):
+    # clean <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir> [stages snap,sym]: one judged folder per stage.
+    labels_dir, views_dir, frame_path, micro_path, out = a[:5]
+    stages = a[5].split(',') if len(a) > 5 else ['snap', 'sym']
+    frame = json.loads(Path(frame_path).read_text()); partner, _ = MJ.partners(micro_path)
+    Ls = {v: np.load(Path(labels_dir) / ('labels_%s.npz' % v))['labels'] for v in VIEWS}
+    sils = {v: Ls[v] >= 0 for v in VIEWS}
+    res = {}
+    for i, st in enumerate(stages, 1):
+        prev = Ls
+        if st == 'snap':
+            Ls = {v: snap(Ls[v], views_dir, v) for v in VIEWS}
+        elif st == 'jsnap':
+            shapes = {v: Ls[v].shape for v in VIEWS}
+            Ls = {v: snap(Ls[v], views_dir, v, joint_tophat(views_dir, frame, v, Ls[v].shape, shapes)) for v in VIEWS}
+        elif st == 'sym':
+            import CutTournament as CT
+            outs, _ = CT.m3_sym(Ls, frame, partner, views_dir)
+            Ls = {v: keep_silhouette(outs[v], sils[v]) for v in VIEWS}
+        Ls = {v: guard(prev[v], despeck(Ls[v], sils[v])) for v in VIEWS}
+        d = Path(out) / ('%d-%s' % (i, st)); d.mkdir(parents=True, exist_ok=True)
+        for v in VIEWS:
+            np.savez_compressed(d / ('labels_%s.npz' % v), labels=Ls[v].astype(np.int32))
+        j = MJ.judge(d, views_dir, frame_path, micro_path, d / 'judge', name=st)
+        res['%d-%s' % (i, st)] = j['summary']
+        print('%d-%s' % (i, st), json.dumps(j['summary']), flush=True)
+    return res
+
+
+def overlay(L, views_dir, v, k):
+    # Reference in grey under a random grey per part (Flood Fill to Random Grayscale), red borders, scaled by k.
+    import MaskAtlas as MA
+    g = np.asarray(Image.open(Path(views_dir) / (FILES[v] + '_rgb.png')).convert('L').resize(L.shape[::-1], Image.LANCZOS)).astype(float)
+    grey = np.zeros(L.shape); lab = L >= 0
+    grey[lab] = np.vectorize(MA.grey_of)(L[lab])
+    out = np.where(lab, g * 0.45 + grey * 0.55, g * 0.35)
+    rgb = np.repeat(out[..., None], 3, 2)
+    rgb[ndi.minimum_filter(L, 3) != ndi.maximum_filter(L, 3)] = (255, 59, 48)
+    im = Image.fromarray(rgb.astype(np.uint8))
+    return im.resize((int(im.width * k), int(im.height * k)), Image.LANCZOS)
+
+
+def board(a):
+    # board <labels_a> <title_a> <labels_b> <title_b> <views_dir> <out.png> [views] [crop y0:y1:x0:x1 in label px]
+    da, ta, db, tb, views_dir, out = a[:6]
+    views = a[6].split(',') if len(a) > 6 else VIEWS
+    crop = [int(x) for x in a[7].split(':')] if len(a) > 7 else None
+    k = 1.0 if crop else 0.5
+    rows = []
+    for v in views:
+        ims = []
+        for d in (da, db):
+            L = np.load(Path(d) / ('labels_%s.npz' % v))['labels']
+            im = overlay(L, views_dir, v, k)
+            ims.append(im.crop((crop[2], crop[0], crop[3], crop[1])) if crop else im)
+        rows.append((v, ims))
+    from PIL import ImageFont
+    f = ImageFont.truetype('/Users/zenray/Library/Fonts/AdobeClean-Regular.otf', 24)
+    W = max(r[1][0].width for r in rows); Hs = [r[1][0].height + 40 for r in rows]
+    B = Image.new('RGB', (2 * W + 20, sum(Hs) + 10), (18, 18, 18)); d = ImageDraw.Draw(B); y = 0
+    for (v, ims), h in zip(rows, Hs):
+        for i, (im, t) in enumerate(zip(ims, (ta, tb))):
+            d.text((i * (W + 20) + 8, y + 6), '%s, %s' % (t, v), font=f, fill=(235, 235, 235))
+            B.paste(im, (i * (W + 20), y + 38))
+        y += h
+    B.save(out)
+    print(out, B.size)
+
+
+if __name__ == '__main__':
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    {'smoke': smoke, 'refine': refine, 'split': split, 'clean': clean, 'board': board}[cmd](rest)
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/SheetViews.py (67 lines, 3960 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 23:05 Europe/Paris: ZenRay Meshes V3, orthographic cameras of a 6-view sheet for ModelViews, from
+# frame.json, plus the overlap of a rendered model with a clean mask label (the judge where the mask exists).
+# FR : caméras orthographiques d'une planche 6 vues pour ModelViews, depuis frame.json, et recouvrement modèle contre masque.
+# Usage: SheetViews.py views <frame.json> <views_dir> <model.obj> <title> <out.views.json> view:x0:y0:x1:y1 [...]
+#        SheetViews.py iou <views.json> <view index> <labels.npz> <label> <label_scale>
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+FWD = {'front': [0, 0, -1], 'back': [0, 0, 1], 'left': [-1, 0, 0], 'right': [1, 0, 0], 'top': [0, -1, 0], 'bottom': [0, 1, 0]}
+FILES = {'front': '00_front', 'back': '01_back', 'left': '02_left', 'right': '03_right', 'top': '04_top', 'bottom': '05_bottom'}
+LABELS = {'front': 'vue de face', 'back': 'vue arrière', 'left': 'vue de gauche', 'right': 'vue de droite', 'top': 'vue de dessus', 'bottom': 'vue de dessous'}
+
+
+def camera(frame, name):
+    v = next(x for x in frame['views'] if x['name'] == name)
+    lo = np.array(frame['lo']); hi = lo + np.array(frame['dims_m'])
+    rx, uy = np.array(v['rx'], float), np.array(v['uy'], float)
+    lo_r = sum(min(lo[i] * rx[i], hi[i] * rx[i]) for i in range(3)); lo_u = sum(min(lo[i] * uy[i], hi[i] * uy[i]) for i in range(3))
+    s = v['px_per_m']; fwd = np.array(FWD[name], float)
+    return {'ortho': True, 'right': rx.tolist(), 'up': uy.tolist(), 'fwd': fwd.tolist(), 'pos': (-fwd * 20).tolist(),
+            'cx': v['bbox'][0] - s * lo_r, 'cy': v['bbox'][3] + s * lo_u, 'scale': s}
+
+
+def views(a):
+    frame = json.loads(Path(a[0]).read_text()); vd = a[1]
+    spec = {'title': a[3], 'obj': a[2], 'views': []}
+    from ModelViews import load_obj, project
+    V = load_obj(a[2])[0]
+    for item in a[5:]:
+        if ':' not in item:                              # 9 November 2026: crop framed on the model, 60 percent margin
+            cam = {k: (np.array(x, float) if isinstance(x, list) else x) for k, x in camera(frame, item).items()}
+            UV = project(cam, V)[0]; lo, hi = UV.min(0), UV.max(0); m = (hi - lo) * 0.6 + 12
+            item = '%s:%d:%d:%d:%d' % (item, max(0, lo[0] - m[0]), max(0, lo[1] - m[1]), hi[0] + m[0], hi[1] + m[1])
+        name, x0, y0, x1, y1 = item.split(':')
+        spec['views'].append({'label': LABELS[name], 'photo': str(Path(vd) / (FILES[name] + '_rgb.png')), 'crop': [int(x0), int(y0), int(x1), int(y1)], 'camera': camera(frame, name)})
+    Path(a[4]).write_text(json.dumps(spec, indent=1))
+    return {'views': len(spec['views'])}
+
+
+def iou(a):
+    from ModelViews import load_obj, make_camera, render
+    spec = json.loads(Path(a[0]).read_text()); view = spec['views'][int(a[1])]
+    L = np.load(a[2])['labels']; k = int(a[4]); ref = L == int(a[3])
+    V, F = load_obj(spec['obj'])
+    if len(a) > 5 and a[5] == '--outer':
+        # 9 November 2026: judge the outer skin only; a thin sliver of a part is swamped by the panel's own thickness.
+        F, cur = [], ''
+        for line in open(spec['obj']):
+            if line.startswith('g '):
+                cur = line[2:].strip()
+            elif line.startswith('f ') and cur == 'panel_outer':
+                F.append([int(t.split('/')[0]) - 1 for t in line.split()[1:]])
+    H, W = L.shape
+    alpha = np.asarray(render(V, F, make_camera(view['camera']), [0, 0, W // k, H // k], k).getchannel('A')) > 127
+    alpha = alpha[:H, :W]
+    i, u = (ref & alpha).sum(), (ref | alpha).sum()
+    return {'iou': round(float(i / u), 4), 'mask_px': int(ref.sum()), 'model_px': int(alpha.sum()), 'model_outside_px': int((alpha & ~ref).sum()), 'mask_missed_px': int((ref & ~alpha).sum())}
+
+
+if __name__ == '__main__':
+    print(json.dumps({'views': views, 'iou': iou}[sys.argv[1]](sys.argv[2:])))
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/TraceGrid.py (34 lines, 1865 bytes)
+#!/Users/zenray/.venvs/zenray-meshes/bin/python
+# 9 November 2026, 19:50 Europe/Paris: ZenRay Meshes V3, a zoomed crop with a labelled pixel grid, to trace points by eye.
+# FR : recadrage agrandi avec une grille de pixels numérotée, pour relever des points à l'œil sans se tromper de pixel.
+# Usage: TraceGrid.py <image> <out.png> x0 y0 x1 y1 [--zoom 5] [--step 5] [--points "u,v;u,v;..."]
+import sys
+from PIL import Image, ImageDraw, ImageFont
+
+FONT = '/Users/zenray/Library/Fonts/AdobeClean-Regular.otf'
+
+
+def main(a):
+    src, out = a[0], a[1]
+    x0, y0, x1, y1 = map(int, a[2:6])
+    zoom = int(a[a.index('--zoom') + 1]) if '--zoom' in a else 5
+    step = int(a[a.index('--step') + 1]) if '--step' in a else 5
+    pts = [tuple(map(float, p.split(','))) for p in a[a.index('--points') + 1].split(';')] if '--points' in a else []
+    im = Image.open(src).convert('RGB').crop((x0, y0, x1, y1)).resize(((x1 - x0) * zoom, (y1 - y0) * zoom), Image.LANCZOS)
+    d = ImageDraw.Draw(im, 'RGBA'); f = ImageFont.truetype(FONT, 14)
+    for u in range(x0 - x0 % step + step, x1, step):
+        X = (u - x0) * zoom; major = u % (step * 2) == 0
+        d.line([(X, 0), (X, im.size[1])], fill=(255, 255, 0, 110 if major else 45), width=1)
+        if major: d.text((X + 2, 2), str(u), font=f, fill=(255, 255, 0, 255))
+    for v in range(y0 - y0 % step + step, y1, step):
+        Y = (v - y0) * zoom; major = v % (step * 2) == 0
+        d.line([(0, Y), (im.size[0], Y)], fill=(0, 255, 255, 110 if major else 45), width=1)
+        if major: d.text((2, Y + 2), str(v), font=f, fill=(0, 255, 255, 255))
+    for i, (u, v) in enumerate(pts):
+        X, Y = (u - x0) * zoom, (v - y0) * zoom
+        d.ellipse([X - 5, Y - 5, X + 5, Y + 5], outline=(255, 40, 40, 255), width=2); d.text((X + 7, Y - 18), str(i), font=f, fill=(255, 60, 60, 255))
+    im.save(out)
+
+
+main(sys.argv[1:])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/BlueprintLoop.sh (29 lines, 1998 bytes)
+#!/bin/zsh
+# 9 November 2026, 18:55 Europe/Paris: ZenRay Meshes V3, one command from a traced blueprint to a judged Houdini model.
+# FR : une commande, du plan SVG relevé au modèle Houdini jugé sur les photos ; garde le meilleur tour.
+#
+# Rounds: build the component from the blueprint (hython), judge it on the photos (BlueprintBoard, silhouette error in
+# px), then move the traced silhouette curve to the plane that really makes it (PerspectiveFix). The round with the
+# smallest silhouette error is kept as best.svg, best.obj and best.png; every round stays on disk.
+# Usage: BlueprintLoop.sh <builder.py> <trace.json> <view_id> <curve_id> <blueprint.svg> <out_dir> [rounds]
+set -e
+HERE=${0:A:h}
+BUILDER=$1 TRACE=$2 VIEW=$3 CURVE=$4 SVG=$5 OUT=$6 ROUNDS=${7:-3}
+HYTHON=/Applications/Houdini/Current/Frameworks/Houdini.framework/Versions/Current/Resources/bin/hython
+PY=/Users/zenray/.venvs/zenray-meshes/bin/python
+mkdir -p $OUT
+cp $SVG $OUT/round0.svg
+best_err=999999; best=0
+for r in $(seq 0 $ROUNDS); do
+  perl -e 'alarm 120; exec @ARGV' $HYTHON $BUILDER $OUT/round$r.svg $OUT/round$r > $OUT/round$r.build.log 2>&1
+  $PY $HERE/BlueprintBoard.py $TRACE $OUT/round$r.png "round $r=$OUT/round$r/hood_v3_blueprint.obj" > $OUT/round$r.board.json
+  err=$(python3 -c "import json,sys; r=json.load(open('$OUT/round$r.board.json'))['silhouette_error']; print(next(iter(r.values()))['$VIEW.$CURVE']['max_px'])")
+  echo "round $r: silhouette max ${err} px"
+  if (( err < best_err )); then best_err=$err; best=$r; fi
+  (( r == ROUNDS )) && break
+  $PY $HERE/PerspectiveFix.py $TRACE $VIEW $CURVE $OUT/round$r.svg $OUT/round$r/hood_v3_blueprint.obj $OUT/round$((r+1)).svg > $OUT/round$((r+1)).fix.json
+done
+cp $OUT/round$best.svg $OUT/best.svg; cp $OUT/round$best/hood_v3_blueprint.obj $OUT/best.obj; cp $OUT/round$best.png $OUT/best.png
+cp $OUT/round$best/build-report.json $OUT/best.build-report.json
+echo "{\"best_round\": $best, \"silhouette_max_px\": $best_err, \"best_svg\": \"$OUT/best.svg\"}"
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/v3/SamCutChain.sh (18 lines, 978 bytes)
+#!/bin/zsh
+# 9 November 2026, 23:40 Europe/Paris: ZenRay Meshes, the whole SAM cut chain in one command (one tool, not a retyped
+# sequence): refine every part (zoom + mirror), snap on the drawn lines, symmetry, snap, missing cuts on the whole view,
+# missing cuts on zoomed tiles, last snap; each stage is judged by MaskJudge. FR : toute la chaîne de découpe SAM.
+# Usage: SamCutChain.sh <labels_dir> <views_dir> <frame.json> <micro.json> <out_dir>
+set -e
+L=$1; V=$2; F=$3; M=$4; O=$5
+PY=/Users/zenray/.venvs/zenray-motion/bin/python
+HERE=${0:A:h}
+mkdir -p "$O"
+run() { $PY "$HERE/SamCut.py" "$@" 2>&1 | grep -vE "warn|Warning|from_numpy" }
+run refine "$L" "$V" "$F" "$M" "$O/1-refine" s2
+run clean "$O/1-refine" "$V" "$F" "$M" "$O/2-clean" snap,sym,snap
+run split "$O/2-clean/3-snap" "$V" "$F" "$M" "$O/3-split" 0
+run split "$O/3-split" "$V" "$F" "$M" "$O/4-split-tiles" 1
+run clean "$O/4-split-tiles" "$V" "$F" "$M" "$O/5-final" snap
+echo "final labels: $O/5-final/1-snap"
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/SheetSplit.py (122 lines, 6863 bytes)
+# 25 October 2026 : ZenRay Meshes, step 1 of the software : split a generated 6 views sheet into views, cut each
+# object out of its flat grey background, drop the scale cube, and measure the cross view consistency.
+# EN: separators are the thin straight lines the generator draws between panels (rows / columns whose difference to
+# their neighbours is strong along most of their length). Each panel: background = its median border colour; object =
+# pixels far from it, largest components kept; the small square scale cube (bottom left) is removed by shape.
+# FR : découpe la planche en vues, détoure l'objet, retire le cube d'échelle, mesure la cohérence entre vues.
+# Usage: python SheetSplit.py <sheet.png> <out_dir> <view names in reading order, comma separated>
+import sys, os, json
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+P = {"line_strength": 6.0, "line_cover": 0.6, "min_gap": 40, "bg_thresh": 14.0, "min_area_frac": 0.002, "cube_max_frac": 0.02, "bg_model": "median", "bg_thresh_q": 9.0, "tex_thresh": 3.0, "close_iter": 2,
+     "shadow_drop": 0, "shadow_lo": 3.0, "shadow_hi": 30.0, "shadow_sd": 2.5}   # 26 October 2026: cast shadow removal, off by default
+
+
+def separators(g, axis):
+    # axis 0: horizontal lines (rows), axis 1: vertical lines (cols)
+    d = np.abs(np.diff(g, axis=axis))
+    strong = d > P["line_strength"]
+    cover = strong.mean(axis=1 - axis) if strong.size else np.zeros(0)
+    idx = np.where(cover > P["line_cover"])[0]
+    lines = []
+    for i in idx:
+        if not lines or i - lines[-1] > P["min_gap"]:
+            lines.append(int(i))
+    return lines
+
+
+def panels(img, grid=None):
+    g = np.asarray(img.convert("L")).astype(float)
+    H, W = g.shape
+    if grid:
+        # explicit grid "rows=620;cols=418,836" when the object itself has long straight lines (trunk, ground)
+        spec = dict(kv.split("=") for kv in grid.split(";"))
+        rws = [0] + [int(x) for x in spec.get("rows", "").split(",") if x] + [H]
+        cls = [0] + [int(x) for x in spec.get("cols", "").split(",") if x] + [W]
+        return [(r0 + 3, r1 - 3, c0 + 3, c1 - 3) for r0, r1 in zip(rws[:-1], rws[1:]) for c0, c1 in zip(cls[:-1], cls[1:])]
+    rows = [0] + separators(g, 0) + [H]
+    out = []
+    for r0, r1 in zip(rows[:-1], rows[1:]):
+        band = g[r0:r1]
+        cols = [0] + separators(band, 1) + [W]
+        for c0, c1 in zip(cols[:-1], cols[1:]):
+            if r1 - r0 > 60 and c1 - c0 > 60:
+                out.append((r0 + 2, r1 - 2, c0 + 2, c1 - 2))
+    return out
+
+
+def cutout(rgb):
+    a = rgb.astype(float)
+    border = np.concatenate([a[:6].reshape(-1, 3), a[-6:].reshape(-1, 3), a[:, :6].reshape(-1, 3), a[:, -6:].reshape(-1, 3)])
+    bg = np.median(border, 0)
+    m = np.linalg.norm(a - bg, axis=-1) > P["bg_thresh"]
+    if P.get("bg_model") == "quadratic":
+        # 25 October 2026 : smooth background (vignette) fitted on the border, plus local texture: a light object on a
+        # grey studio backdrop differs little in colour but is never smooth
+        L = a.mean(-1); H, W_ = L.shape; yy, xx = np.mgrid[0:H, 0:W_]; b = 6
+        bm = np.zeros_like(L, bool); bm[:b] = bm[-b:] = True; bm[:, :b] = bm[:, -b:] = True
+        Xf = lambda y, x: np.stack([np.ones_like(x), x, y, x * x, x * y, y * y], -1) / 1.0
+        xn, yn = xx / W_, yy / H
+        coef, *_ = np.linalg.lstsq(Xf(yn[bm], xn[bm]), L[bm], rcond=None)
+        bgL = Xf(yn, xn) @ coef
+        mu = ndi.uniform_filter(L, 5); sd = np.sqrt(np.maximum(ndi.uniform_filter(L * L, 5) - mu * mu, 0))
+        m = (np.abs(L - bgL) > P["bg_thresh_q"]) | (sd > P["tex_thresh"])
+    if P.get("shadow_drop", 0):
+        # 26 October 2026: a soft cast shadow (car top view : 8 to 10 levels under the backdrop, smooth) passed the colour
+        # test and stretched the car 0.2 m at the rear and 6 cm on one side ; a pixel a little DARKER than the backdrop
+        # (shadow_lo to shadow_hi levels) and smooth (local deviation under shadow_sd) is backdrop in shadow, not object.
+        # FR : l'ombre portée, un peu plus sombre que le fond et lisse, n'est pas l'objet.
+        L_ = a.mean(-1); bgL_ = float(np.asarray(bg).mean()); mu_ = ndi.uniform_filter(L_, 5)
+        sd_ = np.sqrt(np.maximum(ndi.uniform_filter(L_ * L_, 5) - mu_ * mu_, 0))
+        m &= ~((L_ < bgL_ - P["shadow_lo"]) & (L_ > bgL_ - P["shadow_hi"]) & (sd_ < P["shadow_sd"]))
+    m = ndi.binary_opening(m, iterations=1)
+    lab, n = ndi.label(m)
+    area = m.size
+    keep = np.zeros_like(m); cube = None
+    for i in range(1, n + 1):
+        comp = lab == i; s = comp.sum()
+        if s < P["min_area_frac"] * area:
+            continue
+        ys, xs = np.nonzero(comp)
+        h, w = np.ptp(ys) + 1, np.ptp(xs) + 1
+        squareish = 0.7 < h / w < 1.4 and s > 0.6 * h * w
+        if squareish and s < P["cube_max_frac"] * area:
+            cube = {"px": int(round((h + w) / 2)), "bbox": [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]}
+            continue
+        keep |= comp
+    keep = ndi.binary_fill_holes(ndi.binary_closing(keep, iterations=P.get("close_iter", 2)))
+    return keep, cube
+
+
+def main(sheet, out, names, grid=None):
+    os.makedirs(out, exist_ok=True)
+    img = Image.open(sheet).convert("RGB"); rgb = np.asarray(img)
+    pans = panels(img, grid)
+    names = names.split(",")
+    rep = {"sheet": sheet, "panels": []}
+    for k, (r0, r1, c0, c1) in enumerate(pans):
+        name = names[k] if k < len(names) else "view%d" % k
+        crop = rgb[r0:r1, c0:c1]
+        m, cube = cutout(crop)
+        ys, xs = np.nonzero(m)
+        bb = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())] if len(xs) else None
+        Image.fromarray(crop).save(os.path.join(out, "%02d_%s_rgb.png" % (k, name)))
+        Image.fromarray((m * 255).astype(np.uint8)).save(os.path.join(out, "%02d_%s_mask.png" % (k, name)))
+        rec = {"index": k, "name": name, "rect": [c0, r0, c1, r1], "object_bbox": bb,
+               "object_w_px": None if bb is None else bb[2] - bb[0] + 1, "object_h_px": None if bb is None else bb[3] - bb[1] + 1,
+               "cube": cube}
+        if cube and bb:
+            rec["object_w_cubes"] = round(rec["object_w_px"] / cube["px"], 2); rec["object_h_cubes"] = round(rec["object_h_px"] / cube["px"], 2)
+        rep["panels"].append(rec)
+    json.dump(rep, open(os.path.join(out, "sheet.json"), "w"), indent=1)
+    for r in rep["panels"]:
+        print(r["index"], r["name"], "panel", r["rect"], "obj w x h px", r["object_w_px"], r["object_h_px"], "cube", r["cube"] and r["cube"]["px"], "in cubes", r.get("object_w_cubes"), r.get("object_h_cubes"))
+
+
+if __name__ == "__main__":
+    for kv in [a for a in sys.argv[3:] if "=" in a and a.split("=")[0] in P]:   # 25 October 2026: rule overrides k=v
+        k_, v_ = kv.split("=", 1); P[k_] = type(P[k_])(v_); sys.argv.remove(kv)
+    main(*sys.argv[1:5])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/SheetFit.py (90 lines, 5841 bytes)
+# 25 October 2026 : ZenRay Meshes, step 2 : put the six cut out views into one world frame and measure their consistency.
+# EN: each panel says which world axis its image right and image up show (params JSON). Every world axis is measured by
+# several views (its extent in pixels); per view scales (px per metre) are solved by least squares in log space with one
+# known real dimension, and the residual of each view says how much the generator contradicted itself. Views above
+# `max_residual` are dropped from reconstruction (reported, never silently). Output: aligned masks on one metric grid.
+# FR : met les vues dans un même repère, calcule l'échelle de chaque vue, mesure et écarte les vues incohérentes.
+# Usage: python SheetFit.py <fit_params.json>
+import sys, os, json
+import numpy as np
+from PIL import Image
+
+AX = {"+x": (1, 0, 0), "-x": (-1, 0, 0), "+y": (0, 1, 0), "-y": (0, -1, 0), "+z": (0, 0, 1), "-z": (0, 0, -1)}
+
+
+def main(pfile):
+    P = json.load(open(pfile))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(pfile)))
+    vdir = os.path.join(root, P["views_dir"]); out = os.path.join(root, P["out_dir"]); os.makedirs(out, exist_ok=True)
+    sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    views = []
+    for pan in sheet["panels"]:
+        spec = P["panels"].get(pan["name"])
+        if spec is None:
+            continue
+        m = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_mask.png" % (pan["index"], pan["name"])))) > 127
+        ys, xs = np.nonzero(m)
+        rx, uy = np.array(AX[spec["right"]], float), np.array(AX[spec["up"]], float)
+        tz = np.cross(rx, uy)
+        views.append(dict(name=pan["name"], mask=m, rx=rx, uy=uy, tz=tz, ext_px={int(np.argmax(np.abs(rx))): np.ptp(xs) + 1, int(np.argmax(np.abs(uy))): np.ptp(ys) + 1},
+                          bbox=(xs.min(), ys.min(), xs.max(), ys.max())))
+    # least squares: log px = log s_v + log D_axis ; unknowns: log s_v (all views), log D_axis (3); gauge: D_ref fixed
+    nv = len(views); rows, rhs = [], []
+    for i, v in enumerate(views):
+        for a, px in v["ext_px"].items():
+            r = np.zeros(nv + 3); r[i] = 1; r[nv + a] = 1; rows.append(r); rhs.append(np.log(px))
+    ref_axis = {"x": 0, "y": 1, "z": 2}[P["known_axis"]]
+    r = np.zeros(nv + 3); r[nv + ref_axis] = 1; rows.append(r * 100); rhs.append(np.log(P["known_size_m"]) * 100)
+    sol, *_ = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)
+    scales = np.exp(sol[:nv]); dims = np.exp(sol[nv:])
+    report = {"dims_m": dims.round(4).tolist(), "views": []}
+    for i, v in enumerate(views):
+        res = {"xyz"[a]: float(round(100 * (px / (scales[i] * dims[a]) - 1), 2)) for a, px in v["ext_px"].items()}
+        worst = max(abs(x) for x in res.values())
+        v["px_per_m"] = float(scales[i]); v["residual_pct"] = res; v["kept"] = bool(worst <= P["max_residual_pct"]) and v["name"] not in P.get("drop_views", [])   # 25 October 2026: explicit drops, reported
+        report["views"].append({"name": v["name"], "px_per_m": round(v["px_per_m"], 2), "residual_pct": res, "kept": v["kept"]})
+    # symmetry registration (rule for mirror symmetric archetypes, P["symmetric_axis"] = "x"): in every view that shows
+    # that axis, find the image line that best mirrors the silhouette onto itself and centre the bbox on it, keeping
+    # the extent; generated sheets often drift the object a few pixels inside its panel.
+    sym = P.get("symmetric_axis")
+    if sym:
+        sa = {"x": 0, "y": 1, "z": 2}[sym]
+        for v in views:
+            for img_axis, vec in ((1, v["rx"]), (0, v["uy"])):
+                if int(np.argmax(np.abs(vec))) != sa:
+                    continue
+                m = v["mask"]; prof = m.sum(axis=1 - img_axis if img_axis == 1 else 1).astype(float) if False else None
+                proj = m.any(axis=0) if img_axis == 1 else m.any(axis=1)
+                mm = m if img_axis == 1 else m.T
+                n = mm.shape[1]; best, bc = -1, None
+                lo_i, hi_i = np.where(proj)[0][[0, -1]]
+                for c2 in range(2 * lo_i + 20, 2 * hi_i - 19):     # c2 = twice the mirror column (half pixel steps)
+                    idx = np.arange(n); mir = c2 - idx
+                    ok = (mir >= 0) & (mir < n)
+                    a = mm[:, idx[ok]]; b = mm[:, mir[ok]]
+                    iou = (a & b).sum() / max((a | b).sum(), 1)
+                    if iou > best:
+                        best, bc = iou, c2 / 2.0
+                E = v["ext_px"][sa]
+                bb = list(v["bbox"])
+                if img_axis == 1:
+                    bb[0], bb[2] = int(round(bc - (E - 1) / 2)), int(round(bc + (E - 1) / 2))
+                else:
+                    bb[1], bb[3] = int(round(bc - (E - 1) / 2)), int(round(bc + (E - 1) / 2))
+                v["bbox"] = tuple(bb); v["sym_axis_px"] = float(bc); v["sym_iou"] = float(best)
+                report.setdefault("symmetry", {})[v["name"]] = {"axis_px": round(bc, 1), "mirror_iou": round(best, 4)}
+    # aligned metric frame: each kept view maps its bbox onto the world extent of its two axes
+    lo = -dims / 2; lo[1] = 0.0           # y from the ground
+    meta = {"dims_m": dims.tolist(), "lo": lo.tolist(), "views": []}
+    for v in views:
+        Image.fromarray((v["mask"] * 255).astype(np.uint8)).save(os.path.join(out, "mask_%s.png" % v["name"]))
+        meta["views"].append({"name": v["name"], "rx": v["rx"].tolist(), "uy": v["uy"].tolist(), "tz": v["tz"].tolist(),
+                              "px_per_m": v["px_per_m"], "bbox": [int(b) for b in v["bbox"]], "kept": bool(v["kept"])})
+    json.dump(meta, open(os.path.join(out, "frame.json"), "w"), indent=1)
+    json.dump(report, open(os.path.join(out, "consistency.json"), "w"), indent=1)
+    print(json.dumps(report, indent=1))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/FeatureLines.py (34 lines, 2154 bytes)
+# 25 October 2026 : ZenRay Meshes, internal design lines of a sheet view (panel joints, creases, glass edges) by edge
+# detection inside the silhouette, drawn over the view with a coordinate grid so curves can be traced and snapped.
+# FR : les lignes intérieures du dessin (joints, plis, vitrages) se lisent par détection de contours dans la silhouette.
+# Usage: python FeatureLines.py <views_dir> <frame_dir> <view> <out.png> [sigma=1.6]
+import sys, os, json
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage as ndi
+from skimage import feature
+
+P = {"sigma": 1.6, "low": 0.04, "high": 0.10, "erode_px": 3, "grid_px": 25, "scale": 2}
+
+
+def main(vdir, fdir, view, out, sigma=None):
+    sheet = json.load(open(os.path.join(vdir, "sheet.json"))); pan = [p for p in sheet["panels"] if p["name"] == view][0]
+    rgb = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], view))).convert("L")).astype(float) / 255
+    mask = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_mask.png" % (pan["index"], view)))) > 127
+    E = feature.canny(rgb, sigma=float(sigma or P["sigma"]), low_threshold=P["low"], high_threshold=P["high"])
+    E &= ndi.binary_erosion(mask, iterations=P["erode_px"])
+    np.save(out.replace(".png", "_edges.npy"), E)
+    s = P["scale"]; img = Image.fromarray((np.stack([rgb * 120 + 60] * 3, -1)).astype(np.uint8)).resize((rgb.shape[1] * s, rgb.shape[0] * s), Image.NEAREST)
+    d = ImageDraw.Draw(img)
+    for y, x in np.argwhere(E): d.rectangle((x * s, y * s, x * s + s - 1, y * s + s - 1), fill=(240, 90, 60))
+    f = ImageFont.truetype("/Users/zenray/Library/Fonts/AnthropicSerif-Regular.ttf", 11)
+    for x in range(0, rgb.shape[1], P["grid_px"]):
+        d.line((x * s, 0, x * s, img.height), fill=(80, 130, 200), width=1); d.text((x * s + 2, 2), str(x), font=f, fill=(150, 200, 255))
+    for y in range(0, rgb.shape[0], P["grid_px"]):
+        d.line((0, y * s, img.width, y * s), fill=(80, 130, 200), width=1); d.text((2, y * s + 2), str(y), font=f, fill=(150, 200, 255))
+    img.save(out); print(out, int(E.sum()))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/LineScore.py (76 lines, 5421 bytes)
+# 25 October 2026 : ZenRay Meshes, LINE SCORE : the silhouette IoU sees only the outline, the remaining gap is in the inner
+# lines (creases, joints, facet edges). Per view, the reference edges (Canny on the sheet panel, inside its mask) are
+# compared with the model edges (normal breaks of the render in the same panel camera as SheetScore) : precision, recall
+# and F1 within tol_px, plus an overlay board (green = matched reference line, red = reference line the model misses,
+# blue = model line the sheet does not have). FR : score des lignes intérieures, la cible que l'IoU ne voit pas.
+# Usage: python LineScore.py <frame_dir> <views_dir> <mesh.obj> <board.png>
+import sys, os, json
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np, trimesh
+from PIL import Image
+from scipy import ndimage as ndi
+import Raster, SheetScore
+
+P = {"tol_px": 3, "grad_pct": 88, "normal_break": 0.25, "erode_px": 3, "depth_break_m": 0.01}   # 26 October 2026: depth steps count as lines too
+for _k in ("normal_break", "depth_break_m", "tol_px"):   # 26 October 2026: env overrides for tests, LS_NORMAL_BREAK=0.05 ...
+    if os.environ.get("LS_" + _k.upper()): P[_k] = type(P[_k])(float(os.environ["LS_" + _k.upper()]))
+
+
+def ref_edges(img):
+    """gradient magnitude edges (OpenCV is not installed) : Gaussian smoothing, Sobel, keep the top grad_pct percentile."""
+    g = ndi.gaussian_filter(img.astype(float), 1.0); m = np.hypot(ndi.sobel(g, 0), ndi.sobel(g, 1))
+    return m > np.percentile(m, P["grad_pct"])
+
+
+def model_edges(N, M, D=None):
+    E = np.zeros(M.shape, bool)
+    for dy, dx in ((0, 1), (1, 0)):
+        a = N[: N.shape[0] - dy, : N.shape[1] - dx]; b = N[dy:, dx:]
+        d = 1 - (a * b).sum(-1); m = M[: M.shape[0] - dy, : M.shape[1] - dx] & M[dy:, dx:]
+        E[: E.shape[0] - dy, : E.shape[1] - dx] |= (d > P["normal_break"]) & m
+    if D is not None and P.get("depth_break_m"):
+        # 26 October 2026: a STEP whose two faces both look at the camera (grille lip, inset rim, proud frame) has no normal
+        # break ; it is a jump of the depth, read by the second difference (a smooth steep surface has none) so the sides
+        # seen at grazing angles do not light up. FR : les marches comptent comme des traits.
+        Dz = np.where(M, D, np.nan)
+        for ax in (0, 1):
+            d2 = np.abs(np.roll(Dz, -1, ax) - 2 * Dz + np.roll(Dz, 1, ax))
+            with np.errstate(invalid="ignore"): E |= np.nan_to_num(d2, nan=0.0) > P["depth_break_m"]
+    return E
+
+
+def main(fdir, vdir, mesh_path, board):
+    meta = json.load(open(os.path.join(fdir, "frame.json"))); sheet = json.load(open(os.path.join(vdir, "sheet.json")))
+    mesh = trimesh.load(mesh_path, force="mesh", process=False); r = Raster.Renderer(mesh.vertices, mesh.faces); cap = {}; orig = r.render
+    def rr(*a, **k):
+        out = orig(*a, **k); cap["N"] = out[2]; cap["D"] = out[1]; return out
+    r.render = rr; res, tiles = {}, []
+    for v in meta["views"]:
+        pan = [p for p in sheet["panels"] if p["name"] == v["name"]][0]
+        ref = np.asarray(Image.open(os.path.join(vdir, "%02d_%s_rgb.png" % (pan["index"], v["name"]))).convert("L"))
+        mref = np.asarray(Image.open(os.path.join(fdir, "mask_%s.png" % v["name"]))) > 127
+        M, _ = SheetScore.render_in_panel(r, meta, v, mref.shape); N = cap["N"][: mref.shape[0], : mref.shape[1]]; Dd = cap["D"][: mref.shape[0], : mref.shape[1]]
+        inner = ndi.binary_erosion(mref, iterations=P["erode_px"]) & ndi.binary_erosion(M, iterations=P["erode_px"])
+        Er = ref_edges(ref) & inner; Em = model_edges(N, M, Dd) & inner
+        Em0 = model_edges(N, M) & inner; dm0 = ndi.distance_transform_edt(~Em0); dr_ = ndi.distance_transform_edt(~Er)   # normal breaks only (score before 26 October 2026)
+        rec0 = float((dm0[Er] <= P["tol_px"]).mean()) if Er.any() else 0.0; pre0 = float((dr_[Em0] <= P["tol_px"]).mean()) if Em0.any() else 0.0
+        dm = ndi.distance_transform_edt(~Em); dr = ndi.distance_transform_edt(~Er)
+        rec = float((dm[Er] <= P["tol_px"]).mean()) if Er.any() else 0.0; pre = float((dr[Em] <= P["tol_px"]).mean()) if Em.any() else 0.0
+        f1 = 2 * pre * rec / max(pre + rec, 1e-9); res[v["name"]] = {"precision": round(pre, 3), "recall": round(rec, 3), "f1": round(f1, 3),
+                                                                       "f1_normal_only": round(2 * pre0 * rec0 / max(pre0 + rec0, 1e-9), 3)}
+        ov = np.stack([ref // 2] * 3, -1).astype(np.uint8)
+        ov[Er & (dm <= P["tol_px"])] = (60, 200, 60); ov[Er & (dm > P["tol_px"])] = (220, 60, 60); ov[Em & (dr > P["tol_px"])] = (60, 120, 230)
+        tiles.append(ov)
+    r.release()
+    Wd = max(t.shape[1] for t in tiles); out = np.concatenate([np.pad(t, ((0, 0), (0, Wd - t.shape[1]), (0, 0))) for t in tiles], 0)
+    Image.fromarray(out).save(board)
+    y0 = 0   # 25 October 2026: tiles have different heights (404, 361, 471 px) ; their start row on the board is written out
+    for v, tl in zip(meta["views"], tiles): res[v["name"]]["tile_y0"] = y0; y0 += tl.shape[0]
+    res["mean_f1"] = round(float(np.mean([v["f1"] for k, v in res.items() if isinstance(v, dict) and "f1" in v])), 3)
+    res["mean_f1_normal_only"] = round(float(np.mean([v["f1_normal_only"] for k, v in res.items() if isinstance(v, dict) and "f1_normal_only" in v])), 3)
+    print(json.dumps(res))
+
+
+if __name__ == "__main__":
+    main(*sys.argv[1:])
+
+
+##### FILE: /Users/zenray/.claude/skills/zenray-meshes/scripts/CarCuts.py (42 lines, 3241 bytes)
+# 25 October 2026 : openings in the body panels for recessed trims (grille, vents, rear panel) : a primitive wrangle
+# deletes the body faces whose centre lies inside a cut box (x, y range, front or rear half), read from the trims cuts
+# JSON written by TrimBuild.py. Run in Houdini with g = {"CUTS": path}. Idempotent.
+import hou, json
+geo = hou.node("/obj/ZRM_Car"); old = geo.node("panel_cuts"); old and old.destroy()
+cuts = json.load(open(globals()["CUTS"]))["cuts"]
+w = geo.createNode("attribwrangle", "panel_cuts"); src = geo.node("panel_split")
+dst = geo.node("panel_normals_pre"); w.setInput(0, src); dst.setInput(0, w); w.parm("class").set(1)
+lines = ["// 25 October 2026 : openings for recessed trims (from %s) ; only faces that FACE the end (normal along z)" % globals()["CUTS"],
+         "vector c = v@P; vector n = prim_normal(0, @primnum, 0.5, 0.5);"]
+for k in cuts:
+    # semantic rule (25 October 2026): an opening only cuts the end panels of its own end (fascia, bumper), never the hood
+    zc = ('c.z > 0 && n.z > 0.3 && (s@panel == "fascia_front_C" || s@panel == "bumper_front_C")' if k["front"]
+          else 'c.z < 0 && n.z < -0.3 && (s@panel == "fascia_rear_C" || s@panel == "bumper_rear_C")')
+    lines.append("if (%s && c.x > %.4f && c.x < %.4f && c.y > %.4f && c.y < %.4f) removeprim(0, @primnum, 1);" % (zc, k["x0"], k["x1"], k["y0"], k["y1"]))
+w.parm("snippet").set("\n".join(lines)); w.moveToGoodPosition()
+# 26 October 2026: UNSHARE POINTS BY PANEL ; Primitive Split keeps the points shared where two panels meet, so a joint
+# without a gap (door to rocker) was one continuous surface, PolyExtrude gave no side wall there (58 open edges per door) and
+# the door was not a separate shell, which a rig needs. Each (panel, point) now gets its own point ; the gap wrangle then sees
+# two coincident points at every joint. FR : points non partagés entre panneaux, chaque panneau devient une coque indépendante.
+for nm_ in ("panel_unshare", "panel_unshare_clean"):
+    o_ = geo.node(nm_); o_ and o_.destroy()
+if globals().get("UNSHARE", 1):
+    u = geo.createNode("attribwrangle", "panel_unshare"); u.parm("class").set(0); u.setInput(0, w)
+    u.parm("snippet").set("""// 26 October 2026 : one point per (panel, original point) ; flat array map[panel * npoints + point]
+string names[] = uniquevals(0, "prim", "panel"); int np0 = npoints(0); int map[]; resize(map, len(names) * np0);
+for (int i = 0; i < len(map); i++) map[i] = -1;
+int nprm = nprimitives(0);
+for (int pr = 0; pr < nprm; pr++) {
+    int pid = find(names, prim(0, "panel", pr)); int pts[] = primpoints(0, pr);
+    for (int k = 0; k < len(pts); k++) {
+        int key = pid * np0 + pts[k]; int np = map[key];
+        if (np < 0) { vector pos = point(0, "P", pts[k]); np = addpoint(0, pos); map[key] = np; }
+        setvertexpoint(0, pr, k, np);
+    }
+}""")
+    uc = geo.createNode("clean", "panel_unshare_clean"); uc.setInput(0, u)
+    for pn_, v_ in (("delunusedpts", 1), ("deldegengeo", 0), ("fusepts", 0), ("delzeroarea", 0), ("dodelpts", 1)):
+        if uc.parm(pn_): uc.parm(pn_).set(v_)
+    dst.setInput(0, uc); u.moveToGoodPosition(); uc.moveToGoodPosition()
+result = {"cuts": len(cuts), "prims": len(geo.node("OUT_panels").geometry().prims())}
+
