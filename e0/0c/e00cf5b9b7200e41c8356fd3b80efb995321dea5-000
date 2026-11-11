@@ -35,10 +35,18 @@ T = lambda f: '%s+(%s-%s)*%s' % (tc, ts, tc, f); B = lambda f: '%s+(%s-%s)*%s' %
 half_top = [('0', tc), (hwm + '*0.34', tc + '+0.004'), (hwm + '*0.68', T(0.42)), (hwm + '*0.85', T(0.72)), (hwm + '*0.93', ts)]
 half_bot = [(hwm + '*0.93', bs), (hwm + '*0.85', B(0.79)), (hwm + '*0.68', B(0.40)), (hwm + '*0.42', bc + '+0.02'), (hwm + '*0.2', bc + '+0.006'), ('0', bc)]
 neg = lambda x: x if x == '0' else '-' + x
-outline = [(neg(x), y, mz) for x, y in reversed(half_top[1:])] + [(x, y, mz) for x, y in half_top] + [(hwm, tip, mz)] + [(x, y, mz) for x, y in half_bot] + [(neg(x), y, mz) for x, y in reversed(half_bot[:-1])] + [('-' + hwm, tip, mz)]
-ol0 = add('outline', outline, prims=True, closed=True)
-ol = g.createNode('resample', 'outline_smooth'); ol.setInput(0, ol0); ol.parm('treatpolysas').set('interp'); ol.parm('dolength').set(0); ol.parm('dosegs').set(1); ol.parm('segs').set(140)
-fr = g.createNode('sweep::2.0', 'frame'); fr.setInput(0, ol); fr.parm('surfaceshape').set('square'); fr.parm('width').setExpression(K('frame')); fr.parm('applyroll').set(1); fr.parm('roll').set(45); fr.parm('cols').set(1)
+# 11 November 2026 (clean pass): the outline is two curves, top and bottom, each smooth, welded at the two side tips so the tips stay sharp
+top_pts = [('-' + hwm, tip, mz)] + [(neg(x), y, mz) for x, y in reversed(half_top[1:])] + [(x, y, mz) for x, y in half_top] + [(hwm, tip, mz)]
+bot_pts = [(hwm, tip, mz)] + [(x, y, mz) for x, y in half_bot] + [(neg(x), y, mz) for x, y in reversed(half_bot[:-1])] + [('-' + hwm, tip, mz)]
+def edge_curve(name, pts, segs):
+    a = add(name, pts, prims=True, closed=False)
+    r = g.createNode('resample', name + '_smooth'); r.setInput(0, a); r.parm('treatpolysas').set('interp'); r.parm('dolength').set(0); r.parm('dosegs').set(1); r.parm('segs').set(segs)
+    return r
+ot, ob = edge_curve('outline_top', top_pts, 70), edge_curve('outline_bottom', bot_pts, 70)  # 11 November 2026: 70 + 70 segments close into 140 edges, an even count as polyfill grid quads needs
+om = g.createNode('merge', 'outline_halves'); om.setInput(0, ot); om.setInput(1, ob)
+of = g.createNode('fuse::2.0', 'weld_tips'); of.setInput(0, om); of.parm('tol3d').set(0.0005)
+ol = g.createNode('polypath', 'outline_smooth'); ol.setInput(0, of); ol.parm('closeloops').set(1)  # 11 November 2026: polypath joins the halves and closes the loop itself (ends repeated a vertex)
+fr = g.createNode('sweep::2.0', 'frame'); fr.setInput(0, ol); fr.parm('surfaceshape').set('tube'); fr.parm('radius').setExpression(K('frame') + '/2'); fr.parm('cols').set(10)  # 11 November 2026: a round rim instead of a turned square
 # duct: the outline face pushed back; its open back is filled as a dark panel
 du = g.createNode('polyextrude::2.0', 'duct'); du.setInput(0, ol); du.parm('dist').setExpression('-' + K('recess')); du.parm('outputfront').set(1); du.parm('outputfrontgrp').set(1); du.parm('frontgrp').set('duct_front'); du.parm('outputback').set(0); du.parm('outputfrontseamgrp').set(1); du.parm('frontseamgrp').set('back_loop')  # 11 November 2026: edge loop of the back opening
 op = g.createNode('blast', 'duct_open'); op.setInput(0, du); op.parm('group').set('duct_front')

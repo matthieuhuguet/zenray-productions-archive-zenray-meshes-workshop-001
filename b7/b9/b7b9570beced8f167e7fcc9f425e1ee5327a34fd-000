@@ -1,0 +1,53 @@
+# 11 November 2026: the headlight zone alone (/obj/HEADLIGHTS): dark socket recess around a round projector (ring, glass, inner reflector), built on one side and mirrored. Native nodes only.
+# FR : la zone des phares seule : orbite sombre en retrait autour d'un projecteur rond (bague, glace, réflecteur), construite d'un côté puis reportée en miroir ; ni Python ni VEX.
+import hou
+obj = hou.node('/obj')
+if obj.node('HEADLIGHTS'): obj.node('HEADLIGHTS').destroy()
+g = obj.createNode('geo', 'HEADLIGHTS'); c = g.createNode('null', 'CTRL_headlights')
+ptg = c.parmTemplateGroup()
+f = hou.FolderParmTemplate('f_socket', 'Socket outline (orbite), measured on the front view')
+for name, lab, v in (('s_a', 'Top outer corner (x y)', (0.987, 0.728)), ('s_b', 'Top inner point (x y)', (0.70, 0.552)), ('s_c', 'Inner tip (x y)', (0.686, 0.500)), ('s_d', 'Bottom point (x y)', (0.898, 0.505)), ('s_e', 'Lower outer point (x y)', (0.955, 0.560))):
+    f.addParmTemplate(hou.FloatParmTemplate(name, lab, 2, default_value=v))
+f.addParmTemplate(hou.FloatParmTemplate('s_z', 'Socket front face z at y 0.5 (m)', 1, default_value=(2.27,), min=1.8, max=2.6))
+f.addParmTemplate(hou.FloatParmTemplate('s_tilt', 'Face leans back, metres of z per metre of height', 1, default_value=(0.9,), min=0.0, max=2.0))  # 11 November 2026: keeps the socket under the side silhouette
+f.addParmTemplate(hou.FloatParmTemplate('s_depth', 'Socket depth (m)', 1, default_value=(0.07,), min=0.01, max=0.3))
+f.addParmTemplate(hou.FloatParmTemplate('s_rim', 'Socket rim thickness (m)', 1, default_value=(0.008,), min=0.002, max=0.03))
+ptg.append(f)
+f2 = hou.FolderParmTemplate('f_lens', 'Projector (projecteur)')
+f2.addParmTemplate(hou.FloatParmTemplate('l_c', 'Centre (x y, m)', 2, default_value=(0.868, 0.587)))
+for name, lab, v in (('l_ring', 'Ring outer radius (m)', 0.060), ('l_glass', 'Glass radius (m)', 0.050), ('l_dome', 'Glass bulge (m)', 0.018), ('l_set', 'Ring set back from the socket face (m)', 0.03)):
+    f2.addParmTemplate(hou.FloatParmTemplate(name, lab, 1, default_value=(v,), min=0.0, max=0.2))
+ptg.append(f2)
+f3 = hou.FolderParmTemplate('f_grey', 'Shade (gris)')
+for name, lab, v in (('g_socket', 'Socket grey', 0.05), ('g_rim', 'Rim grey', 0.10), ('g_ring', 'Ring grey', 0.30), ('g_glass', 'Glass grey', 0.16)):
+    f3.addParmTemplate(hou.FloatParmTemplate(name, lab, 1, default_value=(v,), min=0.0, max=1.0))
+ptg.append(f3); c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_headlights/%s")' % p
+def grey(node, shade):
+    col = g.createNode('color', 'grey_' + node.name()); col.setInput(0, node)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K(shade))
+    return col
+# socket outline on the +x side, smoothed through its points, an even count for the quad fill
+a = g.createNode('add', 'socket_points'); pts = ['s_a', 's_b', 's_c', 's_d', 's_e']; a.parm('points').set(len(pts))
+for i, p in enumerate(pts):
+    a.parm('usept%d' % i).set(1); a.parm('pt%dx' % i).setExpression(K(p + 'x')); a.parm('pt%dy' % i).setExpression(K(p + 'y')); a.parm('pt%dz' % i).setExpression('%s-%s*(%s-0.5)' % (K('s_z'), K('s_tilt'), K(p + 'y')))
+a.parm('prims').set(1); a.parm('prim0').set('0 1 2 3 4'); a.parm('closed0').set(1)
+ol = g.createNode('resample', 'socket_outline'); ol.setInput(0, a); ol.parm('treatpolysas').set('interp'); ol.parm('dolength').set(0); ol.parm('dosegs').set(1); ol.parm('segs').set(48)
+du = g.createNode('polyextrude::2.0', 'socket_walls'); du.setInput(0, ol); du.parm('dist').set(0); du.parm('xformfront').set(1); du.parm('xformspace').set('global'); du.parm('translatez').setExpression('-' + K('s_depth')); du.parm('outputfront').set(1); du.parm('outputfrontgrp').set(1); du.parm('frontgrp').set('socket_back'); du.parm('outputback').set(0); du.parm('outputfrontseamgrp').set(1); du.parm('frontseamgrp').set('back_loop')  # 11 November 2026: the outline face points backward, a positive distance goes into the car
+op = g.createNode('blast', 'socket_open'); op.setInput(0, du); op.parm('group').set('socket_back')
+bk = g.createNode('polyfill', 'socket_back'); bk.setInput(0, op); bk.parm('group').set('back_loop'); bk.parm('fillmode').set('gridquads'); bk.parm('smoothtoggle').set(0); bk.parm('subdivtoggle').set(0); bk.parm('tangentstrength').set(0)
+rim = g.createNode('sweep::2.0', 'socket_rim'); rim.setInput(0, ol); rim.parm('surfaceshape').set('tube'); rim.parm('radius').setExpression(K('s_rim') + '/2'); rim.parm('cols').set(8)
+# projector: two zrm_ring instances facing forward (ring, then glass with a strong rounding for the bulge)
+ring = g.createNode('zrm_ring', 'projector_ring'); ring.parm('r_out').setExpression(K('l_ring')); ring.parm('r_in').setExpression(K('l_glass')); ring.parm('width').set(0.03); ring.parm('bevel').set(0.004); ring.parm('cols').set(48)
+glass = g.createNode('zrm_ring', 'projector_glass'); glass.parm('r_out').setExpression(K('l_glass')); glass.parm('r_in').set(0.004); glass.parm('width').setExpression(K('l_dome') + '*2'); glass.parm('bevel').setExpression(K('l_dome') + '*0.9'); glass.parm('bevel_divs').set(4); glass.parm('cols').set(48)
+lens_parts = []
+for n, shade in ((ring, 'g_ring'), (glass, 'g_glass')):
+    t = g.createNode('xform', 'place_' + n.name()); t.setInput(0, n); t.parm('ry').set(90)
+    t2 = g.createNode('xform', 'tilt_' + n.name()); t2.setInput(0, t); t2.parm('rx').setExpression('-atan(%s)' % K('s_tilt'))  # lens axis leans with the face
+    t2.parm('tx').setExpression(K('l_cx')); t2.parm('ty').setExpression(K('l_cy')); t2.parm('tz').setExpression('%s-%s*(%s-0.5)-%s' % (K('s_z'), K('s_tilt'), K('l_cy'), K('l_set')))
+    lens_parts.append(grey(t2, shade))
+side = g.createNode('merge', 'one_side')
+for i, (n, shade) in enumerate(((op, 'g_socket'), (bk, 'g_socket'), (rim, 'g_rim'))): side.setInput(i, grey(n, shade))
+for n in lens_parts: side.setInput(len(side.inputs()), n)
+mi = g.createNode('mirror', 'both_sides'); mi.setInput(0, side); mi.parmTuple('dir').set((1, 0, 0)); mi.parmTuple('origin').set((0, 0, 0)); mi.parm('keepOriginal').set(1)
+o = g.createNode('null', 'OUT_headlights'); o.setInput(0, mi); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()

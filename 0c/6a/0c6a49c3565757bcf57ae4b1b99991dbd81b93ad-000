@@ -1,0 +1,64 @@
+# 11 November 2026: the brows alone (/obj/BROWS): above each headlight, a dark crescent slit and the white blade between the slit and the socket. One side, mirrored. Native nodes only.
+# FR : les sourcils seuls : fente sombre en croissant et lame blanche entre la fente et l'orbite, un côté puis miroir ; ni Python ni VEX.
+import hou
+obj = hou.node('/obj')
+if obj.node('BROWS'): obj.node('BROWS').destroy()
+g = obj.createNode('geo', 'BROWS'); c = g.createNode('null', 'CTRL_brows')
+ptg = c.parmTemplateGroup()
+f = hou.FolderParmTemplate('f_slit', 'Slit (fente), centre line measured on the front view')
+for name, lab, v in (('sl_tip', 'Inner tip (x y z)', (0.544, 0.639, 2.33)), ('sl_mid', 'Middle (x y z)', (0.75, 0.745, 2.13)), ('sl_out', 'Outer end (x y z)', (0.965, 0.845, 1.94))):  # 11 November 2026: z read on the side silhouette
+    f.addParmTemplate(hou.FloatParmTemplate(name, lab, 3, default_value=v))
+f.addParmTemplate(hou.FloatParmTemplate('sl_w', 'Width at the outer end (m)', 1, default_value=(0.035,), min=0.005, max=0.1))
+f.addParmTemplate(hou.FloatParmTemplate('sl_depth', 'Slit depth (m)', 1, default_value=(0.04,), min=0.005, max=0.2))
+ptg.append(f)
+f2 = hou.FolderParmTemplate('f_blade', 'Blade (lame)')
+for name, lab, v in (('bl_out', 'Lower edge, outer corner (x y z)', (0.987, 0.728, 2.06)), ('bl_mid', 'Lower edge, middle (x y z)', (0.80, 0.613, 2.17)), ('bl_tip', 'Blade tip (x y z)', (0.57, 0.545, 2.30))):  # lower edge sits on the leaning socket
+    f2.addParmTemplate(hou.FloatParmTemplate(name, lab, 3, default_value=v))
+f2.addParmTemplate(hou.FloatParmTemplate('bl_crown', 'Blade crown, forward (m)', 1, default_value=(0.015,), min=-0.05, max=0.1))
+ptg.append(f2)
+f3 = hou.FolderParmTemplate('f_face', 'Front face lean (face avant)')
+for name, lab, v in (('zf', 'Face z at x 0.55, y 0.5 (m)', 2.33), ('kx', 'Back per metre outward', 0.2), ('ky', 'Back per metre upward', 0.9), ('g_body', 'Body grey', 0.62), ('g_slit', 'Slit grey', 0.04)):
+    f3.addParmTemplate(hou.FloatParmTemplate(name, lab, 1, default_value=(v,)))
+ptg.append(f3); c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_brows/%s")' % p
+Z = lambda x, y: '%s-%s*(%s-0.55)-%s*(%s-0.5)' % (K('zf'), K('kx'), x, K('ky'), y)   # the front face leans back with height and outward
+def P(name, dy='0'):
+    x, y = K(name + 'x'), '%s+%s' % (K(name + 'y'), dy)
+    return (x, y, K(name + 'z'))
+def add(name, pts, closed):
+    a = g.createNode('add', name); a.parm('points').set(len(pts))
+    for i, p in enumerate(pts):
+        a.parm('usept%d' % i).set(1)
+        for ax, v in zip('xyz', p): a.parm('pt%d%s' % (i, ax)).setExpression(v)
+    a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(pts)))); a.parm('closed0').set(1 if closed else 0)
+    return a
+def smooth(node, segs):
+    r = g.createNode('resample', node.name() + '_smooth'); r.setInput(0, node); r.parm('treatpolysas').set('interp'); r.parm('dolength').set(0); r.parm('dosegs').set(1); r.parm('segs').set(segs); return r
+def grey(node, shade):
+    col = g.createNode('color', 'grey_' + node.name()); col.setInput(0, node)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K(shade))
+    return col
+w, wm = K('sl_w') + '/2', K('sl_w') + '*0.31'
+# slit: a closed crescent, tip to outer end along the top, back along the bottom
+slit_pts = [P('sl_tip'), P('sl_mid', wm), P('sl_out', w), P('sl_out', '-' + w), P('sl_mid', '-' + wm)]
+so = smooth(add('slit_outline', slit_pts, True), 40)
+sw = g.createNode('polyextrude::2.0', 'slit_walls'); sw.setInput(0, so); sw.parm('dist').set(0); sw.parm('xformfront').set(1); sw.parm('xformspace').set('global'); sw.parm('translatez').setExpression('-' + K('sl_depth')); sw.parm('outputfront').set(1); sw.parm('outputfrontgrp').set(1); sw.parm('frontgrp').set('slit_back'); sw.parm('outputback').set(0); sw.parm('outputfrontseamgrp').set(1); sw.parm('frontseamgrp').set('back_loop')  # 11 November 2026: positive distance goes into the car
+sb = g.createNode('blast', 'slit_open'); sb.setInput(0, sw); sb.parm('group').set('slit_back')
+sf = g.createNode('polyfill', 'slit_bottom'); sf.setInput(0, sb); sf.parm('group').set('back_loop'); sf.parm('fillmode').set('gridquads'); sf.parm('smoothtoggle').set(0); sf.parm('subdivtoggle').set(0); sf.parm('tangentstrength').set(0)
+# blade: from the slit's lower edge down to the socket's top edge, with a small forward crown in the middle
+up = smooth(add('blade_top', [P('sl_out', '-' + w), P('sl_mid', '-' + wm), P('sl_tip')], False), 24)
+mid_pts = []
+for a_, b_ in (('sl_out', 'bl_out'), ('sl_mid', 'bl_mid'), ('sl_tip', 'bl_tip')):
+    x = '(%s+%s)/2' % (K(a_ + 'x'), K(b_ + 'x')); y = '(%s+%s)/2' % (K(a_ + 'y'), K(b_ + 'y'))
+    z = '(%s+%s)/2' % (K(a_ + 'z'), K(b_ + 'z'))
+    mid_pts.append((x, y, '%s+%s' % (z, K('bl_crown'))))
+md = smooth(add('blade_middle', mid_pts, False), 24)
+lo = smooth(add('blade_bottom', [P('bl_out'), P('bl_mid'), P('bl_tip')], False), 24)
+mg = g.createNode('merge', 'blade_sections'); mg.setInput(0, up); mg.setInput(1, md); mg.setInput(2, lo)
+sk = g.createNode('skin', 'blade_skin'); sk.setInput(0, mg); sk.parm('surftype').set('quads'); sk.parm('polys').set(1)
+rv = g.createNode('reverse', 'blade_face_forward'); rv.setInput(0, sk)  # 11 November 2026: skin from top to bottom faced backward
+bd = g.createNode('subdivide', 'blade_surface'); bd.setInput(0, rv); bd.parm('iterations').set(1)
+side = g.createNode('merge', 'one_side')
+for i, (n, s) in enumerate(((sb, 'g_slit'), (sf, 'g_slit'), (bd, 'g_body'))): side.setInput(i, grey(n, s))
+mi = g.createNode('mirror', 'both_sides'); mi.setInput(0, side); mi.parmTuple('dir').set((1, 0, 0)); mi.parmTuple('origin').set((0, 0, 0)); mi.parm('keepOriginal').set(1)
+o = g.createNode('null', 'OUT_brows'); o.setInput(0, mi); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
