@@ -1,0 +1,68 @@
+# 11 November 2026: the mouth alone (/obj/MOUTH): measured smile outline, dark thin frame, duct, perforated diamond mesh kept inside the outline, back panel, centre bar, fasteners. Native nodes only.
+# FR : la bouche seule : contour mesuré, cadre sombre fin, conduit, maille perforée gardée dans le contour, fond, barre centrale, fixations ; ni Python ni VEX dans le graphe.
+import hou
+obj = hou.node('/obj')
+if obj.node('MOUTH'): obj.node('MOUTH').destroy()
+g = obj.createNode('geo', 'MOUTH'); c = g.createNode('null', 'CTRL_mouth')
+ptg = c.parmTemplateGroup()
+def folder(name, label, items):
+    f = hou.FolderParmTemplate(name, label)
+    for n, lab, v, lo, hi in items:
+        f.addParmTemplate(hou.IntParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi) if isinstance(v, int) else hou.FloatParmTemplate(n, lab, 1, default_value=(v,), min=lo, max=hi))
+    ptg.append(f)
+folder('f_outline', 'Outline (contour)', [('m_z', 'Mouth plane z (m)', 2.34, 2.0, 2.7), ('m_hw', 'Half width to the side tip (m)', 0.59, 0.2, 1.0), ('m_top_c', 'Top edge at the centre (m)', 0.472, 0.1, 1.0), ('m_top_s', 'Top edge near the tip (m)', 0.548, 0.1, 1.0), ('m_bot_c', 'Bottom edge at the centre (m)', 0.212, 0.0, 1.0), ('m_bot_s', 'Bottom edge near the tip (m)', 0.42, 0.0, 1.0), ('m_tip_y', 'Side tip height (m)', 0.50, 0.0, 1.0)])
+folder('f_frame', 'Frame and duct (cadre)', [('frame', 'Frame thickness (m)', 0.016, 0.004, 0.05), ('recess', 'Duct depth (m)', 0.08, 0.02, 0.3), ('mesh_back', 'Mesh set back from the frame (m)', 0.018, 0.0, 0.08)])
+folder('f_mesh', 'Mesh (grille)', [('cell', 'Cell size (m)', 0.012, 0.004, 0.04), ('wire', 'Wire width (m)', 0.0022, 0.0005, 0.01), ('hole', 'Hole depth (m)', 0.004, 0.0, 0.02), ('angle', 'Mesh angle (deg)', 45.0, 0.0, 90.0)])
+folder('f_bar', 'Centre bar and fasteners (barre, vis)', [('bar_w', 'Bar width (m)', 0.007, 0.002, 0.03), ('bolt_r', 'Fastener radius (m)', 0.008, 0.002, 0.02)])
+folder('f_grey', 'Shade (gris)', [('g_frame', 'Frame grey', 0.06, 0.0, 1.0), ('g_mesh', 'Mesh grey', 0.10, 0.0, 1.0), ('g_hole', 'Hole and back grey', 0.015, 0.0, 1.0), ('g_bar', 'Bar and fastener grey', 0.42, 0.0, 1.0)])
+c.setParmTemplateGroup(ptg)
+K = lambda p: 'ch("../CTRL_mouth/%s")' % p
+def add(name, pts, prims=None, closed=False):
+    a = g.createNode('add', name); a.parm('points').set(len(pts))
+    for i, p in enumerate(pts):
+        a.parm('usept%d' % i).set(1)
+        for ax, v in zip('xyz', p): a.parm('pt%d%s' % (i, ax)).setExpression(v) if isinstance(v, str) else a.parm('pt%d%s' % (i, ax)).set(v)
+    if prims is not None:
+        a.parm('prims').set(1); a.parm('prim0').set(' '.join(str(i) for i in range(len(pts)))); a.parm('closed0').set(1 if closed else 0)
+    return a
+def grey(node, shade):
+    col = g.createNode('color', 'grey_' + node.name()); col.setInput(0, node)
+    for ax in 'rgb': col.parm('color' + ax).setExpression(K(shade))
+    return col
+# outline: points read column by column on the front view (11 November 2026)
+hwm, tc, ts, bc, bs, mz, tip = K('m_hw'), K('m_top_c'), K('m_top_s'), K('m_bot_c'), K('m_bot_s'), K('m_z'), K('m_tip_y')
+T = lambda f: '%s+(%s-%s)*%s' % (tc, ts, tc, f); B = lambda f: '%s+(%s-%s)*%s' % (bc, bs, bc, f)
+half_top = [('0', tc), (hwm + '*0.34', tc + '+0.004'), (hwm + '*0.68', T(0.42)), (hwm + '*0.85', T(0.72)), (hwm + '*0.93', ts)]
+half_bot = [(hwm + '*0.93', bs), (hwm + '*0.85', B(0.79)), (hwm + '*0.68', B(0.40)), (hwm + '*0.42', bc + '+0.02'), (hwm + '*0.2', bc + '+0.006'), ('0', bc)]
+neg = lambda x: x if x == '0' else '-' + x
+outline = [(neg(x), y, mz) for x, y in reversed(half_top[1:])] + [(x, y, mz) for x, y in half_top] + [(hwm, tip, mz)] + [(x, y, mz) for x, y in half_bot] + [(neg(x), y, mz) for x, y in reversed(half_bot[:-1])] + [('-' + hwm, tip, mz)]
+ol0 = add('outline', outline, prims=True, closed=True)
+ol = g.createNode('resample', 'outline_smooth'); ol.setInput(0, ol0); ol.parm('treatpolysas').set('interp'); ol.parm('dolength').set(0); ol.parm('dosegs').set(1); ol.parm('segs').set(140)
+fr = g.createNode('sweep::2.0', 'frame'); fr.setInput(0, ol); fr.parm('surfaceshape').set('square'); fr.parm('width').setExpression(K('frame')); fr.parm('applyroll').set(1); fr.parm('roll').set(45); fr.parm('cols').set(1)
+# duct: the outline face pushed back; its open back is filled as a dark panel
+du = g.createNode('polyextrude::2.0', 'duct'); du.setInput(0, ol); du.parm('dist').setExpression('-' + K('recess')); du.parm('outputfront').set(1); du.parm('outputfrontgrp').set(1); du.parm('frontgrp').set('duct_front'); du.parm('outputback').set(0)
+op = g.createNode('blast', 'duct_open'); op.setInput(0, du); op.parm('group').set('duct_front')
+bk = g.createNode('polyfill', 'back_panel'); bk.setInput(0, op); bk.parm('fillmode').set('gridquads'); bk.parm('smoothtoggle').set(0); bk.parm('subdivtoggle').set(0); bk.parm('tangentstrength').set(0)
+# closed solid of the opening, used as the bounding object that keeps only the mesh cells inside the outline
+sol = g.createNode('polyextrude::2.0', 'opening_solid'); sol.setInput(0, ol); sol.parm('dist').set(-0.3); sol.parm('outputback').set(1); sol.parm('outputfront').set(1)
+so = g.createNode('xform', 'opening_solid_centred'); so.setInput(0, sol); so.parm('tz').set(0.15)
+gr = g.createNode('grid', 'mesh_cells'); gr.parm('orient').set('xy'); gr.parmTuple('size').set((1.6, 1.6)); gr.parm('rows').setExpression('ceil(1.6/%s)+1' % K('cell')); gr.parm('cols').setExpression('ceil(1.6/%s)+1' % K('cell'))
+gr.parm('rz').setExpression(K('angle')); gr.parm('ty').setExpression('(%s+%s)/2' % (tc, bc)); gr.parm('tz').setExpression('%s-%s' % (mz, K('mesh_back')))
+gi = g.createNode('groupcreate', 'cells_inside'); gi.setInput(0, gr); gi.setInput(1, so); gi.parm('groupname').set('inside'); gi.parm('grouptype').set('point'); gi.parm('groupbase').set(0)  # 11 November 2026: bounding object works on points only
+gi.parm('groupbounding').set(1); gi.parm('boundtype').set('usebobject'); gi.parm('includenotwhollycontained').set(0)
+ko = g.createNode('blast', 'keep_inside'); ko.setInput(0, gi); ko.parm('group').set('inside'); ko.parm('grouptype').set('points'); ko.parm('negate').set(1)  # deleting outside points removes every cell that touches them
+pe = g.createNode('polyextrude::2.0', 'perforate'); pe.setInput(0, ko); pe.parm('splittype').set('elements'); pe.parm('inset').setExpression(K('wire')); pe.parm('dist').setExpression('-' + K('hole'))
+pe.parm('outputfront').set(1); pe.parm('outputfrontgrp').set(1); pe.parm('frontgrp').set('holes')
+mesh_wire = g.createNode('blast', 'mesh_wire'); mesh_wire.setInput(0, pe); mesh_wire.parm('group').set('holes')
+mesh_hole = g.createNode('blast', 'mesh_holes'); mesh_hole.setInput(0, pe); mesh_hole.parm('group').set('holes'); mesh_hole.parm('negate').set(1)
+bar = g.createNode('box', 'centre_bar'); bar.parm('sizex').setExpression(K('bar_w')); bar.parm('sizey').setExpression('%s-%s' % (tc, bc)); bar.parm('sizez').set(0.012)
+bar.parm('ty').setExpression('(%s+%s)/2' % (tc, bc)); bar.parm('tz').setExpression('%s-%s+0.006' % (mz, K('mesh_back')))
+# fasteners: one ring definition (zrm_ring) copied onto the measured points
+bp = add('fastener_points', [(-0.333, 0.480, mz), (-0.300, 0.457, mz), (-0.200, 0.457, mz), (0.200, 0.457, mz), (0.300, 0.457, mz), (0.333, 0.480, mz), (-0.365, 0.292, mz), (0.365, 0.292, mz)])
+bz = g.createNode('xform', 'fasteners_on_mesh'); bz.setInput(0, bp); bz.parm('tz').setExpression('-' + K('mesh_back') + '+0.004')
+br = g.createNode('zrm_ring', 'fastener'); br.parm('r_out').setExpression(K('bolt_r')); br.parm('r_in').setExpression(K('bolt_r') + '*0.3'); br.parm('width').set(0.006); br.parm('bevel').set(0.0015); br.parm('cols').set(16); br.parm('inner_band').set(1)
+bf = g.createNode('xform', 'fastener_facing_front'); bf.setInput(0, br); bf.parm('ry').set(90)
+cpb = g.createNode('copytopoints::2.0', 'fasteners'); cpb.setInput(0, bf); cpb.setInput(1, bz); cpb.parm('pack').set(0)
+mg = g.createNode('merge', 'mouth_parts')
+for i, (n, s) in enumerate(((fr, 'g_frame'), (op, 'g_hole'), (bk, 'g_hole'), (mesh_wire, 'g_mesh'), (mesh_hole, 'g_hole'), (bar, 'g_bar'), (cpb, 'g_bar'))): mg.setInput(i, grey(n, s))
+o = g.createNode('null', 'OUT_mouth'); o.setInput(0, mg); o.setDisplayFlag(True); o.setRenderFlag(True); g.layoutChildren()
