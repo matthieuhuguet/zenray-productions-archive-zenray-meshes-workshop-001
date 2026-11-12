@@ -1,0 +1,67 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 12 November 2026, 19:55 Europe/Paris: CornerSheet.py, ONE sheet of close looks at every corner of the latest drawing of components:
+# the reference enlarged with the red line, one tile per corner anchor (and per sharp turn of the curve), so that a hook, a feather or a
+# spike (forbidden, section 501 of ZenRayMeshes1.md) is seen before a drawing is sent. Reading aid, no text in the tiles.
+# FR : planche des zooms de chaque coin des derniers dessins, pour voir un crochet avant d'envoyer.
+# usage: CornerSheet.py <project_dir> <out.jpg> <component> [<component> ...]
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v5')
+import Draw
+import Shapes as S
+import V5
+
+P = {'half': 22, 'zoom': 6, 'cols': 8, 'gap': 6, 'red': (31, 42, 255), 'turn_deg': 60.0}
+
+
+def tiles(pdir, cid):
+    dd = Path(pdir) / 'components' / cid / 'drawing'
+    D = V5.jload(dd / (V5.latest_version(dd) + '.json'))
+    out = []
+    for view, v in D['views'].items():
+        img = cv2.imread(v['image'])
+        for c in v['curves']:
+            an, closed = S.curve_anchors(c)
+            pts = [(a['x'], a['y']) for a in an if a.get('t') == 'corner']
+            cp = S.curve_points(c, 1.0)                                  # sharp turns of the drawn curve, corner or not
+            d1 = np.roll(cp, -3, 0) - cp
+            d0 = cp - np.roll(cp, 3, 0)
+            ang = np.degrees(np.abs(np.arctan2(d0[:, 0] * d1[:, 1] - d0[:, 1] * d1[:, 0], (d0 * d1).sum(1))))
+            for i in np.where(ang > P['turn_deg'])[0]:
+                if all(np.hypot(cp[i][0] - x, cp[i][1] - y) > 10 for x, y in pts):
+                    pts.append((float(cp[i][0]), float(cp[i][1])))
+            for x, y in pts:
+                h, z = P['half'], P['zoom']
+                x0, y0 = int(round(x)) - h, int(round(y)) - h
+                crop = img[max(y0, 0):y0 + 2 * h, max(x0, 0):x0 + 2 * h]
+                if crop.shape[0] != 2 * h or crop.shape[1] != 2 * h:
+                    continue
+                big = cv2.resize(crop, None, fx=z, fy=z, interpolation=cv2.INTER_CUBIC)
+                for p, cl in Draw.curve_strokes(c, 0.25):
+                    q = ((np.asarray(p) - [x0, y0]) * z * 16).round().astype(np.int32)
+                    cv2.polylines(big, [q.reshape(-1, 1, 2)], bool(cl), P['red'], 2, cv2.LINE_AA, 4)
+                out.append(big)
+    return out
+
+
+def run(pdir, out, cids):
+    ts = [t for cid in cids for t in tiles(pdir, cid)]
+    s = 2 * P['half'] * P['zoom']
+    n = len(ts)
+    cols = min(P['cols'], n)
+    rows = (n + cols - 1) // cols
+    g = P['gap']
+    sheet = np.full((rows * (s + g) + g, cols * (s + g) + g, 3), 24, np.uint8)
+    for k, t in enumerate(ts):
+        r, c = divmod(k, cols)
+        sheet[g + r * (s + g):g + r * (s + g) + s, g + c * (s + g):g + c * (s + g) + s] = t
+    cv2.imwrite(out, sheet, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    print(out, n, 'tiles')
+
+
+if __name__ == '__main__':
+    run(sys.argv[1], sys.argv[2], sys.argv[3:])

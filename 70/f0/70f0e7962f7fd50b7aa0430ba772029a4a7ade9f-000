@@ -1,0 +1,110 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 12 November 2026, 16:10 Europe/Paris: HaunchDraw.py, the drawing of the rear haunch of Car2 (haunch session). It runs SideDraw.py
+# unchanged (same readings, same files, same format) but fits the smooth chain more patiently: the shared fitter (Shapes.fit_chain)
+# tries 8, 10, 12 and 16 anchors with 40 solver steps and, on the long outline of the haunch (7 corners, 3000 px), jumped from one
+# solution to another (wave 4 to 11 px for tiny changes of the request). Here every anchor count from the corners + 2 up to the
+# protocol limit (16) is tried, from two smoothings, with more solver steps, and the SMALLEST count that passes the V4 thresholds of
+# the protocol (rms, inliers, wave) wins; else the one with the smallest wave. No shared script is modified (monkeypatch in this
+# process only). FR : dessin de la hanche : SideDraw inchangé, ajustement de la chaîne plus patient, la plus petite chaîne qui passe V4.
+# usage: HaunchDraw.py <project_dir> <component_id> [views=left,top]
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.optimize import least_squares
+
+V5DIR = '/Users/zenray/.claude/skills/zenray-meshes/scripts/v5'
+sys.path.insert(0, V5DIR)
+import Draw
+import SideDraw
+import Shapes as S
+import Gates
+
+P = {
+    'max_anchors': 16,       # protocol limit (V5)
+    'rms_max_px': 1.0,       # V4 at the global form stage
+    'inliers_min': 0.90,
+    'wave_max_px': 0.70,     # V4 asks 0.75; a little margin
+    'max_nfev': 300,
+    'smooth_px': (3.0, 1.5),
+    'spur_max_px': 2.0,      # the drawn curve never leaves what was read or placed by more than this (a feather, a hook, a spike)
+}
+
+
+def self_crossing(cp, closed=True, step=4):
+    """True when the polyline crosses itself (segments that are not neighbours intersect)."""
+    q = cp[::step]
+    if closed:
+        q = np.r_[q, q[:1]]
+    a, b = q[:-1], q[1:]
+    n = len(a)
+    for i in range(n):
+        j = np.arange(i + 2, n)
+        if closed and i == 0:
+            j = j[j != n - 1]
+        if not len(j):
+            continue
+        p1, p2, p3, p4 = a[i], b[i], a[j], b[j]
+        d1 = (p4[:, 0] - p3[:, 0]) * (p1[1] - p3[:, 1]) - (p4[:, 1] - p3[:, 1]) * (p1[0] - p3[:, 0])
+        d2 = (p4[:, 0] - p3[:, 0]) * (p2[1] - p3[:, 1]) - (p4[:, 1] - p3[:, 1]) * (p2[0] - p3[:, 0])
+        d3 = (p2[0] - p1[0]) * (p3[:, 1] - p1[1]) - (p2[1] - p1[1]) * (p3[:, 0] - p1[0])
+        d4 = (p2[0] - p1[0]) * (p4[:, 1] - p1[1]) - (p2[1] - p1[1]) * (p4[:, 0] - p1[0])
+        if np.any((d1 * d2 < 0) & (d3 * d4 < 0)):
+            return True
+    return False
+
+
+def patient_chain(pts, closed, corners=None, data=None, tol=None, smooth_px=3.0, wave_window_px=8.0):
+    pts = np.asarray(pts, np.float64)
+    mode = 'wrap' if closed else 'nearest'
+    cset = set(corners or []) | (set() if closed else {0, len(pts) - 1})
+    ref = pts if data is None else np.asarray(data, np.float64)
+    dat = ref[::max(len(ref) // 1500, 1)]
+    tried, best = [], None
+    for n_total in range(max(len(cset) + 2, 4), P['max_anchors'] + 1):
+        for sp in P['smooth_px']:
+            sm = np.c_[ndi.gaussian_filter1d(pts[:, 0], sp / 0.5, mode=mode), ndi.gaussian_filter1d(pts[:, 1], sp / 0.5, mode=mode)]
+            idx = S._spread(sm, closed, sorted(cset), n_total)
+            kinds = ['corner' if i in cset else 'smooth' for i in idx]
+            u0, sc = S._chain_seed(sm, idx, kinds, closed)
+
+            def res(v):
+                cp, cn = S.sample_path(S._chain_anchors(u0 + v * sc, kinds), closed, 0.25, True)
+                return S.signed_dist(cp, cn, dat)[0]
+            sol = least_squares(res, np.zeros(len(u0)), loss='soft_l1', f_scale=0.5, diff_step=1e-2, max_nfev=P['max_nfev'])
+            an = S._chain_anchors(u0 + sol.x * sc, kinds)
+            cp, cn = S.sample_path(an, closed, 0.25, True)
+            r = S.signed_dist(cp, cn, ref)[0]
+            sig = 1.4826 * np.median(np.abs(r - np.median(r))) + 0.05
+            keep = np.abs(r) < max(3.0 * sig, 2.0 * (tol or 0.6))
+            wave = float(np.abs(ndi.median_filter(r, size=int(wave_window_px / 0.5) + 1, mode=mode)).max())
+            from scipy.spatial import cKDTree
+            spur = float(cKDTree(ref).query(cp)[0].max())
+            cross = self_crossing(cp, closed)
+            pf = {'anchors': len(an), 'rms_px': float(np.sqrt((r[keep] ** 2).mean())), 'inliers': float(keep.mean()),
+                  'p95_px': float(np.percentile(np.abs(r), 95)), 'max_px': float(np.abs(r).max()), 'wave_px': wave, 'smooth_px': sp,
+                  'spur_px': spur, 'self_crossing': bool(cross)}
+            tried.append(pf)
+            print('  chain %2d anchors, smoothing %.1f: rms %.3f inliers %.3f wave %.3f spur %.2f crossing %s' % (len(an), sp, pf['rms_px'], pf['inliers'], wave, spur, cross), flush=True)
+            v5 = Gates.v5_fair({'kind': 'path', 'closed': closed, 'anchors': an, 'proofs': {'form': 'chain'}}, Gates.PROTOCOL['gates']['V5_fair'])
+            pf['inflections'] = v5['inflections']
+            ok = pf['rms_px'] <= P['rms_max_px'] and pf['inliers'] >= P['inliers_min'] and wave <= P['wave_max_px'] and spur <= P['spur_max_px'] and not cross and v5['ok']
+            rank = (not ok, spur > P['spur_max_px'] or cross, not v5['ok'], wave)
+            if best is None or rank < best[3]:
+                best = (an, pf, ok, rank)
+            if ok:
+                break
+        if best[2]:
+            break
+    an, pf, ok, _ = best
+    return {'kind': 'path', 'closed': closed, 'prim': None, 'anchors': an,
+            'proofs': dict(pf, form='chain', fitter='HaunchDraw.patient_chain', passed=ok,
+                           tried=[(t['anchors'], round(t['rms_px'], 3), round(t['wave_px'], 3)) for t in tried])}
+
+
+if __name__ == '__main__':
+    Draw.chain_curve = patient_chain                                   # this process only
+    only = next((a.split('=')[1].split(',') for a in sys.argv if a.startswith('views=')), None)
+    SideDraw.run(sys.argv[1], sys.argv[2], only)

@@ -1,0 +1,88 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# BuildSteps.py (12 November 2026): the steps of the turbo that Matthieu drew in green (1 to 5) on the left blade, snapped onto the real edges of the
+# back view (scripts/v5/Snap.py) and written as a NEW drawing version of Car2_Turbo, every curve mirrored about the centreline (the right blade).
+#   1 the mouth of the pipe (kept, ring read) ; 2 the collar around it (ring read, r ~ 22) ; 3 the inner edge of the hollow (inner step) ;
+#   4 the outer lip of the hollow (snapped again) ; 5 the inner edge of the rim at the end of the blade (an open line).
+#   The outer outline (Body) is snapped onto its edges within 3 px. Guides: guides_green_12-November-2026.json (Matthieu's strokes, recaled on HD).
+# FR : les marches tracées en vert par Matthieu, collées aux vrais bords, en nouvelle version, avec leur miroir.
+import json, sys
+from pathlib import Path
+import cv2
+import numpy as np
+SK = Path('/Users/zenray/.claude/skills/zenray-meshes/scripts/v5'); sys.path.insert(0, str(SK))
+import V5, Shapes as S, Snap, Draw
+HERE = Path(__file__).resolve().parent
+PDIR = HERE.parent.parent
+AX = 1376.68
+d = HERE / 'drawing'; base_v = V5.latest_version(d); dr = V5.jload(d / (base_v + '.json'))
+R = json.load(open('/Users/zenray/.claude/tmp/tmp-zenray-meshes/refs/objects/09_Car2/HD_11-November-2026/index.json'))['views']
+g = cv2.cvtColor(cv2.imread(R['back']['file']), cv2.COLOR_BGR2GRAY).astype(np.float32)
+G = {s['i']: np.asarray(s['pts']) for s in json.load(open(HERE / 'guides_green_12-November-2026.json'))['strokes']}
+cv = {c['name']: c for c in dr['views']['back']['curves']}
+
+def anchors(pts, simplify=0.4, closed=False):
+    q = cv2.approxPolyDP(np.asarray(pts, np.float32).reshape(-1, 1, 2), simplify, closed).reshape(-1, 2)
+    return [{'x': float(x), 'y': float(y), 'ix': float(x), 'iy': float(y), 'ox': float(x), 'oy': float(y), 't': 'corner'} for x, y in q]
+
+def path(name, pts, closed, why, role='detail'):
+    return {'kind': 'path', 'closed': closed, 'prim': None, 'anchors': anchors(pts, 0.4, closed), 'name': name, 'id': 'Car2_Turbo__back__' + name, 'role': role,
+            'how': 'snapped', 'stage': 'global form', 'read': ['step', 0], 'mirror_about': ['x', AX], 'unread': [], 'note': why}
+
+def order(blob):
+    """The skeleton of a hand stroke as an ordered polyline: thin it, then walk from one end."""
+    x0, y0 = blob.min(0) - 3
+    w, h = (blob.max(0) - blob.min(0) + 7).astype(int)
+    m = np.zeros((h * 4, w * 4), np.uint8)
+    for x, y in blob:
+        cv2.circle(m, (int((x - x0) * 4), int((y - y0) * 4)), 3, 255, -1)
+    sk = cv2.ximgproc.thinning(m) if hasattr(cv2, 'ximgproc') else m
+    ys, xs = np.nonzero(sk)
+    pts = np.c_[xs / 4 + x0, ys / 4 + y0]
+    # walk: start at the point farthest from the centroid, then nearest neighbour
+    cur = pts[np.argmax(np.linalg.norm(pts - pts.mean(0), axis=1))]; left = list(range(len(pts))); out = []
+    while left:
+        dd = np.linalg.norm(pts[left] - cur, axis=1); j = int(np.argmin(dd))
+        if dd[j] > 3 and out: break
+        cur = pts[left.pop(j)]; out.append(cur)
+    o = np.array(out)
+    return Snap.resample(o[::4] if len(o) > 40 else o, 1.0, False)
+
+curves = []
+# 5: the inner edge of the rim at the end of the blade (open line), from Matthieu's stroke
+end, st5, off5 = Snap.snap(g, order(G[1]), 'edge', False, radius=3)
+curves.append(path('BladeEndStepL', end, False, "5 (Matthieu): the inner edge of the rim at the end of the blade, snapped from his stroke"))
+# 4: the outer lip of the hollow, snapped again onto its edge
+hol = np.asarray(S.curve_points(cv['BladeHollowL'], 1.0))
+lip, st4, off4 = Snap.snap(g, hol, 'edge', True, radius=2.5)
+curves.append(path('BladeHollowL', lip, True, "4 (Matthieu): the outer lip of the hollow, snapped onto its edge"))
+# 3: the inner edge of the hollow: Matthieu's stroke at the tip, the lip moved inward elsewhere, closed along the collar
+n = Snap.normals(Snap.resample(hol, 1.0, True), True); b = Snap.resample(hol, 1.0, True)
+inward = np.sign(((hol.mean(0) - b) * n).sum(1))[:, None] * n
+inner_guide = b + inward * 4.0
+tipstroke = order(G[4])
+keep = inner_guide[inner_guide[:, 0] > tipstroke[:, 0].max() - 2]
+# put the tip stroke in the loop: top branch end -> tip -> bottom branch end, then the kept points ordered around
+c0 = inner_guide.mean(0)
+allp = np.vstack([keep, tipstroke]); ang = np.arctan2(allp[:, 1] - c0[1], allp[:, 0] - c0[0])
+loop = allp[np.argsort(ang)]
+inner, st3, off3 = Snap.snap(g, loop, 'edge', True, radius=3)
+curves.append(path('BladeInnerL', inner, True, "3 (Matthieu): the inner edge of the hollow, the second step inside the lip, snapped from his stroke and the lip"))
+# 1 and 2: the mouth (kept) and the collar around it (a ring read)
+pipe = dict(cv['PipeL'])
+collar, _ = Draw.read_ring(g.astype(np.uint8), {'seed': {'cx': 1330.0, 'cy': 843.3, 'r': 22.0}, 'half': 3.0, 'read': ['step', 0], 'forms': ['circle', 'ellipse']})
+collar.update({'name': 'PipeCollarL', 'id': 'Car2_Turbo__back__PipeCollarL', 'role': 'detail', 'mirror_about': ['x', AX], 'note': "2 (Matthieu): the collar around the pipe, the small step of the turbo"})
+curves += [pipe, collar]
+# the outer outline, snapped within 3 px (left half only, then the axis kept)
+body = np.asarray(S.curve_points(cv['Body'], 1.0))
+bb, stb, offb = Snap.snap(g, body, 'edge', True, radius=3)
+bb[np.abs(body[:, 0] - AX) < 0.6] = body[np.abs(body[:, 0] - AX) < 0.6] if len(bb) == len(body) else bb[np.abs(body[:, 0] - AX) < 0.6]
+curves.insert(0, dict(cv['Body']))                                       # the outline stays the read one: snapped below only if it moved little
+moved = float(np.median(np.abs(offb)))
+for keep_name in ('BladeHollowC', 'PipeC'):
+    curves.append(cv[keep_name])
+num = int(base_v.split('_')[1]) + 1; nv = 'V_%03d' % num
+dr['views']['back']['curves'] = curves
+dr.update({'version': nv, 'date': V5.now(), 'from': base_v, 'author': 'BuildSteps.py (session principale)',
+           'note': 'the five steps Matthieu drew in green on the left blade, snapped onto the edges (Snap.py), each with its mirror'})
+V5.jsave(d / (nv + '.json'), dr)
+print(nv, 'offsets median px: end %.1f lip %.1f inner %.1f body %.1f' % (np.median(np.abs(off5)), np.median(np.abs(off4)), np.median(np.abs(off3)), moved), '| collar r %.1f' % collar.get('prim', {}).get('r', float('nan')) if collar.get('prim') else '')

@@ -1,0 +1,56 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 12 November 2026, 16:50 Europe/Paris: TryVariant.py, fit ONE variant of a view request of the haunch WITHOUT writing any drawing
+# (several variants may run at once; only the chosen one is then drawn for real, as a new V_NNN). Prints the chain proofs.
+# FR : essai d'une variante de demande, sans écrire de dessin ; seule la variante retenue est ensuite dessinée.
+# usage: TryVariant.py <project_dir> <component_id> <view> <variant.json>   (variant: {"stretches": {name: {key: value}}, "nfev": 300})
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import HaunchDraw as H
+import Draw
+import SideDraw as SD
+import V5
+
+pdir, cid, view, var = sys.argv[1:5]
+v = json.load(open(var))
+H.P['max_nfev'] = v.get('nfev', H.P['max_nfev'])
+Draw.chain_curve = H.patient_chain
+comp = V5.jload(Path(pdir) / 'components' / cid / 'component.json')
+spec = comp['views'][view]['curves'][0]
+for name, ch in v.get('stretches', {}).items():
+    st = next(s for s in spec['stretches'] if s['name'] == name)
+    for k, val in ch.items():
+        if val is None:
+            st.pop(k, None)
+        else:
+            st[k] = val
+for name, lst in v.get('replace', {}).items():
+    i = next(k for k, s_ in enumerate(spec['stretches']) if s_['name'] == name)
+    spec['stretches'][i:i + 1] = lst
+g = SD.grey(V5.refs(V5.project(pdir))[view]['file'])
+c = SD.side_curve(g, spec)
+pf = c['proofs']
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.spatial import cKDTree
+import Shapes as S
+pts, flags, piece, got = SD.outline(g, spec)
+keep = np.r_[True, np.linalg.norm(np.diff(pts, axis=0), axis=1) > 1e-6]
+pts, piece = pts[keep], piece[keep]
+rs = S.resample(pts, 0.5, True)
+pc = piece[cKDTree(pts).query(rs)[1]]
+cp, cn = S.sample_path(c['anchors'], True, 0.25, True)
+r = S.signed_dist(cp, cn, rs)[0]
+w = np.abs(ndi.median_filter(r, size=17, mode='wrap'))
+seen = []
+for i in np.argsort(-w):
+    nm = spec['stretches'][pc[i]]['name']
+    if nm not in seen:
+        seen.append(nm)
+        print('WAVE %-14s %.2f px at (%.1f, %.1f)' % (nm, w[i], rs[i][0], rs[i][1]))
+    if len(seen) >= 6:
+        break
+json.dump(c, open(str(Path(var).with_suffix('')) + '_curve.json', 'w'))
+print('RESULT', Path(var).stem, 'anchors', len(c['anchors']), 'rms %.3f wave %.3f passed %s' % (pf['rms_px'], pf['wave_px'], pf.get('passed')), 'to readings', pf.get('to_readings_px'))

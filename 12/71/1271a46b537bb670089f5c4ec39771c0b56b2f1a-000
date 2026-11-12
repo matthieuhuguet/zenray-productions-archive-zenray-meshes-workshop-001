@@ -1,0 +1,154 @@
+#!/Users/zenray/.venvs/zenray-motion/bin/python
+# 12 November 2026, 19:40 Europe/Paris: Windshield3D_V_003.py (V_001 and V_002 kept beside it), the 3D record of the windscreen glass of Car2 (windshield session),
+# 12 November 2026, 17:11 Europe/Paris: correction: the hour in the line above was typed by hand and is wrong; real time 16:36 (file time, read by date).
+# a TEST asked by Matthieu ("teste de le faire en 3D directement") before his verdict on the drawing: global form only.
+# FR : la fiche 3D du pare-brise (test demandé par Matthieu avant son verdict) : forme globale seule.
+# How: the glass is ONE four-sided patch on each half (the middle line, the front arc of the roof, the shut line of the door, the seam
+# at its foot). Each edge takes its plan (X, Z) from the view from above, its height Y from the front view (pinhole of the front
+# session) corrected on the side view, the middle line its height from the side view. A Coons patch fills the four edges; sections
+# across are written as guides for native nodes in Houdini (Skin, Mirror, PolyExtrude). Nothing is drawn by eye.
+# Axes: X to the left of the car, Y up, Z to the front; origin on the middle of the car at the rear axle (as Cameras.py).
+# V_002, 12 November 2026: after Matthieu's green line, the side of the glass seen from the front is the OUTER edge of the pillar band
+# (drawing V_010), no longer the thin seam: the front corners move to the top of the band and to the lower corner after the rounded tip.
+# V_003, 12 November 2026, 19:40: Matthieu withdrew his first green line: the band beyond the seam is the window of the door; the side of
+# the glass seen from the front is the seam again (drawing V_022, corners slightly rounded).
+# usage: Windshield3D_V_003.py <project_dir> [drawing=V_022]
+import sys, json
+from pathlib import Path
+import numpy as np
+sys.path.insert(0, '/Users/zenray/.claude/skills/zenray-meshes/scripts/v5')
+import V5, Shapes as S
+
+P = {
+    'cid': 'Car2_Windshield_Glass', 'assembly': 'Car2_Windshield',
+    'axis_top_y': 771.0,           # axis of the glass seen from above (measured on the glass itself, 12 November 2026)
+    'axis_front_x': 1373.4031317569315,
+    'n_u': 41, 'n_v': 21,          # sections fore and aft, points across each section (half)
+    'thickness_m': 0.008,          # global form: a thin glass (hypothesis, not read)
+    'step_px': 0.5,
+}
+
+
+def drawn(d, view, name):
+    c = next(c for c in d['views'][view]['curves'] if c['name'] == name)
+    return S.curve_points(c, P['step_px'])
+
+
+def arc_between(pts, a, b):
+    """The run of a closed sampled curve from the point nearest a to the point nearest b, in walking order."""
+    ia = int(np.argmin(np.linalg.norm(pts - a, axis=1))); ib = int(np.argmin(np.linalg.norm(pts - b, axis=1)))
+    return pts[ia:ib + 1] if ib >= ia else np.r_[pts[ia:], pts[:ib + 1]]
+
+
+def resample(p, n):
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+    t = np.linspace(0, s[-1], n)
+    return np.stack([np.interp(t, s, p[:, k]) for k in range(p.shape[1])], 1)
+
+
+def main(pdir, ver='V_022'):
+    pdir = Path(pdir)
+    fr = V5.frame(V5.project(pdir))['views']
+    d = V5.jload(pdir / 'components' / P['cid'] / 'drawing' / (ver + '.json'))
+    cam = V5.jload(pdir / 'components' / 'Car2_Front' / 'camera' / 'front_pinhole_V_001.json')['params']
+    sl = fr['left']['px_per_m']; st = fr['top']['px_per_m']
+    xl0, yl0 = fr['left']['wheels']['R']['cx'], fr['left']['wheels']['R']['cy']
+    zf = (xl0 - fr['left']['wheels']['F']['cx']) / sl                     # front axle, metres ahead of the rear one (left view)
+    bt = fr['bottom']['tyres']; xfa = 0.5 * (bt['FL']['cx'] + bt['FR']['cx'])   # the front axle seen from above (as Front3D.py)
+    top_xz = lambda p: np.stack([(P['axis_top_y'] - p[:, 1]) / st, zf + (p[:, 0] - xfa) / st], 1)
+    left_zy = lambda p: np.stack([(xl0 - p[:, 0]) / sl, (yl0 - p[:, 1]) / sl], 1)
+    f, cx, cy, Yc, Zc = cam['f_px'], P['axis_front_x'], cam['cy_px'], cam['Yc_m'], cam['Zc_m']
+    front_xy = lambda p, Z: np.stack([(p[:, 0] - cx) * (Zc - Z) / f, Yc - (p[:, 1] - cy) * (Zc - Z) / f], 1)
+
+    # the corners of each view, as drawn (V_008)
+    T = drawn(d, 'top', 'Plan'); F_ = drawn(d, 'front', 'Face'); L = drawn(d, 'left', 'Side')
+    tc = {'rear_axis': (1681.0, 771.0), 'rear_corner': (1586.7, 543.3), 'low_corner': (1740.5, 443.5), 'front_axis': (1996.0, 771.0)}
+    fc = {'top_axis': (1373.4, 445.9), 'top_corner': (1745.0, 462.0), 'low_corner': (1925.7, 700.0), 'low_axis': (1373.4, 742.5)}   # 12 November 2026, 19:40: the rounded corners on the seam (drawing V_022)
+    rear_t = arc_between(T, tc['rear_corner'], tc['rear_axis'])[::-1]       # axis -> rear corner
+    shut_t = arc_between(T, tc['low_corner'], tc['rear_corner'])[::-1]      # rear corner -> low corner
+    foot_t = arc_between(T, tc['front_axis'], tc['low_corner'])             # axis -> low corner
+    top_f = arc_between(F_, fc['top_axis'], fc['top_corner'])               # axis -> top corner
+    seam_f = arc_between(F_, fc['top_corner'], fc['low_corner'])            # top corner -> low corner, along the outer edge (V_002)
+    foot_f = arc_between(F_, fc['low_corner'], fc['low_axis'])[::-1]        # axis -> low corner
+    crown_l = arc_between(L, (840.0, 727.6), (1063.5, 614.5))              # read middle line, front -> back (the tip under the wiper excluded)
+
+    def edge(pt, pf, n):
+        """Plan from above, height from the front: the front run is matched to the plan run by its share of the run along X."""
+        xz = resample(top_xz(pt), n)
+        q = resample(pf, 4 * n)
+        Zm = float(xz[:, 1].mean())
+        xy = front_xy(q, Zm)
+        xs = (xy[:, 0] - xy[0, 0]) / (xy[-1, 0] - xy[0, 0])
+        ts = (xz[:, 0] - xz[0, 0]) / (xz[-1, 0] - xz[0, 0])
+        order = np.argsort(xs)
+        Y = np.interp(ts, xs[order], xy[order, 1])
+        return np.stack([xz[:, 0], Y, xz[:, 1]], 1)
+
+    n_u, n_v = P['n_u'], P['n_v']
+    E_rear = edge(rear_t, top_f, n_v)          # v from axis to the side, at the rear
+    E_front = edge(foot_t, foot_f, n_v)        # v from axis to the side, at the front
+    # the shut line: plan from above, height from the pillar seam seen from the front, matched along its own run (X then Y)
+    xz = resample(top_xz(shut_t), n_u); q = resample(seam_f, n_u)
+    E_side = np.stack([xz[:, 0], front_xy(q, xz[:, 1])[:, 1], xz[:, 1]], 1)
+    # correction of the front heights on the side view (the pinhole reads 2 cm low at the top, 2 mm at the low corner): Y' = a + b Y
+    yl_rc = float(left_zy(np.array([[1165.6, 623.8]]))[0, 1]); yl_lc = float(left_zy(np.array([[1008.3, 782.0]]))[0, 1])
+    yl_ax = float(left_zy(np.array([[1063.5, 614.5]]))[0, 1])                   # V_002: the roof corner on the axis, seen from the side, as a third point
+    fy = np.array([E_side[0, 1], E_side[-1, 1], E_rear[0, 1]]); ly = np.array([yl_rc, yl_lc, yl_ax])
+    b_, a_ = np.polyfit(fy, ly, 1)                                                # least squares on the three corners
+    resid = (ly - (a_ + b_ * fy)).tolist()
+    for E in (E_rear, E_front, E_side):
+        E[:, 1] = a_ + b_ * E[:, 1]
+    # the middle line: height from the side view (read part), carried straight down its own slope to the foot on the axis
+    zy = left_zy(crown_l)[::-1]                                                  # rear -> front
+    z0, z1 = E_rear[0, 2], E_front[0, 2]
+    zs = np.linspace(z0, z1, n_u)
+    seen = zs <= zy[:, 0].max()
+    Ym = np.interp(zs, zy[:, 0], zy[:, 1])
+    k = zy[-40:]; sl_ = np.polyfit(k[:, 0], k[:, 1], 1)[0]
+    Ym[~seen] = zy[-1, 1] + sl_ * (zs[~seen] - zy[-1, 0])
+    E_mid = np.stack([np.zeros(n_u), Ym, zs], 1)
+    # Coons patch: C0 = middle line (v 0), C1 = shut line (v 1), D0 = rear edge (u 0), D1 = foot (u 1)
+    C0, C1, D0, D1 = E_mid, resample(E_side, n_u), E_rear, E_front
+    # ends must meet: the patch is built on the corners of the edges
+    U, Vv = np.meshgrid(np.linspace(0, 1, n_u), np.linspace(0, 1, n_v), indexing='ij')
+    Su = (1 - Vv)[..., None] * C0[:, None, :] + Vv[..., None] * C1[:, None, :]
+    Sv = (1 - U)[..., None] * D0[None, :, :] + U[..., None] * D1[None, :, :]
+    P00, P01, P10, P11 = D0[0], D0[-1], D1[0], D1[-1]
+    B = ((1 - U) * (1 - Vv))[..., None] * P00 + ((1 - U) * Vv)[..., None] * P01 + (U * (1 - Vv))[..., None] * P10 + (U * Vv)[..., None] * P11
+    G = Su + Sv - B
+    gaps = {'mid_rear': float(np.linalg.norm(C0[0] - D0[0])), 'mid_front': float(np.linalg.norm(C0[-1] - D1[0])),
+            'side_rear': float(np.linalg.norm(C1[0] - D0[-1])), 'side_front': float(np.linalg.norm(C1[-1] - D1[-1]))}
+    # guides: one section per u (axis -> side), polylines
+    out = pdir / 'components' / P['assembly'] / 'houdini'
+    out.mkdir(parents=True, exist_ok=True)
+    lines, n = ['# 12 November 2026: Windshield3D_V_001.py, sections of the windscreen glass (left half), car frame'], 0
+    for i in range(n_u):
+        for p in G[i]:
+            lines.append('v %.6f %.6f %.6f' % tuple(p))
+        lines.append('l ' + ' '.join(str(n + j + 1) for j in range(n_v)))
+        n += n_v
+    (out / 'guides_symmetric.obj').write_text('\n'.join(lines) + '\n')
+    checks = {
+        'rear_corner_side_vs_top': {'top_Z': float(E_rear[-1, 2]), 'left_Z': float(left_zy(np.array([[1165.6, 623.8]]))[0, 0])},
+        'low_corner_side_vs_top': {'top_Z': float(E_side[-1, 2]), 'left_Z': float(left_zy(np.array([[1008.3, 782.0]]))[0, 0])},
+        'roof_corner_on_axis_side_vs_top': {'top_Z': float(E_rear[0, 2]), 'left_Z': float(left_zy(np.array([[1063.5, 614.5]]))[0, 0])},
+        'middle_line_end_vs_foot_on_axis': {'middle_line_carried_Y': float(Ym[-1]), 'foot_front_Y': float(E_front[0, 1])},
+        'half_width_low_corner': {'top_X': float(E_side[-1, 0]), 'front_X_at_its_depth': float(front_xy(np.array([[1925.2, 699.5]]), E_side[-1, 2])[0, 0])},
+        'edge_gaps_m': gaps,
+        'front_height_correction': {'a': a_, 'b': b_, 'residuals_m': resid, 'why': 'the pinhole of the front view reads the glass lower than the side view (2 cm at the top, 2 mm at the low corner): one linear correction, least squares on three corners (rear corner, low corner, roof corner on the axis; V_002)'},
+    }
+    par = {'schema': 'zenray-meshes/windshield3d@1', 'date': V5.now(), 'component': P['cid'], 'drawing': ver, 'test': True,
+           'test_note': 'asked by Matthieu on 12 November 2026 before his verdict on the drawing (V9 not given): a test of the global form, not a validation; V_003: side of the glass seen from the front = the seam (his second green line)', 'script': 'Windshield3D_V_003.py',
+           'params': P, 'front_axle_z': zf, 'top_front_axle_x': xfa, 'checks': checks,
+           'hypotheses': ['thickness 8 mm (not read)', 'the middle line below the wiper (Z %.3f to %.3f m) carried straight on the slope of its last 20 read pixels' % (zy[:, 0].max(), z1),
+                          'the height of each edge across the car taken from the front view, matched to the plan by its share of the run along X (the front view reads the half widths 8 % narrower than the view from above)',
+                          'the surface between the edges: a Coons patch (no section of the glass is seen in any view)'],
+           'corners': {'rear_axis': E_rear[0].tolist(), 'rear_corner': E_rear[-1].tolist(), 'low_corner': E_side[-1].tolist(), 'front_axis': E_front[0].tolist()}}
+    V5.jsave(out / 'params_symmetric.json', par)
+    print(json.dumps(checks, indent=1)); print('corners', json.dumps(par['corners']))
+    print('guides', out / 'guides_symmetric.obj', G.shape)
+
+
+if __name__ == '__main__':
+    kw = dict(a.split('=', 1) for a in sys.argv[2:])
+    main(sys.argv[1], kw.get('drawing', 'V_022'))
