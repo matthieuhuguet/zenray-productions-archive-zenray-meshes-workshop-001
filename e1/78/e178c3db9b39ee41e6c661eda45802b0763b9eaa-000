@@ -1,0 +1,51 @@
+# PromptGrid V6 (Proxy-Guided 5-View Orthographic Generation & Isolation Spec)
+
+Horodatage : 14 November 2026, 04:26 CET
+Objectif : Éliminer la dérive de perspective, l'inversion avant/arrière et les fuites de silhouette sur les planches 5 vues (`Front`, `Back`, `Left`, `Top`, `Bottom`), comme l'écart mesuré `Bottom IoU 0,4842` sur `Arm_Cuff`.
+
+## 1. Principe Proxy-First (avant tout appel Gemini / image)
+
+Avant de demander à Gemini les 5 vues finales d'un composant isolé :
+1. Construire un volume proxy minimal (cage boîte/tube courbé/section elliptique issue des mesures 2D initiales ou de la vue maître) dans Houdini / Python.
+2. Rendre les **2 cartes guides orthographiques par vue** sur grille `[Front | Back | Left | Top | Bottom]` :
+   - **Carte Depth + Silhouette (Proxy Mask + Z-Depth)** : verrouille le cadre, les proportions exactes et la ligne d'horizon à l'échelle 1:1 sur toutes les vues.
+   - **Carte Normales / Orientation (Normal World)** : interdit les retournements d'axe (notamment `Bottom` vs `Top` et `Left` vs `Right`).
+3. Joindre la référence isolée détourée (entourée sur l'image de départ par masque propre) ET la grille guide Proxy lors de la génération image.
+
+## 2. Prompt canonique V6 (5 vues verrouillées par archétype)
+
+### Bloc invariant (commun aux 4 archétypes A, B, C, D)
+
+```text
+Generate a 5-view ORTHOGRAPHIC technical turnaround sheet of ONLY the isolated component shown in red outline on Reference Image 1, strictly aligned inside the 5 wireframe/depth slots of Proxy Guide Image 2.
+Views in exact order (left to right or 3+2 strict labeled grid):
+1. FRONT (0 deg orthographic, zero perspective foreshortening)
+2. BACK (180 deg exact mirrored silhouette against FRONT)
+3. LEFT PROFILE (90 deg exact side orthographic, height strictly matches FRONT and BACK)
+4. TOP (90 deg top-down orthographic, width strictly matches FRONT)
+5. BOTTOM (90 deg bottom-up orthographic, exact footprint inverse of TOP)
+
+Hard constraints:
+- TRUE ORTHOGRAPHIC PROJECTION ONLY (focal length = infinity, parallel projection rays).
+- Background: flat uniform neutral #808080 mid-gray, ZERO cast shadows, ZERO ground plane, ZERO props or neighboring parts.
+- Material: neutral matte light-gray clay (#B8B8B8) with crisp ambient occlusion in crevices ONLY, no painterly lighting, no specular blowout, no text outside cell labels.
+- Alignment lock: top-most and bottom-most silhouette extrema of FRONT, BACK, and LEFT must sit on exact identical horizontal scanlines (+/- 2 px).
+- Width extrema of FRONT, TOP, and BOTTOM must sit on exact identical vertical scanlines (+/- 2 px).
+```
+
+### Complément par archétype
+
+- **Archétype A (Coque mince / Arm_Cuff)** : `Show exact uniform wall thickness along exposed rim cuts and clean underside curvature in BOTTOM view.`
+- **Archétype B (Pièce usinée / encoches / Arm_Flare)** : `Preserve crisp bevel breaks, recessed slots, and sharp crease ridges without rounding out internal corners.`
+- **Archétype C (Organique / membre / corps)** : `Maintain neutral T/A anatomy pose, relaxed muscle landmarks visible symmetrically in clay shading, no clothing folds invented if not visible on ref.`
+- **Archétype D (Arbre & feuillage)** : `Render trunk + primary/secondary bark scaffold CLEAN and BARE of leaves in panel set A (Scaffold), and isolated repeatable flat frond/leaf clusters against #808080 in panel set B (Foliage Cards).`
+
+## 3. Portes de contrôle automatique `IsoGate 2.0` (avant validation CMY)
+
+Chaque planche 5 vues passe 5 vérifications mesurées en < 150 ms avant d'entrer dans CMY 2.0 :
+
+1. **`scanline_height_lock`** : `|h(Front) - h(Back)| <= max(2, round(0.015 * h))` et `|h(Front) - h(Left)| <= max(2, round(0.015 * h))`.
+2. **`scanline_width_lock`** : `|w(Front) - w(Top)| <= max(2, round(0.015 * w))` et `|w(Front) - w(Bottom)| <= max(2, round(0.015 * w))`.
+3. **`silhouette_leak_guard`** : tolérance `max(1, radius // 3)` (corrige le bug V5 sur `OrthoViews.py:299` qui laissait passer de petites saillies isolées ou du bruit fond gris).
+4. **`bottom_inversion_guard`** : IoU entre silhouette `Bottom` et miroir vertical de `Top` `>= 0.85` (détecte immédiatement une dérive d'axe avant d'envoyer à Houdini, aurait bloqué l'erreur `0,4842` de `Arm_Cuff` dès l'étape 5 vues).
+5. **`bg_uniformity_guard`** : variance luminance hors masque `< 6.0` et absence de texte ou ombre portée parasite hors cadre.

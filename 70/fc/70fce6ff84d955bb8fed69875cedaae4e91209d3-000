@@ -1,0 +1,67 @@
+# Deep Research 07: Exact Bridge Between `zenray-meshes` and `zenray-houdini` (`Geo`, `UV`, `Height`)
+
+**Timestamp:** `14 November 2026, 04:32 CET`  
+**Audit Scope:** Cross-skill inspection across [/Users/zenray/.claude/skills/zenray-meshes/](/Users/zenray/.claude/skills/zenray-meshes/SKILL.md) and [/Users/zenray/.claude/skills/zenray-houdini/](/Users/zenray/.claude/skills/zenray-houdini/SKILL.md)  
+**Verified Zero-Reuse Baseline:** `rg -n "GeoAudit|ContactGraph|HiddenFaces|ZenRayUV|HeightInputs|PerIslandAlign|HeightTo5Maps|CleanPropGeometry|DelightBaseColor|CheckAiHeight" /Users/zenray/.claude/skills/zenray-meshes/scripts/` returned **0 matches**. Every downstream verification and PBR texturing engine already built by Matthieu is absent from the `zenray-meshes` export path.
+
+---
+
+## 1. Executive Summary
+
+`zenray-meshes` stops at raw VEX `Build*.py` SOP/HDA geometry and an unlinked UI `/edit` preview, while `zenray-houdini` already provides a hardened, self-tested downstream stack covering geometric quality assurance, straight artist-cut UV unwrapping (`0.999` threshold), reference delighting without an image model call, per-island 2D height alignment (`0.99944`), and Copernicus 5-map PBR generation (`BaseColor`, `Normal`, `Height`, `Roughness`, `AO`, `Metallic`, `ORM`).
+
+Connecting the two eliminates three major sources of manual rework:
+1. **Lit-reference bias in CMY extraction:** Directional studio lighting in `master.png` creates asymmetric highlight/shadow gradients across symmetric edges, corrupting `BuildYellowEdge.py` and `BuildRimSym.py` ridge weights. Running [`DelightBaseColor.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/DelightBaseColor.py) + [`CheckAiHeight.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/CheckAiHeight.py) neutralizes light gradients analytically before edge extraction and extracts an unlit `BaseColor` directly.
+2. **Broken meshes reaching UV/Unreal:** Passing raw VEX extrusion shells without [`GeoAudit.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/GeoAudit.py), [`ContactGraph.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/ContactGraph.py), and [`HiddenFaces.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/HiddenFaces.py) leaks open seams, flipped winding, floating hardware, and buried faces wasting UV texel budget.
+3. **Manual UV seams and arbitrary texel density:** Writing intrinsic `(gu, gv)` quad coordinates plus CMY Yellow crease groups (`zrm_seam_suggest` / `zrm_keep_edge`) on the component geometry lets [`HeadlessM1.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/zenray_uv/HeadlessM1.py) compute square `1:1` UVs (`1024 px/m` prop, `2048 px/m` character, hard cap `4096 px`, `8192 px` banned) and hand off cleanly to [`HeightInputs.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/zenray_uv/HeightInputs.py), [`PerIslandAlign.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/PerIslandAlign.py), [`HeightToBaseColor.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/HeightToBaseColor.py), and [`HeightTo5MapsCop.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/HeightTo5MapsCop.py).
+
+---
+
+## 2. Exact Reuse Matrix (`zenray-houdini` Modules -> `zenray-meshes` Stages)
+
+| Stage in `zenray-meshes` | Exact Reusable Module in `zenray-houdini` | Verified Function / CLI Contract | Concrete Payoff Measured |
+|---|---|---|---|
+| **Pre-CMY Reference Prep** | [`DelightBaseColor.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/DelightBaseColor.py) | `delight(lin, height=None)` (tercile soft mask + deg-3 polynomial divide + Retinex exposure) | Strips directional shading while keeping `0.9999` fine detail (`selftest: 0.464 -> 0.736`) |
+| **Ref / Depth Light Check** | [`CheckAiHeight.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/CheckAiHeight.py) | `measure(img)` -> `bright_share <= 0.15`, `coherence <= 0.15`, `seam <= 1.5` | Flags directional raking light (`0.24..0.63`) vs neutral relief (`0.03..0.06`) |
+| **Height Uniformiser** | [`RollingBallTop.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/RollingBallTop.py) & [`Delight.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/Delight.py) | `uniformise(a)` + `delight(a, sigma_px=64)` | Removes low-frequency height lumps while keeping sharp pores/grooves |
+| **Solid / Winding Gate** | [`GeoAudit.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/GeoAudit.py) | `audit(geo, group_attr='name', tol=1e-4)` & `shape_error(new, old)` | Asserts `duplicate_points==0`, `open_edges==0`, `nonmanifold==0`, `flipped_pieces==0` |
+| **Assembly Contact Gate** | [`ContactGraph.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/ContactGraph.py) | `contact_graph(..., touch=1e-3)` | Guarantees single connected component (`floating == []`, gap `<= 1 mm`) |
+| **Buried Texel Audit** | [`HiddenFaces.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/HiddenFaces.py) | `hidden_faces(geo, group_attr='name', offset=1e-3)` | Counts faces enclosed inside neighbor solids wasting UV area |
+| **Direct Component UV** | [`HeadlessM1.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/zenray_uv/HeadlessM1.py) | `hython HeadlessM1.py --file comp.bgeo.sc --kind prop|character --seams zrm_seam_suggest` | Produces `0.999+` upright square-tile UVs with `0` border staircases |
+| **PBR Sheet Packaging** | [`HeightInputs.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/zenray_uv/HeightInputs.py) | `build(runs, asset)` -> `uv_sheet.png`, `uv_sheet_numbers.png`, `six_views.png`, `reference.png` | Packages UV templates + 6 views + prompt bundle per component |
+| **AI Height Registration** | [`PerIslandAlign.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/PerIslandAlign.py) | `--height ai.png --runs runs --asset ZRUV_Comp` -> `remap.png` (`border_score >= 0.999`) | Aligns every UV island independently (`0.99944` proven on Arch) |
+| **Albedo Fit & 5 Maps** | [`HeightToBaseColor.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/HeightToBaseColor.py) & [`HeightTo5MapsCop.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/height/HeightTo5MapsCop.py) | `build(net_path, out_dir, stem, px_per_m=..., relief_depth_m=...)` | Outputs physically scaled `BaseColor`, `Normal`, `Height`, `Roughness`, `AO`, `Metallic`, `ORM` |
+
+---
+
+## 3. Geometry Export Contract Required by `zenray-houdini`
+
+To bridge `zenray-meshes` directly into `zenray-uv` and `zenray-height` without manual cleanup in Houdini, every exported component `.bgeo.sc` / `.obj` must carry five exact attributes (formalized in [`CMY2_ComponentContract_Schema.json`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/proposals/patches/CMY2_ComponentContract_Schema.json)):
+
+1. **Primitive String Attribute `s@name`:** Exact component ID matching `Kit.json` (`Arm_Flare`, `Arm_Cuff`, `Oak_Bark_Main`), never blank or merged under `'default'`.
+2. **Vertex UV Seed Attribute `uv` (Intrinsic `(gu, gv)`):** Generated directly during structured Coons patch or Bishop sweep construction so `HeadlessM1` starts with an undistorted straight quad strip layout when `--pattern` is absent, guaranteeing zero border staircases.
+3. **Edge Group `zrm_seam_suggest`:** Automatically populated from **CMY 2.0 Yellow ridges** and open shell cap rings (`> 35 deg` dihedral creases + Archetype D bark split seam + Archetype C underside keel line), passed straight to `HeadlessM1.py --seams zrm_seam_suggest`.
+4. **Edge Group `zrm_keep_edge`:** Hard creases (archetype bevel flanks, armor trim chamfers) that `Shrink/Collapse` must never weld away and UV unfolder must align along `U`/`V` axes.
+5. **World-Scale Calibrator Attribute `s@scale_ref = 'zenray_mannequin_1.76m'`:** Enforces real metre scale so `HeadlessM1` computes true texel density (`1024 px/m` prop, `2048 px/m` character) and `HeightTo5MapsCop` derives exact `normal_scale = relief_depth_m * px_per_m * 2.0 / W` and `ao_heightscale = relief_depth_m * px_per_m`.
+
+---
+
+## 4. Handling Asymmetric Shading in Reference Views (Pre-CMY Delighting)
+
+Real component crops (`14_ArmGuard/components/Arm_Flare/cmy/C_005/master.png`) carry baked studio lighting (bright specular streak on one cheek, soft shadow falloff across the bevel). Two immediate bugs arise in CMY 1.0:
+- Yellow Sobel/DoG extraction triggers more strongly on the high-contrast lit rim than on the identical mirrored shadow rim, skewing symmetry estimation and `field_u` ridge confidence.
+- Feeding lit `master.png` into downstream texturing bakes directional shadows twice (once in `BaseColor`, once in the game engine light).
+
+**Solution Tested in [`poc5_delight_and_uv_height_bridge.py`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc5_delight_and_uv_height_bridge.py):**
+- Convert foreground `master.png` (inside `mask.png`, background filled with neutral mean grey to prevent boundary ringing!) through `DelightBaseColor.delight` with safe mask-bounded exposure normalization.
+- Compare `CheckAiHeight.measure` directional coherence and Left-vs-Right bilateral symmetry error (`|I(x) - I(2*cx - x)|` inside `mask & flip(mask)`) BEFORE and AFTER delighting.
+- Extract `DelightBaseColor` + straight-strip `HeadlessM1`-compatible UV sheet + Copernicus formula `BaseColor`, `Height`, `Normal`, `Roughness`, `AO` (`ORM`) directly on the PoC 2 `Arm_Cuff` & PoC 4 `Forearm_Limb` meshes.
+
+---
+
+## 5. Exact Pitfall Guards When Connecting the Two Skills
+
+1. **Resolution Ceiling Rule (`zenray-uv`):** Never emit `8192` sheets. Default `2048 px` per tile (`4096 px` hard ceiling only for multi-piece heroes).
+2. **Staircase UV Ban (`zenray-uv`):** Rectangular border strips (`Arm_Cuff` trim bands, bevel walls, cylinder bark barrels) MUST be aligned orthogonally along `U`/`V` axes (`straighten` pass) so pixel-aligned relief maps from Copernicus do not alias on diagonal edges.
+3. **Foreground Mask Padding Before Delighting:** Applying global `gaussian_filter` on `master.png` without padding background pixels smears background brightness (`105`) into object rims. Pad outside `mask.png` via nearest-foreground extension before calling `DelightBaseColor.relight`.
+4. **Houdini Winding Sign Convention:** Houdini inward normals produce `volume < 0` in `GeoAudit.py` and invert extruded thickness. Always run `GeoAudit.audit` immediately after mesh build and reverse winding automatically if `flipped_pieces > 0`.

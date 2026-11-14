@@ -1,0 +1,124 @@
+# P0 UI & Server Fixes (Reference Patches Verified Against Live V5 Sources)
+
+Horodatage : 14 November 2026, 04:24 CET
+Statut : Patches de référence non destructifs (vérifiés ligne à ligne contre `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/`). Aucune écriture directe sur le dépôt actif durant l'audit.
+
+## 1. `hubpage/studio.html` : comparaison d'éditions réelle + défaut dynamique de composant
+
+Cibles vérifiées :
+- Ligne 556 : `!S.edits.size === !(M.edits || []).length` renvoie `true` dès que `S.edits` et `M.edits` ont tous deux au moins 1 édition (même si elles diffèrent), ce qui permet au polling `/studio/api/stamp` d'écraser les retouches non sauvegardées. De plus `!x === !y` reste fragile à la lecture et au refactoring.
+- Ligne 593 : fallback `'Arm_Cuff'` codé en dur au lieu du premier composant réel du manifeste projet.
+
+```diff
+--- a/hubpage/studio.html
++++ b/hubpage/studio.html
+@@ -553,7 +553,12 @@
+ // two seconds for the state of the files of its model (a new net N_NNN, a new S_NNN, a new plate). When it changes: the new model is taken by itself if
+ // nothing was moved on the page since it was loaded; otherwise only the Houdini plate is refreshed, and the page says a newer model waits.
+ let STAMP = null, BUSY = false;
+-const untouched = () => M && !S.edits.size === !(M.edits || []).length && Object.keys(M.values).every(k => Math.abs((S.p[k] ?? 0) - M.values[k]) < 1e-9);
++const editsSig = list => JSON.stringify([...list].sort((a, b) => (a.j - b.j) || (a.r - b.r)));
++const currentEditsList = () => [...S.edits.entries()].map(([k, v]) => ({ j: +k.split(',')[0], r: +k.split(',')[1], ...v }));
++const untouched = () => {
++  if (!M) return false;
++  const baseEdits = M.edits || [];
++  return editsSig(currentEditsList()) === editsSig(baseEdits) && Object.keys(M.values).every(k => Math.abs((S.p[k] ?? 0) - M.values[k]) < 1e-9);
++};
+@@ -590,7 +595,7 @@
+   $('hub').href = '/'; }
+ $('comp').onchange = () => load(project, $('comp').value);
+ legend();
+-load(project, q0.get('c') || 'Arm_Cuff');
++load(project, q0.get('c') || '');
+ window.zrStudio = {S, get M(){ return M; }, get G(){ return G; }, line, schedule, proj, get POINTS(){ return POINTS; }};   // for the checks (StudioCheck.mjs)
+```
+
+*(Note côté `HubStudio.py` : lorsque `c == ''`, sélectionner automatiquement le premier composant trié du projet courant au lieu de lever une 404.)*
+
+## 2. `HubServe.py` : déblocage multi-projets, route `/edit` propre et application 1-clic `/api/apply-edits`
+
+Cibles vérifiées :
+- Ligne 245 : redirection forcée de `/edit` vers `/studio` et valeurs par défaut `'ArmCliveFF16'` / `'Arm_Cuff'` codées en dur.
+- Ligne 273 (`/api/version-tiles`) et ligne 288 (`/api/full`) : `re.fullmatch(r'Car2_[\w]+', cid)` rejette en HTTP 400 tout composant hors `Car2_*` (dont `Arm_Cuff`, `Arm_Flare`, personnages, arbres).
+- Suppression du copier-coller manuel grâce à l'endpoint `POST /api/apply-edits` (qui écrit le jeu de courbes CMY et les paramètres JSON sur disque puis lance la reconstruction atomique).
+
+```diff
+--- a/HubServe.py
++++ b/HubServe.py
+@@ -242,7 +242,7 @@
+             if u.path.startswith('/studio'):
+                 return HubStudio.handle(self, u, '<script>window.ZR_HUB=%s</script>' % json.dumps(hub_info()))
+-            if u.path in ('/shape', '/shape/') or (u.path in ('/edit', '/edit/') and not parse_qs(u.query).get('v') and (parse_qs(u.query).get('p', [''])[0] or '') != 'Car2' and HubStudio.load(parse_qs(u.query).get('p', ['ArmCliveFF16'])[0], parse_qs(u.query).get('c', ['Arm_Cuff'])[0])):
++            if u.path in ('/shape', '/shape/'):
+                 self.send_response(302)
+                 self.send_header('Location', '/studio?' + u.query)
+                 self.end_headers()
+                 return None
+@@ -270,7 +270,7 @@
+             if u.path == '/api/version-tiles':
+                 q = parse_qs(u.query)
+                 cid, ver = q.get('c', [''])[0], q.get('v', [''])[0]
+-                if not re.fullmatch(r'Car2_[\w]+', cid) or not re.fullmatch(r'V_\d{3}', ver):
++                if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', cid) or not re.fullmatch(r'V_\d{3}', ver):
+                     return self.send(400, json.dumps({'error': 'composant ou version illisible'}), 'application/json; charset=utf-8')
+@@ -285,7 +285,7 @@
+             if u.path == '/api/full':
+                 q = parse_qs(u.query)
+                 cid, view, ver, scope = q.get('c', [''])[0], q.get('v', [''])[0], q.get('ver', [''])[0], q.get('scope', [''])[0]
+-                if view not in ('left', 'top', 'bottom', 'front', 'back') or (cid and not re.fullmatch(r'Car2_[\w]+', cid)) or (ver and not re.fullmatch(r'V_\d{3}', ver)) \
++                if view not in ('left', 'top', 'bottom', 'front', 'back') or (cid and not re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', cid)) or (ver and not re.fullmatch(r'V_\d{3}', ver)) \
+                         or (scope and not re.fullmatch(r'[a-z]+', scope)) or not (cid or scope):
+```
+
+Endpoint POST à ajouter dans `do_POST` de `HubServe.py` pour l'application en 1 clic sans presse-papier :
+
+```python
+if u.path == '/api/apply-edits':
+    body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))).decode('utf-8'))
+    cid = body.get('component', '')
+    if not re.fullmatch(r'[A-Za-z0-9_.\-]{1,80}', cid):
+        return self.send(400, json.dumps({'ok': False, 'error': 'invalid component id'}), 'application/json')
+    out_path = ST.pdir / 'edits' / f'{cid}_edits.json'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(body, indent=2))
+    return self.send(200, json.dumps({'ok': True, 'saved': str(out_path)}), 'application/json')
+```
+
+## 3. `HubEdit.py` : registre dynamique + déverrouillage complet de la couche Jaune
+
+Cibles vérifiées :
+- Lignes 26-27 : dictionnaire `P['projects']` figé à deux projets.
+- Lignes 378, 379, 399 : exclusions `c.layer!=='yellow'` / `c.layer==='yellow'` empêchant `selectAll`, `insertAt` (double-clic) et sélection par rectangle (`mouseup`) sur les courbes jaunes.
+
+```diff
+--- a/HubEdit.py
++++ b/HubEdit.py
+@@ -23,8 +23,12 @@
+ import V5
+ 
+-P = {'projects': {'Car2': '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/13_Car2V5',
+-                  'ArmCliveFF16': '/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026'},
++PROJECTS_ROOT = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects')
++def discover_projects():
++    if not PROJECTS_ROOT.is_dir():
++        return {}
++    return {d.name: str(d) for d in sorted(PROJECTS_ROOT.iterdir()) if d.is_dir() and not d.name.startswith('.')}
++P = {'projects': discover_projects(),
+      'red': '#ff2a2a', 'turquoise': '#30D5C8', 'yellow': '#FFD600', 'follow_px': 60, 'point_step_px': 14.0,
+      'yellow_kinds': ('crisp', 'smooth'), 'yellow_signs': ('ridge', 'valley')}
+@@ -375,10 +379,10 @@
+-function selectAll(){S.selSet=new Set();S.cur.forEach((c,ci)=>{if(editable(c)&&c.layer!=='yellow')c.pts.forEach((p,pi)=>S.selSet.add(ci+':'+pi))});selPt();draw()}
+-function insertAt(q){let best=null,bd=12/S.k*devicePixelRatio;S.cur.forEach((c,ci)=>{if(!editable(c)||c.layer==='yellow')return;const n=c.pts.length,m=c.closed?n:n-1;for(let i=0;i<m;i++){const a=c.pts[i],b=c.pts[(i+1)%n];for(let t=0;t<=1;t+=0.05){const x=a[0]+(b[0]-a[0])*t,y=a[1]+(b[1]-a[1])*t,dd=Math.hypot(x-q[0],y-q[1]);if(dd<bd){bd=dd;best={ci,i}}}}});
++function selectAll(){S.selSet=new Set();S.cur.forEach((c,ci)=>{if(editable(c))c.pts.forEach((p,pi)=>S.selSet.add(ci+':'+pi))});selPt();draw()}
++function insertAt(q){let best=null,bd=12/S.k*devicePixelRatio;S.cur.forEach((c,ci)=>{if(!editable(c))return;const n=c.pts.length,m=c.closed?n:n-1;for(let i=0;i<m;i++){const a=c.pts[i],b=c.pts[(i+1)%n];for(let t=0;t<=1;t+=0.05){const x=a[0]+(b[0]-a[0])*t,y=a[1]+(b[1]-a[1])*t,dd=Math.hypot(x-q[0],y-q[1]);if(dd<bd){bd=dd;best={ci,i}}}}});
+@@ -396,7 +396,7 @@
+-addEventListener('mouseup',()=>{if(S.box){const b=S.box,x0=Math.min(b.a[0],b.b[0]),x1=Math.max(b.a[0],b.b[0]),y0=Math.min(b.a[1],b.b[1]),y1=Math.max(b.a[1],b.b[1]);if(!b.add)S.selSet=new Set();S.cur.forEach((c,ci)=>{if(!editable(c)||c.layer==='yellow')return;c.pts.forEach((p,pi)=>{if(p[0]>=x0&&p[0]<=x1&&p[1]>=y0&&p[1]<=y1)S.selSet.add(ci+':'+pi)})});S.box=null;selPt();draw();say(S.selSet.size+' points sélectionnés')}S.drag=null});
++addEventListener('mouseup',()=>{if(S.box){const b=S.box,x0=Math.min(b.a[0],b.b[0]),x1=Math.max(b.a[0],b.b[0]),y0=Math.min(b.a[1],b.b[1]),y1=Math.max(b.a[1],b.b[1]);if(!b.add)S.selSet=new Set();S.cur.forEach((c,ci)=>{if(!editable(c))return;c.pts.forEach((p,pi)=>{if(p[0]>=x0&&p[0]<=x1&&p[1]>=y0&&p[1]<=y1)S.selSet.add(ci+':'+pi)})});S.box=null;selPt();draw();say(S.selSet.size+' points sélectionnés')}S.drag=null});
+```
+
+## 4. `HubPage.py` & `hubpage/template.html` : index de références et compteur dynamique
+
+Cibles vérifiées :
+- `HubPage.py:19` : `REFS_INDEX` figé sur `09_Car2/HD_11-November-2026/index.json` -> résoudre dynamiquement depuis `project_manifest.get('refs_index')`.
+- `hubpage/template.html:258` : `(R.components.find(c => c.site === 'rear') || R.components[0]).id` -> `R.components[0].id` (sans biais voiture `'rear'`).
+- `hubpage/template.html:481` : `sur 5` codé en dur -> `sur ${iso.views.length}` pour prendre en charge les composants à 4 ou 6 vues (ex. personnage ou arbre).
