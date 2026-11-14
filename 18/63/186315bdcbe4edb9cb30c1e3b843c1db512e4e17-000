@@ -1,0 +1,45 @@
+# Dossier 11 (14 November 2026, 05:01 CET): Audit reel 07_Manny (45 pieces humanoide) et pipeline Relief Vectorielle vers UV PBR (vs 639K polygones)
+
+## 1. Constat terrain : deux chantiers live inspectes sur disque le 14 November 2026
+
+L'inspection directe des donnees reelles sur disque explique a la fois pourquoi un personnage segmente a `99.944 %` s'est fige avant la 3D dans `07_Manny`, et pourquoi la gravure de motifs en cours sur `14_ArmGuard_13-November-2026` (`RunRelief.py` / `MotifLines.py` / `CmyAssemble.py`, ecrits entre `04:13` et `04:29 CET`) explose le poids geometrique tout en laissant des marches et des bavures sur les bords.
+
+| Cible mesuree sur disque | Constat chiffre exact | Goulot racine identifie |
+|---|---|---|
+| [`07_Manny/06_checks/truth.json`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/07_Manny/06_checks/truth.json) | `accuracy = 99.51 %`, `accuracy_2px = 99.944 %`, `outline_iou = 97.056 %`, `45` instances / `24` familles | `04_received/` et `05_models/` vides : absence des Archetypes B (`Bishop Tube`) et C (`Dual-Flank`) dans `v5` |
+| [`07_Manny/02_masks/mc.json`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/07_Manny/02_masks/mc.json) | `24` familles avec `size_m` deja en metres (`1.76 m` total), ex. `MANNY_throat_plate` vu uniquement en `left` | Occlusion Front (`parts_missed: [2]`) non levee automatiquement par reconstruction multi-vue |
+| [`Arm_Forearm/net/N_006/sym/Grid_plate.obj`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/net/N_006/sym/Grid_plate.obj) | `9,660,435` octets (`9.21 MiB`), `159,794` sommets, `159,796` faces, **`vt = 0`** | Maillage deja sur-subdivise, aucune coordonnee UV (`vt = 0`), aucune passerelle vers `zenray-uv` |
+| [`Arm_Forearm/motifs/R_002/plate_relief.obj`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/motifs/R_002/plate_relief.obj) | `168,362,112` octets (`160.56 MiB`), `639,182` sommets, `639,184` faces, **`vt = 0`** | Subdivision x4 + deplacement vertex orthogonal Front XY (`u=@P.x/W, v=1+@P.y/H`) |
+| [`Arm_Forearm/motifs/M_001/motifs.json`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/motifs/M_001/motifs.json) | `301` courbes subpixel (`265` rouges + `36` jaunes, resolution `0.5 px`), mais ignorees pour la 3D | `MotifLines.py` jette les polylignes vectorielles propres pour cuire un raster binaire `relief_height.png` |
+| [`assembly/A_002/assembly.obj`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/assembly.obj) | `44,550,164` octets (`42.49 MiB`), `764,362` sommets, `764,358` faces, **`vt = 0`** | Placement en pixels image Clive (`CmyAssemble.py`), penetration frontale de `Arm_Flare` dans `Arm_Forearm` |
+
+---
+
+## 2. Diagnostic visuel et mathematique de `RunRelief.py` (inspection `MV_003_relief` et `A_002`)
+
+L'inspection directe des rendus [`MV_003_relief_14-November-2026-0424/q_front.png`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/mesh_views/MV_003_relief_14-November-2026-0424/q_front.png), [`A_002/views/q_front.png`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/views/q_front.png) et [`A_002/views/q_back.png`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/views/q_back.png) montre quatre defauts precis mesures sur [`RunRelief.py`](/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/houdini/RunRelief.py) :
+
+1. **Etirement rasant `1 / n.z` sur les flancs courbes** : `RunRelief.py` lit la carte uniquement par projection frontale XY (`u = @P.x / W`, `v = 1.0 + @P.y / H`) des que `n.z > 0.2`. Sur les vrais sommets de `N_006/sym/Grid_plate.obj`, le facteur d'etirement atteint **`1.53x` en mediane (`P50`), `3.58x` au `P95` et `5.00x` au maximum**, ce qui etire les moulures courbes sur les flancs du brassard et coupe tout motif des que `n.z <= 0.2`.
+2. **Bavures sur l'arriere de la bordure (`q_back.png`)** : `24.12 %` des sommets avec `n.z > 0.2` se trouvent derriere le `Z` median de la coque (biseau de bordure et retours lateraux). Deplacing aveuglement sur `n.z > 0.2` projette des pics blancs et marches d'escalier a l'interieur du brassard en bas a gauche et a droite de `A_002/views/q_back.png`.
+3. **Sauts raster et rayures speculaires** : `MotifLines.py` cree `relief_height.png` avec une bande binaire dilatee (`0.6 + 0.4 * hm`), qui saute brutalement de `0` a `0.6` sur `1 px` et retient des reflets speculaires verticaux en haut du brassard ainsi que des points isoles. Subdiviser la geometrie jusqu'a `639,184` faces ne resout pas l'escalier tant que la source reste un plateau raster a `~1 px`.
+4. **Penetration inter-pieces dans `A_002`** : `CmyAssemble.py` cale chaque piece en pixels d'une vue de reference (`axis_depth_share = 0.9`) sans graphe de contact ni squelette porteur : sur `A_002/views/q_front.png`, la pointe avant de la coudiere `Arm_Flare` traverse la surface superieure de `Arm_Forearm`, tandis que `Arm_Cuff` montre l'escalier boolen de sa fente sommitale.
+
+---
+
+## 3. Solution : Routage 4 Archetypes pour `07_Manny` + Cuisson Vectorielle vers UV PBR (`PoC 9`)
+
+Le prototype [`poc9_manny_char_and_relief_pbr.py`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc9_manny_char_and_relief_pbr.py) prouve deux avancees sur les fichiers reels :
+
+### A. Routage complet des `45` pieces de `07_Manny` (echelle `1.76 m`)
+- **Archetype A (`Mirror Shell`)** : `6` familles, **`9` instances** (`head_half`, `neck_half`, `torso_front`, `torso_back`, `throat_plate`, `sole`).
+- **Archetype B (`Bishop Tube` / sections en coupe fermees)** : `15` familles, **`30` instances** (`shoulder_arm`, `elbow`, `forearm`, `thigh`, `shin`, `thumb_*`, `finger_*`).
+- **Archetype C (`Dual-Flank` asymetrique)** : `3` familles, **`6` instances** (`hand_back`, `palm`, `foot`).
+- **Verification de contact articulation (`shoulder_arm` / `forearm`)** : un ecart initial sous-seuil (`0.427 mm`) detecte par distance signee sur maillages fermes (`watertight = true`) est ajuste automatiquement a **`+1.50 mm` de jeu minimal** avant assemblage.
+- **Porte de completude multi-vues** : detection automatique que `MANNY_throat_plate` n'apparait que dans `left`, declenchant un basculement vers reconstruction locale par coupe `left` au lieu de bloquer Front.
+
+### B. Passage de `639,184` faces (`160.56 MiB`) a `3,600` quads UV PBR (`0.32 MiB`)
+- **Reechantillonnage a longueur d'arc uniforme** sur `Arm_Forearm` : `60 x 60 = 3,600` quads purs avec UVs bandes droites `HeadlessM1` (`vt = 3,721`), reduisant le maillage d'un facteur **`177.6x` en polygones** et **`499.3x` en taille OBJ** (`0.32 MiB`), avec une anisotropie UV horizontale de **`1.04x`** (contre **`3.58x` au P95** en projection Front `RunRelief`).
+- **Filtrage des `301` courbes de `M_001/motifs.json`** : rejet automatique de `111` fragments (`< 45 px` ou rayures speculaires verticales haut-centre), ne conservant que **`160` courbes rouges et `30` jaunes** structurelles.
+- **Cuisson vectorielle directe en espace UV (`1024 x 1024`)** : profil de biseau lisse C2 par champ de distance exact sur les polylignes, produisant `Height + Normal + AO Cavity` compatibles `HeightTo5MapsCop` sans aucune marche d'escalier ni bavure arriere (`q_back` vierge). Si un relief profond (`> 1.5 mm` de silhouette) exige une vraie geometrie finale, le deplacement se fait alors *dans l'espace UV du maillage retopologise* le long de `@N` filtre uniquement sur la coque externe (`island_face == "outer"`), jamais par projection Front `u=@P.x/W`.
+
+Preuve visuelle et metriques verifiees dans [`poc9_manny_and_relief_proof.png`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc9_manny_and_relief_proof.png), objet exporte avec UVs [`poc9_forearm_clean_m1.obj`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc9_forearm_clean_m1.obj), et module autonome [`VectorMotifReliefUV_ref.py`](file:///Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/proposals/patches/VectorMotifReliefUV_ref.py) (`selftest PASS`, `coherence = 0.11 <= 0.15`, `seam = 0.7577 <= 1.5`, `normal_z_mean = 0.9762`, montrant au passage que `CheckAiHeight.py` releve un `bright_share` eleve `0.5929` sur `M_001` et `0.5017` sur embossage positif, justifiant un mode `--mode embossed` pour les moulures saillantes d'armure).

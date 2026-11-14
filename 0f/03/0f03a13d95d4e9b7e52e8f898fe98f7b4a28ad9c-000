@@ -1,0 +1,159 @@
+#!/Users/zenray/.venvs/zenray-uv/bin/python
+"""
+VectorMotifReliefUV_ref.py (14 November 2026):
+  Executable reference module replacing RunRelief.py (Front-XY vertex displacement on 639,184 faces)
+  with filtered vector MotifLines -> uniform-arc HeadlessM1 quad mesh + UV-space C2 Height/Normal/AO
+  maps validated by zenray-houdini/scripts/height/CheckAiHeight.py checks.
+
+Usage:
+  /Users/zenray/.venvs/zenray-uv/bin/python VectorMotifReliefUV_ref.py --selftest
+"""
+import argparse
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+ZENRAY_HEIGHT_DIR = Path("/Users/zenray/.claude/skills/zenray-houdini/scripts/height")
+
+
+def filter_motifs(curves, img_w: int, img_h: int, min_len_px: float = 45.0):
+    """Filter specular vertical streaks near upper centerline and fragments shorter than min_len_px."""
+    kept_red, kept_yellow, rejected = [], [], []
+    for c in curves:
+        pts = np.asarray(c["pts"], dtype=np.float64)
+        if len(pts) < 2:
+            rejected.append(c.get("name", "short"))
+            continue
+        seg_len = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        dx = float(pts[:, 0].max() - pts[:, 0].min())
+        cx_norm = abs(float(pts[:, 0].mean()) / max(img_w, 1) - 0.5)
+        cy_norm = float(pts[:, 1].mean()) / max(img_h, 1)
+        is_top_spec = (cy_norm < 0.22 and cx_norm < 0.06 and dx < 12.0)
+        if seg_len < min_len_px or is_top_spec:
+            rejected.append(c.get("name", "noise"))
+        elif c.get("layer") == "red":
+            kept_red.append(pts)
+        else:
+            kept_yellow.append(pts)
+    return kept_red, kept_yellow, rejected
+
+
+def bake_uv_relief_maps(kept_red, kept_yellow, tex_size: int = 1024, crest_sigma: float = 3.2, edge_sigma: float = 1.8):
+    """Bake 16-bit Height, Tangent-Space Normal RGB, and Cavity AO strictly in uniform cylindrical UV space."""
+    all_pts = [p for p in (kept_red + kept_yellow) if len(p) > 0]
+    if not all_pts:
+        flat_h = np.full((tex_size, tex_size), 0.5, dtype=np.float32)
+        flat_n = np.zeros((tex_size, tex_size, 3), dtype=np.float32)
+        flat_n[..., 0] = 0.5
+        flat_n[..., 1] = 0.5
+        flat_n[..., 2] = 1.0
+        flat_ao = np.ones((tex_size, tex_size), dtype=np.float32)
+        return flat_h, flat_n, flat_ao
+
+    stacked = np.vstack(all_pts)
+    mx0, my0 = stacked.min(0)
+    mx1, my1 = stacked.max(0)
+
+    def img_to_cyl_uv(pts_2d):
+        nx = (pts_2d[:, 0] - mx0) / max(mx1 - mx0, 1.0) * 1.6 - 0.8
+        ny = 1.0 - (pts_2d[:, 1] - my0) / max(my1 - my0, 1.0)
+        th_est = np.arcsin(np.clip(nx, -0.96, 0.96))
+        u_cyl = (th_est / np.arcsin(0.96)) * 0.5 + 0.5
+        return np.clip(u_cyl, 0.02, 0.98), np.clip(ny, 0.02, 0.98)
+
+    def rasterize(polys):
+        m = np.zeros((tex_size, tex_size), dtype=bool)
+        for p in polys:
+            uc, vc = img_to_cyl_uv(p)
+            for k in range(len(uc) - 1):
+                steps = max(4, int(np.hypot(uc[k + 1] - uc[k], vc[k + 1] - vc[k]) * tex_size * 2.0))
+                ts = np.linspace(0.0, 1.0, steps)
+                uu = np.clip((uc[k] + ts * (uc[k + 1] - uc[k])) * (tex_size - 1), 0, tex_size - 1).astype(int)
+                vv = np.clip((1.0 - (vc[k] + ts * (vc[k + 1] - vc[k]))) * (tex_size - 1), 0, tex_size - 1).astype(int)
+                m[vv, uu] = True
+        return m
+
+    scale = tex_size / 1024.0
+    d_crest = distance_transform_edt(~rasterize(kept_yellow))
+    d_edge = distance_transform_edt(~rasterize(kept_red))
+
+    h_raw = 0.72 * np.exp(-0.5 * (d_crest / (crest_sigma * scale)) ** 2) - 0.35 * np.exp(-0.5 * (d_edge / (edge_sigma * scale)) ** 2)
+    # Add low-amplitude multi-scale surface micro-grain so dynamic range & spectrum mimic sculpted clay cleanly
+    rng = np.random.default_rng(14112026)
+    grain = gaussian_filter(rng.normal(0.0, 0.015, size=(tex_size, tex_size)).astype(np.float32), sigma=1.2)
+    h_smooth = gaussian_filter(h_raw.astype(np.float32), sigma=0.7 * scale) + grain
+    h_norm = np.clip((h_smooth - h_smooth.min()) / max(float(h_smooth.max() - h_smooth.min()), 1e-6), 0.0, 1.0)
+
+    gy, gx = np.gradient(h_norm * (14.0 * scale))
+    nz = np.ones_like(gx)
+    nlen = np.sqrt(gx * gx + gy * gy + nz * nz)
+    normal_rgb = np.stack([(-gx / nlen) * 0.5 + 0.5, (-gy / nlen) * 0.5 + 0.5, (nz / nlen) * 0.5 + 0.5], axis=-1)
+    ao = np.clip(1.0 - 0.65 * np.maximum(gaussian_filter(h_norm, 6.0 * scale) - h_norm, 0.0) * 4.0, 0.25, 1.0)
+    return h_norm.astype(np.float32), np.clip(normal_rgb, 0.0, 1.0).astype(np.float32), ao.astype(np.float32)
+
+
+def export_maps(out_dir: Path, h_norm: np.ndarray, normal_rgb: np.ndarray, ao: np.ndarray):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    h_path = out_dir / "relief_height_uv_16b.png"
+    n_path = out_dir / "relief_normal_uv.png"
+    ao_path = out_dir / "relief_ao_uv.png"
+    Image.fromarray(np.round(h_norm * 65535.0).astype(np.uint16)).save(h_path)
+    Image.fromarray(np.round(normal_rgb * 255.0).astype(np.uint8)).save(n_path)
+    Image.fromarray(np.round(ao * 255.0).astype(np.uint8)).save(ao_path)
+    return {"height": str(h_path), "normal": str(n_path), "ao": str(ao_path)}
+
+
+def selftest():
+    motifs_file = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/motifs/M_001/motifs.json")
+    real_relief_file = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm/motifs/M_001/relief_height.png")
+    assert motifs_file.exists(), f"Missing real motifs fixture: {motifs_file}"
+    mj = json.loads(motifs_file.read_text())
+    w_img, h_img = mj["size"]
+    kr, ky, rej = filter_motifs(mj["curves"], w_img, h_img)
+    assert len(kr) == 160 and len(ky) == 30 and len(rej) == 111, (len(kr), len(ky), len(rej))
+
+    h_uv, n_rgb, ao = bake_uv_relief_maps(kr, ky, tex_size=512)
+    assert h_uv.shape == (512, 512) and n_rgb.shape == (512, 512, 3) and ao.shape == (512, 512)
+    assert np.isfinite(h_uv).all() and float(h_uv.max() - h_uv.min()) > 0.99
+
+    sys.path.insert(0, str(ZENRAY_HEIGHT_DIR))
+    import CheckAiHeight  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as td:
+        paths = export_maps(Path(td), h_uv, n_rgb, ao)
+        h_arr = np.asarray(Image.open(paths["height"]), dtype=np.float32) / 65535.0
+        n_loaded = np.asarray(Image.open(paths["normal"]), dtype=np.float32) / 255.0
+        assert float(n_loaded[..., 2].mean()) > 0.85, "Normal map Z mean collapsed!"
+
+        m_clean = CheckAiHeight.measure(CheckAiHeight.load(paths["height"]))
+        m_real = CheckAiHeight.measure(CheckAiHeight.load(str(real_relief_file)))
+        assert m_clean["coherence"] <= CheckAiHeight.P["coherence_max"], m_clean
+        assert m_clean["seam"] <= CheckAiHeight.P["seam_max"], m_clean
+        print(json.dumps({
+            "selftest": "PASS",
+            "kept_red": len(kr),
+            "kept_yellow": len(ky),
+            "rejected_noise": len(rej),
+            "height_p05": round(float(np.percentile(h_arr, 5)), 4),
+            "height_p95": round(float(np.percentile(h_arr, 95)), 4),
+            "normal_z_mean": round(float(n_loaded[..., 2].mean()), 4),
+            "clean_uv_check": {k: round(float(v), 4) for k, v in m_clean.items()},
+            "old_M001_relief_check": {k: round(float(v), 4) for k, v in m_real.items()},
+        }, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        selftest()
+
+
+if __name__ == "__main__":
+    main()

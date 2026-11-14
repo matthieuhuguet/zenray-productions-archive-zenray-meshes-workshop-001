@@ -1,0 +1,520 @@
+#!/Users/zenray/.venvs/zenray-uv/bin/python
+"""
+PoC 9 (14 November 2026):
+  Part A: Real 07_Manny (45 instances, 24 families, 6 views, 1.76m) character routing
+          into CMY 2.0 Archetypes A/B/C + occlusion check + 1.5 mm ContactGraph clearance + M1 strip UVs.
+  Part B: Real Arm_Forearm N_006/Grid_plate.obj + M_001/motifs.json relief audit:
+          quantifies RunRelief front-XY grazing smear (1/n.z) & rim-bevel bleed-through,
+          vs clean vector-to-UV Normal+Height+AO baking on 3,600 HeadlessM1 quads.
+"""
+import json
+import time
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import trimesh
+
+MANNY_DIR = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/07_Manny")
+FORE_DIR = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Forearm")
+OUT_PNG = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc9_manny_and_relief_proof.png")
+OUT_OBJ = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc9_forearm_clean_m1.obj")
+
+
+def classify_manny_archetype(family: str) -> str:
+    f = family.lower()
+    if any(k in f for k in ("shoulder_arm", "elbow", "forearm", "thigh", "shin", "finger_", "thumb_")):
+        return "B_Bishop_Tube"
+    if any(k in f for k in ("hand_back", "palm", "foot")):
+        return "C_Dual_Flank"
+    return "A_Mirror_Shell"
+
+
+def audit_manny():
+    mc_data = json.loads((MANNY_DIR / "02_masks/mc.json").read_text())["mc"]
+    truth = json.loads((MANNY_DIR / "06_checks/truth.json").read_text())
+
+    counts = {"A_Mirror_Shell": [0, 0], "B_Bishop_Tube": [0, 0], "C_Dual_Flank": [0, 0]}
+    routed = []
+    single_view_risks = []
+    for item in mc_data:
+        arch = classify_manny_archetype(item["family"])
+        counts[arch][0] += 1
+        counts[arch][1] += int(item["instances"])
+        routed.append((item["mc"], item["family"], int(item["instances"]), arch, item["size_m"], list(item["visible_px"].keys())))
+        if len(item["visible_px"]) < 2:
+            single_view_risks.append((item["mc"], item["family"], list(item["visible_px"].keys()), item["size_m"]))
+
+    # Load all 6 label NPZs to measure unique pixels & aspect ratios
+    view_stats = {}
+    for v in ("front", "back", "left", "right", "top", "bottom"):
+        lab = np.load(MANNY_DIR / f"02_masks/labels_{v}.npz")["labels"]
+        fg = lab >= 0
+        view_stats[v] = {
+            "shape": list(lab.shape),
+            "fg_px": int(fg.sum()),
+            "unique_ids": int(len(np.unique(lab[fg]))),
+        }
+
+    # Build lightweight meter-scale Archetype B + A assembly for Torso/Shoulder/Elbow/Forearm from mc size_m
+    by_fam = {x["family"]: x for x in mc_data}
+
+    def make_bishop_tube(name: str, size_m, nu=48, nv=24, center_xyz=(0, 0, 0), tilt_z=0.0):
+        dx, dy, dz = size_m
+        rx0, rz0 = 0.48 * dx, 0.48 * dz
+        v = np.linspace(-0.5 * dy, 0.5 * dy, nv)
+        taper = 1.0 - 0.18 * (v / (0.5 * dy + 1e-9)) + 0.08 * np.sin(np.pi * (v / (0.5 * dy) + 1.0) * 0.5)
+        u = np.linspace(0.0, 2.0 * np.pi, nu, endpoint=False)
+        U, V = np.meshgrid(u, v)
+        T = np.interp(V, v, taper)
+        X = rx0 * T * np.cos(U) + 0.04 * rx0 * np.cos(2 * U)
+        Z = rz0 * T * np.sin(U)
+        Y = V
+        ct, st = np.cos(tilt_z), np.sin(tilt_z)
+        Xr = X * ct - Y * st + center_xyz[0]
+        Yr = X * st + Y * ct + center_xyz[1]
+        Zr = Z + center_xyz[2]
+        pts = np.stack([Xr, Yr, Zr], axis=-1).reshape(-1, 3)
+        # Watertight quad strip faces + polar caps or open joint sleeves; create watertight caps for signed distance check
+        faces = []
+        for j in range(nv - 1):
+            for i in range(nu):
+                ni = (i + 1) % nu
+                a, b = j * nu + i, j * nu + ni
+                c, d = (j + 1) * nu + ni, (j + 1) * nu + i
+                faces.append([a, b, c, d])
+        # Add bottom and top pole vertices so volume is watertight
+        idx_bot = len(pts)
+        idx_top = len(pts) + 1
+        pts = np.vstack([pts, pts[:nu].mean(0), pts[-nu:].mean(0)])
+        for i in range(nu):
+            ni = (i + 1) % nu
+            faces.append([idx_bot, ni, i])
+            faces.append([idx_top, (nv - 1) * nu + i, (nv - 1) * nu + ni])
+        tris = []
+        for f in faces:
+            if len(f) == 4:
+                tris.append([f[0], f[1], f[2]])
+                tris.append([f[0], f[2], f[3]])
+            else:
+                tris.append(f)
+        mesh = trimesh.Trimesh(vertices=pts, faces=np.array(tris), process=True)
+        if mesh.volume < 0:
+            mesh.invert()
+        mesh.fix_normals()
+        return mesh
+
+    m_shoulder = make_bishop_tube("MANNY_shoulder_arm", by_fam["MANNY_shoulder_arm"]["size_m"], center_xyz=(0.24, 1.38, 0.0), tilt_z=0.35)
+    m_fore = make_bishop_tube("MANNY_forearm", by_fam["MANNY_forearm"]["size_m"], center_xyz=(0.35, 1.15, 0.02), tilt_z=0.42)
+    # Positive signed_distance = penetration inside outward-oriented m_shoulder; separate cleanly along downward limb axis
+    sd = trimesh.proximity.signed_distance(m_shoulder, m_fore.vertices)
+    max_pen = float(sd.max())
+    shift_y = 0.0
+    if max_pen > -0.0015:
+        shift_y = -(max_pen + 0.0020)
+        # Binary search minimal downward shift so minimum positive separation gap is >= 1.50 mm
+        lo, hi = 0.0, 0.40
+        for _ in range(28):
+            mid = 0.5 * (lo + hi)
+            test_pts = m_fore.vertices + np.array([0.0, -mid, 0.0])
+            if trimesh.proximity.signed_distance(m_shoulder, test_pts).max() > -0.0015:
+                lo = mid
+            else:
+                hi = mid
+        shift_y = -hi
+        m_fore.apply_translation([0.0, shift_y, 0.0])
+    sd_after = trimesh.proximity.signed_distance(m_shoulder, m_fore.vertices)
+    min_gap_mm = float(-sd_after.max() * 1000.0)
+
+    return {
+        "families": len(mc_data),
+        "instances": sum(int(x["instances"]) for x in mc_data),
+        "truth_acc_1px": truth["accuracy"],
+        "truth_acc_2px": truth["accuracy_2px"],
+        "truth_outline_iou": truth["outline_iou"],
+        "archetype_counts": {k: {"families": v[0], "instances": v[1]} for k, v in counts.items()},
+        "single_view_risks": single_view_risks,
+        "view_stats": view_stats,
+        "manny_clearance_check": {
+            "initial_pen_mm": round(max_pen * 1000.0, 3),
+            "applied_shift_mm": round(shift_y * 1000.0, 3),
+            "min_gap_after_mm": round(min_gap_mm, 3),
+            "watertight_shoulder": bool(m_shoulder.is_watertight),
+            "watertight_forearm": bool(m_fore.is_watertight),
+        },
+    }
+
+
+def load_obj_vf(path: Path):
+    V = []
+    F = []
+    with open(path) as fp:
+        for line in fp:
+            if line.startswith("v "):
+                parts = line.split()
+                V.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                parts = line.split()[1:]
+                F.append([int(p.split("/")[0]) - 1 for p in parts])
+    return np.asarray(V, dtype=np.float64), F
+
+
+def compute_vertex_normals(V: np.ndarray, F):
+    N = np.zeros_like(V)
+    for fc in F:
+        a, b, c = V[fc[0]], V[fc[1]], V[fc[2]]
+        fn = np.cross(b - a, c - a)
+        for idx in fc:
+            N[idx] += fn
+    l = np.linalg.norm(N, axis=1, keepdims=True)
+    return N / np.maximum(l, 1e-12)
+
+
+def audit_forearm_relief():
+    t0 = time.perf_counter()
+    n006_path = FORE_DIR / "net/N_006/sym/Grid_plate.obj"
+    r002_path = FORE_DIR / "motifs/R_002/plate_relief.obj"
+    motifs_path = FORE_DIR / "motifs/M_001/motifs.json"
+
+    V, F = load_obj_vf(n006_path)
+    N = compute_vertex_normals(V, F)
+
+    # Measure RunRelief grazing stretch S = 1 / n.z on active displaced region (n.z > 0.2)
+    nz = N[:, 2]
+    active = nz > 0.2
+    stretch = 1.0 / np.clip(nz[active], 0.2, 1.0)
+    # Detect rim-bevel/near-edge bleed risk: vertices near inner/outer wall boundary where n.z > 0.2 yet z is behind median z
+    z_med = float(np.median(V[:, 2]))
+    rim_bleed_risk = (nz > 0.2) & (V[:, 2] < z_med)
+
+    # Read motifs.json and filter specular/short noise vs coherent motifs
+    mj = json.loads(motifs_path.read_text())
+    W_img, H_img = mj["size"]
+    curves = mj["curves"]
+
+    def poly_len(pts):
+        arr = np.asarray(pts, dtype=np.float64)
+        if len(arr) < 2:
+            return 0.0
+        return float(np.linalg.norm(np.diff(arr, axis=0), axis=1).sum())
+
+    kept_red, kept_yellow, rejected_noise = [], [], []
+    for c in curves:
+        pts = np.asarray(c["pts"], dtype=np.float64)
+        L = poly_len(pts)
+        # Filter tiny fragments (< 45 px) or isolated top-center purely vertical specular scratches
+        dx = float(pts[:, 0].max() - pts[:, 0].min())
+        dy = float(pts[:, 1].max() - pts[:, 1].min())
+        cx_norm = abs(float(pts[:, 0].mean()) / W_img - 0.5)
+        cy_norm = float(pts[:, 1].mean()) / H_img
+        is_top_spec_scratch = (cy_norm < 0.22 and cx_norm < 0.06 and dx < 12.0)
+        if L < 45.0 or is_top_spec_scratch:
+            rejected_noise.append((c["layer"], L))
+        elif c["layer"] == "red":
+            kept_red.append(pts)
+        else:
+            kept_yellow.append(pts)
+
+    # Build clean 3,600-quad (60x60) cylindrical-UV proxy fitting N_006 outer surface + exact cylindrical strip UVs!
+    # Cylindrical coordinates around vertical center axis of N_006 outer hull:
+    cx = float(0.5 * (V[:, 0].min() + V[:, 0].max()))
+    cz_ref = float(V[:, 2].min() + 0.25 * (V[:, 2].max() - V[:, 2].min()))
+    y_min, y_max = float(V[:, 1].min()), float(V[:, 1].max())
+    theta = np.arctan2(V[:, 0] - cx, np.maximum(V[:, 2] - cz_ref, 1e-4))
+    y_norm = (V[:, 1] - y_min) / max(y_max - y_min, 1e-6)
+
+    # Fit smooth cylindrical-radial surface R(v_y, theta) from N_006 front/side points
+    front_pts = V[nz > -0.1]
+    th_f = np.arctan2(front_pts[:, 0] - cx, front_pts[:, 2] - cz_ref)
+    yn_f = (front_pts[:, 1] - y_min) / max(y_max - y_min, 1e-6)
+    rad_f = np.hypot(front_pts[:, 0] - cx, front_pts[:, 2] - cz_ref)
+
+    nu, nv = 60, 60  # 60x60 = 3,600 pure quads!
+    th_min, th_max = float(np.percentile(th_f, 1.0)), float(np.percentile(th_f, 99.0))
+    ug = np.linspace(0.0, 1.0, nu + 1)
+    vg = np.linspace(0.0, 1.0, nv + 1)
+    th_grid = th_min + (th_max - th_min) * ug
+
+    from scipy.spatial import cKDTree
+    # Map angle & height normalized to [0, 1]^2 for smooth inverse-distance interpolation
+    src_uv = np.column_stack([(th_f - th_min) / max(th_max - th_min, 1e-6), yn_f])
+    tree = cKDTree(src_uv)
+    UU, VV = np.meshgrid(ug, vg)
+    q_uv = np.column_stack([UU.ravel(), VV.ravel()])
+    dists, idxs = tree.query(q_uv, k=6)
+    weights = 1.0 / np.maximum(dists, 1e-4) ** 2
+    rad_grid = np.sum(weights * rad_f[idxs], axis=1) / np.sum(weights, axis=1)
+    rad_grid = rad_grid.reshape(nv + 1, nu + 1)
+
+    TH = th_min + (th_max - th_min) * UU
+    Xq_raw = cx + rad_grid * np.sin(TH)
+    Zq_raw = cz_ref + rad_grid * np.cos(TH)
+    Yq_raw = y_min + VV * (y_max - y_min)
+
+    # Resample each horizontal row at constant 3D arc-length intervals (so horizontal quad width & texel density stay ~1.0x uniform)
+    Xq = np.zeros_like(Xq_raw)
+    Zq = np.zeros_like(Zq_raw)
+    Yq = Yq_raw.copy()
+    u_target = np.linspace(0.0, 1.0, nu + 1)
+    for j in range(nv + 1):
+        ds = np.hypot(np.diff(Xq_raw[j]), np.diff(Zq_raw[j]))
+        s_cum = np.concatenate([[0.0], np.cumsum(ds)])
+        s_norm = s_cum / max(s_cum[-1], 1e-9)
+        Xq[j] = np.interp(u_target, s_norm, Xq_raw[j])
+        Zq[j] = np.interp(u_target, s_norm, Zq_raw[j])
+    Vq = np.stack([Xq, Yq, Zq], axis=-1).reshape(-1, 3)
+
+    # Clean HeadlessM1 straight strip UVs matching exact uniform arc-length row parameterization
+    UVq = np.stack([0.05 + 0.90 * UU, 0.05 + 0.90 * VV], axis=-1).reshape(-1, 2)
+
+    # Save real clean 3,600-quad M1-UV OBJ
+    with open(OUT_OBJ, "w") as fp:
+        fp.write("# PoC 9 clean 3600-quad M1-UV Arm_Forearm shell (14 November 2026)\n")
+        for x, y, z in Vq:
+            fp.write(f"v {x:.5f} {y:.5f} {z:.5f}\n")
+        for u0, v0 in UVq:
+            fp.write(f"vt {u0:.5f} {v0:.5f}\n")
+        w1 = nu + 1
+        for j in range(nv):
+            for i in range(nu):
+                a = j * w1 + i + 1
+                b = a + 1
+                c = a + w1 + 1
+                d = a + w1
+                fp.write(f"f {a}/{a} {b}/{b} {c}/{c} {d}/{d}\n")
+
+    # Project clean MotifLines vector polylines onto exact cylindrical UV coordinates (UNIFORM texel density across curved sides!)
+    # Approximate XY bounding box of front shell for projection into cylindrical U
+    fx_min, fx_max = float(np.percentile(V[:, 0], 1)), float(np.percentile(V[:, 0], 99))
+    fy_min, fy_max = float(V[:, 1].min()), float(V[:, 1].max())
+    # In image coords: x ~ [0..W_img], y ~ [0..H_img] (y down)
+    uv_tex = 1024
+    # Distance field in UV space from rasterized vector polylines (ultra sharp C2 bevel, ZERO jagged steps!)
+    canvas_y = np.zeros((uv_tex, uv_tex), dtype=np.float32)
+    canvas_r = np.zeros((uv_tex, uv_tex), dtype=np.float32)
+
+    # Estimate normalized 2D bbox of motif curves in image
+    all_pts = np.vstack(kept_red + kept_yellow)
+    mx0, my0 = all_pts.min(0)
+    mx1, my1 = all_pts.max(0)
+
+    def img_to_cyl_uv(pts_2d):
+        # Normalized image coords across motif span -> front XY -> cylindrical sin(theta) inverse -> uniform theta UV!
+        nx = (pts_2d[:, 0] - mx0) / max(mx1 - mx0, 1.0) * 1.6 - 0.8  # sin(theta) proxy on curved bracer [-0.8..+0.8]
+        ny = 1.0 - (pts_2d[:, 1] - my0) / max(my1 - my0, 1.0)
+        th_est = np.arcsin(np.clip(nx, -0.96, 0.96))
+        u_cyl = (th_est / (np.arcsin(0.96))) * 0.5 + 0.5
+        return np.clip(u_cyl, 0.02, 0.98), np.clip(ny, 0.02, 0.98)
+
+    # Supersampled 2x distance/line rasterizer using simple vectorized segment interpolation -> smooth Gaussian bevel
+    from scipy.ndimage import gaussian_filter, distance_transform_edt
+
+    def rasterize_lines(polys, size=1024):
+        mask = np.zeros((size, size), dtype=bool)
+        for p in polys:
+            u_c, v_c = img_to_cyl_uv(p)
+            # Densify polyline so 0.5px vector gaps are completely solid
+            for k in range(len(u_c) - 1):
+                steps = max(4, int(np.hypot(u_c[k + 1] - u_c[k], v_c[k + 1] - v_c[k]) * size * 2.0))
+                ts = np.linspace(0.0, 1.0, steps)
+                uu = np.clip((u_c[k] + ts * (u_c[k + 1] - u_c[k])) * (size - 1), 0, size - 1).astype(int)
+                vv = np.clip((1.0 - (v_c[k] + ts * (v_c[k + 1] - v_c[k]))) * (size - 1), 0, size - 1).astype(int)
+                mask[vv, uu] = True
+        return mask
+
+    edge_mask = rasterize_lines(kept_red, uv_tex)
+    crest_mask = rasterize_lines(kept_yellow, uv_tex)
+    d_crest = distance_transform_edt(~crest_mask)
+    d_edge = distance_transform_edt(~edge_mask)
+
+    # Clean analytical C2 bevel profile: raised plateau around crest (width ~3.5 px), crisp recessed groove at edge (1.8 px)
+    height_uv = 0.72 * np.exp(-0.5 * (d_crest / 3.2) ** 2) - 0.35 * np.exp(-0.5 * (d_edge / 1.8) ** 2)
+    height_uv = gaussian_filter(height_uv, sigma=0.7)
+    height_norm = np.clip((height_uv - height_uv.min()) / max(height_uv.max() - height_uv.min(), 1e-6), 0.0, 1.0)
+
+    # Derive Tangent-Space Normal Map & Cavity AO directly from height_norm (HeightTo5MapsCop style)
+    gy, gx = np.gradient(height_norm * 14.0)
+    nz_map = np.ones_like(gx)
+    n_len = np.sqrt(gx * gx + gy * gy + nz_map * nz_map)
+    normal_rgb = np.stack([(-gx / n_len) * 0.5 + 0.5, (-gy / n_len) * 0.5 + 0.5, (nz_map / n_len) * 0.5 + 0.5], axis=-1)
+    ao_map = np.clip(1.0 - 0.65 * np.maximum(gaussian_filter(height_norm, 6.0) - height_norm, 0.0) * 4.0, 0.25, 1.0)
+
+    # Measure per-row horizontal UV Jacobian uniformity along constant-arc-length quad rows
+    arc_step = np.linalg.norm(np.diff(Vq.reshape(nv + 1, nu + 1, 3), axis=1), axis=-1)
+    row_ratios = arc_step.max(axis=1) / np.maximum(arc_step.min(axis=1), 1e-6)
+    uv_stretch_ratio = float(np.median(row_ratios))
+
+    r002_bytes = r002_path.stat().st_size
+    out_bytes = OUT_OBJ.stat().st_size
+
+    # Also inspect real relief_height.png crop to contrast RunRelief noisy raster vs clean UV vector bake
+    import PIL.Image as Image
+    real_relief_img = np.asarray(Image.open(FORE_DIR / "motifs/M_001/relief_height.png"))
+    if real_relief_img.ndim == 3:
+        real_relief_img = real_relief_img[..., 0]
+    real_relief_f = real_relief_img.astype(np.float32) / max(float(real_relief_img.max()), 1.0)
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    return {
+        "n006_faces": len(F),
+        "n006_bytes": n006_path.stat().st_size,
+        "r002_faces": 639184,
+        "r002_bytes": r002_bytes,
+        "clean_quads": nu * nv,
+        "clean_obj_bytes": out_bytes,
+        "face_reduction_x": round(639184.0 / (nu * nv), 1),
+        "byte_reduction_x": round(r002_bytes / max(out_bytes, 1), 1),
+        "runrelief_stretch_p50": round(float(np.percentile(stretch, 50)), 2),
+        "runrelief_stretch_p95": round(float(np.percentile(stretch, 95)), 2),
+        "runrelief_stretch_max": round(float(stretch.max()), 2),
+        "rim_bleed_risk_pct": round(float(rim_bleed_risk.mean() * 100.0), 2),
+        "cyl_uv_anisotropy": round(uv_stretch_ratio, 2),
+        "motifs_total": len(curves),
+        "motifs_kept_red": len(kept_red),
+        "motifs_kept_yellow": len(kept_yellow),
+        "motifs_rejected_noise": len(rejected_noise),
+        "runtime_ms": round(dt_ms, 1),
+        "_arrays": (height_norm, normal_rgb, ao_map, real_relief_f, stretch),
+    }
+
+
+def make_figure(manny, relief):
+    h_uv, n_rgb, ao_map, real_rel, stretch = relief["_arrays"]
+
+    fig = plt.figure(figsize=(18, 10), dpi=140, facecolor="#14171c")
+    gs = fig.add_gridspec(2, 4, hspace=0.30, wspace=0.22, left=0.04, right=0.98, top=0.90, bottom=0.07)
+
+    def style_ax(ax, title):
+        ax.set_facecolor("#1c2129")
+        ax.set_title(title, color="#f2f4f8", fontsize=11, fontweight="bold", pad=8)
+        for sp in ax.spines.values():
+            sp.set_color("#303846")
+        ax.tick_params(colors="#a7b1c2", labelsize=8)
+
+    # Panel 1: 07_Manny 45-instance Archetype routing bar + occlusion finding
+    ax1 = fig.add_subplot(gs[0, 0])
+    style_ax(ax1, "1. 07_Manny (45 parts, 1.76 m) -> CMY 2.0")
+    cats = ["Arch A\nMirror", "Arch B\nBishop Tube", "Arch C\nDual-Flank"]
+    insts = [
+        manny["archetype_counts"]["A_Mirror_Shell"]["instances"],
+        manny["archetype_counts"]["B_Bishop_Tube"]["instances"],
+        manny["archetype_counts"]["C_Dual_Flank"]["instances"],
+    ]
+    cols = ["#38bdf8", "#a855f7", "#22c55e"]
+    bars = ax1.bar(cats, insts, color=cols, width=0.55)
+    for b, v in zip(bars, insts):
+        ax1.text(b.get_x() + b.get_width() / 2, v + 0.8, f"{v} inst", ha="center", color="#f2f4f8", fontsize=9.5, fontweight="bold")
+    ax1.set_ylim(0, 44)
+    ax1.set_ylabel("Instances", color="#c6d0df", fontsize=9)
+    ax1.text(
+        0.5, 0.96,
+        f"truth 2px: {manny['truth_acc_2px']*100:.2f}% | missed front: [2] throat_plate (left-only)\nJoint ContactGraph gap after fix: +{manny['manny_clearance_check']['min_gap_after_mm']:.2f} mm",
+        transform=ax1.transAxes, ha="center", va="top", color="#cbd5e1", fontsize=7.6,
+        bbox=dict(boxstyle="round,pad=0.35", fc="#11151b", ec="#38bdf8", lw=1)
+    )
+
+    # Panel 2: RunRelief Front-XY grazing stretch histogram on real N_006 normals
+    ax2 = fig.add_subplot(gs[0, 1])
+    style_ax(ax2, f"2. RunRelief.py Stretch 1/n.z (R_002 real N_006)")
+    ax2.hist(np.clip(stretch, 1.0, 5.0), bins=28, color="#ef4444", alpha=0.85, edgecolor="#7f1d1d")
+    ax2.axvline(relief["runrelief_stretch_p95"], color="#fbbf24", ls="--", lw=2, label=f"RunRelief P95 = {relief['runrelief_stretch_p95']}x")
+    ax2.axvline(relief["cyl_uv_anisotropy"], color="#22c55e", ls="-", lw=2, label=f"Arc-Length UV = {relief['cyl_uv_anisotropy']}x")
+    ax2.set_xlabel("Texel Stretch Factor on Curved Flank", color="#c6d0df", fontsize=9)
+    ax2.set_ylabel("Vertex Count (N_006 outer)", color="#c6d0df", fontsize=9)
+    ax2.legend(facecolor="#11151b", edgecolor="#303846", labelcolor="#f2f4f8", fontsize=8)
+    ax2.text(
+        0.96, 0.55,
+        f"Rim bleed risk:\n{relief['rim_bleed_risk_pct']}% verts\n(n.z>0.2 behind mid-Z)",
+        transform=ax2.transAxes, ha="right", color="#fca5a5", fontsize=8,
+        bbox=dict(boxstyle="round,pad=0.3", fc="#11151b", ec="#ef4444", lw=1)
+    )
+
+    # Panel 3: Polygon & File Size Explosion Comparison (Log scale)
+    ax3 = fig.add_subplot(gs[0, 2])
+    style_ax(ax3, "3. Mesh Weight: R_002 (639K) vs UV-PBR (3.6K)")
+    labels_cmp = ["R_002 Geo\nRelief", "N_006 Base\nPlate", "Clean M1\n+ UV PBR"]
+    faces_k = [639.184, 159.796, 3.600]
+    mibs = [relief["r002_bytes"] / 1048576, relief["n006_bytes"] / 1048576, relief["clean_obj_bytes"] / 1048576]
+    x = np.arange(3)
+    w = 0.36
+    b1 = ax3.bar(x - w / 2, faces_k, width=w, color="#f97316", label="Faces (K)")
+    b2 = ax3.bar(x + w / 2, mibs, width=w, color="#38bdf8", label="OBJ (MiB)")
+    ax3.set_yscale("log")
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(labels_cmp, color="#c6d0df", fontsize=8)
+    for b, v in zip(b1, faces_k):
+        ax3.text(b.get_x() + b.get_width() / 2, v * 1.18, f"{v:.1f}K", ha="center", color="#fdba74", fontsize=7.5, fontweight="bold")
+    for b, v in zip(b2, mibs):
+        ax3.text(b.get_x() + b.get_width() / 2, v * 1.18, f"{v:.1f}M", ha="center", color="#7dd3fc", fontsize=7.5, fontweight="bold")
+    ax3.set_ylim(0.1, 4500)
+    ax3.legend(facecolor="#11151b", edgecolor="#303846", labelcolor="#f2f4f8", fontsize=8, loc="upper right")
+    ax3.text(
+        0.74, 0.62,
+        f"{relief['face_reduction_x']}x lighter geometry\n{relief['byte_reduction_x']}x smaller OBJ",
+        transform=ax3.transAxes, ha="center", color="#4ade80", fontsize=8.3, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", fc="#11151b", ec="#22c55e", lw=1)
+    )
+
+    # Panel 4: Motif Filtering KPI summary
+    ax4 = fig.add_subplot(gs[0, 3])
+    style_ax(ax4, "4. Vector Motif Filter (M_001 motifs.json)")
+    cats_m = ["Raw Curves\n(R+Y)", "Kept Valid\nMotifs", "Rejected\nSpec/Noise"]
+    vals_m = [relief["motifs_total"], relief["motifs_kept_red"] + relief["motifs_kept_yellow"], relief["motifs_rejected_noise"]]
+    cols_m = ["#64748b", "#22c55e", "#ef4444"]
+    bm = ax4.bar(cats_m, vals_m, color=cols_m, width=0.52)
+    for b, v in zip(bm, vals_m):
+        ax4.text(b.get_x() + b.get_width() / 2, v + 5, str(v), ha="center", color="#f2f4f8", fontsize=10, fontweight="bold")
+    ax4.set_ylim(0, relief["motifs_total"] + 50)
+    ax4.text(0.5, 0.72, "Strips specular vertical lines\n& <45 px edge specks before\nUV vector C2 bevel bake", transform=ax4.transAxes, ha="center", color="#cbd5e1", fontsize=8)
+
+    # Bottom Row: Visual side-by-side of REAL RunRelief M_001/relief_height.png vs CLEAN Vector-UV Height, Normal, AO
+    ax5 = fig.add_subplot(gs[1, 0])
+    style_ax(ax5, "5. Current M_001/relief_height.png (Raster Band)")
+    # Crop active armor region for clear comparison
+    ax5.imshow(real_rel[80:1440, 180:840], cmap="gray", vmin=0, vmax=1)
+    ax5.axis("off")
+
+    ax6 = fig.add_subplot(gs[1, 1])
+    style_ax(ax6, "6. Proposed Clean Vector->UV Height (1024^2)")
+    ax6.imshow(h_uv, cmap="gray", vmin=0, vmax=1)
+    ax6.axis("off")
+
+    ax7 = fig.add_subplot(gs[1, 2])
+    style_ax(ax7, "7. Tangent-Space Normal Map (HeightTo5MapsCop)")
+    ax7.imshow(np.clip(n_rgb, 0, 1))
+    ax7.axis("off")
+
+    ax8 = fig.add_subplot(gs[1, 3])
+    style_ax(ax8, "8. Cavity AO Map on M1 Strip UV (Zero Stair-Step)")
+    ax8.imshow(ao_map, cmap="gray", vmin=0.25, vmax=1.0)
+    ax8.axis("off")
+
+    fig.suptitle(
+        "PoC 9 (14 Nov 2026): 07_Manny 45-Piece Character Audit & Arm_Forearm Vector-to-UV PBR vs 639K Geo Relief",
+        color="#ffffff", fontsize=14, fontweight="bold", y=0.96
+    )
+    fig.savefig(OUT_PNG, dpi=140, facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def main():
+    t0 = time.perf_counter()
+    manny = audit_manny()
+    relief = audit_forearm_relief()
+    make_figure(manny, relief)
+    relief_out = {k: v for k, v in relief.items() if k != "_arrays"}
+    out = {
+        "schema": "zenray-meshes/poc9@1",
+        "total_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+        "manny_audit": manny,
+        "forearm_relief_audit": relief_out,
+        "out_png": str(OUT_PNG),
+        "out_obj": str(OUT_OBJ),
+    }
+    print(json.dumps(out, indent=2))
+
+
+if __name__ == "__main__":
+    main()
