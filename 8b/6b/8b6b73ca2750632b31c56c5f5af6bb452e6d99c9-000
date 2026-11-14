@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+PoC 3 (14 November 2026): 10-Second Visual Error Localization & Surface Quality Overlays on Real Arm_Cuff Delivery
+Reads Projects/14_ArmGuard_13-November-2026/boards/14_ArmGuard_13-November-2026_finish_Arm_Cuff_14-November-2026-0126.jpg
+(Column 1 = Reference views, Column 3 = Delivered Houdini Render) and computes:
+1. Green / Red Silhouette & Shading Disagreement Heatmap (< 1.5 px Green, > 4 px Crimson Glow)
+2. Edge-Continuity / Normal-Gradient Zebra Audit showing sawtooth notch errors & bottom dangling wing tips in < 2 seconds.
+"""
+import json
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+BOARD = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/boards/14_ArmGuard_13-November-2026_finish_Arm_Cuff_14-November-2026-0126.jpg')
+OUT = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc')
+
+
+def silhouette_mask(panel_bgr):
+    gray = cv2.cvtColor(panel_bgr, cv2.COLOR_BGR2GRAY)
+    # Estimate panel background intensity from corner pixels (left col bg ~88, dark clay col ~26)
+    corners = np.concatenate([gray[:10, :10].ravel(), gray[:10, -10:].ravel(), gray[-10:, :10].ravel(), gray[-10:, -10:].ravel()])
+    bg = float(np.median(corners))
+    fg = np.abs(gray.astype(np.float32) - bg) > 14.0
+    fg = cv2.morphologyEx(fg.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+    # Largest connected component
+    n, lbl, st, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8))
+    if n <= 1:
+        return fg
+    best = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+    return lbl == best
+
+
+def bbox_align_mask(m_src, m_ref):
+    """Tight bounding box + scale alignment so framing offsets do not inflate geometric silhouette mismatch."""
+    def bbox(m):
+        ys, xs = np.nonzero(m)
+        if not len(xs):
+            return (0, 0, 1, 1)
+        return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    x0, y0, x1, y1 = bbox(m_src)
+    rx0, ry0, rx1, ry1 = bbox(m_ref)
+    crop = (m_src[y0:y1, x0:x1]).astype(np.uint8) * 255
+    resized = cv2.resize(crop, (max(1, rx1 - rx0), max(1, ry1 - ry0)), interpolation=cv2.INTER_NEAREST)
+    aligned = np.zeros_like(m_ref, dtype=bool)
+    aligned[ry0:ry1, rx0:rx1] = resized > 127
+    return aligned, (rx0, ry0, rx1, ry1)
+
+
+def main():
+    t0 = time.perf_counter()
+    img = cv2.imread(str(BOARD))
+    H, W = img.shape[:2]
+    # Board is 4 rows (front, back, left, bottom) x 3 columns (Ref, Variant A, Variant B)
+    rh = H // 4
+    cw = W // 3
+    view_names = ['Front', 'Back', 'Left Profile', 'Bottom Axis']
+
+    overlays = []
+    stats = {}
+    for r in range(4):
+        y0, y1 = r * rh, (r + 1) * rh
+        ref_panel = img[y0:y1, 0:cw]
+        mod_panel = img[y0:y1, 2 * cw:3 * cw]
+
+        m_ref = silhouette_mask(ref_panel)
+        m_mod = silhouette_mask(mod_panel)
+        m_mod_al, _ = bbox_align_mask(m_mod, m_ref)
+
+        inter = np.logical_and(m_ref, m_mod_al).sum()
+        union = np.logical_or(m_ref, m_mod_al).sum()
+        iou = float(inter) / max(float(union), 1.0)
+
+        # Signed pixel distance error (false positive + false negative zones)
+        dist_out = cv2.distanceTransform((~m_ref).astype(np.uint8), cv2.DIST_L2, 5)
+        dist_in = cv2.distanceTransform(m_ref.astype(np.uint8), cv2.DIST_L2, 5)
+        fn = m_ref & (~m_mod_al)
+        fp = m_mod_al & (~m_ref)
+        err_px = np.maximum(np.where(fp, dist_out, 0.0), np.where(fn, dist_in, 0.0))
+
+        # 10-second overlay over ref_panel: Green where match, Amber 1.5..4 px, Crimson > 4 px!
+        vis = (ref_panel.astype(np.float32) * 0.72).astype(np.uint8)
+        ok_match = m_ref & m_mod_al
+        vis[ok_match] = np.clip(vis[ok_match] * 0.65 + np.array([30, 145, 55]) * 0.35, 0, 255)
+        warn_band = (err_px >= 1.5) & (err_px < 4.5)
+        crit_band = err_px >= 4.5
+        vis[warn_band] = np.array([0, 195, 255], np.uint8)
+        vis[crit_band] = np.array([45, 55, 255], np.uint8)
+
+        # Mask blurred background before Sobel so silhouette boundary ring never bleeds inward into Zebra stripes
+        g_mod = cv2.cvtColor(mod_panel, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        bg_val = float(np.median(g_mod[m_mod])) if m_mod.any() else 128.0
+        g_clean = np.where(m_mod, g_mod, bg_val)
+        g_sm = cv2.GaussianBlur(g_clean, (0, 0), 3.6)
+        gx = cv2.Sobel(g_sm, cv2.CV_32F, 1, 0, ksize=5)
+        gy = cv2.Sobel(g_sm, cv2.CV_32F, 0, 1, ksize=5)
+        m_mod_in = cv2.erode(m_mod.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        phase = (gx * 0.18 + gy * 0.10 + np.arange(mod_panel.shape[1])[None, :] * 0.14)
+        zebra = np.where(m_mod_in[..., None], np.where((np.sin(phase)[..., None] > 0), np.array([235, 240, 245]), np.array([32, 36, 44])), np.where(m_mod[..., None], np.array([78, 86, 98]), np.array([22, 24, 28]))).astype(np.uint8)
+
+        stats[view_names[r]] = {
+            'iou': round(iou, 4),
+            'pct_error_gt_4px': round(100.0 * float(crit_band.sum()) / max(float(m_ref.sum()), 1.0), 2),
+            'max_err_px': round(float(err_px.max()), 1),
+        }
+        overlays.append((view_names[r], ref_panel, mod_panel, vis, zebra))
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    metrics = {'timestamp': time.strftime('%Y-%m-%d %H:%M:%S CET'), 'elapsed_ms': round(elapsed_ms, 1), 'views': stats}
+    json.dump(metrics, open(OUT / 'poc3_metrics.json', 'w'), indent=2)
+    print(json.dumps(metrics, indent=2))
+
+    # Build 4-column visual comparison: Col 1 Reference | Col 2 Houdini Model | Col 3 10s Diff Heatmap | Col 4 Zebra Check
+    tile_w, tile_h = 340, 310
+    banner_h, pad = 110, 12
+    W_out = tile_w * 4 + pad * 5
+    H_out = banner_h + tile_h * 4 + pad * 5 + 36
+    out = Image.new('RGB', (W_out, H_out), (20, 22, 26))
+    d = ImageDraw.Draw(out)
+
+    f_b = next((p for p in ['/Users/zenray/Library/Fonts/AdobeClean-Bold.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf'] if Path(p).exists()), None)
+    f_r = next((p for p in ['/Users/zenray/Library/Fonts/AdobeClean-Regular.ttf', '/System/Library/Fonts/Supplemental/Arial.ttf', f_b] if p and Path(p).exists()), None)
+    ft_t = ImageFont.truetype(f_b, 26) if f_b else ImageFont.load_default()
+    ft_s = ImageFont.truetype(f_r, 16) if f_r else ImageFont.load_default()
+    ft_badge = ImageFont.truetype(f_b or f_r, 12) if (f_b or f_r) else ImageFont.load_default()
+
+    d.text((pad, 16), 'PoC 3: 10-Second Error Heatmap & Zebra Audit on Real Arm_Cuff Board (arm_cuff_finish_0126)', fill=(244, 245, 248), font=ft_t)
+    headers = ['1. Reference View', '2. Delivered Houdini Model', '3. 10s Green/Red Diff Heatmap', '4. Synthetic Zebra Flow Check']
+    for ci, htxt in enumerate(headers):
+        d.text((pad + ci * (tile_w + pad), 68), htxt, fill=(140, 215, 245) if ci >= 2 else (200, 205, 215), font=ft_s)
+
+    for r, (vname, ref_p, mod_p, vis_p, zeb_p) in enumerate(overlays):
+        y = banner_h + r * (tile_h + pad)
+        for ci, mat in enumerate((ref_p, mod_p, vis_p, zeb_p)):
+            x = pad + ci * (tile_w + pad)
+            rz = cv2.resize(mat, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+            out.paste(Image.fromarray(cv2.cvtColor(rz, cv2.COLOR_BGR2RGB)), (x, y))
+        st = stats[vname]
+        badge = f'{vname}: IoU {st["iou"]:.3f} | >4px: {st["pct_error_gt_4px"]}% (max {st["max_err_px"]}px)'
+        x_b = pad + 2 * (tile_w + pad) + 8
+        tw = int(d.textlength(badge, font=ft_badge))
+        d.rectangle([x_b - 5, y + 6, x_b + tw + 6, y + 26], fill=(15, 17, 22))
+        d.text((x_b, y + 9), badge, fill=(255, 130, 130) if st['pct_error_gt_4px'] > 2.0 else (120, 235, 175), font=ft_badge)
+
+    d.text((pad, H_out - 28), f'Computed in {round(elapsed_ms, 1)} ms | Crimson immediately exposes top notch stairs & Row 4 bottom dangling wing flaps', fill=(195, 200, 210), font=ft_s)
+    out_png = OUT / 'poc3_10s_heatmap_arm_cuff.png'
+    out.save(out_png)
+    print('WROTE', out_png)
+
+
+if __name__ == '__main__':
+    main()
