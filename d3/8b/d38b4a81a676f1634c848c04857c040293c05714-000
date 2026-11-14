@@ -1,0 +1,76 @@
+# Deep Research 04: Houdini 22 Native Retopology, 4-Archetype Builders & Clean Quad Flow
+
+Timestamp: `2026-11-14 04:03:44 CET` (`14 November 2026, 04:03`)
+Target Bottleneck: Eliminating Boolean+QuadRemesh sawtooth notches and dangling wing triangles (`Arm_Cuff`), removing Python-SOP file couplings (`RunCmy.py`), and unifying Hard-Surface, Character (`Dracard`), and Tree (`BranchLab`) reconstruction into Houdini 22.0.368 native editable SOP graphs.
+
+---
+
+## 1. Audited Houdini Failures in Current Scripts
+
+Inspecting `BuildRimGrid.py`, `BuildRimSym.py`, `BuildYellowEdge.py`, `RunCmy.py`, `RunNetGrid.py`, and `Arm_Cuff`'s delivered render (`14_ArmGuard_13-November-2026_finish_Arm_Cuff_14-November-2026-0126.jpg`) reveals five critical Houdini pipeline defects:
+
+1. **Boolean Subtract + `quadremesh` Destroys Edge Loops & Parameterization (`BuildRimSym.py:257-298`)**:
+   - Cutting slots and notches via `boolean::2.0` -> `quadremesh(method='rectangular')` creates staircase edges on curved notch walls (seen directly in `Arm_Cuff` rows 1 to 3) and drops the `(gu, gv, rc)` quad grid coordinates required by `BuildYellowEdge.py`.
+   - Furthermore, `_Sy_HolesOpen` deletes post-remesh faces using a naive 2D XY planar point-in-polygon check; when `wrap` curls the wings past 60 deg, rear curved faces fail or create dangling thin sliver corners visible in Row 4 (`bottom` view).
+2. **`RunCmy.py` Violates Native SOP Rules & Leaks Creases (`RunCmy.py:26-84`)**:
+   - Uses a `python` SOP (`CMY_Grid`) reading a raw filesystem path `G = json.load(open(%r))` instead of native `attribwrangle` + `addprim`/`setpointattrib` or stash `.bgeo.sc` / parameter tables (fails if files move or scene is archived!).
+   - Promotes `keel_pts` AFTER `CMY_Plate` (`polyextrude`), so both the OUTER sculpted ridge AND the INNER underside wall receive `creaseweight`, AND any connecting edge along borders gets creased unintentionally!
+   - Drops grid quads outside mask instead of smooth boundary quad fitting, causing pixelated silhouette stair-steps on `Arm_Flare`.
+3. **`BuildRimGrid.py` Dead Variable & Unwelded Cut Loops (`BuildRimGrid.py:222-239`)**:
+   - Computes `keep` array inside `resample()` and never consumes it; relies on `Divide (max 4 sides convex)` which splits concave polygons near booleans into triangles.
+4. **`Dracard` Jacket Crash Trap (`CharacterCreationDracardHoudini22.md:32`)**:
+   - Running `Quad Remesh` on open thin surfaces hung Houdini at 100% CPU for 10+ minutes. Always keep open shells quad-constructed by Gordon-Coons / PolyPatch / PolyBridge BEFORE any thickening!
+5. **`BranchLab.py` Stops at JSON Instead of Native Houdini Tree Asset**:
+   - Produces a clean 3D tree graph (`nodes`, `parent`, `radius`) across 6 orthographic Sato ridge maps, but never feeds it into Houdini `Sweep (Round Tube)` + `CurveU` radius ramp + Smooth Fork Blend (`VDB` only on trunk forks or clean quad branch sockets) + `Scatter + CopyToPoints` oriented foliage alpha cards.
+
+---
+
+## 2. Houdini 22 Native 4-Archetype Builder Architecture
+
+Every V5 asset compiles inside Houdini 22.0.368 into a standardized subnet `/obj/<Asset>/<Comp>_V6` sharing ONE `CTRL_zrm` HDA parameter block and ONE clean output contract (`OUT_<Comp>`):
+
+### Archetype A: Symmetric / Curved Hard-Surface Plate (`Arm_Cuff`, `Car_Hood`, `Car_Roof`)
+1. **Clean Quad Cage Without Boolean**:
+   - Build half-surface natively from structural CMY NURBS `Skin` (`fit` -> `skin`), PLUS **pre-planned hole cells (`MILP` + `PolyFill (Quadrilateral Grid)` with explicit Custom Corners + interior Yellow rail tridiagonal B-spline solve)**.
+   - Where a hole/slot sits inside a quad patch, split the enclosing block (`PolySplit` or parametric sub-blocks `[Left, Right, Above, Below]` around the hole!) -> guarantees **100% quad ring loops concentric around EVERY hole** with ZERO `boolean` or `quadremesh`!
+2. **Smooth Symmetry & Variable Creases**:
+   - Stamp `f@creaseweight` ONLY on outer front-surface edges (`i@side_face == 0`) BEFORE extrusion/thickening (`group` restricted to outer shell!).
+   - Snap symmetry vertices exactly (`abs(d) < tol`) -> `Mirror` + `Fuse` -> **verify zero non-manifold / pinhole edges**.
+3. **Thickening & Clean Mitre Rim**:
+   - `PolyExtrude` along smooth welded `-normalize(v@N)` (`Divide Covered Edges` off, `Output Side` groups cleanly tagged `rim_side`!), followed by **`Bevel` OR outer/inner support loop + `OpenSubdiv Catmull-Clark`** -> eliminates Row 4 bottom bowtie pinches and keeps clean `rim_bevel` seam loops for `ZenRayUV`.
+
+### Archetype B: Asymmetric Compound Shell (`Arm_Flare`, `Car_Fender`, `Headlight`)
+1. **Multi-Block Gordon-Coons Surface**:
+   - Medial Axis / Saddle decomposition (`CMY 2.0`) divides complex concave silhouettes (`Arm_Flare`) into 3 to 5 clean 4-sided (or 3/5-sided Tarini) patches.
+   - Solve edge intervals globally in `scipy.optimize.milp` (`< 40 ms`), generate patches directly in VEX `attribwrangle` + `Fuse`, project interior onto curved 3D Magento profile + Yellow ridges (`BuildYellowEdge` tridiagonal solver generalized per patch).
+2. **Double-Surface Decoupling**:
+   - Outer face driven by `M_outer` (`front + 3/4 + left` triangulation), inner face either `PolyExtrude` offset OR independent inner surface bridged cleanly along outer boundary with `PolyBridge` (`1:1` edge match!).
+
+### Archetype C: Closed Organic Character / Creature (`Dracard`, `Manny`, `Character`)
+1. **Anatomical Tube + Cage (`Sweep` Quad Loops)**:
+   - Cyan skeletal polylines (`CurveU`) -> `Sweep (Surface Type = Quadrilaterals, Closed Tube)` driven by Magenta elliptical radial profiles (`r_x(u), r_y(u), tilt(u)` measured from Front+Side silhouettes!) + anatomical Yellow line ridges (clavicle, brow ridge, spine crest, shin bone).
+   - **Rule Loops**: Force explicit quad rings at anatomical bends (elbows, knees, knuckles, shoulders, lips/eyes using `PolyFill` circular loops!).
+2. **Controlled Junction Welding (`Arm -> Torso`, `Head -> Neck`)**:
+   - Option 1 (Hero Animation Ready): Native `PolyBridge` between pre-matched ring openings (`n` edges torso socket = `n` edges limb root!), preserving 100% pure anatomical quad loops for KineFX `Joint Capture Biharmonic`!
+   - Option 2 (Rapid Complex Fusing): `VDB from Polygons (voxel 0.004)` -> `VDB Smooth` -> `Convert VDB` -> **strictly closed** `Quad Remesh (Symmetry X, Guide = Cyan+Yellow feature edges)` ONLY on closed solid manifolds (never open cloth!).
+
+### Archetype D: Branching Trees & Botanicals (`BranchLab 2.0`)
+1. **Trunk & Boughs (`BranchSweep`)**:
+   - Import `nodes / parent / radius` -> Houdini `Curve` chains separated cleanly at bifurcation forks -> `Resample` + `Orientation Along Curve` (Bishop frame) + `Sweep (Quads, Apply Scale Along Curve from f@radius)` -> smooth fork sockets via `VDB + Smooth` at primary Y-junctions or clean collar skirts + automatic longitudinal UV (`u` along circumference, `v` along branch length for `M2` seamless tileable bark!).
+2. **Foliage Canopy Cards (`FoliageCards`)**:
+   - Extract twig terminal volumes from image canopy alpha -> `Scatter` + curved arched 2x2 quad cards oriented by canopy sphere normals (`v@N`) + Copernicus 5-map leaf cluster textures (`BaseColor`, `AlphaCut`, `Normal`, `Roughness`, `Subsurface/Transmission`).
+
+---
+
+## 3. Universal Mandatory Houdini Geometry Attribute Contract
+
+Every SOP output `OUT_<Comp>` across ALL 4 archetypes MUST write these exact attributes before downstream export or UV unwrapping:
+
+| Attribute | Class | Type | Purpose Downstream (`/zenray-uv` & `/zenray-height`) |
+|---|---|---|---|
+| `s@name` | Primitive | String | Exact component ID (`Arm_Flare`, `Trunk_Main`) required by `ZenRayUV.py` & Multi-Material splitting. |
+| `s@zrm_archetype` | Detail | String | `plate_sym` / `plate_asym` / `organic_tube` / `tree_branch` for automated UV strategy selection. |
+| `s@zrm_mat_family` | Primitive | String | Material group (`steel_armor`, `leather_strap`, `bark`, `skin`) mapped automatically to `CTRL_zruv.families` & M2/M1 sheets! |
+| `edgegroup: zrm_seam_suggest` | Edge | Group | **Goldmine bridge**: Outer beveled rim borders, symmetry midline (`hidden_side`), back cavity lips, and tube back-seams pre-marked at mesh creation! |
+| `edgegroup: zrm_crease` | Edge | Group | Yellow sharp features (`creaseweight > 0.5`) telling `UVSeamChecker` NOT to mistake sharp ridges or chamfer transitions carelessly vs flat closure cuts. |
+| `v@uv_proxy` | Vertex | Vector | Intrinsic harmonic `(gu, gv, 0)` coordinates carried over from CMY 2.0 patches -> instant distortion-free quad straightening! |

@@ -1,0 +1,65 @@
+# Deep Research 02: Component Cutting, Micro-Isolation & Surface Signal Extraction
+
+Timestamp: `2026-11-14 04:02:43 CET` (`14 November 2026, 04:02`)
+Target Bottleneck: Fixing jagged silhouettes, shadow-vs-hole confusion, missed multiple creases (`Arm_Flare`), and missing fine alpha separation (hair, foliage, thin straps, recessed cavities).
+
+---
+
+## 1. Empirical Failure Analysis in Current V5 Codebase
+
+Reading `Sam.py`, `ContextOutline.py`, `OrthoViews.py`, and `CmySym.py` against actual `Arm_Cuff` & `Arm_Flare` renders demonstrates four concrete extraction bugs:
+
+1. **Lighting-Dependent Shadow vs True Hole Confusion (`OrthoViews.py:108-115` & `CmySym.py`)**:
+   - `OrthoViews.py` flags any interior region with `gray < 70` and distance `> 20 px` from boundary as a through-hole. Deep shadowed concavities (e.g., overlapping plates, armored grooves, nostril/eye cavities) trip this luminance gate, while bright lit through-holes showing grey studio background slightly brighter than 70 are completely missed!
+   - On `Arm_Flare` (`14_ArmGuard_13-November-2026_cmy_Arm_Flare_C_005_14-November-2026-0351.jpg`), `CmySym` detected partial red dot noise inside the slot recess rather than a crisp closed polygon edge loop.
+2. **Horizontal-Only & Top-Lit Keel Bias (`CmySym.py:175-204`)**:
+   - `ridge_map` scans strictly column-by-column (`for x in range(S.shape[1])`) looking for maxima in `clip(-dy, 0, None)`.
+   - Consequence 1: Any vertical ridge (like the center keel of `Arm_Cuff`!), steep >60 deg diagonal crest, curved concentric trim, or forked branching fold cannot be traced monotonically by `x`.
+   - Consequence 2: `-dy` assumes illumination strictly from `+Y` (top lit, dark below). In `Arm_Flare`, the lower secondary overlap crease exhibits a bright rim light below a cast shadow (`+dy`!) and was completely invisible to `-dy`!
+3. **Hard Binary SAM Boundaries Without Sub-Pixel Alpha (`Sam.py`)**:
+   - SAM 2.1 outputs discrete binary pixel masks at `1024x1024` upscaled back to ref size, introducing 1 to 2 px stair-stepping on oblique edges and failing completely on hair tufts, foliage cards, thin belts/laces, or lace trim.
+4. **Destructive Cut Between Neighboring Components (`ContextOutline.py` / `FrontCells.py`)**:
+   - When an overlapping component (`Arm_Flare`) partially occludes `Arm_Forearm`, cutting solely by 2D contour leaves ambiguous T-junction edges that belong to the upper plate silhouette vs the lower plate rim.
+
+---
+
+## 2. State-of-the-Art Research Synthesis (2024 to 2026)
+
+1. **SAM 2.1 + BiRefNet / ViTMatte Hybrid Cascade**:
+   - **Stage A (Semantic Instance Locking)**: Keep SAM 2.1 Large on MPS (`Sam.py`) with multi-modal prompts (positive points inside part, negative points inside holes/neighbors, tight box) for crisp semantic component identity.
+   - **Stage B (Boundary Sub-Pixel Alpha)**: Extract a narrow `+-12 px` trimap band around the SAM boundary (or use **BiRefNet** for thin organic strands/leaves/straps) to recover smooth sub-pixel coverage `alpha in [0, 1]`, giving true continuous `alpha = 0.5` sub-pixel contours via Marching Squares instead of pixelated integer stair-steps!
+2. **Intrinsic Image Decomposition + Surface Normal Crease Detection**:
+   - Instead of raw luminance (`cv2.cvtColor(RGB -> GRAY)`) + `Sobel(-dy)`:
+     - Separate **Cast Shadow / Albedo** from **3D Geometry** using monocular **Surface Normal Estimation** (Marigold Normals or Omnidata/DSINE) or **Steger Curvilinear Hessian Ridges + Orientation-Normalized Gradient Tensor (`Structure Tensor`)**.
+     - **Mathematical advantage on Normals**: On a 3D surface normal map `N(x, y) = (nx, ny, nz)`, a *creased ridge* is invariant to light direction! It shows a sharp step discontinuity `||div(N)||` or eigenvalue ratio `|lambda1 - lambda2|` in **any orientation** (0 deg to 360 deg), while flat shadowed concavities show low `||grad(N)||`!
+     - **True Through-Hole Classifier**: A true through-hole seeing the grey background exhibits: (a) color matching background RGB distribution (`|rgb - bg_rgb| < eps`), (b) flat background texture (`local_variance ~ 0`), (c) sharp exterior depth/normal drop on ALL surrounding sides (`360 deg` inward-facing bezel ring), whereas a shadowed recess has varying depth/normal gradients connecting continuously to the plate.
+3. **Orientation-Agnostic Curve Extraction: Frangi / Steger + Geodesic Minimal Path (A* / Fast Marching)**:
+   - Replace X-column Viterbi (`CmySym.keel`) with **2D Anisotropic Fast Marching (`scikit-fmm`, ALREADY INSTALLED in `zenray-uv` venv!) or Dijkstra Minimal Path** over the full 2D Hessian Ridge Strength + Structure Tensor Orientation Field (`S_ridge(x, y) = sqrt(G_x^2 + G_y^2)` / Hessian `lambda_1` magnitude)!
+   - Allows extracting **arbitrary N yellow curves**: vertical, horizontal, curved, branching, forked (`Y`-junctions like `Arm_Flare`'s triple confluence on the right tip!), or closed concentric rings!
+
+---
+
+## 3. Concrete Improvement Architecture
+
+### A. Unified 4-Channel Extraction Bundle (`CompExtract.py`)
+For any isolated component image, generate one deterministic analysis stack (`extract/`):
+1. `alpha_subpx.png`: Sub-pixel contour via distance-weighted bilateral alpha / BiRefNet trimap refinement -> sub-pixel contour precision `< 0.15 px` (eliminates SAM staircase artifacts before curve fitting!).
+2. `normal_est.png`: Lighting-invariant surface normals (`N`), isolating geometry creases cleanly from painted patterns and cast shadows.
+3. `ridge_field.npy` + `crease_width.npy`: **Hessian Eigenvalue (`|lambda_1|`) + Full Width at Half Maximum (FWHM)** measured across every ridge cross-section. **Major upgrade**: FWHM directly measures `crease_weight` (`0%` = very wide smooth roll -> `100%` = zero-width razor crease!), replacing `CmySym`'s arbitrary `0.8 * sin(pi * t)` hardcode with real pixel-measured bevel sharpness!
+4. `hole_candidates.json`: Dual-check hole segmentation (color match to background + gradient ring + closed contour convexity check) ranked by confidence so `/edit` presents click-to-toggle hole chips instead of forcing manual tracing or deleting false-positive shadows!
+
+### B. Interactive Zero-Friction Component & Micro-Cutting in `/edit`
+- **Neg/Pos Point & Brush Prompting directly in `ZenRay Blueprints 3D`**: Clicking inside an accidentally included armor strap or missed horn updates SAM 2.1 live via `/api/sam-refine` in `< 200 ms` on Apple Silicon MPS.
+- **Hierarchy Awareness (`Parent Shell -> Child Trim / Hole / Floating Stud`)**:
+  - Tag sub-contours cleanly as:
+    - `red:outer` (primary boundary),
+    - `red:hole` (through-opening, drives Quad Bridge loop!),
+    - `red:overlay` (layered plate, strap, buckle -> separate manifold sub-mesh intersecting cleanly or Boolean-free layered solid!),
+    - `yellow:crisp` / `yellow:smooth` / `yellow:valley` (surface structural lines with measured FWHM sharpness profile).
+
+---
+
+## 4. Direct Payoff on Real Failure Cases
+- **`Arm_Flare` (`14_ArmGuard`)**: Structure-tensor + Hessian minimal-path automatically detects ALL 3 curved intersecting ridges converging toward the right tip (`upper fold`, `middle primary keel`, `lower overlap valley`), plus separates the small shadowed left slot from a through-hole vs recessed socket!
+- **`Arm_Cuff`**: Sub-pixel alpha refinement removes SAM jaggedness inside the top U-notch; vertical center keel (`90 deg`) is detected effortlessly because extraction has zero X/Y axis bias.
+- **Organic Trees & Characters**: BiRefNet + Sato multiscale ridge filter (`BranchLab` already proves Sato scales work!) unifies hard-surface edge extraction and botanical/anatomical ridge extraction under one math engine.

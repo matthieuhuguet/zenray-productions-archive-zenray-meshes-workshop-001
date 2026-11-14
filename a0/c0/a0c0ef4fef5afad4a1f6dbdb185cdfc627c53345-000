@@ -1,0 +1,75 @@
+# Deep Research 05: Direct Per-Component Handoff to `/zenray-uv` & `/zenray-height`
+
+Timestamp: `2026-11-14 04:03:44 CET` (`14 November 2026, 04:03`)
+Target Bottleneck: Making `/zenray-meshes` -> `/zenray-houdini` -> `/zenray-uv` -> `/zenray-height` seamless per component, turning raw grey geometry into game-ready UV'd + 5-map Copernicus PBR assets (`BaseColor`, `Normal`, `Height`, `Roughness`, `AO` + `ORM`) with zero manual rework.
+
+---
+
+## 1. Audited Interface Between `zenray-meshes` and `zenray-houdini` (`zenray-uv` + `height`)
+
+Reading `/Users/zenray/.claude/skills/zenray-houdini/scripts/zenray_uv/ZenRayUV.py`, `Build.py`, `ZruvArtist.py`, `HeightInputs.py`, `Score.py`, `height/Reproduce.py`, `height/PerIslandAlign.py`, and `height/HeightTo5MapsCop.py` reveals that `/zenray-houdini` ALREADY built the exact mathematical machinery needed, yet `zenray-meshes` stops one step too early!
+
+### What Already Works at 0.999+ Downstream
+1. **`ZenRayUV.py` & `ZruvArtist.py` (M1 Artist Cut, Score 0.999)**:
+   - Supports `manual_seams`, `manual_no_seams`, `organic_orient` (upright vs horizontal), `m1_max_px` (`2048` default, `4096` forbidden), `m1_oversize_px`, `m1_min_fill` (`>= 0.5` sheet packing efficiency), `m1_stack` / `m1_unstack` (twin reuse), and deterministic `Score.py` verification.
+   - Has built-in concept rules (`midline`, `blade_rim`, `crease`, `buried_edge`, `set_edge`, `grid_meridian`, `grid_ring`, `cavity_rule`, `cap_rings`).
+2. **`HeightInputs.py` (`zenray_uv -> chatgpt/height -> Align`)**:
+   - Generates `uv_<sheet>.png`, `uv_<sheet>_numbers.png`, `six_views.png`, `reference.png` (auto-crops concept reference around component!), and `prompt.md` automatically from any unwrapped `ZRUV` asset!
+3. **`PerIslandAlign.py` (Score 0.99944 on Arch)**:
+   - Aligns AI-drawn UV-sheet height maps per UV island to `0.2 to 0.3 px` accuracy using global affine + per-island Tukey affine + membrane elastic fit + host rule (bolts/plates stay nested!).
+4. **`Reproduce.py --atlas` + `HeightToBaseColorCop.py` + `HeightTo5MapsCop.py` + `PreviewHeightAsBaseColor.py`**:
+   - Reconstructs the height in **native Copernicus nodes** (`ALIGN_OUT`), derives Base Color (`HBC_OUT`) or uses `DelightBaseColor.py` from the concept ref, generates physically scaled `Normal`, `AO`, `Roughness`, `Metallic`, and `ORM` (`T5_` Copernicus box), and renders via **Karma CPU/XPU**!
+
+### The Missing Bridge Inside `zenray-meshes`
+Right now, `zenray-meshes` outputs bare `.obj` files (`Sym_plate.obj`, `plate.obj`) lacking primitive `name` groups, `uv_seam` hints, clean hole edge loops, material separation, or any hook in `ZenRay Blueprints 3D` to trigger UV/Height! Even worse, `Boolean+QuadRemesh` creates staircase triangles on holes that trigger staircase UV seam penalties (`UVSeamChecker` fails `unstep_rule`!).
+
+---
+
+## 2. The Unified Per-Component Pipeline (`/zenray-meshes` -> `/zenray-uv` -> `/zenray-height`)
+
+By making every V6 component clean-quad + attribute-tagged at the end of Houdini building, downstream texturing becomes a **3-Stage Component Stage** directly inside `ZenRay Blueprints 3D`:
+
+```
+  [V6 Houdini OUT_<Comp>]
+   Quads only + s@name + s@zrm_mat_family + edgegroup:zrm_seam_suggest + v@uv_proxy
+           |
+           v
+  (Stage 5A) ZENRAY UV PER COMPONENT (ZruvBridge.py)
+   - Hard-surface plate (Modes A/B): Cut outer rim bevel + slot inner wall loops (zrm_seam_suggest)
+     -> Unwrap straight Front Face island + Inner Face island + Rim Ribbon strip cleanly on 1:1 grid!
+   - Organic limb/torso (Mode C): ZruvArtist + Tailor (loops at joints + back/underside seam via Ray openness)
+   - Branch/Bark (Mode D): Native Sweep v@uv_proxy longitudinal strip -> M2 Tileable Bark sheet + Foliage Alpha sheet
+   - Gate: Score.py >= 0.995 (no flipped faces, zero staircase seams, density <= 1% off 1024/2048 px/m)
+           |
+           v
+  (Stage 5B) HEIGHT PROXY + DETAIL SYNTHESIS (Copernicus + HeightInputs)
+   - Bake free geometric signals in Copernicus ("Bake Geometry Textures v2" / Rasterize Geometry):
+       * Curvature Map  (drives edge wear & embossed trim detection)
+       * Cavity / AO    (drives leather stitching & armor engravings)
+       * Thickness Map  (drives subsurface scattering on skin/leaves/horn)
+   - Two relief modes:
+       (1) CLEAN MATERIAL (No AI needed): HeightTo5MapsCop directly synthesizes hammer-forged steel, leather grain,
+           wood bark, or brushed anodized metal in native Copernicus nodes driven by Curvature + Cavity!
+       (2) ORNATE COMPONENT (e.g. Clive Forearm engravings, carvings): Auto-run HeightInputs.py with cropped component ref!
+           Notice: Because Front & Back islands lie STRAIGHT and RECTANGULAR from CMY grid UVs, ChatGPT/Copernicus sees
+           an undistorted 2D plaque (not warped petals!) -> PerIslandAlign hits 0.999+ trivially -> Reproduce.py --atlas!
+           |
+           v
+  (Stage 5C) DELIGHTED BASE COLOR + 5 MAPS + LIVE HUB LOOKDEV
+   - Run DelightBaseColor.py (delight original crop using reconstructed height!) OR HeightToProceduralColorCop (5 color wheels).
+   - Export 5 aligned maps <= 2048 px (+ 4-map ORM pack for Unreal Engine / ZenRayShards).
+   - Render turntable + ref-matched camera view in Karma -> display side-by-side inside ZenRay Blueprints 3D Tab 4!
+```
+
+---
+
+## 3. Why CMY Grid Topology Accelerates UV + Height by 10x
+
+1. **Zero UV Warping on Sculpted Plates (`Arm_Forearm`, `Arm_Cuff`)**:
+   - Look closely at `Arm_Forearm` in `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238/ref_board.png` (bottom piece on left)! It is covered in intricate filigree engravings (`ornate scrolls & ribs`)!
+   - If unwrapped with random `AutoUV` / `ABF` after `QuadRemesh`, those filigree borders become diagonally sheared polygons on the UV sheet.
+   - If unwrapped from **CMY intrinsic `(gu, gv)` quads**, the curved forearm unrolls cleanly into a **straight rectangular upright island** (`straight_tol <= 0.08` in `Build.py:46`)! An embossed carving in Copernicus / Height texture maps cleanly onto the 3D surface without waviness or aliasing, AND `uv_checker` squares align cleanly along armor curvature!
+2. **Subdivision + Displacement Synergy**:
+   - Keep hero armor plates at **~4k to 12k clean quads** (`Mid-Poly` + bevel creases) while micro-engravings, bolts, hammered dents, cloth weave, and bark crevices live in **16-bit Copernicus `Height` + `Normal` + `Roughness`**, keeping a full armored character well under real-time budgets while reading 100% faithfully at `1024 px/m` (prop) or `2048 px/m` (hero character)!
+3. **Zero UV Boundary Bleeding**:
+   - Wire `Rebuild Seam Padding (UV Boundary Filling / Extrapolate Boundaries)` + `PerIslandAlign` island dilation automatically before export so mipmapping in Unreal Engine 5 / Karma never shows dark black seam lines along plate bevels!

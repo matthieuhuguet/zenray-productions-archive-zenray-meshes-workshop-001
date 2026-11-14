@@ -1,0 +1,70 @@
+# Deep Research 03: CMY 2.0 Mathematical Kernel (Any Mesh: Hard Surface, Asymmetric, Characters, Trees)
+
+Timestamp: `2026-11-14 04:02:43 CET` (`14 November 2026, 04:02`)
+Target Bottleneck: Generalizing Matthieu's **CMY Protocol** (Cyan, Magenta, Yellow) from single-plane symmetric open plates (`CmySym.py` `keel_columns`) to **any arbitrary 3D component at 99.9%**: concave notches, holes, asymmetric compound armor (`Arm_Flare`), closed tubes/limbs/torsos (`Dracard`/`Manny`), and branching trees (`BranchLab`).
+
+---
+
+## 1. Why CMY V1 Succeeds Locally Yet Fails Globally
+
+From inspecting `CmyProtocol1.md`, `CmySym.py`, `OrthoNet.py`, and `BuildRimSym.py`:
+- **What V1 got profoundly right**: Separating 3 orthogonal semantic responsibilities into **Cyan** (longitudinal flow/skeleton), **Magenta** (cross-sectional volume/thickness/wrap), and **Yellow** (creases, keels, surface folds with variable sharpness weights) gives deterministic low-DOF curves instead of noisy dense vertex optimization (which plateaued at `0.9715` in V3).
+- **Where V1 breaks mathematically**:
+  1. `CmySym` computes ONE scalar harmonic field `u` between arbitrary `col_bottom` (`u=0`) and `col_top` (`u=1`). Any deeply concave U-notch (`Arm_Cuff`), multi-pronged outline (`Arm_Flare`), or Y-branching shape causes level-set contours (`u = k / (G + 1)`) to split into disconnected pieces, pinch at saddle singularities, or run nearly tangent to vertical silhouette walls (risking curve crossing!).
+  2. `CmySym` enforces a single flat mirror plane (`z -> -z`), failing completely on asymmetrical parts (`Arm_Flare` spiral flare, helical armor, car asymmetric trim) and closed organic volumes (arms, faces, trunks).
+  3. `OrthoNet` assumes an open 2-pole horseshoe sheet (`rows x cols`) where yellow crease #1 is hardcoded to row `0` and gorge to `gorge_row = 8`.
+  4. Single-view CMY reads only 2D pixels and reconstructs depth `z` purely from a 1D wrap curve (`thickness_px`, `wrap` radius), which cannot disambiguate twist, asymmetrical flaring, or perspective foreshortening without multi-view curve triangulation.
+
+---
+
+## 2. CMY 2.0: Universal 4-Archetype Mathematical Kernel
+
+To hit **99.9% geometric accuracy on ANY mesh** while keeping editability at `< 10` human curves + `< 12` HDA sliders, upgrade CMY into **one unified 3-color language backed by four mathematical archetypes**:
+
+```
+ANY COMPONENT  --->  Structural Mode Selector (Automatic + 1-click Override in Hub)
+                        |
+                        +--> Mode A: SYMMETRIC / CURVED PLATE     (Arm_Cuff, Car_Hood, Fender)
+                        +--> Mode B: ASYMMETRIC / MULTI-PATCH CAD (Arm_Flare, Headlight, Trim)
+                        +--> Mode C: CLOSED ORGANIC TUBE / BODY   (Torso, Limb, Hand, Dragon)
+                        +--> Mode D: BRANCHING SKELETON & FOLIAGE (Tree Trunk, Horns, Roots)
+```
+
+### Universal Semantics of Cyan, Magenta, Yellow in CMY 2.0
+
+1. **CYAN (`C`) = Skeleton / Harmonic Flow Graph (Longitudinal Parameter `u`)**
+   - **Modes A & B (Shells / Plates)**: Replace single harmonic gradient with **Boundary-Conforming Multi-Block Harmonic Quadrangulation / Medial Axis Partition (`Straight Skeleton / Cross-Field`)**:
+     - Instead of forcing 1 strip over a multi-pronged outline like `Arm_Flare`, detect reflex/concave notches (`angle > 210 deg`) and insert **Topological Saddle Cuts** along the Medial Axis (`scikit-fmm` distance transform ridge!).
+     - This decomposes ANY arbitrary 2D silhouette (even with holes!) into a small graph of **clean 4-sided (or 3/5-sided Tarini) patches** (`Patch 1: Main Elbow`, `Patch 2: Upper Ear`, `Patch 3: Front Horn`, `Patch 4: Rear Wing`).
+     - Solve an independent harmonic scalar field `nabla^2 u = 0`, `nabla^2 v = 0` inside each patch with `u in [0, 1]`, `v in [0, 1]` -> guaranteed **zero-crossing streamlines** that flow smoothly around EVERY hole and concave corner!
+   - **Modes C & D (Closed Organic & Trees)**: Cyan is the **3D Piecewise Cubic Bezier Skeleton Curve `S(u)`** (parallel-transport / Bishop rotation-minimizing frame `(T(u), N(u), B(u))` so limbs/branches NEVER suffer Frenet inflection flipping!).
+
+2. **MAGENTA (`M`) = Cross-Section Profile & Volumetric Wrap Rings (Transverse Parameter `v`)**
+   - **What Magenta represents in 3D**: Cross-sectional closed loops (`Mode C/D`) or open transverse arcs (`Mode A/B`) attached along `u` in local Bishop frame `(N(u), B(u))`:
+     $$R(u, \theta) = R_0(u) \cdot \Big(1 + e(u)\cos(2(\theta - \alpha(u))) + \text{wrap\_bend}(u, \theta)\Big) + \text{crease\_bump}(u, \theta)$$
+   - **Multi-View Triangulation Lock**: Instead of guessing depth solely from 1 view, whenever >= 2 views exist (`front`, `left`, `top`), triangulate exact `(x(u, v), y(u, v), z(u, v))` intersection rays (`Cameras.py` ALREADY achieves `2.3e-15 m` precision!) so front+left+top silhouettes constrain both **Centerline Depth (`Z`)** AND **Cross-Section Eccentricity / Wrap Angle** simultaneously!
+   - **Asymmetric Outer + Inner Profiles (Solves `Arm_Flare`!)**: Mode B decouples `M_outer(u, v)` (outer sculpted surface facing camera) from `M_inner(u, v)` (inner thickness offset OR true reconstructed `back` view profile), instead of forcing `z_back = -z_front`!
+
+3. **YELLOW (`Y`) = Feature Curve Graph with Per-Vertex Crease Profile (`Crease / Ridge / Valley / Fold`)**
+   - **Upgraded Feature Representation**: Each Yellow curve `Y_k` is NOT just a fixed row `row=0` or X-column pixel path:
+     - Stored as a **parametric UV/surface spline `(u(s), v(s))`** embedded directly inside the patch/tube topology (or edge-loop aligned via **Snake / Tridiagonal Constraint** so patch edges snap cleanly ONTO Yellow ridges!).
+     - Carries explicit per-vertex vectors: `(kind: crisp | smooth | valley | fold, weight_0_1: float, width_px: float, amplitude: float, bevel_radius: float)`.
+     - **Pin-Exact Sharpness**: `weight` drives OpenSubdiv `creaseweight` directly (`RunCmy.py:83` ALREADY validates variable vertex `f@creaseweight`, once isolated cleanly from inner faces!).
+
+---
+
+## 3. Solving `Arm_Flare` & Hard Irregular Shapes Cleanly (Patch + MILP + Gordon/Coons)
+
+Recall `CurveNetworkToQuads_29-October-2026.md` already benchmarked `scipy.optimize.milp` (HiGHS):
+- Solving exact integer edge subdivision counts across 118 to 1,201 arcs takes **`8 ms to 135 ms`**!
+- By feeding **Patch Boundaries (Red outer + Red holes) + Primary Yellow Ridges + Cyan Medial Cuts** as the arc graph into `scipy.optimize.milp`:
+  1. Every hole (`slot`, `U-notch`) gets a concentric clean **Quad Hole Ring** (`n` edges top, `n` edges bottom, `m` left, `m` right).
+  2. Every patch is surfaced smoothly via **Transfinite Gordon-Coons Interpolation** (`C = L_u + L_v - B`, plus interior Yellow rail blending!), **eliminating `Boolean::2.0` + `QuadRemesh` entirely**!
+  3. Zero sliver triangles, zero aliasing stairs on `Arm_Cuff`'s notch, zero dangling tip flaps, and **100% continuity** across Yellow creases!
+
+---
+
+## 4. Quantitative Verification Plan (Round 3 PoC)
+In `Audit_14-November-2026/poc/`, we will run TWO executable proofs directly on `Arm_Flare` & `Arm_Cuff`:
+1. **`poc_cmy2_extractor.py`**: Replace V1 `-dy` X-column scanner with Structure-Tensor + Multi-Orientation Hessian + Fast-Marching / Dijkstra Path Extractor + FWHM sharpness Estimator on `Arm_Flare/cmy/C_005/master.png` -> measure how many real creases (`3/3` vs `1/3`) and noise rejection (`0` false hole pixels) are achieved.
+2. **`poc_quad_hole_milp.py`**: Solve a clean quad patch + concentric hole ring topology using `scipy.optimize.milp` + harmonic/Coons grid solver -> compare triangle count (`0` vs boolean slivers), quad orthogonality (`Jacobian > 0.75`), and silhouette IoU (`> 0.995`) against `Arm_Cuff`-style boolean+remesh!

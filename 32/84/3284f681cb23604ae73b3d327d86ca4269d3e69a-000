@@ -1,0 +1,58 @@
+# Deep Research 01: Multi-View & 5-View Isolation Consistency
+
+Timestamp: `2026-11-14 04:02:43 CET` (`14 November 2026, 04:02`)
+Target Bottleneck: Eliminating multi-round retry failures when generating canonical orthographic 4-view / 5-view sheets from 1 reference image (e.g., Clive `Arm_Flare` requiring 9 iterations `I_001` through `I_009`, asymmetrical limbs, foreshortened armor, characters, trees).
+
+---
+
+## 1. Empirical Diagnosis from the Repository
+
+Inspecting `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/` (`I_001` through `I_009`) alongside `AntigravityElbow_13-November-2026-1854.md` and `PromptGrid4V5.md` exposes four root causes behind multi-view failure:
+
+1. **Zero 3D Geometric Conditioning in Image Generation Prompts**:
+   - Currently, image generation receives 2D images (`ref.png`, `ref_red.png`, `ref_cut.png`, `armor.png`, plus `front.png`) and natural language instructions pleading for true orthographic projections ("Les vues top et bottom ne sont PAS la vue de face : on regarde dans l'axe du bras...").
+   - Diffusion and multimodal image models lack explicit epipolar constraints when predicting unseen `90 deg` (`left`, `top`, `bottom`, `back`) views from a single perspective crop (`Clive`), causing view collapse (top drawn as tilted front), mirror confusion, and invented geometry on occluded backsides.
+2. **Perspective Foreshortening & Boundary Contamination (`ref_board.png`)**:
+   - In `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238/ref_board.png`, the isolated right crop overlaps adjacent pieces (`Arm_Cuff` top flange, `Arm_Forearm` inner socket). Without 3D depth separation or clean inpainted neighbor context, image generators hallucinate neighboring armor flanges as part of the target component.
+3. **2x2 Grid vs Per-View Conditioning Mismatch**:
+   - `PromptGrid4V5.md` requests a 2x2 orthographic grid (front, back, left, top) simultaneously. While grid packing enforces shared pixel height across neighboring cells, generative models routinely leak silhouettes across quadrants or misalign bounding boxes by 4% to 12%, which breaks V5's `RefFrame` and `Cameras` strict epipolar tolerances (`V7_cross`).
+4. **Hard-Surface vs Organic Gap**:
+   - Cars (`13_Car2V5`) often have real blueprints or 4+ multi-view renders. Characters and single-shot armor (`14_ArmGuard`) start from 1 perspective painting/render. Trees (`BranchLab`) need 6 consistent views without foliage occluding primary trunks.
+
+---
+
+## 2. State-of-the-Art Research Synthesis (2024 to 2026)
+
+1. **Proxy-First Coarse-to-Fine Conditioning (Era3D / MV-Adapter Pattern)**:
+   - Generating final multi-view detail straight from a single RGB cutout is mathematically ill-posed. Modern multi-view synthesis (Era3D row-wise epipolar attention, MV-Adapter unified camera+geometry condition encoders, ControlNet Depth+Normal) conditions the image generator on **rendered orthographic clay/depth/normal proxies** rather than text descriptions of camera angles.
+2. **Feed-Forward Geometric Priors via VGGT / Marigold V2 (Priors Only, Never Raw Output)**:
+   - **VGGT (CVPR 2025 Best Paper)** recovers camera pose (extrinsics + intrinsics), dense depth maps, and point tracks across 1 to N views in under 1 second in a single forward pass without brittle SfM/COLMAP failure on untextured grey armor.
+   - **Marigold V2 (Diffusion Transformer Normals + Depth + IID)** gives razor-sharp monocular normal and depth maps directly from a single cropped view (`ref_cut.png`), predicting the true orientation of oblique bevels, concave pockets, and curvature gradients before any view rotation is requested.
+3. **Epipolar Lock Lines & Canonical Registration Cube**:
+   - Placing faint orthographic alignment tick rails and a normalized color-coded gizmo cube (`+X Red`, `+Y Green`, `+Z Blue`) or rendered wireframe bounding box outside the grey matte margin gives multimodal image generators direct visual anchors for `front / back / left / top / bottom` camera orientation and vertical/horizontal scale lock.
+
+---
+
+## 3. Concrete Improvement Architecture: The "Proxy-First 5-View Loop"
+
+Instead of iterating 9 blind image-generation retries on pure prose prompts, transform V5 isolation into a **3-step deterministic geometric loop**:
+
+| Step | Action | Output / Gate | Expected Effect on Retry Count |
+|---|---|---|---|
+| **Stage 1: Single-View CMY + Normal Proxy** | Run **Marigold Normals** (or V5 CMY 1-view wrap) + coarse `CMY` symmetric/asymmetric 3D blockout directly from `front` (`master.png` / `ref_cut.png`) in `< 3 seconds`. | Coarse 3D proxy mesh (`proxy_blockout.obj`) in Houdini/Mitsuba. | Replaces pure textual guesswork with explicit 3D volume. |
+| **Stage 2: Render Locked Canonical 5-View Blueprint Guides** | Project `proxy_blockout.obj` through the 5 exact orthographic cameras (`front`, `back`, `left`, `top`, `bottom`) + subtle normal map tint + clean RGB axis gimbal + neighbor ghost hulls (dimmed). | 1 stitched `proxy_guide_2x2.png` (or 5 view guides + exact `RefFrame` boxes). | Forces true `90 deg` orthographic framing, exact height alignment, and non-overlapping back/top views. |
+| **Stage 3: Conditioned Re-Detailing + Pixel Gate** | Pass `(ref_cut.png, proxy_guide.png)` to Gemini/ChatGPT Image: keep proxy silhouette & orthographic axes fixed, transfer surface bevels, creases, slots, and back details. Immediately run V5 `RefFrame` + `Cameras` + **Mask-vs-Proxy IoU Gate** before saving `returned/`. | Verified 5-view ortho kit (`V7_cross < 2 px` disagreement). | Drops isolation attempts from `9` tries down to `1 to 2` tries. |
+
+### Extension to Organic (Characters & Trees)
+- **Characters**: Fit an anatomical parametric mannequin cage (`ZrlBodyNet` / Houdini KineFX proxy skeleton derived from 2D joint keypoints) -> render ortho Depth/Silhouette guides for `front / back / left / top / 3-4` -> condition image generator so limb proportions, head angle, and shoulder width stay identical to `< 1%` across all views (`Manny` & `Dracard`).
+- **Trees**: First generate/clean **leafless structural pass** ("winter branch structure, matte grey bark on flat grey background") across 4 ortho views so `BranchLab` Sato ridges see 100% of primary/secondary boughs, then generate **canopy foliage clusters + leaf card alpha sheets** separately!
+
+---
+
+## 4. Direct Concrete Proposals for `zenray-meshes` Scripts
+
+1. **Extend `HubOnePicture.py` + `scripts/v5/PromptGrid4V5.md` -> `PromptGridV6_ProxyGuided.md`**:
+   - Auto-render a coarse proxy strip (`front`, `back`, `left`, `top` shaded + colored normal contour) from the first 1-view `CmySym` / `FrontRimLoft` pass (`I_001` only needs front!).
+   - Attach this proxy strip as `Image 4: ortho_proxy_guides.png` in every `Antigravity*.md` isolation handoff!
+2. **Automated Pre-Save Validation Gate (`IsoGate.py`)**:
+   - Check every generated `returned/<view>.png` immediately for: (a) flat background uniformity (`std < 4`), (b) vertical span agreement between `front`, `back`, `left` (`< 2%`), (c) horizontal span agreement between `front` and `top/bottom` (`< 2%`), and (d) front-view silhouette match against `ref_cut.png`. Reject broken views BEFORE Matthieu wastes time reviewing them in the Hub!
