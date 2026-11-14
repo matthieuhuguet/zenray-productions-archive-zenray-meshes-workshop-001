@@ -1,0 +1,53 @@
+# Dossier 10 : Refactoring Structurel de `zenray-meshes` et Généralisation Any-Mesh 99.9 %
+
+**Horodatage** : 2026-11-14 04:45 CET
+**Cibles auditées** : `/Users/zenray/.claude/skills/zenray-meshes/scripts/`, `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/`, `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/houdini/`, `/Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/`, `/Users/zenray/.claude/skills/zenray-meshes/scripts/lines/`, `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/07_Manny/`
+
+## 1. Diagnostic Structurel du Dépôt (Mesure AST Exacte)
+
+Un scan AST et système non destructif sur `/Users/zenray/.claude/skills/zenray-meshes/scripts/` révèle que la vélocité et la fiabilité de `zenray-meshes` sont freinées par l'accumulation de prototypes historiques jamais consolidés :
+
+1. **Dispersion des fichiers (`820` scripts `.py`)** : `251` scripts Python résident directement à la racine de `scripts/`, incluant `60` scripts historiques `BuildDelivery*.py` et `6` fichiers `.bak` / `.bak2` / `.bak3` encore présents dans l'arborescence active (`lines/`, etc.).
+2. **Monolithes et duplication dans `v5/` (`114` scripts, `27 644` lignes)** :
+   - Le plus gros fichier, `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/FrontRimLoft.py`, atteint `1 624` lignes (`114 880` octets), suivi de `Shapes.py` (`1 040` lignes), `Forms.py` (`893`), `CmySym.py` (`808`), `Poly.py` (`709`), `Draw.py` (`645`), `OrthoNet.py` (`637`), `FrontYellow.py` (`634`), `FrontTurquoise.py` (`621`), `Spokes.py` (`574`), `Wing3D.py` (`528`), `FrontCells.py` (`523`), `Gates.py` (`521`).
+   - L'analyse AST dénombre `74` noms de fonctions non triviales dupliqués au niveau module dans `v5/` : `node()` est copié dans `14` fichiers de `v5/houdini/`, `wrangle()` et `export()` chacun dans `7` fichiers de `v5/houdini/`, `latest()` dans `10` fichiers, `build()` dans `8`, `resample()` dans `6`, `measure()` dans `6`, `read_obj()` dans `5`, `master()` dans `4`, `catmull()` dans `3`, `stage()` dans `3`.
+3. **Couplage en dur aux anciens chantiers** :
+   - `114` chemins absolus `/Users/zenray/...` sont codés en dur dans `v5/`.
+   - `30` références codées en dur vers `Car2` ou `ArmCliveFF16` restent présentes dans `v5/` et `v5/houdini/` (`HubEdit.py`, `HubServe.py`, `HubShape.py`, `HubStudio.py`, `Front3D.py`, `Trunk3D.py`, `BuildFront*.py`, `BuildTrunk.py`, `BuildTyre.py`, `BuildWheel.py`, `BuildWing.py`, `CaptureViews.py`, `ExportParts.py`).
+
+## 2. Pourquoi `07_Manny` et les Formes Organiques Asymétriques Bloquent Avant Houdini
+
+### Observation directe dans le code
+- Dans `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/07_Manny/params.json`, l'extraction de masques sur un personnage organique complet (`45` pièces, rendu Karma `1920x1080`) atteignait déjà `99.51 %` à +-1 pixel et plus de `99.9 %` à +-2 pixels (`doc_summary`), mais les dossiers `04_received/` et `05_models/` sont restés vides.
+- Dans `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/houdini/RunCmy.py` (lignes 40 à 55) et `BuildRimGrid.py` (lignes 4 à 17, 26 à 30), la génération 3D suppose :
+  1. Un plan de symétrie rigide en `Z = 0` (`p[0], p[1], -p[2]` et `WC = 2 * NC - 1`), ce qui détruit toute asymétrie naturelle (pli de cape, épaule asymétrique, feuille vrillée, muscle oblique, col organique).
+  2. Une extrusion rigide de plaque uniforme (`PolyExtrude` par `-ch("../cmy_thickness")`), incapable de représenter un ourlet effilé vers `0`, une épaisseur organique variable ou une section fermée tubulaire.
+- Inversement, deux noyaux mathématiques beaucoup plus puissants dorment déjà dans le même dépôt sans être branchés sur `v5/houdini/` :
+  1. `/Users/zenray/.claude/skills/zenray-meshes/scripts/retopo/ZrrPatch.py` (29 October 2026) implémente déjà le lissage thin-plate borné par IRLS (Hildebrandt & Polthier 2007), l'ajustement B-spline clamped à courbure maîtrisée (`CurveFair`), le plongement **Tutte / Floater** (`every interior vertex of valence 4, no fold`) et la fermeture solide avec bord roulé (`hem_steps`).
+  2. `/Users/zenray/.claude/skills/zenray-meshes/scripts/lines/ZenRayRetopology.py` (30 October 2026) implémente déjà la détection automatique de régime (`hard` si partage d'arêtes dièdres > 60 degrés >= `0.12`, sinon `organic`), la détection d'axe de symétrie par distance point-triangle P95 (`sym_p95_frac = 0.004`), la barrière de Winslow consciente du layout (`ZrlLayoutBarrier`) et la protection stricte des 6 extrema (`gate_envelope_frac = 0.01`).
+  3. `/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/houdini/BuildRimLoft.py` résout déjà un système tridiagonal cubique B-spline par ligne puis par colonne (`NR x NC` points cibles) avec poids de pli variables par arête (`rl_crisp_crease`, `OpenSubdiv Catmull-Clark`).
+
+## 3. Plan de Consolidation Atomique (Sans Casser l'Existant)
+
+### A. Archiver la dette sans la perdre
+- Déplacer les `251` scripts racine et `60` `BuildDelivery*.py` et `6` `.bak*` hors du chemin actif vers `/Users/zenray/.claude/skills/zenray-meshes/scripts/_legacy_archive/` en gardant uniquement les points d'entrée vivants documentés dans `SKILL.md`.
+- Supprimer toute valeur par défaut `Car2` / `ArmCliveFF16` dans `HubEdit.py`, `HubServe.py`, `HubShape.py`, `HubStudio.py` et lire systématiquement `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/CurrentProjects.json` plus le scan réel des dossiers `Projects/*`.
+
+### B. Extraire 4 modules cœur partagés dans `scripts/v5/core/`
+1. **`GeometryCurveCore.py`** : unique source pour `arc_length`, `eval_curve_at`, `nearest_param`, `resample_even`, `catmull_spline`, `resample_2d`, `mesh_volume`, `mirror_distance` (élimine la duplication de `FrontRimLoft.py`, `Shapes.py`, `FrontYellow.py`, `FrontTurquoise.py`, `Symmetrize.py`, `ContextOutline.py`, `HubEdit.py`, `HubStudio.py`, `BuildRimGrid.py`).
+2. **`HoudiniNodeCore.py`** : unique source pour `node()`, `wrangle()`, `stage()`, `ensure_folder_parms()`, `export_obj_with_uv()` (remplace les 14 copies dans `v5/houdini/*.py`).
+3. **`OrthoGateCore.py`** (`V0_OrthoIsoGate`) : contrôle épipolaire avant tout tracé (`GeminiBridge.py /save` + `OnePictureIsolate.py`) rejetant tout retour IA à mauvais ratio, décentré, tronqué ou perspective 3/4 avant même le dessin CMY.
+4. **`AnyMeshRouter.py`** : aiguille chaque composant CMY 2.0 selon son **Archétype (`A` Coque Symétrique, `B` Tube / Membre / Corne / Tronc, `C` Drapé / Feuillage / Pli Organique Asymétrique, `D` Hiérarchie Branchue)** puis applique automatiquement en sortie `GeoAudit.py` + `ContactGraph.py` + `ZenRayRetopology.py` + `HeadlessM1.py` (UV droites) + `HeightTo5MapsCop.py` (micro-détail normal/AO/roughness/basecolor).
+
+## 4. Résolution du Cas Critique : Archétype C (Surface Organique Plissée Asymétrique)
+
+Pour qu'un vêtement drapé, un pli de peau, une épaulette asymétrique ou une feuille vrillée atteigne `>= 99.9 %` de fidélité sans dépendre d'un miroir `Z = -Z` :
+- **Contrat CMY 2.0 Dual-Flank** :
+  - `M` trace l'épine dorsale 3D libre (courbe gauche asymétrique portée par les vues `Front` + `Left`/`Top`, pas figée sur `Z = 0`).
+  - `C` encode deux bords indépendants (`flank_left`, `flank_right`) et deux bordures extrêmes (`rim_top`, `rim_bot`) échantillonnés par abscisse curviligne normalisée.
+  - `Y` porte les lignes de crête ou plis internes avec un poids variable `kw in [0, 1]` qui s'atténue vers les ourlets (`soft crease decay`) + un profil d'épaisseur effilé (`hem taper`) au lieu d'un bloc extrudé constant.
+- **Solveur** : interpolation B-spline bicubique (tridiagonale sur grille `NR x NC`) sous contrainte de bordure exacte + fermeture par peau interne décalée le long de la normale avec transition arrondie aux bords (`hem`), produisant un solide 100 % quads, orienté positif, zéro arête ouverte, et des UV de bande droites prêts pour `/zenray-uv` (`HeadlessM1`) et `/zenray-height`.
+
+## 5. Preuve Quantifiée Associée
+
+Exécutée et mesurée dans `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc8_cmy2_asymmetric_organic_fold.py` avec planche visuelle `/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc8_asymmetric_organic_proof.png`.

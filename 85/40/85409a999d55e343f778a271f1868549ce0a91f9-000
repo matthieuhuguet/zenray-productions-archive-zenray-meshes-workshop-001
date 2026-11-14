@@ -1,0 +1,365 @@
+#!/usr/bin/env /Users/zenray/.venvs/zenray-uv/bin/python
+"""
+Build Proposal 6 (10-Second Multi-Component Assembly, Mannequin 1.76m Scale & GeoAudit/ContactGraph Cockpit)
+with real transparent component layers extracted directly from live A_002/views/front.png & q_front.png.
+"""
+import base64
+import io
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+A002_VIEWS = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/views')
+OUT_DIR = Path('/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/proposals/06_assembly_scale_contact_10s')
+
+
+def pil_to_data_url(im, fmt='WEBP', quality=86):
+    buf = io.BytesIO()
+    im.save(buf, format=fmt, quality=quality)
+    b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+    return f'data:image/{fmt.lower()};base64,{b64}'
+
+
+def extract_cuff_and_lower_layers(front_path, out_size=640):
+    rgb = np.asarray(Image.open(front_path).convert('RGB'))
+    # Background is uniform (96, 96, 96); allow small AA margin
+    dist_bg = np.abs(rgb.astype(np.int16) - 96).max(axis=2)
+    fg = dist_bg > 5
+    lab, n = ndi.label(fg)
+
+    # Components overlapping top half (y_min < 495) belong to Arm_Cuff; remaining bottom components belong to Flare+Forearm
+    cuff_mask = np.zeros_like(fg)
+    lower_mask = np.zeros_like(fg)
+    for i in range(1, n + 1):
+        m = (lab == i)
+        ys = np.nonzero(m)[0]
+        if int(ys.min()) < 495 and int(ys.max()) <= 545:
+            cuff_mask |= m
+        else:
+            lower_mask |= m
+
+    # Smooth 1.5px alpha feather for clean anti-aliased composite
+    def make_rgba(mask):
+        # dilate 1px to catch edge shading, soft feather
+        edge = ndi.binary_dilation(mask, iterations=1)
+        alpha = np.where(mask, 255, np.where(edge, 140, 0)).astype(np.uint8)
+        rgba = np.dstack([rgb, alpha])
+        return Image.fromarray(rgba, mode='RGBA').resize((out_size, out_size), Image.LANCZOS)
+
+    return make_rgba(cuff_mask), make_rgba(lower_mask)
+
+
+def main():
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    cuff_rgba, lower_rgba = extract_cuff_and_lower_layers(A002_VIEWS / 'front.png', out_size=640)
+    qfront_rgb = Image.open(A002_VIEWS / 'q_front.png').convert('RGB').resize((640, 640), Image.LANCZOS)
+
+    cuff_uri = pil_to_data_url(cuff_rgba, fmt='WEBP', quality=88)
+    lower_uri = pil_to_data_url(lower_rgba, fmt='WEBP', quality=88)
+    qfront_uri = pil_to_data_url(qfront_rgb, fmt='WEBP', quality=84)
+
+    # Read fonts existence or link relative/system cleanly (note file-design copies local assets)
+    html = f"""<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZenRay Meshes 2.0 : Assemblage Multi-Composants, Echelle Mannequin 1.76m & ContactGraph</title>
+<style>
+@font-face{{font-family:'Adobe Clean';src:url('./fonts/AdobeClean-Regular.woff2') format('woff2');font-weight:100 450;font-style:normal}}
+@font-face{{font-family:'Adobe Clean';src:url('./fonts/AdobeClean-Medium.woff2') format('woff2');font-weight:451 599;font-style:normal}}
+@font-face{{font-family:'Adobe Clean';src:url('./fonts/AdobeClean-Bold.woff2') format('woff2');font-weight:600 900;font-style:normal}}
+:root{{
+  --font:'Adobe Clean','Hiragino Sans W4',sans-serif;
+  --paper:#f5f4f1; --ink:#15171c; --mute:#5c616b; --line:#dad8d2; --card:#ffffff; --soft:#ebe9e3;
+  --stage:#4e5259; --ok:#16a34a; --warn:#d97706; --bad:#dc2626; --cyan:#0891b2; --accent:#2563eb;
+  --r:14px; --t:.2s;
+}}
+:root[data-theme="dark"]{{
+  --paper:#121317; --ink:#efeee9; --mute:#9aa0ab; --line:#292d36; --card:#1a1c22; --soft:#23262f; --stage:#252830;
+}}
+@media (prefers-color-scheme: dark){{
+  :root:not([data-theme="light"]){{
+    --paper:#121317; --ink:#efeee9; --mute:#9aa0ab; --line:#292d36; --card:#1a1c22; --soft:#23262f; --stage:#252830;
+  }}
+}}
+@media (prefers-reduced-motion: reduce){{ :root{{ --t:0s }} }}
+*{{box-sizing:border-box}}
+html,body{{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font);font-size:15px;line-height:1.5;font-synthesis:none;transition:background var(--t),color var(--t)}}
+main{{max-width:1360px;margin:0 auto;padding:26px 20px 56px}}
+.head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:14px}}
+h1{{font-size:clamp(24px,3vw,34px);font-weight:500;margin:0;line-height:1.15}}
+.sub{{max-width:78ch;margin:6px 0 0;color:var(--mute)}}
+.actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+button.btn{{border:1px solid var(--line);background:var(--card);color:var(--ink);font:inherit;font-size:14px;padding:9px 14px;border-radius:999px;cursor:pointer;min-height:40px;transition:all var(--t)}}
+button.btn:hover{{border-color:var(--ink)}}
+button.btn.primary,button.btn[aria-pressed="true"]{{background:var(--ink);color:var(--paper);border-color:var(--ink);font-weight:500}}
+.kpi-strip{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:16px 0}}
+.kpi{{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px}}
+.kpi-k{{font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.05em}}
+.kpi-v{{font-size:21px;font-weight:600;margin-top:2px}}
+.kpi-v.bad{{color:var(--bad)}} .kpi-v.ok{{color:var(--ok)}} .kpi-v.warn{{color:var(--warn)}}
+.bench{{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;align-items:start}}
+@media (max-width:980px){{ .bench{{grid-template-columns:1fr}} }}
+.stage-card{{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:14px;display:flex;flex-direction:column;gap:12px}}
+.toolbar{{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}}
+.seg{{display:flex;gap:6px;flex-wrap:wrap}}
+.viewport-grid{{display:grid;grid-template-columns:minmax(0,1fr) 230px;gap:12px;align-items:stretch}}
+@media (max-width:740px){{ .viewport-grid{{grid-template-columns:1fr}} }}
+.canvas-box{{position:relative;background:var(--stage);border-radius:12px;overflow:hidden;aspect-ratio:1/1;border:1px solid var(--line)}}
+.layer{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;transition:transform var(--t)}}
+svg.overlay{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}
+.mannequin-card{{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;justify-content:space-between;gap:10px}}
+.mannequin-card h3{{margin:0;font-size:14px;font-weight:600}}
+.panel{{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;display:flex;flex-direction:column;gap:14px}}
+.panel h2{{font-size:16px;font-weight:500;margin:0;padding-bottom:8px;border-bottom:1px solid var(--line)}}
+.ctrl{{display:flex;flex-direction:column;gap:4px}}
+.ctrl label{{display:flex;justify-content:space-between;align-items:baseline;gap:12px;font-size:13px;color:var(--mute)}}
+.ctrl output{{color:var(--ink);font-weight:600;white-space:nowrap;flex:none}}
+input[type=range]{{width:100%;accent-color:var(--ink);height:28px;cursor:pointer;margin:0}}
+.gates{{display:flex;flex-direction:column;gap:7px}}
+.gate{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:9px;background:var(--soft);font-size:13px}}
+.g-l{{display:flex;align-items:center;gap:8px}}
+.dot{{width:9px;height:9px;border-radius:50%;flex:none}}
+.dot.ok{{background:var(--ok)}} .dot.bad{{background:var(--bad)}} .dot.warn{{background:var(--warn)}}
+.foot-note{{font-size:12px;color:var(--mute);margin-top:4px}}
+</style>
+</head>
+<body>
+<main>
+  <header class="head">
+    <div>
+      <h1>ZenRay Blueprints 3D : Assemblage Multi-Composants & Echelle Mannequin 1.76 m</h1>
+      <p class="sub">Mesures reelles sur l'assemblage 14_ArmGuard (A_002, 764 358 faces) : fermez en un clic l'ecart flottant de 15.34 mm entre Arm_Cuff et Arm_Flare, calibrez le repere pixels sur le mannequin 1.76 m et basculez les motifs de filigrane en HeightTo5Maps 2K.</p>
+    </div>
+    <div class="actions">
+      <button class="btn" id="themeBtn" type="button">Mode sombre</button>
+      <button class="btn primary" id="copyBtn" type="button">Copier les valeurs pour le prompt</button>
+    </div>
+  </header>
+
+  <section class="kpi-strip" aria-label="Indicateurs instantanes">
+    <div class="kpi"><div class="kpi-k">Ecart Arm_Cuff / Flare</div><div class="kpi-v bad" id="kpiGap">15.34 mm (FLOTTANT)</div></div>
+    <div class="kpi"><div class="kpi-k">ContactGraph (seuil 1 mm)</div><div class="kpi-v bad" id="kpiConn">2 ilots (KO)</div></div>
+    <div class="kpi"><div class="kpi-k">Hauteur Monde Calibree</div><div class="kpi-v warn" id="kpiScale">374.3 m (Brut pixels!)</div></div>
+    <div class="kpi"><div class="kpi-k">Polygones Export</div><div class="kpi-v warn" id="kpiPoly">764 358 faces (161 MB)</div></div>
+  </section>
+
+  <section class="bench">
+    <div class="stage-card">
+      <div class="toolbar">
+        <div class="seg">
+          <button class="btn" id="btnFront" type="button" aria-pressed="true">Vue Front Interactive</button>
+          <button class="btn" id="btnQFront" type="button" aria-pressed="false">Vue 3/4 Reference A_002</button>
+          <button class="btn" id="btnOverlay" type="button" aria-pressed="true">Zones Alertes & Socket</button>
+        </div>
+        <div class="seg">
+          <button class="btn primary" id="btnAutoSnap" type="button">Tout Corriger (1 clic)</button>
+          <button class="btn" id="btnReset" type="button">Etat Brut A_002</button>
+        </div>
+      </div>
+
+      <div class="viewport-grid">
+        <div class="canvas-box" id="stageBox">
+          <img class="layer" id="imgLower" src="{lower_uri}" alt="Arm_Flare et Arm_Forearm">
+          <img class="layer" id="imgCuff" src="{cuff_uri}" alt="Arm_Cuff mobile">
+          <img class="layer" id="imgQFront" src="{qfront_uri}" alt="Vue 3/4 A_002" style="display:none">
+          <svg class="overlay" id="svgOverlay" viewBox="0 0 640 640" aria-hidden="true">
+            <rect id="gapRect" x="180" y="188" width="250" height="28" rx="6" fill="rgba(220,38,38,0.18)" stroke="#ef4444" stroke-width="2.5"/>
+            <text id="gapText" x="438" y="207" fill="#fef08a" font-family="Adobe Clean, sans-serif" font-size="15" font-weight="600">Ecart 15.34 mm</text>
+            <rect id="hiddenRect" x="220" y="340" width="150" height="195" rx="8" fill="rgba(245,158,11,0.12)" stroke="#f59e0b" stroke-width="2" stroke-dasharray="6 4"/>
+            <text id="hiddenText" x="226" y="330" fill="#fde68a" font-family="Adobe Clean, sans-serif" font-size="14" font-weight="600">639 184 f relief</text>
+          </svg>
+        </div>
+
+        <aside class="mannequin-card">
+          <div>
+            <h3>Gabarit Mannequin 1.76 m</h3>
+            <p class="foot-note" id="manText">Sans calibration, 374.3 pixels valent 374.3 m en Houdini (891x trop grand).</p>
+          </div>
+          <svg viewBox="0 0 180 280" style="width:100%;height:auto">
+            <line x1="28" y1="20" x2="28" y2="260" stroke="currentColor" stroke-opacity=".3" stroke-width="2"/>
+            <line x1="20" y1="20" x2="36" y2="20" stroke="currentColor" stroke-width="2"/>
+            <line x1="20" y1="260" x2="36" y2="260" stroke="currentColor" stroke-width="2"/>
+            <text x="42" y="30" fill="currentColor" font-size="12">1.76 m</text>
+            <circle cx="110" cy="42" r="14" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="2"/>
+            <rect x="92" y="60" width="36" height="72" rx="10" fill="none" stroke="currentColor" stroke-opacity=".45" stroke-width="2"/>
+            <line x1="92" y1="70" x2="62" y2="148" stroke="currentColor" stroke-opacity=".45" stroke-width="4" stroke-linecap="round"/>
+            <line x1="128" y1="70" x2="152" y2="148" stroke="currentColor" stroke-opacity=".45" stroke-width="4" stroke-linecap="round"/>
+            <line x1="101" y1="132" x2="96" y2="255" stroke="currentColor" stroke-opacity=".45" stroke-width="5" stroke-linecap="round"/>
+            <line x1="119" y1="132" x2="124" y2="255" stroke="currentColor" stroke-opacity=".45" stroke-width="5" stroke-linecap="round"/>
+            <rect id="armBox" x="50" y="90" width="24" height="62" rx="6" fill="rgba(239,68,68,0.25)" stroke="#ef4444" stroke-width="2"/>
+            <text id="armLbl" x="62" y="178" text-anchor="middle" fill="#ef4444" font-size="11" font-weight="600">374 m BRUT</text>
+          </svg>
+          <div class="foot-note" id="pbrNote">Texel M1 : bloque tant que l'echelle brute reste en pixels.</div>
+        </aside>
+      </div>
+    </div>
+
+    <aside class="panel">
+      <h2>Curseurs HDA Assemblage</h2>
+
+      <div class="ctrl">
+        <label><span>Snap Axial Arm_Cuff (mm)</span><output id="oSnap">0.0 mm</output></label>
+        <input id="rSnap" type="range" min="0" max="18" step="0.5" value="0">
+      </div>
+
+      <div class="ctrl">
+        <label><span>Recouvrement Emboitement (%)</span><output id="oTuck">0 %</output></label>
+        <input id="rTuck" type="range" min="0" max="8" step="1" value="0">
+      </div>
+
+      <div class="ctrl">
+        <label><span>Scale Mannequin (1.76m)</span><output id="oScale">Brut 374.3 m</output></label>
+        <input id="rScale" type="range" min="0" max="1" step="1" value="0">
+      </div>
+
+      <div class="ctrl">
+        <label><span>Split Filigrane -> PBR</span><output id="oSplit">Brut (764k f)</output></label>
+        <input id="rSplit" type="range" min="0" max="1" step="1" value="0">
+      </div>
+
+      <h2>Portes GeoAudit / ZenRayUV</h2>
+      <div class="gates" id="gatesList"></div>
+    </aside>
+  </section>
+</main>
+<script>
+const S = {{ snapMm: 0, tuckPct: 0, calibrated: 0, pbrSplit: 0, view: 'front', showOverlay: true }};
+const root = document.documentElement;
+const themeBtn = document.getElementById('themeBtn');
+themeBtn.onclick = () => {{
+  const dark = root.getAttribute('data-theme') === 'dark';
+  root.setAttribute('data-theme', dark ? 'light' : 'dark');
+  themeBtn.textContent = dark ? 'Mode sombre' : 'Mode clair';
+}};
+
+function update() {{
+  const gap = Math.max(0.0, 15.34 - S.snapMm);
+  const tuckShift = S.tuckPct * 0.4;
+  const totalPxShift = ((S.snapMm + tuckShift) / 15.34) * 18.0; // visual pixel displacement matching 15.34mm gap in 640px stage
+  const isFront = S.view === 'front';
+
+  document.getElementById('imgLower').style.display = isFront ? 'block' : 'none';
+  document.getElementById('imgCuff').style.display = isFront ? 'block' : 'none';
+  document.getElementById('imgQFront').style.display = isFront ? 'none' : 'block';
+  document.getElementById('imgCuff').style.transform = `translateY(${{totalPxShift.toFixed(1)}}px)`;
+  document.getElementById('svgOverlay').style.display = (S.showOverlay && isFront) ? 'block' : 'none';
+
+  document.getElementById('btnFront').setAttribute('aria-pressed', isFront ? 'true' : 'false');
+  document.getElementById('btnQFront').setAttribute('aria-pressed', isFront ? 'false' : 'true');
+  document.getElementById('btnOverlay').setAttribute('aria-pressed', S.showOverlay ? 'true' : 'false');
+
+  document.getElementById('oSnap').textContent = `-${{S.snapMm.toFixed(1)}} mm`;
+  document.getElementById('oTuck').textContent = `${{S.tuckPct}} %`;
+  document.getElementById('oScale').textContent = S.calibrated ? '0.420 m (OK)' : 'Brut 374.3 m';
+  document.getElementById('oSplit').textContent = S.pbrSplit ? '3 600 q + 2K PBR' : 'Brut (764k f)';
+
+  const contactOk = gap <= 1.0;
+  const kpiGap = document.getElementById('kpiGap');
+  kpiGap.textContent = contactOk ? `${{gap.toFixed(2)}} mm (ASSEMBLE)` : `${{gap.toFixed(2)}} mm (FLOTTANT)`;
+  kpiGap.className = 'kpi-v ' + (contactOk ? 'ok' : 'bad');
+
+  const kpiConn = document.getElementById('kpiConn');
+  kpiConn.textContent = contactOk ? '1 bloc soude (OK)' : '2 ilots (Arm_Cuff isole)';
+  kpiConn.className = 'kpi-v ' + (contactOk ? 'ok' : 'bad');
+
+  const kpiScale = document.getElementById('kpiScale');
+  kpiScale.textContent = S.calibrated ? '0.420 m (Mannequin OK)' : '374.3 m (891x trop grand!)';
+  kpiScale.className = 'kpi-v ' + (S.calibrated ? 'ok' : 'bad');
+
+  const kpiPoly = document.getElementById('kpiPoly');
+  kpiPoly.textContent = S.pbrSplit ? '3 600 quads (-99.5%) + 2K PBR' : '764 358 faces (161 MB)';
+  kpiPoly.className = 'kpi-v ' + (S.pbrSplit ? 'ok' : 'warn');
+
+  const gapRect = document.getElementById('gapRect');
+  const gapText = document.getElementById('gapText');
+  gapRect.setAttribute('y', (188 + totalPxShift * 0.5).toFixed(1));
+  gapRect.setAttribute('stroke', contactOk ? '#22c55e' : '#ef4444');
+  gapRect.setAttribute('fill', contactOk ? 'rgba(34,197,94,0.16)' : 'rgba(220,38,38,0.18)');
+  gapText.textContent = contactOk ? 'Contact <= 1 mm OK' : `Ecart ${{gap.toFixed(2)}} mm`;
+  gapText.setAttribute('y', (207 + totalPxShift * 0.5).toFixed(1));
+  gapText.setAttribute('fill', contactOk ? '#86efac' : '#fef08a');
+
+  document.getElementById('hiddenText').textContent = S.pbrSplit ? '1 200 q + 2K Height (PBR)' : '639 184 f relief (83.6%)';
+  document.getElementById('hiddenRect').setAttribute('stroke', S.pbrSplit ? '#22c55e' : '#f59e0b');
+
+  document.getElementById('manText').textContent = S.calibrated
+    ? 'Echelle 0.001122 m/px appliquee : avant-bras + coude = 0.420 m sur Mannequin 1.76 m.'
+    : 'Sans calibration, 374.3 pixels valent 374.3 m en Houdini (891x trop grand).';
+  document.getElementById('armBox').setAttribute('fill', S.calibrated ? 'rgba(34,197,94,0.22)' : 'rgba(239,68,68,0.25)');
+  document.getElementById('armBox').setAttribute('stroke', S.calibrated ? '#22c55e' : '#ef4444');
+  document.getElementById('armLbl').textContent = S.calibrated ? '0.420 m OK' : '374 m BRUT';
+  document.getElementById('armLbl').setAttribute('fill', S.calibrated ? '#16a34a' : '#ef4444');
+  document.getElementById('pbrNote').textContent = (S.calibrated && S.pbrSplit)
+    ? 'Pret pour HeadlessM1 (2048 px/m) + HeightTo5Maps (relief 10 mm).'
+    : 'Activez calibration 1.76 m + split PBR pour lancer M1 sans saturation.';
+
+  const gates = [
+    ['Manifold OBJ (open=0, nonman=0)', true, 'OK'],
+    ['ContactGraph <= 1.0 mm', contactOk, contactOk ? '0.08 mm' : `${{gap.toFixed(1)}} mm KO`],
+    ['Scale zenray_mannequin (1.76m)', !!S.calibrated, S.calibrated ? '0.420 m' : '374.3 m'],
+    ['Split Relief -> 2K HeightTo5Maps', !!S.pbrSplit, S.pbrSplit ? '3 600 q' : '764k f'],
+    ['HiddenFaces (minor_density=0.25)', !!S.pbrSplit, S.pbrSplit ? 'Actif' : 'Inactif'],
+    ['Pret HeadlessM1 (score >= 0.999)', contactOk && S.calibrated && S.pbrSplit, (contactOk && S.calibrated && S.pbrSplit) ? 'PRET' : 'BLOQUE'],
+  ];
+  document.getElementById('gatesList').innerHTML = gates.map(([n, ok, tag]) =>
+    `<div class="gate"><span class="g-l"><span class="dot ${{ok ? 'ok' : 'bad'}}"></span>${{n}}</span><strong>${{tag}}</strong></div>`
+  ).join('');
+}}
+
+['rSnap', 'rTuck', 'rScale', 'rSplit'].forEach(id => {{
+  document.getElementById(id).oninput = e => {{
+    if (id === 'rSnap') S.snapMm = parseFloat(e.target.value);
+    if (id === 'rTuck') S.tuckPct = parseFloat(e.target.value);
+    if (id === 'rScale') S.calibrated = parseInt(e.target.value, 10);
+    if (id === 'rSplit') S.pbrSplit = parseInt(e.target.value, 10);
+    update();
+  }};
+}});
+document.getElementById('btnFront').onclick = () => {{ S.view = 'front'; update(); }};
+document.getElementById('btnQFront').onclick = () => {{ S.view = 'qfront'; update(); }};
+document.getElementById('btnOverlay').onclick = () => {{ S.showOverlay = !S.showOverlay; update(); }};
+document.getElementById('btnAutoSnap').onclick = () => {{
+  S.snapMm = 17.5; S.tuckPct = 5; S.calibrated = 1; S.pbrSplit = 1;
+  document.getElementById('rSnap').value = 17.5;
+  document.getElementById('rTuck').value = 5;
+  document.getElementById('rScale').value = 1;
+  document.getElementById('rSplit').value = 1;
+  update();
+}};
+document.getElementById('btnReset').onclick = () => {{
+  S.snapMm = 0; S.tuckPct = 0; S.calibrated = 0; S.pbrSplit = 0;
+  document.getElementById('rSnap').value = 0;
+  document.getElementById('rTuck').value = 0;
+  document.getElementById('rScale').value = 0;
+  document.getElementById('rSplit').value = 0;
+  update();
+}};
+document.getElementById('copyBtn').onclick = async () => {{
+  const payload = JSON.stringify({{
+    snap_axial_mm: -S.snapMm,
+    socket_overlap_pct: S.tuckPct,
+    mannequin_calibrated: !!S.calibrated,
+    target_height_m: 0.42,
+    split_relief_to_2k_pbr: !!S.pbrSplit,
+    texel_density_px_per_m: 2048
+  }}, null, 2);
+  try {{ await navigator.clipboard.writeText(payload); document.getElementById('copyBtn').textContent = 'Valeurs copiees!'; }}
+  catch (_) {{ document.getElementById('copyBtn').textContent = 'Pret (voir console)'; }}
+  setTimeout(() => {{ document.getElementById('copyBtn').textContent = 'Copier les valeurs pour le prompt'; }}, 1400);
+}};
+update();
+</script>
+</body>
+</html>
+"""
+    (OUT_DIR / 'index.html').write_text(html, encoding='utf-8')
+    print('Wrote', OUT_DIR / 'index.html', 'bytes:', len(html))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

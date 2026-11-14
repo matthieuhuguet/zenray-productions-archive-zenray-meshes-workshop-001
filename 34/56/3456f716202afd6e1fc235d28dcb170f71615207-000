@@ -1,0 +1,53 @@
+# Deep Research 09: 5-View Orthographic Isolation, Proxy-Grid Locking & Automated `V0_OrthoIsoGate`
+
+**Timestamp:** `14 November 2026, 04:43 CET`  
+**Live Forensics Audited:** [`OnePictureIsolate.py`](/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/OnePictureIsolate.py), [`GeminiBridge.py`](/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/GeminiBridge.py), [`OrthoCompare.py`](/Users/zenray/.claude/skills/zenray-meshes/scripts/v5/OrthoCompare.py), and failed `Arm_Flare` lot [`I_008_14-November-2026-0153/returned/`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_008_14-November-2026-0153/returned/) vs validated `Arm_Cuff` & `Arm_Forearm` `2x2` grids (`neighbor_crown_grid4_V5.png`, `neighbor_forearm_grid4_V5.png`).
+
+---
+
+## 1. Forensic Diagnosis: Why Per-View Isolation Needed 9 Retries (`I_001` to `I_009`)
+
+Inspecting the actual binary files inside `I_008/returned/` explains verbatim why Matthieu deprecated single-view prompts (`OnePictureIsolate.py:80`) and rejected `I_008`:
+
+1. **Aspect Ratio Drift Across Views:**
+   - `I_008/front.png`: `1254 x 1254` (`1.000` square)
+   - `I_008/back.png`: `1254 x 1254` (`1.000` square)
+   - `I_008/left.png`: `1086 x 1448` (**`0.750` portrait**, NOT `1:1` square)
+   - `I_008/top.png`: `1774 x 887` (**`2.000` panorama**, NOT `1:1` square)
+   Downstream `OrthoViews.py` and `OrthoCompare.py` assume uniform aspect scale across views; `0.75` and `2.00` silently corrupt depth-vs-width calibration.
+
+2. **Oblique View Collapse & Feature Teleportation:**
+   - `I_008/left.png` rendered a 3/4 oblique slab instead of a true 90 deg profile, keeping the whole front outer plate and rectangular slot visible.
+   - `I_008/top.png` hallucinated an extra lower wing horn AND placed the vertical side slot onto the upper lip, violating cross-view geometry.
+
+3. **Missing `V0_OrthoIsoGate` Pre-Houdini Validation:**
+   - `Gates.py` only validates vector curves (`V1_edge .. V9_human`) *after* isolation images are accepted. Neither `OnePictureIsolate.py` nor `GeminiBridge.py`'s `POST /save` endpoint verifies square aspect ratios, mirror IoU (`Front` vs `flip_x(Back)`), or **orthographic epipolar height/width consistency (`Front Y-span == Left Y-span == Back Y-span` and `Front X-span == Top X-span`)**.
+
+---
+
+## 2. Why `2x2` `Grid4` Generation + `V0_OrthoIsoGate` Solves Both Hard-Surface & Organic Isolation
+
+Examining validated [`neighbor_crown_grid4_V5.png`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238/neighbor_crown_grid4_V5.png) and [`neighbor_forearm_grid4_V5.png`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238/neighbor_forearm_grid4_V5.png) confirms why generating a single `2x2` sheet (`TL=Front, TR=Back, BL=Left, BR=Top`, extensible to `3x2` with `Bottom`) performs dramatically better:
+- Shared canvas latent attention enforces identical clay tone, directional softness, and approximate scale in one shot.
+- Adding a **coarse 3D Depth + Edge Proxy `grid4` plate** as Reference #1 (`PromptGridV6_ProxyGuided.md`) eliminates the final failure mode (oblique camera hallucination on `left`/`top`), because Control/reference conditioning fixes the camera angle mathematically instead of relying on French prose (`"ce n'est PAS la vue de face"`).
+
+Even before changing the generator model, adding a pure-CV **`V0_OrthoIsoGate`** check (<100 ms per kit inside `GeminiBridge.py` `/save` and `OnePictureIsolate.py`) catches bad lots deterministically:
+
+| Gate Metric (`V0_OrthoIsoGate`) | Threshold | What It Catches Immediately |
+|---|---|---|
+| **G0.1 Square Aspect** | `abs(W/H - 1.0) <= 0.02` | Rejects `0.750` portrait (`I_008/left`) and `2.000` landscape (`I_008/top`) |
+| **G0.2 Background Uniformity** | `std(bg_border) <= 4.0` & `1` main island | Rejects textured floors, shadows, and multiple stray neighbor shards |
+| **G0.3 Mirror Silhouette IoU (`Front` vs `flip_x(Back)`)** | Normalized BBox IoU `>= 0.78` | Catches mismatched outer notches, tilted poses, or hallucinated horns |
+| **G0.4 Epipolar Height Span (`Front` vs `Back`, `Front` vs `Left`)** | Relative height ratio in `[0.88, 1.14]` | Rejects oblique tilted side/front mismatches before contour tracing |
+| **G0.5 Epipolar Width Span (`Front` vs `Top`)** | Relative width ratio in `[0.88, 1.14]` | Rejects unaligned `top` arches that widen or narrow vs `front` |
+| **G0.6 Light Direction Flatness (`CheckAiHeight`)** | Interior directional coherence `<= 0.25` | Flags dramatic spotlight shading that biases CMY Yellow extraction |
+
+---
+
+## 3. Auto-Calibration Post-Processor (`IsoAlign2x2`) for Already-Generated Good Grids
+
+Even validated `2x2` grids (`neighbor_forearm_grid4_V5.png`) show a real residual scale bias in Quadrant BL (`left` is vertically ~10% taller than `front`, matching why `OrthoCompare.py:7` needed manual CLI hints `[zoom_left=1.24] [zoom_top=0.96]`).
+
+Running **`IsoAlign2x2`** automatically after cropping the `2x2` quadrants rescales & centers `Back`, `Left` (matching `Front`'s `Y` span `[y0, y1]`), and `Top` (matching `Front`'s `X` span `[x0, x1]`) so `zoom_left` and `zoom_top` converge to **`1.000` mathematically**, removing all manual CLI zoom overrides!
+
+Verified quantitatively on real `I_008`, `neighbor_crown_grid4_V5`, and `neighbor_forearm_grid4_V5` inside [`poc7_5views_iso_gate_and_reproj.py`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc7_5views_iso_gate_and_reproj.py).

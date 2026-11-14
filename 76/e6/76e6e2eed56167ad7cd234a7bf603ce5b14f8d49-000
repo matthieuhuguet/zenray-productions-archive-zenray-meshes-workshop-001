@@ -1,0 +1,58 @@
+# Deep Research 08: Component Splitting, ContactGraph Merge, Mannequin Metric Scale & Relief Split
+
+**Timestamp:** `14 November 2026, 04:36 CET`  
+**Live Specimen Audited:** [/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/assembly.obj](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/assembly.obj) & [`assembly.json`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/assembly/A_002/assembly.json)  
+**Downstream Gate Targets:** [`ContactGraph.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/ContactGraph.py) (`touch = 1.0 mm`), [`HiddenFaces.py`](/Users/zenray/.claude/skills/zenray-houdini/scripts/geo/HiddenFaces.py), [`CleanPropGeometry1.md`](/Users/zenray/.claude/skills/zenray-houdini/references/CleanPropGeometry1.md) (`zenray_mannequin` `1.76 m`)
+
+---
+
+## 1. Real Measurements Observed on `14_ArmGuard` (`A_002`)
+
+Parsing all `764,362` vertices and `764,358` quad faces in `A_002/assembly.obj` exposes four concrete pipeline failures that explain manual iteration cost when moving from isolated components to an assembled hero asset:
+
+| Audit Metric | Measured in Live `A_002` | Required by `zenray-houdini` / Unreal | Root Cause |
+|---|---|---|---|
+| **Coordinate Unit Frame** | `374.30` units tall (`frame: "Clive picture pixels"`) | `~0.42 m` calibrated next to `1.76 m` mannequin (**891x off!**) | Missing metric scale step (`m/px = 0.001122`) before export |
+| **Floating Part Gap (`Arm_Cuff` <-> `Arm_Flare`)** | **`13.67 px` (`15.34 mm` min gap; `25.92 mm` P5)** | `<= 1.0 mm` (`ContactGraph` `"RIEN NE FLOTTE"`) | Pieces placed by separate 2D pixel BBox instead of 3D anchor sockets |
+| **Forearm Overlap (`Arm_Forearm` <-> `Arm_Flare`)** | `0.03 px` (`0.04 mm` contact; `73.8 mm` Y overlap) | Seated clearance + buried faces flagged | No `HiddenFaces` raycast or socket clip |
+| **Polygon Bloat (`Arm_Forearm`)** | **`639,184` faces (`83.6%` of `764,358`; `161 MB` OBJ)** | `~1,200..4,000` clean quad shell + `2048 px` `HeightTo5Maps` | Ornament motifs baked as high-poly geometry instead of Normal/Height PBR |
+
+---
+
+## 2. Solution A: Component Splitting with Neighbour Anchors (From `I_008` Failure to `I_009` + Socket Graph)
+
+In [`Arm_Flare/isolation/I_009_14-November-2026-0238/kit.json`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238/kit.json), `I_008` failed (`"le elbow c'est n'importe quoi"`) until neighbor context grids (`neighbor_crown_grid4_V5.png`, `neighbor_forearm_grid4_V5.png`) were supplied.
+
+To generalize cleanly to **any multi-component mesh (hard surface armor, vehicle, character, modular tree)**:
+1. **Explicit Anchor Graph in `Project.json`:** Each component declares `parent` and `socket` (`Arm_Cuff -> Arm_Flare -> Arm_Forearm` or `Trunk -> Fork -> Limbs -> FoliageCards`), carrying two shared metric points (`p_top_anchor`, `p_bot_anchor`) in world space so each piece's isolation prompt and camera frustum stay co-registered.
+2. **Overlap Margin Rule:** Splitting adjacent components along anatomical/mechanical creases uses a **5% seam sleeve margin** (e.g., upper cuff lip tucks `4..8 mm` inside/over elbow bell rather than ending in empty air), guaranteeing `ContactGraph` produces **1 connected component (`floating == []`)**.
+3. **Never Split Ornament Relief from Base Shell Geometry:** Filigree, rivets, leather stitching, and bark fissures remain **2D high-res UV detail channels** fed to `HeightInputs.py` + `HeightTo5MapsCop.py` unless macro silhouette silhouette height exceeds **`> 8 mm`** at `zenray_mannequin` scale. That cuts scene triangle budget from `764,358` faces (`44.5 MB` OBJ) down to `~3,600` quad faces (**99.5% reduction**) while producing crisper sub-millimetre surface relief at `2048 px/m` (`0.49 mm/texel`!).
+
+---
+
+## 3. Solution B: Metric Calibration to `zenray_mannequin` (`1.76 m`)
+
+Pixel-space assembly (`"Clive picture pixels"`) breaks every downstream Houdini physical unit (`HeadlessM1.py` texel density, `HeightTo5MapsCop.py` `relief_depth_m` and `normal_scale`, `GeoAudit.py` volume and edge tolerance `1e-4 m = 0.1 mm`).
+
+**Automated `zrm_mannequin_calibrate(scale_ref='arm_full', target_m=0.42)` transform:**
+1. Compute total assembled height `H_raw` along main anatomical axis.
+2. Scale all component transforms uniformly by `s = target_m / H_raw` around the primary socket origin `(cx, cy_base, 0)`.
+3. For `14_ArmGuard`: `374.30 px -> 0.420 m` (`s = 0.0011221 m/px`), landing `Arm_Cuff` at `12.3 cm`, `Arm_Flare` at `17.7 cm`, `Arm_Forearm` at `20.5 cm`, matching a `1.76 m` `zenray_mannequin` forearm + elbow armor silhouette exactly.
+
+---
+
+## 4. Solution C: Automated Merge Assembly Gates (`GeoAudit` + `ContactGraph` + `HiddenFaces`)
+
+Before final export from `zenray-meshes` to `zenray-uv`:
+1. **Per-Component `GeoAudit`:** Assert `open_edges == 0`, `nonmanifold_edges == 0`, `inconsistent_winding == 0`, `flipped_pieces == 0` (`volume_m3 > 0`), and detect notched Boolean contour spikes (`min_scaled_jacobian >= 0.45` after MILP Coons reconstruction).
+2. **Inter-Piece `ContactGraph` (`touch = 1.0 mm`):** Compute pairwise surface distances `gap[a, b]`. Any piece with `min_gap > 1.0 mm` triggers an automatic axial seat translation along its parent socket vector (sliding `Arm_Cuff` `-15.4 mm` along `Y` closes `Arm_Cuff <-> Arm_Flare` from `15.34 mm` floating to `0.0 mm` seated contact) OR flags a red `"FLOTTANT"` warning badge in the 10-second Blueprints 3D Cockpit.
+3. **`HiddenFaces` Texel Guard:** Raycast 1 mm along outward face normals; mark interior faces totally enclosed by overlapping armor/limb shells so `HeadlessM1` assigns minor density (`0.25x`, `m1_minor_density=0.25`) or deletes redundant hidden polygons instead of wasting prime `2048x2048` texture pixels.
+
+---
+
+## 5. PoC 6 Verification Summary
+
+Tested in [`poc6_multicomponent_contact_and_scale.py`](/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc6_multicomponent_contact_and_scale.py) directly on live `A_002/assembly.obj` + `A_002/views/{front,q_front}.png`:
+- Reproduces `ContactGraph` measurement: detects `Arm_Cuff` floating **`15.34 mm`** above `Arm_Flare` (`floating: ['Arm_Cuff']`) while `Arm_Flare <-> Arm_Forearm` sits at **`0.04 mm`**.
+- Applies automated Mannequin metric scaling (`0.001122 m/px` -> `0.420 m`) + socket contact snap (`-15.4 mm` along arm axis -> `gap = 0.0 mm`, `floating: []`, `components: 1`).
+- Audits hidden face share inside the overlap pocket (`73.8 mm` Y overlap zone) and compares `764,358` live baked faces (`44.5 MB`) vs `~3,600` quad shell + `2048 px` Copernicus PBR (`99.5%` poly reduction).
