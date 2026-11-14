@@ -1,0 +1,240 @@
+#!/Users/zenray/.venvs/zenray-uv/bin/python
+"""
+V0_OrthoIsoGate_ref.py (14 November 2026)
+Non-destructive reference patch module ready to be imported by:
+  - /Users/zenray/.claude/skills/zenray-meshes/scripts/v5/GeminiBridge.py (on POST /save)
+  - /Users/zenray/.claude/skills/zenray-meshes/scripts/v5/OnePictureIsolate.py (post-isolation gate)
+
+Validates 4/5 orthographic views BEFORE contour/CMY drawing starts:
+  1. Square aspect ratio per view (catches I_008 left=0.75, top=2.00 drift)
+  2. Neutral background uniformity & clean main foreground silhouette without frame border clipping
+  3. Horizontal Mirror IoU (Front vs horizontally flipped Back silhouette)
+  4. Epipolar span lock: Front_H vs Left_H, Front_H vs Back_H, Front_W vs Top_W
+  5. Auto-computes per-view scale correction hints (zoom_left, zoom_top, zoom_back)
+"""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from scipy import ndimage as ndi
+
+
+DEFAULT_PARAMS = {
+    "max_aspect_err": 0.04,
+    "max_bg_std": 14.0,
+    "min_border_margin_px": 2,
+    "min_mirror_iou": 0.85,
+    "max_height_ratio_err": 0.12,
+    "max_width_ratio_err": 0.14,
+    "pass_score": 0.80,
+}
+
+
+def extract_fg_mask(im_rgb: Image.Image):
+    """Segment foreground object using border ring median color and largest connected component."""
+    arr = np.asarray(im_rgb, dtype=np.float32)
+    h, w, _ = arr.shape
+    border = np.concatenate([
+        arr[0:6, :].reshape(-1, 3),
+        arr[-6:, :].reshape(-1, 3),
+        arr[:, 0:6].reshape(-1, 3),
+        arr[:, -6:].reshape(-1, 3),
+    ], axis=0)
+    bg_col = np.median(border, axis=0)
+    bg_std = float(np.mean(np.std(border, axis=0)))
+    dist = np.linalg.norm(arr - bg_col, axis=2)
+    raw = dist > max(8.0, 4.0 * bg_std)
+    raw = ndi.binary_closing(raw, iterations=2)
+    raw = ndi.binary_fill_holes(raw)
+    lab, n = ndi.label(raw)
+    if n == 0:
+        return np.zeros((h, w), dtype=bool), bg_std, (0, 0, 0, 0), 0
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    best = int(np.argmax(sizes))
+    sig_islands = int((sizes[1:] > 0.01 * sizes[best]).sum())
+    mask = (lab == best)
+    ys, xs = np.nonzero(mask)
+    bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    return mask, bg_std, bbox, sig_islands
+
+
+def normalize_bbox_mask(mask: np.ndarray, bbox, side: int = 160) -> np.ndarray:
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((side, side), dtype=bool)
+    crop = Image.fromarray(mask[y0:y1, x0:x1].astype(np.uint8) * 255).resize((side, side), Image.NEAREST)
+    return np.asarray(crop) > 127
+
+
+def evaluate_views(imgs: dict, params: dict = None) -> dict:
+    """
+    Evaluate {'front': PIL, 'back': PIL, 'left': PIL, 'top': PIL} (and optional 'right').
+    Returns crisp traffic-light gate verdict + remediation hints + score in [0, 1].
+    """
+    P = dict(DEFAULT_PARAMS)
+    if params:
+        P.update(params)
+
+    required = ("front", "back", "left", "top")
+    missing = [k for k in required if k not in imgs]
+    if missing:
+        return {"status": "REJECT_REDO", "score": 0.0, "reasons": [f"missing views: {missing}"]}
+
+    info = {}
+    reasons = []
+    for name, im in imgs.items():
+        w, h = im.size
+        aspect = w / float(max(h, 1))
+        aspect_err = abs(aspect - 1.0)
+        mask, bg_std, bbox, islands = extract_fg_mask(im.convert("RGB"))
+        x0, y0, x1, y1 = bbox
+        mpx = P["min_border_margin_px"]
+        clipped = (x0 <= mpx) or (y0 <= mpx) or (x1 >= w - mpx) or (y1 >= h - mpx)
+        w_frac = (x1 - x0) / float(max(w, 1))
+        h_frac = (y1 - y0) / float(max(h, 1))
+        info[name] = {
+            "size": [w, h],
+            "aspect": round(aspect, 4),
+            "aspect_err": round(aspect_err, 4),
+            "bg_std": round(bg_std, 2),
+            "bbox": list(bbox),
+            "w_frac": round(w_frac, 4),
+            "h_frac": round(h_frac, 4),
+            "clipped": bool(clipped),
+            "islands": islands,
+        }
+        if aspect_err > P["max_aspect_err"]:
+            reasons.append(f"{name}: non-square aspect {aspect:.3f}")
+        if bg_std > P["max_bg_std"]:
+            reasons.append(f"{name}: noisy background std={bg_std:.1f}")
+        if w_frac < 0.05 or h_frac < 0.05:
+            reasons.append(f"{name}: empty or tiny foreground ({w_frac:.2f}x{h_frac:.2f})")
+
+        info[name]["_mask"] = mask
+
+    mf = normalize_bbox_mask(info["front"]["_mask"], info["front"]["bbox"])
+    mb = normalize_bbox_mask(info["back"]["_mask"], info["back"]["bbox"])[:, ::-1]
+    mirror_iou = float((mf & mb).sum()) / float(max((mf | mb).sum(), 1))
+
+    fh = max(info["front"]["h_frac"], 1e-6)
+    fw = max(info["front"]["w_frac"], 1e-6)
+    h_ratio_back = info["back"]["h_frac"] / fh
+    h_ratio_left = info["left"]["h_frac"] / fh
+    w_ratio_top = info["top"]["w_frac"] / fw
+
+    if mirror_iou < P["min_mirror_iou"]:
+        reasons.append(f"front/back mirror IoU too low ({mirror_iou:.3f} < {P['min_mirror_iou']})")
+    if abs(h_ratio_left - 1.0) > P["max_height_ratio_err"]:
+        reasons.append(f"epipolar height drift left/front ({h_ratio_left:.3f})")
+    if abs(h_ratio_back - 1.0) > P["max_height_ratio_err"]:
+        reasons.append(f"epipolar height drift back/front ({h_ratio_back:.3f})")
+    if abs(w_ratio_top - 1.0) > P["max_width_ratio_err"]:
+        reasons.append(f"epipolar width drift top/front ({w_ratio_top:.3f})")
+
+    # Sub-scores (0..1)
+    s_aspect = 1.0 if all(info[k]["aspect_err"] <= P["max_aspect_err"] for k in required) else 0.0
+    s_mirror = min(1.0, max(0.0, (mirror_iou - 0.50) / (P["min_mirror_iou"] - 0.50)))
+    s_epip = 1.0 if (
+        abs(h_ratio_left - 1.0) <= P["max_height_ratio_err"]
+        and abs(h_ratio_back - 1.0) <= P["max_height_ratio_err"]
+        and abs(w_ratio_top - 1.0) <= P["max_width_ratio_err"]
+    ) else 0.35
+    s_bg = 1.0 if all(info[k]["bg_std"] <= P["max_bg_std"] for k in required) else 0.4
+    score = round(0.30 * s_aspect + 0.30 * s_mirror + 0.25 * s_epip + 0.15 * s_bg, 3)
+
+    # Strip internal numpy masks before returning JSON-safe dict
+    for k in info:
+        info[k].pop("_mask", None)
+
+    zoom_hints = {
+        "zoom_back": round(1.0 / max(h_ratio_back, 1e-4), 4),
+        "zoom_left": round(1.0 / max(h_ratio_left, 1e-4), 4),
+        "zoom_top": round(1.0 / max(w_ratio_top, 1e-4), 4),
+    }
+
+    if score >= P["pass_score"] and s_aspect == 1.0 and not any("empty" in r for r in reasons):
+        status = "PASS"
+    elif s_aspect == 1.0 and mirror_iou >= P["min_mirror_iou"] and abs(h_ratio_left - 1.0) <= 0.22 and abs(w_ratio_top - 1.0) <= 0.22:
+        status = "AUTO_ZOOM_FIX"
+    else:
+        status = "REJECT_REDO"
+
+    return {
+        "status": status,
+        "score": score,
+        "mirror_iou_front_back": round(mirror_iou, 4),
+        "epipolar": {
+            "height_ratio_back": round(h_ratio_back, 4),
+            "height_ratio_left": round(h_ratio_left, 4),
+            "width_ratio_top": round(w_ratio_top, 4),
+        },
+        "zoom_hints": zoom_hints,
+        "reasons": reasons,
+        "views": info,
+    }
+
+
+def split_grid4(grid_img: Image.Image, margin: int = 12) -> dict:
+    """Split a 2x2 Grid4 sheet: TL=front, TR=back, BL=left, BR=top (trimming divider crosshairs)."""
+    w, h = grid_img.size
+    hw, hh = w // 2, h // 2
+    m = margin
+    return {
+        "front": grid_img.crop((m, m, hw - m, hh - m)),
+        "back": grid_img.crop((hw + m, m, w - m, hh - m)),
+        "left": grid_img.crop((m, hh + m, hw - m, h - m)),
+        "top": grid_img.crop((hw + m, hh + m, w - m, h - m)),
+    }
+
+
+def selftest():
+    i008 = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_008_14-November-2026-0153/returned")
+    i009 = Path("/Users/zenray/.claude/tmp/tmp-zenray-meshes/Projects/14_ArmGuard_13-November-2026/components/Arm_Flare/isolation/I_009_14-November-2026-0238")
+
+    # 1. Real failed I_008 must trigger REJECT_REDO
+    r_i008 = evaluate_views({k: Image.open(i008 / f"{k}.png") for k in ("front", "back", "left", "top")})
+    assert r_i008["status"] == "REJECT_REDO", f"Expected REJECT_REDO on I_008, got {r_i008}"
+
+    # 2. Real validated Arm_Cuff Grid4 must PASS cleanly
+    cuff_grid = Image.open(i009 / "neighbor_crown_grid4_V5.png")
+    r_cuff = evaluate_views(split_grid4(cuff_grid))
+    assert r_cuff["status"] == "PASS", f"Expected PASS on Arm_Cuff Grid4, got {r_cuff}"
+
+    # 3. Real Arm_Forearm Grid4 measures epipolar width/height and yields auto-zoom hints
+    forearm_grid = Image.open(i009 / "neighbor_forearm_grid4_V5.png")
+    r_arm = evaluate_views(split_grid4(forearm_grid))
+    assert r_arm["status"] in ("PASS", "AUTO_ZOOM_FIX"), f"Unexpected status on Arm_Forearm: {r_arm}"
+
+    # 4. Synthetic perspective/aspect failure
+    syn_ok = {}
+    for k in ("front", "back", "left", "top"):
+        im = Image.new("RGB", (256, 256), (128, 128, 128))
+        arr = np.asarray(im).copy()
+        arr[64:192, 96:160] = (210, 210, 210)
+        syn_ok[k] = Image.fromarray(arr)
+    r_syn_ok = evaluate_views(syn_ok)
+    assert r_syn_ok["status"] == "PASS" and r_syn_ok["score"] >= 0.99, r_syn_ok
+
+    syn_bad = dict(syn_ok)
+    syn_bad["left"] = Image.new("RGB", (192, 256), (128, 128, 128))
+    r_syn_bad = evaluate_views(syn_bad)
+    assert r_syn_bad["status"] == "REJECT_REDO", r_syn_bad
+
+    print(json.dumps({
+        "selftest": "PASS",
+        "I_008": {"status": r_i008["status"], "score": r_i008["score"], "reasons": r_i008["reasons"]},
+        "Arm_Cuff_Grid4": {"status": r_cuff["status"], "score": r_cuff["score"], "mirror_iou": r_cuff["mirror_iou_front_back"]},
+        "Arm_Forearm_Grid4": {"status": r_arm["status"], "score": r_arm["score"], "zoom_hints": r_arm["zoom_hints"]},
+        "Synthetic_Clean": r_syn_ok["status"],
+        "Synthetic_AspectDrift": r_syn_bad["status"],
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("selftest", "--selftest"):
+        selftest()
+    else:
+        print("Usage: python V0_OrthoIsoGate_ref.py selftest")

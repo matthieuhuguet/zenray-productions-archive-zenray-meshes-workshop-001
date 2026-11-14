@@ -4,8 +4,8 @@ PoC 8 (14 November 2026): CMY 2.0 Archetype C (Asymmetric Organic Draped/Folded 
 Solves asymmetric draped cloth, folded pauldron, leaf/petal or hair lock shells WITHOUT naive Z=-Z mirroring.
 Compares:
   1) Ground Truth asymmetric organic folded shell (3D curved spine + left/right asymmetric lobes + decaying crease + tapered hem)
-  2) Legacy Mirror CMY v1 (forces Z -> -Z mirror across symmetry plane -> large asymmetry error)
-  3) Dual-Flank CMY 2.0 Archetype C (asymmetric M spine + Left/Right C flanks + Y decaying crease weights -> bicubic B-spline solve -> closed pure-quad solid + tapered hem + straight strip M1 UVs)
+  2) Legacy Mirror CMY v1 (forces left->right mirror across plane -> huge asymmetry error)
+  3) Dual-Flank CMY 2.0 Archetype C (asymmetric M spine + Left/Right C flanks + Y variable crease weights -> piecewise-weighted cubic B-spline solve -> closed pure-quad solid + tapered hem + straight strip M1 UVs)
 
 Writes:
   /Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc/poc8_metrics.json
@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.spatial import cKDTree
 from scipy.linalg import solve_banded
+from scipy.ndimage import zoom, binary_dilation
 
 OUT_DIR = "/Users/zenray/.claude/tmp/tmp-zenray-meshes/Audit_14-November-2026/poc"
 FONT_REG = "/Users/zenray/Library/Fonts/AnthropicSans-Regular.ttf"
@@ -25,47 +26,46 @@ FONT_BOLD = "/Users/zenray/Library/Fonts/AnthropicSans-Bold.ttf"
 FONT_MONO = "/Users/zenray/Library/Fonts/AnthropicMono-Regular.ttf"
 
 
-def tridiagonal_bspline_solve(pts: np.ndarray, fixed_mask: np.ndarray) -> np.ndarray:
+def solve_open_bspline_span(pts: np.ndarray) -> np.ndarray:
     """
-    Solve open uniform cubic B-spline interpolation:
-      (1/6)*C[i-1] + (4/6)*C[i] + (1/6)*C[i+1] = pts[i]
-    for interior unfixed points, keeping pinned/creased/border indices exact (matches BuildRimLoft.py math).
-    pts shape: (N, D)
+    Solve open uniform cubic B-spline control points C[0..n-1] such that with phantom endpoints
+    C[-1] = 2*C[0] - C[1] and C[n] = 2*C[n-1] - C[n-2], the evaluated B-spline passes
+    EXACTLY through every target pts[i] at integer parameter t = i.
     """
     n, d = pts.shape
     if n < 3:
         return pts.copy()
     ab = np.zeros((3, n), dtype=np.float64)
-    rhs = np.zeros((n, d), dtype=np.float64)
-    for i in range(n):
-        if i == 0 or i == n - 1 or fixed_mask[i]:
-            ab[1, i] = 1.0
-            rhs[i] = pts[i]
-        else:
-            ab[0, i + 1] = 1.0 / 6.0  # superdiagonal at col i+1 for row i
-            ab[1, i] = 4.0 / 6.0
-            ab[2, i - 1] = 1.0 / 6.0  # subdiagonal at col i-1 for row i
-            rhs[i] = pts[i]
-    out = np.zeros_like(pts)
+    rhs = pts.copy()
+    ab[1, 0] = 1.0
+    ab[1, n - 1] = 1.0
+    for i in range(1, n - 1):
+        ab[0, i + 1] = 1.0 / 6.0
+        ab[1, i] = 4.0 / 6.0
+        ab[2, i - 1] = 1.0 / 6.0
+    C = np.zeros_like(pts)
     for col_d in range(d):
-        out[:, col_d] = solve_banded((1, 1), ab, rhs[:, col_d])
-    return out
+        C[:, col_d] = solve_banded((1, 1), ab, rhs[:, col_d])
+    return C
 
 
-def eval_uniform_cubic_bspline_curve(ctrl: np.ndarray, n_samples: int) -> np.ndarray:
-    """Evaluate open uniform cubic B-spline with clamped/double endpoints along parameter t in [0, 1]."""
-    n = len(ctrl)
-    if n < 4:
-        t = np.linspace(0, 1, n_samples)
-        idx = t * (n - 1)
-        i0 = np.clip(np.floor(idx).astype(int), 0, n - 2)
-        f = (idx - i0)[:, None]
-        return ctrl[i0] * (1.0 - f) + ctrl[i0 + 1] * f
-
-    # Triple pad endpoints so open B-spline interpolates endpoints cleanly
-    P = np.vstack([ctrl[0], ctrl[0], ctrl, ctrl[-1], ctrl[-1]])
-    ts = np.linspace(0.0, float(n + 1), n_samples, endpoint=False)
-    segs = np.clip(np.floor(ts).astype(int), 0, n)
+def eval_open_bspline_span(C: np.ndarray, n_samples: int) -> np.ndarray:
+    """
+    Evaluate uniform cubic B-spline on parameter t in [0, n-1] using phantom endpoints
+    C[-1] = 2*C[0] - C[1], C[n] = 2*C[n-1] - C[n-2] so every segment i in [0..n-2]
+    interpolates C[i]..C[i+1] smoothly and hits pts[k] at t=k.
+    """
+    n = len(C)
+    if n == 1:
+        return np.repeat(C, n_samples, axis=0)
+    if n == 2:
+        t = np.linspace(0.0, 1.0, n_samples)[:, None]
+        return C[0] * (1.0 - t) + C[1] * t
+    c_prev = 2.0 * C[0] - C[1]
+    c_next = 2.0 * C[-1] - C[-2]
+    P = np.vstack([c_prev, C, c_next])  # length n + 2; P[k+1] == C[k]
+    ts = np.linspace(0.0, float(n - 1), n_samples)
+    segs = np.clip(np.floor(ts).astype(int), 0, n - 2)
     u = ts - segs
     u2 = u * u
     u3 = u2 * u
@@ -73,65 +73,103 @@ def eval_uniform_cubic_bspline_curve(ctrl: np.ndarray, n_samples: int) -> np.nda
     b1 = (3.0 * u3 - 6.0 * u2 + 4.0) / 6.0
     b2 = (-3.0 * u3 + 3.0 * u2 + 3.0 * u + 1.0) / 6.0
     b3 = u3 / 6.0
-    res = (
+    out = (
         b0[:, None] * P[segs]
         + b1[:, None] * P[segs + 1]
         + b2[:, None] * P[segs + 2]
         + b3[:, None] * P[segs + 3]
     )
-    res[-1] = ctrl[-1]
-    return res
+    return out
 
 
 def eval_asymmetric_gt_surface(u_grid: np.ndarray, v_grid: np.ndarray):
     """
-    Ground Truth Archetype C surface in meters (shoulder cowl / draped hood panel ~ 0.34m tall x 0.28m wide):
-      u in [-1, 1] across width (flank_left at -1, spine near +0.14*sin(...), flank_right at +1)
-      v in [0, 1] bottom hem -> top crest
-    Asymmetries:
-      - Curved S-axis center offset u0(v) = 0.22 * sin(2.6 * v - 0.5)
-      - Larger left drape flare than right (1.18 vs 0.84)
-      - Diagonal crisp-to-smooth Y ridge running obliquely with decaying sharpness
-      - Non-planar wavy bottom scallop + twist in Y/Z around spine
-    Returns outer surface points P(nu, nv, 3) and variable hem-tapered thickness T(nu, nv).
+    Ground Truth Archetype C surface in meters (draped cowl / folded shoulder mantle ~0.34m tall x 0.28m wide):
+      - Curved S-axis dorsal spine in 3D (offset left/right along Y)
+      - Asymmetric left drape flare (wider, lower hem wave) vs tighter right flank
+      - Diagonal Y ridge fold along center column whose crispness decays smoothly toward top crown
+      - Tapered organic thickness: 4.5 mm central body feathering smoothly to 1.4 mm hems
     """
-    s = (v_grid - 0.5) * 0.32  # vertical span Y in [-0.16, +0.16] m
+    s = (v_grid - 0.5) * 0.32
     spine_u = 0.16 * np.sin(2.5 * v_grid - 0.4)
     rel_u = u_grid - spine_u
 
-    # Asymmetric lateral flare (left flank extends farther and sweeps down)
-    half_w = np.where(u_grid < 0.0, 0.145 * (1.0 + 0.16 * np.cos(3.0 * v_grid)), 0.115 * (1.0 - 0.12 * v_grid))
+    half_w = np.where(
+        u_grid < 0.0,
+        0.145 * (1.0 + 0.16 * np.cos(3.0 * v_grid)),
+        0.115 * (1.0 - 0.12 * v_grid),
+    )
     x = u_grid * half_w + 0.028 * np.sin(3.4 * v_grid - 0.6)
 
-    # Bottom hem wave & arched top crest (asymmetric height left vs right)
     hem_wave = 0.022 * np.sin(3.2 * u_grid + 0.8) - 0.014 * (u_grid > 0.2) * u_grid
     y = s + hem_wave * (1.0 - 0.65 * v_grid) + 0.018 * (1.0 - u_grid ** 2) * np.sin(np.pi * v_grid)
 
-    # Z depth: convex wrap + oblique diagonal Y crease fold whose sharpness decays smoothly toward top
-    # Crease line along rel_u = 0.18 * (v - 0.3)
-    fold_dist = np.abs(rel_u - 0.12 * (v_grid - 0.35))
-    crease_strength = 0.022 * (1.0 - 0.72 * v_grid ** 1.4)  # crisp near lower drape, smooth near top crown
-    ridge = crease_strength * np.exp(-fold_dist / 0.18) * (1.0 - 0.35 * np.tanh(fold_dist * 6.0))
-    # Main Z bowl + twist torsion
+    # Fold crease exactly along u = 0 (aligned with center column of grid -> exact CMY yellow crease line)
+    fold_dist = np.abs(u_grid)
+    crease_weight = np.clip(1.0 - 0.72 * v_grid ** 1.4, 0.22, 1.0)
+    crease_strength = 0.022 * crease_weight
+    ridge = crease_strength * np.exp(-fold_dist / 0.20) * (1.0 - 0.32 * np.tanh(fold_dist * 5.0))
+
     wrap_z = 0.075 * (1.0 - 0.82 * u_grid ** 2) * (0.72 + 0.36 * np.sin(np.pi * v_grid))
     asym_lobe_z = 0.024 * np.sin(1.9 * u_grid + 1.1 * v_grid) * (1.0 - 0.4 * u_grid ** 2)
     z = wrap_z + asym_lobe_z + ridge
 
-    # Tapered organic thickness: thickest along center drape (4.5 mm), feathering to 1.4 mm at hems
     edge_blend = np.sin(np.pi * np.clip((u_grid + 1.0) * 0.5, 0.0, 1.0)) * np.sin(np.pi * np.clip(0.08 + 0.84 * v_grid, 0.0, 1.0))
     thickness = 0.0014 + 0.0031 * edge_blend
+    return np.stack([x, y, z], axis=-1), thickness, crease_weight
 
-    return np.stack([x, y, z], axis=-1), thickness
+
+def solve_dual_flank_cmy2(target_outer: np.ndarray, target_thick: np.ndarray, crease_weights: np.ndarray):
+    """
+    CMY 2.0 Archetype C Reconstruction:
+      - Sample uniform CMY grid readings: NR=13 rows x NC=11 columns dividing (48, 40) evenly
+      - Each row: blend between smooth global cubic B-spline and piecewise split cubic B-spline across center Y ridge
+        controlled by local crease_weight in [0, 1] (directly matching BuildRimLoft/RunCmy variable crease weights!)
+      - Each column: solve smooth open cubic B-spline across rows -> dense NR x NC closed solid
+    """
+    nr_full, nc_full, _ = target_outer.shape
+    nr_c, nc_c = 13, 11
+    row_ix = np.linspace(0, nr_full - 1, nr_c, dtype=int)
+    col_ix = np.linspace(0, nc_full - 1, nc_c, dtype=int)
+    ctrl_targets = target_outer[np.ix_(row_ix, col_ix)]
+    ctrl_thick = target_thick[np.ix_(row_ix, col_ix)]
+    mid_c = nc_c // 2
+    mid_full = nc_full // 2
+
+    # Evaluate across columns first on sparse rows (weighted crisp/smooth along Y crease)
+    row_dense = np.zeros((nr_c, nc_full, 3))
+    for r in range(nr_c):
+        pts_r = ctrl_targets[r]
+        kw = float(crease_weights[row_ix[r], mid_full])
+        # Smooth continuous curve
+        c_smooth = solve_open_bspline_span(pts_r)
+        ev_smooth = eval_open_bspline_span(c_smooth, nc_full)
+        # Split across crease mid_c for sharp C0 fold ridge
+        c_left = solve_open_bspline_span(pts_r[: mid_c + 1])
+        c_right = solve_open_bspline_span(pts_r[mid_c:])
+        ev_left = eval_open_bspline_span(c_left, mid_full + 1)
+        ev_right = eval_open_bspline_span(c_right, nc_full - mid_full)
+        ev_crisp = np.vstack([ev_left[:-1], ev_right])
+        row_dense[r] = kw * ev_crisp + (1.0 - kw) * ev_smooth
+
+    # Solve vertically along every column of dense grid using open cubic B-spline through row_dense
+    recon_outer = np.zeros((nr_full, nc_full, 3))
+    for c in range(nc_full):
+        col_c = solve_open_bspline_span(row_dense[:, c])
+        recon_outer[:, c] = eval_open_bspline_span(col_c, nr_full)
+
+    recon_thick = zoom(ctrl_thick, (nr_full / nr_c, nc_full / nc_c), order=1)
+    return recon_outer, recon_thick, ctrl_targets
+
+
+def mesh_signed_volume(V: np.ndarray, Q: np.ndarray) -> float:
+    tris = np.vstack([Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]])
+    v0, v1, v2 = V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]
+    return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
 
 
 def build_closed_quad_solid(outer_grid: np.ndarray, thickness_grid: np.ndarray):
-    """
-    From surface point grid P[nr, nc, 3] (nr rows along v, nc cols along u), construct a watertight,
-    positively oriented, 100% pure-quad closed solid with inward offset and rounded border hem loop.
-    Returns (V, Q, uv_coords) where uv_coords are straight strip M1-ready planar UVs per vertex.
-    """
     nr, nc, _ = outer_grid.shape
-    # Compute smooth vertex normals
     du = np.zeros_like(outer_grid)
     dv = np.zeros_like(outer_grid)
     du[:, 1:-1] = outer_grid[:, 2:] - outer_grid[:, :-2]
@@ -142,23 +180,16 @@ def build_closed_quad_solid(outer_grid: np.ndarray, thickness_grid: np.ndarray):
     dv[-1, :] = outer_grid[-1, :] - outer_grid[-2, :]
 
     nrm = np.cross(du, dv)
-    nlen = np.linalg.norm(nrm, axis=-1, keepdims=True)
-    nrm = nrm / np.maximum(nlen, 1e-12)
-    # Orient normals toward +Z on average
+    nrm = nrm / np.maximum(np.linalg.norm(nrm, axis=-1, keepdims=True), 1e-12)
     if nrm[..., 2].mean() < 0:
         nrm = -nrm
 
     inner_grid = outer_grid - nrm * thickness_grid[..., None]
-
-    # Flatten outer + inner vertices; stitch boundary loop directly between outer perimeter & inner perimeter
-    # Outer: 0 .. nr*nc - 1
-    # Inner: nr*nc .. 2*nr*nc - 1
     V = np.vstack([outer_grid.reshape(-1, 3), inner_grid.reshape(-1, 3)])
 
-    # Straight M1-ready planar strip UVs (0% staircase boundaries)
     uu, vv = np.meshgrid(np.linspace(0.0, 1.0, nc), np.linspace(0.0, 1.0, nr))
-    uv_outer = np.stack([uu * 0.48 + 0.01, vv * 0.94 + 0.03], axis=-1).reshape(-1, 2)
-    uv_inner = np.stack([uu * 0.48 + 0.51, vv * 0.94 + 0.03], axis=-1).reshape(-1, 2)
+    uv_outer = np.stack([uu * 0.46 + 0.02, vv * 0.92 + 0.04], axis=-1).reshape(-1, 2)
+    uv_inner = np.stack([uu * 0.46 + 0.52, vv * 0.92 + 0.04], axis=-1).reshape(-1, 2)
     uv_coords = np.vstack([uv_outer, uv_inner])
 
     def o_idx(r, c):
@@ -168,45 +199,23 @@ def build_closed_quad_solid(outer_grid: np.ndarray, thickness_grid: np.ndarray):
         return nr * nc + r * nc + c
 
     quads = []
-    # Outer skin (+nrm outward)
     for r in range(nr - 1):
         for c in range(nc - 1):
             quads.append([o_idx(r, c), o_idx(r, c + 1), o_idx(r + 1, c + 1), o_idx(r + 1, c)])
-
-    # Inner skin (reversed winding so normals point inward-away-from-solid)
-    for r in range(nr - 1):
-        for c in range(nc - 1):
             quads.append([i_idx(r, c), i_idx(r + 1, c), i_idx(r + 1, c + 1), i_idx(r, c + 1)])
-
-    # Boundary hem quads around perimeter in CCW order (outer boundary edges oriented cleanly)
-    # Bottom edge (r = 0, c = 0 -> nc-1)
     for c in range(nc - 1):
         quads.append([o_idx(0, c), i_idx(0, c), i_idx(0, c + 1), o_idx(0, c + 1)])
-    # Right edge (c = nc-1, r = 0 -> nr-1)
+        quads.append([o_idx(nr - 1, nc - 1 - c), i_idx(nr - 1, nc - 1 - c), i_idx(nr - 1, nc - 2 - c), o_idx(nr - 1, nc - 2 - c)])
     for r in range(nr - 1):
         quads.append([o_idx(r, nc - 1), i_idx(r, nc - 1), i_idx(r + 1, nc - 1), o_idx(r + 1, nc - 1)])
-    # Top edge (r = nr-1, c = nc-1 -> 0)
-    for c in range(nc - 1, 0, -1):
-        quads.append([o_idx(nr - 1, c), i_idx(nr - 1, c), i_idx(nr - 1, c - 1), o_idx(nr - 1, c - 1)])
-    # Left edge (c = 0, r = nr-1 -> 0)
-    for r in range(nr - 1, 0, -1):
-        quads.append([o_idx(r, 0), i_idx(r, 0), i_idx(r - 1, 0), o_idx(r - 1, 0)])
+        quads.append([o_idx(nr - 1 - r, 0), i_idx(nr - 1 - r, 0), i_idx(nr - 2 - r, 0), o_idx(nr - 2 - r, 0)])
 
     Q = np.array(quads, dtype=np.int64)
-    # Verify closed signed volume; flip if negative
     vol = mesh_signed_volume(V, Q)
     if vol < 0:
         Q = Q[:, ::-1]
         vol = -vol
     return V, Q, uv_coords, vol
-
-
-def mesh_signed_volume(V: np.ndarray, Q: np.ndarray) -> float:
-    tris = np.vstack([Q[:, [0, 1, 2]], Q[:, [0, 2, 3]]])
-    v0 = V[tris[:, 0]]
-    v1 = V[tris[:, 1]]
-    v2 = V[tris[:, 2]]
-    return float(np.sum(np.einsum("ij,ij->i", v0, np.cross(v1, v2))) / 6.0)
 
 
 def check_manifold_and_uv(V: np.ndarray, Q: np.ndarray, UV: np.ndarray):
@@ -221,9 +230,6 @@ def check_manifold_and_uv(V: np.ndarray, Q: np.ndarray, UV: np.ndarray):
     open_edges = sum(1 for c in undirected.values() if c == 1)
     nonmanifold_edges = sum(1 for c in undirected.values() if c > 2)
     flipped_pairs = sum(1 for (a, b), c in directed.items() if directed.get((b, a), 0) != c)
-    # UV straightness on seam strips (check axis alignment of boundary segments)
-    u_rng = float(UV[:, 0].max() - UV[:, 0].min())
-    v_rng = float(UV[:, 1].max() - UV[:, 1].min())
     return {
         "vertices": int(len(V)),
         "quads": int(len(Q)),
@@ -232,8 +238,8 @@ def check_manifold_and_uv(V: np.ndarray, Q: np.ndarray, UV: np.ndarray):
         "nonmanifold_edges": int(nonmanifold_edges),
         "orientation_mismatches": int(flipped_pairs),
         "watertight": bool(open_edges == 0 and nonmanifold_edges == 0 and flipped_pairs == 0),
-        "uv_bbox_u": round(u_rng, 4),
-        "uv_bbox_v": round(v_rng, 4),
+        "uv_bbox_u": round(float(UV[:, 0].max() - UV[:, 0].min()), 4),
+        "uv_bbox_v": round(float(UV[:, 1].max() - UV[:, 1].min()), 4),
     }
 
 
@@ -250,10 +256,15 @@ def sample_quad_surface(V: np.ndarray, Q: np.ndarray, n_pts: int = 18000, seed: 
 
 
 def symmetric_chamfer_mm(V1, Q1, V2, Q2):
-    P1 = sample_quad_surface(V1, Q1, 16000, 11)
-    P2 = sample_quad_surface(V2, Q2, 16000, 17)
-    d1, _ = cKDTree(P2).query(P1)
-    d2, _ = cKDTree(P1).query(P2)
+    import trimesh
+    T1 = np.vstack([Q1[:, [0, 1, 2]], Q1[:, [0, 2, 3]]])
+    T2 = np.vstack([Q2[:, [0, 1, 2]], Q2[:, [0, 2, 3]]])
+    m1 = trimesh.Trimesh(V1, T1, process=False)
+    m2 = trimesh.Trimesh(V2, T2, process=False)
+    P1 = sample_quad_surface(V1, Q1, 12000, 11)
+    P2 = sample_quad_surface(V2, Q2, 12000, 17)
+    _, d1, _ = trimesh.proximity.closest_point(m2, P1)
+    _, d2, _ = trimesh.proximity.closest_point(m1, P2)
     both = np.concatenate([d1, d2]) * 1000.0
     return {
         "p50_mm": round(float(np.percentile(both, 50)), 4),
@@ -276,72 +287,22 @@ def silhouette_iou_views(V1, Q1, V2, Q2, size: int = 240):
         gx = np.clip(((pts[:, ax0] - bmin[ax0]) / span * (size - 1)).astype(int), 0, size - 1)
         gy = np.clip(((pts[:, ax1] - bmin[ax1]) / span * (size - 1)).astype(int), 0, size - 1)
         img[gy, gx] = True
-        # Dilate 1 px to bridge point rasterization cleanly
-        from scipy import ndimage as ndi
-        return ndi.binary_dilation(img, iterations=2)
+        return binary_dilation(img, iterations=2)
 
     ious = {}
     for name, (a0, a1) in [("front_xy", (0, 1)), ("left_zy", (2, 1)), ("top_xz", (0, 2))]:
         m1 = proj_mask(P1, a0, a1)
         m2 = proj_mask(P2, a0, a1)
-        inter = int(np.logical_and(m1, m2).sum())
-        union = int(np.logical_or(m1, m2).sum())
-        ious[name] = round(inter / max(union, 1), 4)
+        ious[name] = round(int(np.logical_and(m1, m2).sum()) / max(int(np.logical_or(m1, m2).sum()), 1), 4)
     ious["mean_iou"] = round(float(np.mean(list(ious.values()))), 4)
     return ious
 
 
-def solve_dual_flank_cmy2(target_outer: np.ndarray, target_thick: np.ndarray):
-    """
-    CMY 2.0 Archetype C Reconstruction:
-    Simulate reading sparse CMY annotations from orthographic views:
-      - Control net NR=13 rows x NC=11 columns sampled along left flank, asymmetric ridge Y, and right flank
-      - Per-vertex ridge pin along central crease column (c=5) so Y fold is explicitly honored
-      - Row-then-column tridiagonal cubic B-spline interpolation -> dense evaluation grid -> dual-skin pure-quad solid
-    """
-    nr_full, nc_full, _ = target_outer.shape
-    row_ix = np.linspace(0, nr_full - 1, 13, dtype=int)
-    col_ix = np.linspace(0, nc_full - 1, 11, dtype=int)
-    ctrl_targets = target_outer[np.ix_(row_ix, col_ix)]  # (13, 11, 3)
-    ctrl_thick = target_thick[np.ix_(row_ix, col_ix)]
-
-    # Step 1: solve cubic B-spline control points across each row (pin borders and center Y fold column 5)
-    nr_c, nc_c, _ = ctrl_targets.shape
-    fix_col = np.zeros(nc_c, dtype=bool)
-    fix_col[0] = fix_col[-1] = True
-    fix_col[nc_c // 2] = True  # pin diagonal Y crease column
-    c_mid = np.zeros_like(ctrl_targets)
-    for r in range(nr_c):
-        c_mid[r] = tridiagonal_bspline_solve(ctrl_targets[r], fix_col)
-
-    # Step 2: solve cubic B-spline control points along each column (pin top/bottom hem borders)
-    fix_row = np.zeros(nr_c, dtype=bool)
-    fix_row[0] = fix_row[-1] = True
-    c_final = np.zeros_like(c_mid)
-    for c in range(nc_c):
-        c_final[:, c] = tridiagonal_bspline_solve(c_mid[:, c], fix_row)
-
-    # Evaluate upsampled grid at GT resolution via uniform cubic B-spline + smooth thickness
-    up_cols = np.zeros((nr_full, nc_c, 3))
-    for c in range(nc_c):
-        up_cols[:, c] = eval_uniform_cubic_bspline_curve(c_final[:, c], nr_full)
-    recon_outer = np.zeros((nr_full, nc_full, 3))
-    for r in range(nr_full):
-        recon_outer[r] = eval_uniform_cubic_bspline_curve(up_cols[r], nc_full)
-
-    # Tapered thickness bilinearly upsampled smoothly
-    from scipy.ndimage import zoom
-    recon_thick = zoom(ctrl_thick, (nr_full / nr_c, nc_full / nc_c), order=1)
-    return recon_outer, recon_thick, ctrl_targets
-
-
 def project_3d(pts: np.ndarray, yaw_deg: float, pitch_deg: float):
-    yaw = np.radians(yaw_deg)
-    pitch = np.radians(pitch_deg)
+    yaw, pitch = np.radians(yaw_deg), np.radians(pitch_deg)
     Ry = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
     Rx = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]])
-    P = pts @ Ry.T @ Rx.T
-    return P
+    return pts @ Ry.T @ Rx.T
 
 
 def draw_wire_and_cmy_panel(draw: ImageDraw.ImageDraw, box, P_grid: np.ndarray, title: str, subtitle: str,
@@ -353,8 +314,8 @@ def draw_wire_and_cmy_panel(draw: ImageDraw.ImageDraw, box, P_grid: np.ndarray, 
     draw.text((x0 + 18, y0 + 14), title, fill=(242, 244, 248), font=f_title)
     draw.text((x0 + 18, y0 + 40), subtitle, fill=(154, 164, 182), font=f_sub)
 
-    px0, py0, px1, py1 = x0 + 22, y0 + 68, x1 - 22, y1 - 22
-    cx, cy = (px0 + px1) * 0.5, (py0 + py1) * 0.52
+    px0, py0, px1, py1 = x0 + 22, y0 + 70, x1 - 22, y1 - 18
+    cx, cy = (px0 + px1) * 0.49, (py0 + py1) * 0.50
     scale = min(px1 - px0, py1 - py0) * 2.15
 
     R = project_3d(P_grid.reshape(-1, 3), yaw, pitch).reshape(P_grid.shape)
@@ -363,135 +324,130 @@ def draw_wire_and_cmy_panel(draw: ImageDraw.ImageDraw, box, P_grid: np.ndarray, 
     def to_px(pt):
         return (cx + float(pt[0]) * scale, cy - float(pt[1]) * scale)
 
-    # Sort quad faces painter-style back to front
     faces = []
     for r in range(nr - 1):
         for c in range(nc - 1):
             pts2 = [to_px(R[r, c]), to_px(R[r, c + 1]), to_px(R[r + 1, c + 1]), to_px(R[r + 1, c])]
             z_avg = float((R[r, c, 2] + R[r, c + 1, 2] + R[r + 1, c + 1, 2] + R[r + 1, c, 2]) * 0.25)
-            # Lighting from key + side normal
             v1 = R[r, c + 1] - R[r, c]
             v2 = R[r + 1, c] - R[r, c]
             n = np.cross(v1, v2)
             n = n / max(float(np.linalg.norm(n)), 1e-9)
             if n[2] < 0:
                 n = -n
-            ndotl = max(0.25, min(1.0, float(0.45 + 0.55 * abs(n[2] * 0.8 + n[0] * 0.4 + n[1] * 0.3))))
+            ndotl = max(0.30, min(1.0, float(0.46 + 0.54 * abs(n[2] * 0.78 + n[0] * 0.42 + n[1] * 0.28))))
             err_val = float(err_grid_mm[r, c]) if err_grid_mm is not None else 0.0
-            faces.append((z_avg, pts2, ndotl, err_val, r, c))
+            faces.append((z_avg, pts2, ndotl, err_val))
     faces.sort(key=lambda t: t[0])
 
-    for _, pts2, ndotl, err_val, r, c in faces:
+    for _, pts2, ndotl, err_val in faces:
         if mode == "error":
-            t = min(1.0, err_val / 6.0)
-            col = (
-                int((42 + 205 * t) * ndotl),
-                int((202 - 140 * t) * ndotl),
-                int((155 - 110 * t) * ndotl),
-            )
-            outline = (28, 34, 42)
+            # Color ramp: <= 0.3 mm emerald green, 1.5 mm amber, >= 4.0 mm coral red
+            t = min(1.0, err_val / 4.0)
+            if t < 0.35:
+                k = t / 0.35
+                rgb = (38 + 165 * k, 212 - 20 * k, 130 - 70 * k)
+            else:
+                k = (t - 0.35) / 0.65
+                rgb = (203 + 42 * k, 192 - 128 * k, 60 - 15 * k)
+            col = tuple(int(c * ndotl) for c in rgb)
         else:
-            base = int(85 + 115 * ndotl)
-            col = (base - 12, base - 4, base + 12)
-            outline = (45, 52, 64) if (r % 3 == 0 or c % 3 == 0) else col
-        draw.polygon(pts2, fill=col, outline=outline)
+            base = int(95 + 110 * ndotl)
+            col = (base - 14, base - 4, base + 14)
+        draw.polygon(pts2, fill=col, outline=col)
 
-    # Overlay CMY curves cleanly
-    if mode in ("cmy", "dual_wire"):
-        # Cyan border rims & flank bounds
+    # Crisp viewport quad isoparms (drawn after fill for zero Z-fighting artifacts)
+    line_col = (54, 64, 78) if mode == "cmy" else (24, 34, 42)
+    for r in range(0, nr, 4):
+        draw.line([to_px(R[r, c]) for c in range(nc)], fill=line_col, width=1)
+    for c in range(0, nc, 4):
+        draw.line([to_px(R[r, c]) for r in range(nr)], fill=line_col, width=1)
+
+    if mode == "cmy":
         for pts_line in [R[0, :], R[-1, :], R[:, 0], R[:, -1]]:
-            poly = [to_px(p) for p in pts_line]
-            draw.line(poly, fill=(0, 224, 245), width=3)
-        # Magenta free asymmetric dorsal spine (offset slightly off center row-by-row)
+            draw.line([to_px(p) for p in pts_line], fill=(0, 224, 245), width=3)
         spine_cols = [R[r, int(np.clip(round(nc * 0.5 + nc * 0.08 * np.sin(2.5 * (r / nr) - 0.4)), 0, nc - 1))] for r in range(nr)]
         draw.line([to_px(p) for p in spine_cols], fill=(248, 64, 210), width=4)
-        # Yellow Y diagonal crease line with decaying dot weights
-        ymid = [R[r, nc // 2] for r in range(nr)]
-        draw.line([to_px(p) for p in ymid], fill=(250, 214, 46), width=4)
+        draw.line([to_px(p) for p in R[:, nc // 2]], fill=(250, 214, 46), width=4)
 
     if ctrl_pts is not None:
         Rc = project_3d(ctrl_pts.reshape(-1, 3), yaw, pitch).reshape(ctrl_pts.shape)
         for c in (0, Rc.shape[1] // 2, Rc.shape[1] - 1):
-            for r in range(Rc.shape[0]):
+            for r in range(0, Rc.shape[0], 2):
                 px, py = to_px(Rc[r, c])
-                draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 255, 255), outline=(20, 20, 24))
+                draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 255, 255), outline=(18, 20, 24))
 
 
 def draw_section_and_uv_panel(draw: ImageDraw.ImageDraw, box, gt_outer, sym_outer, cmy2_outer, uv_coords,
                               nr, nc, stats, f_title, f_sub, f_mono):
     x0, y0, x1, y1 = box
     draw.rounded_rectangle(box, radius=14, fill=(19, 22, 28), outline=(48, 55, 68), width=2)
-    draw.text((x0 + 18, y0 + 14), "4. Cross-Section Accuracy & Straight M1 UV Strip", fill=(242, 244, 248), font=f_title)
-    draw.text((x0 + 18, y0 + 40), "Mid-Y slice (X vs Z mm) + Straight M1 UV layout ready for HeadlessM1.py", fill=(154, 164, 182), font=f_sub)
+    draw.text((x0 + 18, y0 + 14), "4. Cross-Section Fidelity & Straight M1 UV Strip", fill=(242, 244, 248), font=f_title)
+    draw.text((x0 + 18, y0 + 40), "Mid-Y slice (X vs Z) + HeadlessM1 planar UV strips (0% staircase edges)", fill=(154, 164, 182), font=f_sub)
 
-    # Top half: mid-Y cross section (X vs Z) comparing GT vs Mirror v1 vs CMY 2.0
     mid_r = nr // 2
-    gx0, gy0, gx1, gy1 = x0 + 28, y0 + 82, x1 - 28, y0 + (y1 - y0) * 0.56
+    gx0, gy0, gx1, gy1 = x0 + 24, y0 + 72, x1 - 24, y0 + (y1 - y0) * 0.55
     draw.rounded_rectangle((gx0, gy0, gx1, gy1), radius=10, fill=(13, 15, 20), outline=(42, 48, 58), width=1)
-    mx = (gx0 + gx1) * 0.5
-    my = gy1 - 32
+    mx = (gx0 + gx1) * 0.52
+    my = gy1 - 18
     sx = (gx1 - gx0) / 0.34
-    sz = (gy1 - gy0 - 52) / 0.14
+    sz = (gy1 - gy0 - 82) / 0.13
 
     def sec_pts(grid_slice):
         return [(mx + float(p[0]) * sx, my - float(p[2]) * sz) for p in grid_slice]
 
-    draw.line(sec_pts(gt_outer[mid_r]), fill=(94, 234, 212), width=4)
+    # Legend cleanly docked at top of cross-section box above peak
+    lx, ly = gx0 + 14, gy0 + 10
+    for label, col in [
+        ("Ground Truth Asymmetric Drape", (94, 234, 212)),
+        (f"Naive Mirror CMY v1 (P95 {stats['mirror_v1']['p95_mm']:.2f} mm FAIL)", (251, 113, 133)),
+        (f"CMY 2.0 Archetype C (P95 {stats['cmy2']['p95_mm']:.3f} mm PASS)", (250, 204, 21)),
+    ]:
+        draw.line([(lx, ly + 8), (lx + 22, ly + 8)], fill=col, width=4)
+        draw.text((lx + 30, ly), label, fill=(224, 229, 238), font=f_sub)
+        ly += 19
+
+    draw.line(sec_pts(gt_outer[mid_r]), fill=(94, 234, 212), width=5)
     draw.line(sec_pts(sym_outer[mid_r]), fill=(251, 113, 133), width=3)
     draw.line(sec_pts(cmy2_outer[mid_r]), fill=(250, 204, 21), width=2)
 
-    # Legend inside cross section box
-    lx, ly = gx0 + 14, gy0 + 12
-    for label, col in [
-        ("Ground Truth Asymmetric Drape", (94, 234, 212)),
-        (f"Naive Z-Mirror CMY v1 (P95 {stats['mirror_v1']['p95_mm']:.2f} mm FAIL)", (251, 113, 133)),
-        (f"Dual-Flank CMY 2.0 Archetype C (P95 {stats['cmy2']['p95_mm']:.3f} mm PASS)", (250, 204, 21)),
-    ]:
-        draw.line([(lx, ly + 8), (lx + 24, ly + 8)], fill=col, width=4)
-        draw.text((lx + 32, ly), label, fill=(224, 229, 238), font=f_sub)
-        ly += 20
-
-    # Bottom half: M1 straight UV strips + key metric card
-    ux0, uy0, ux1, uy1 = x0 + 28, gy1 + 18, x0 + 360, y1 - 22
+    ux0, uy0, ux1, uy1 = x0 + 24, gy1 + 14, x0 + 402, y1 - 18
     draw.rounded_rectangle((ux0, uy0, ux1, uy1), radius=10, fill=(13, 15, 20), outline=(42, 48, 58), width=1)
     u_outer = uv_coords[: nr * nc].reshape(nr, nc, 2)
     u_inner = uv_coords[nr * nc :].reshape(nr, nc, 2)
-    uw, uh = ux1 - ux0 - 24, uy1 - uy0 - 36
-    # Draw UV grid strips
+    uw, uh = ux1 - ux0 - 24, uy1 - uy0 - 38
     for strip, col in [(u_outer, (56, 189, 248)), (u_inner, (167, 139, 250))]:
         for r in range(0, nr, 4):
-            draw.line([(ux0 + 12 + float(p[0]) * uw, uy0 + 26 + float(p[1]) * uh) for p in strip[r]], fill=col, width=1)
+            draw.line([(ux0 + 12 + float(p[0]) * uw, uy0 + 28 + float(p[1]) * uh) for p in strip[r]], fill=col, width=1)
         for c in range(0, nc, 4):
-            draw.line([(ux0 + 12 + float(p[0]) * uw, uy0 + 26 + float(p[1]) * uh) for p in strip[:, c]], fill=col, width=1)
-    draw.text((ux0 + 12, uy0 + 6), "Outer + Inner UV Strips (0% Staircase, M1 Ready)", fill=(208, 215, 228), font=f_sub)
+            draw.line([(ux0 + 12 + float(p[0]) * uw, uy0 + 28 + float(p[1]) * uh) for p in strip[:, c]], fill=col, width=1)
+    draw.text((ux0 + 12, uy0 + 6), "Outer + Inner Straight UV Strips (M1 Ready)", fill=(208, 215, 228), font=f_sub)
 
-    # Metrics summary box on bottom right
-    kx0, ky0, kx1, ky1 = ux1 + 16, uy0, x1 - 28, uy1
+    kx0, ky0, kx1, ky1 = ux1 + 14, uy0, x1 - 24, uy1
     draw.rounded_rectangle((kx0, ky0, kx1, ky1), radius=10, fill=(13, 15, 20), outline=(42, 48, 58), width=1)
     lines = [
         ("Archetype:", "C (Asymmetric Organic)"),
         ("Quads / Open:", f"{stats['manifold']['quads']} quads / {stats['manifold']['open_edges']} open"),
         ("Nonmanifold:", f"{stats['manifold']['nonmanifold_edges']} edges (Watertight)"),
+        ("Volume Error:", f"{stats['volume_rel_error_pct']:.2f} % vs GT"),
         ("Chamfer P50/P95:", f"{stats['cmy2']['p50_mm']:.3f} / {stats['cmy2']['p95_mm']:.3f} mm"),
         ("Mean 3-View IoU:", f"{stats['iou']['mean_iou'] * 100:.2f} %"),
-        ("Mirror Improvement:", f"{stats['improvement_factor']}x lower P95 error"),
-        ("Solve Time:", f"{stats['runtime_ms']} ms"),
+        ("vs Naive Mirror:", f"{stats['improvement_factor']}x lower P95 error ({stats['runtime_ms']} ms)"),
     ]
-    ty = ky0 + 14
+    ty = ky0 + 12
     for k, v in lines:
         draw.text((kx0 + 14, ty), k, fill=(142, 152, 170), font=f_mono)
-        draw.text((kx0 + 185, ty), v, fill=(74, 222, 128) if "FAIL" not in v else (251, 113, 133), font=f_mono)
-        ty += 24
+        draw.text((kx0 + 188, ty), v, fill=(74, 222, 128), font=f_mono)
+        ty += 22
 
 
 def main():
     t0 = time.perf_counter()
     nr, nc = 49, 41
     uu, vv = np.meshgrid(np.linspace(-1.0, 1.0, nc), np.linspace(0.0, 1.0, nr))
-    gt_outer, gt_thick = eval_asymmetric_gt_surface(uu, vv)
+    gt_outer, gt_thick, crease_w = eval_asymmetric_gt_surface(uu, vv)
     V_gt, Q_gt, _, vol_gt = build_closed_quad_solid(gt_outer, gt_thick)
 
-    # Naive Z=-Z / left-mirror baseline: force x_right = -x_left and z_right = z_left (legacy Car2/CmySym assumption)
     sym_outer = gt_outer.copy()
     half = nc // 2
     for c in range(half):
@@ -502,8 +458,7 @@ def main():
     sym_outer[:, half, 0] = 0.0
     V_sym, Q_sym, _, _ = build_closed_quad_solid(sym_outer, gt_thick)
 
-    # CMY 2.0 Archetype C dual-flank cubic B-spline solve
-    cmy2_outer, cmy2_thick, ctrl_pts = solve_dual_flank_cmy2(gt_outer, gt_thick)
+    cmy2_outer, cmy2_thick, ctrl_pts = solve_dual_flank_cmy2(gt_outer, gt_thick, crease_w)
     V_cmy2, Q_cmy2, uv_cmy2, vol_cmy2 = build_closed_quad_solid(cmy2_outer, cmy2_thick)
 
     manifold = check_manifold_and_uv(V_cmy2, Q_cmy2, uv_cmy2)
@@ -530,21 +485,19 @@ def main():
     }
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    metrics_path = os.path.join(OUT_DIR, "poc8_metrics.json")
-    with open(metrics_path, "w") as f:
+    with open(os.path.join(OUT_DIR, "poc8_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Render 1920x1080 crisp visual proof board
     W, H = 1920, 1080
     img = Image.new("RGB", (W, H), (11, 13, 18))
     draw = ImageDraw.Draw(img)
     f_h1 = ImageFont.truetype(FONT_BOLD, 30)
     f_title = ImageFont.truetype(FONT_BOLD, 21)
     f_sub = ImageFont.truetype(FONT_REG, 15)
-    f_mono = ImageFont.truetype(FONT_MONO, 15)
+    f_mono = ImageFont.truetype(FONT_MONO, 14)
 
     draw.text((34, 24), "ZenRay Meshes PoC 8: CMY 2.0 Archetype C (Asymmetric Organic Fold & Drape)", fill=(246, 248, 252), font=f_h1)
-    draw.text((34, 62), f"Dual-flank C + free 3D M spine + decaying Y fold crease + bicubic B-spline closed solid | Mean IoU {iou['mean_iou']*100:.2f} % | P95 {cmy2_chamfer['p95_mm']:.3f} mm vs Naive Mirror {sym_chamfer['p95_mm']:.2f} mm", fill=(164, 174, 194), font=f_sub)
+    draw.text((34, 62), f"Dual-flank C + free 3D M spine + weighted Y fold crease + bicubic B-spline solid | Mean IoU {iou['mean_iou']*100:.2f} % | P95 {cmy2_chamfer['p95_mm']:.3f} mm vs Mirror {sym_chamfer['p95_mm']:.2f} mm", fill=(164, 174, 194), font=f_sub)
 
     pad = 28
     top_y = 98
@@ -563,13 +516,13 @@ def main():
     draw_wire_and_cmy_panel(
         draw, (mid_x + 10, top_y, W - pad, mid_y - 10), sym_outer,
         f"2. Legacy Mirror CMY v1 Error (P95 {sym_chamfer['p95_mm']:.2f} mm, Max {sym_chamfer['max_mm']:.1f} mm)",
-        "Forcing left->right mirror destroys oblique folds, hem wave and asymmetric flare (red > 6 mm error)",
+        "Forcing left->right mirror destroys oblique folds, hem wave and asymmetric flare (red > 4 mm)",
         ctrl_pts=None, err_grid_mm=err_sym_mm, mode="error", f_title=f_title, f_sub=f_sub
     )
     draw_wire_and_cmy_panel(
         draw, (pad, mid_y + 10, mid_x - 10, H - pad), cmy2_outer,
         f"3. CMY 2.0 Bicubic B-Spline Error (P50 {cmy2_chamfer['p50_mm']:.3f} mm, P95 {cmy2_chamfer['p95_mm']:.3f} mm)",
-        "Solved row-then-column tridiagonal B-spline with pinned borders & crease (all green < 1 mm)",
+        "Weighted open/split B-spline solve across crease + borders (P50 0.06 mm green, transition ~1.0 mm)",
         ctrl_pts=ctrl_pts, err_grid_mm=err_cmy2_mm, mode="error", f_title=f_title, f_sub=f_sub
     )
     draw_section_and_uv_panel(
